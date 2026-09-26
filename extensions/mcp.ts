@@ -136,17 +136,29 @@ export function formatSearchHits(hits: ToolMeta[], total: number): string {
   return `${head}:\n${lines.join("\n")}`;
 }
 
+/** Shared mode precedence: empty strings read as "not provided" so rendering
+ * and behavior agree. */
+export function modeOf(args: { tool?: unknown; search?: unknown; describe?: unknown; server?: unknown }): "call" | "search" | "describe" | "list" | "status" {
+  const has = (v: unknown) => typeof v === "string" && v !== "";
+  return has(args.tool) ? "call" : has(args.search) ? "search" : has(args.describe) ? "describe" : has(args.server) ? "list" : "status";
+}
+
 /** One-line display for an `mcp` tool call: the selected mode and target. */
 export function renderMcpCall(args: { tool?: unknown; search?: unknown; describe?: unknown; server?: unknown }, theme: Pick<Theme, "fg" | "bold">): string {
   const clip = (s: string) => (s.length > 60 ? `${s.slice(0, 57)}...` : s);
   const str = (v: unknown) => (typeof v === "string" && v ? v : "");
-  const mode =
-    str(args.tool) ? `call ${args.tool}` :
-    str(args.search) ? `search "${clip(str(args.search))}"` :
-    str(args.describe) ? `describe ${args.describe}` :
-    str(args.server) ? `list ${args.server}` :
+  const mode = modeOf(args);
+  const target =
+    mode === "call" ? `call ${args.tool}` :
+    mode === "search" ? `search "${clip(str(args.search))}"` :
+    mode === "describe" ? `describe ${args.describe}` :
+    mode === "list" ? `list ${args.server}` :
     "status";
-  return theme.fg("toolTitle", theme.bold("mcp ")) + theme.fg("accent", mode);
+  return theme.fg("toolTitle", theme.bold("mcp ")) + theme.fg("accent", target);
+}
+
+function reply(text: string): { content: Array<{ type: "text"; text: string }>; details: {} } {
+  return { content: [{ type: "text", text }], details: {} };
 }
 
 /** Reuse the prior render component when available (pi renderer idiom). */
@@ -164,11 +176,15 @@ export function registerMcpTool(pi: ExtensionAPI, configPath: string = CONFIG_PA
     servers.set(name, state);
   }
 
-  function closeClient(state: ServerState): void {
+  function clearIdleTimer(state: ServerState): void {
     if (state.idleTimer) {
       clearTimeout(state.idleTimer);
       state.idleTimer = undefined;
     }
+  }
+
+  function closeClient(state: ServerState): void {
+    clearIdleTimer(state);
     const client = state.client;
     state.client = undefined;
     if (client) void client.close().catch(() => undefined);
@@ -176,10 +192,7 @@ export function registerMcpTool(pi: ExtensionAPI, configPath: string = CONFIG_PA
 
   /** Schedule teardown when idle. unref() so the timer never keeps pi alive. */
   function scheduleIdleClose(state: ServerState): void {
-    if (state.idleTimer) {
-      clearTimeout(state.idleTimer);
-      state.idleTimer = undefined;
-    }
+    clearIdleTimer(state);
     if (state.activeCalls > 0) return;
     state.idleTimer = setTimeout(() => {
       if (state.activeCalls > 0) return;
@@ -210,10 +223,7 @@ export function registerMcpTool(pi: ExtensionAPI, configPath: string = CONFIG_PA
     }
     if (state.shuttingDown) throw new Error("MCP is shutting down");
     if (state.invalid) throw new Error(`Server "${name}" has invalid config: ${state.invalid}`);
-    if (state.idleTimer) {
-      clearTimeout(state.idleTimer);
-      state.idleTimer = undefined;
-    }
+    clearIdleTimer(state);
     if (state.client && state.tools) return state;
     if (state.connecting) {
       await state.connecting;
@@ -276,6 +286,20 @@ export function registerMcpTool(pi: ExtensionAPI, configPath: string = CONFIG_PA
     return failed;
   }
 
+  /** Connect the server named by a qualified tool, or all servers when the
+   * name is bare — just enough metadata to resolve the name either way.
+   * A named server's connect failure propagates; bare names swallow per-server
+   * errors (returned as the failed list) so a down server doesn't hide others. */
+  async function connectForResolve(name: string): Promise<string[]> {
+    const sep = name.indexOf("__");
+    const maybe = sep > 0 ? name.slice(0, sep) : undefined;
+    if (maybe && servers.has(maybe)) {
+      await ensureMeta(maybe);
+      return [];
+    }
+    return ensureAllMeta();
+  }
+
   function unreachableNote(failed: string[]): string {
     if (failed.length === 0) return "";
     const detail = failed.map((n) => `${n} (${servers.get(n)?.lastError ?? "connect failed"})`).join("; ");
@@ -319,17 +343,7 @@ Tool names are "server__tool"; a bare name works when unambiguous. Servers conne
       return text;
     },
     async execute(_id, params, signal) {
-      // Empty strings read as "not provided" so rendering and behavior agree.
-      const has = (v: string | undefined) => v !== undefined && v !== "";
-      const mode = has(params.tool)
-        ? "call"
-        : has(params.search)
-          ? "search"
-          : has(params.describe)
-            ? "describe"
-            : has(params.server)
-              ? "list"
-              : "status";
+      const mode = modeOf(params);
 
       if (signal?.aborted) throw new Error("Aborted");
 
@@ -347,13 +361,13 @@ Tool names are "server__tool"; a bare name works when unambiguous. Servers conne
                 : "not connected yet";
           lines.push(`- ${name} (${kind}): ${status}`);
         }
-        return { content: [{ type: "text", text: lines.join("\n") || "No MCP servers configured." }], details: {} };
+        return reply(lines.join("\n") || "No MCP servers configured.");
       }
 
       if (mode === "list") {
         const state = await ensureMeta(params.server!);
         const tools = (state.tools ?? []).map((t) => `- ${t.qualified}${t.description ? ` — ${t.description}` : ""}`);
-        return { content: [{ type: "text", text: `Tools on ${params.server}:\n${tools.join("\n") || "(none)"}` }], details: {} };
+        return reply(`Tools on ${params.server}:\n${tools.join("\n") || "(none)"}`);
       }
 
       if (mode === "search") {
@@ -365,24 +379,20 @@ Tool names are "server__tool"; a bare name works when unambiguous. Servers conne
         const body = matching.length === 0
           ? `No tools matching "${params.search}".`
           : formatSearchHits(hits, matching.length);
-        return { content: [{ type: "text", text: body + unreachableNote(failed) }], details: {} };
+        return reply(body + unreachableNote(failed));
       }
 
       if (mode === "describe") {
-        const failed = await ensureAllMeta();
+        const failed = await connectForResolve(params.describe!);
         const tool = resolveToolByName(allTools(), params.describe!);
         const text = `${tool.qualified}${tool.description ? `\n\n${tool.description}` : ""}\n\nParameters: ${JSON.stringify(tool.inputSchema ?? {}, null, 1)}`;
-        return { content: [{ type: "text", text: text + unreachableNote(failed) }], details: {} };
+        return reply(text + unreachableNote(failed));
       }
 
       // mode === "call": connect lazily before resolving so a bare
       // mcp({ tool }) works on first use.
-      const requested = params.tool!;
-      const sep = requested.indexOf("__");
-      const maybeServer = sep > 0 ? requested.slice(0, sep) : undefined;
-      if (maybeServer && servers.has(maybeServer)) await ensureMeta(maybeServer);
-      else await ensureAllMeta();
-      const tool = resolveToolByName(allTools(), requested);
+      await connectForResolve(params.tool!);
+      const tool = resolveToolByName(allTools(), params.tool!);
       const state = await ensureConnected(tool.server);
       state.activeCalls++;
       try {
@@ -391,7 +401,7 @@ Tool names are "server__tool"; a bare name works when unambiguous. Servers conne
           CALL_TIMEOUT_MS + 5_000,
           `Call ${tool.qualified}`,
         );
-        return { content: [{ type: "text", text: serializeCallResult(result) }], details: {} };
+        return reply(serializeCallResult(result));
       } finally {
         state.activeCalls--;
         scheduleIdleClose(state);

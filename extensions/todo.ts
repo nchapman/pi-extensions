@@ -252,6 +252,8 @@ class TodoListComponent {
 		return lines;
 	}
 
+	// Required by pi's Component interface; the width-keyed render cache makes
+	// this a no-op for width changes, but pi may call it for other reasons.
 	invalidate(): void {
 		this.cachedWidth = undefined;
 		this.cachedLines = undefined;
@@ -266,7 +268,7 @@ class TodoListComponent {
  */
 function reconstructFromSession(ctx: ExtensionContext): { todos: TodoItem[]; planHiddenByCompaction: boolean } {
 	const branch = ctx.sessionManager.getBranch();
-	let todos: TodoItem[] = [];
+	let lastDetails: TodoDetails | undefined;
 	let lastIndex = -1;
 	for (let i = 0; i < branch.length; i++) {
 		const entry = branch[i];
@@ -275,9 +277,11 @@ function reconstructFromSession(ctx: ExtensionContext): { todos: TodoItem[]; pla
 		if (msg.role !== "toolResult" || msg.toolName !== TODO_TOOL_NAME) continue;
 		const d = msg.details as TodoDetails | undefined;
 		if (!Array.isArray(d?.todos)) continue;
-		todos = d!.todos.filter(isTodoItem);
+		lastDetails = d;
 		lastIndex = i;
 	}
+	// Filter once — intermediate snapshots are throwaway work.
+	const todos = lastDetails ? lastDetails.todos.filter(isTodoItem) : [];
 	const planHiddenByCompaction = todos.length > 0 && branch.some((e, i) => i > lastIndex && e.type === "compaction");
 	return { todos, planHiddenByCompaction };
 }
@@ -290,7 +294,7 @@ export function registerTodoTool(pi: ExtensionAPI): void {
 	const adoptBranchState = (ctx: ExtensionContext) => {
 		const state = reconstructFromSession(ctx);
 		todos = state.todos;
-		compactedSinceUpdate ||= state.planHiddenByCompaction;
+		compactedSinceUpdate = state.planHiddenByCompaction;
 	};
 
 	pi.on("session_start", (_event, ctx) => {

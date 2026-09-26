@@ -44,11 +44,12 @@ export function splitFrontmatter(text: string): { fm: Record<string, unknown>; b
   for (let i = 1; i < lines.length; i++) {
     if (DELIMITER.test(lines[i])) {
       const parsed = parseYaml(lines.slice(1, i).join("\n"));
-      if (parsed === null || parsed === undefined) return { fm: {}, body: lines.slice(i + 1).join("\n").replace(/^\n/, "") };
+      const body = lines.slice(i + 1).join("\n").replace(/^\n/, "");
+      if (parsed === null || parsed === undefined) return { fm: {}, body };
       if (typeof parsed !== "object" || Array.isArray(parsed)) {
         throw new Error("frontmatter must be a YAML mapping of key/value pairs");
       }
-      return { fm: parsed as Record<string, unknown>, body: lines.slice(i + 1).join("\n").replace(/^\n/, "") };
+      return { fm: parsed as Record<string, unknown>, body };
     }
   }
   // Unterminated frontmatter: treat the whole file as body.
@@ -75,14 +76,13 @@ function warnUnknownTools(kind: string, names: string[]): void {
  * A map entry with no value (`write:`) disables the tool — fail closed. */
 export function resolveTools(fm: Record<string, unknown>): string[] {
   const t = fm.tools;
-  if (typeof t === "string" && t.trim()) {
-    const names = t.split(",").map((s) => s.trim()).filter(Boolean);
-    warnUnknownTools("name(s) in", names);
-    const allow = new Set(names);
-    return BUILTIN_TOOLS.filter((b) => allow.has(b));
-  }
-  if (Array.isArray(t)) {
-    const names = t.map(String).map((s) => s.trim()).filter(Boolean);
+  const names =
+    typeof t === "string" && t.trim()
+      ? t.split(",").map((s) => s.trim()).filter(Boolean)
+      : Array.isArray(t)
+        ? t.map(String).map((s) => s.trim()).filter(Boolean)
+        : null;
+  if (names) {
     warnUnknownTools("name(s) in", names);
     const allow = new Set(names);
     return BUILTIN_TOOLS.filter((b) => allow.has(b));
@@ -152,13 +152,21 @@ export function resolveAgentDef(list: AgentDef[], ref: AgentRef): AgentDef {
   return agentFromText(DEFAULT_AGENT_MD, "generic");
 }
 
+// Streaming renders call refLabel repeatedly with the same agent_md; a
+// one-entry memo makes those consecutive calls skip the YAML parse.
+let labelCache: { md: string; label: string } | undefined;
+
 /** Display name for a task item, without resolving the full definition.
  * Tolerates unparseable agent_md — the error surfaces when the task runs. */
 export function refLabel(ref: AgentRef): string {
   if (ref.agent) return ref.agent;
+  const md = ref.agent_md ?? "";
+  if (labelCache?.md === md) return labelCache.label;
   try {
-    const fm = splitFrontmatter(ref.agent_md ?? "").fm;
-    return typeof fm.name === "string" && fm.name ? fm.name : "generic";
+    const fm = splitFrontmatter(md).fm;
+    const label = typeof fm.name === "string" && fm.name ? fm.name : "generic";
+    labelCache = { md, label };
+    return label;
   } catch {
     return "generic";
   }
@@ -432,6 +440,9 @@ const AGENTS_DIR = join(homedir(), ".pi/agent/agents");
 
 export function registerSubagentTools(pi: ExtensionAPI, agentsDir: string = AGENTS_DIR, spawnFn: SpawnFn = defaultSpawn, preloadedAgents?: AgentDef[]): void {
   const agents = preloadedAgents ?? loadAgents(agentsDir);
+  // The description's agent list is fixed at registration, but execute
+  // re-reads the directory so edited agent files take effect without
+  // reloading the extension.
   const agentList = agents.length
     ? agents.map((a) => `- ${a.name}: ${a.description || "(no description)"}`).join("\n")
     : `(no agents found in ${agentsDir})`;

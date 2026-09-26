@@ -52,6 +52,7 @@ import {
   formatParamNames,
   formatSearchHits,
   loadConfig,
+  modeOf,
   registerMcpTool,
   renderMcpCall,
   resolveToolByName,
@@ -86,6 +87,17 @@ const TWO_TOOLS = [
 
 /** Identity theme: strips styling so assertions see plain text. */
 const THEME = { fg: (_k: string, s: string) => s, bold: (s: string) => s } as never;
+
+describe("modeOf", () => {
+  it("prefers modes in render/execute agreement order, treating empty strings as absent", () => {
+    expect(modeOf({ tool: "x", search: "y" })).toBe("call");
+    expect(modeOf({ search: "y", describe: "z" })).toBe("search");
+    expect(modeOf({ describe: "z", server: "s" })).toBe("describe");
+    expect(modeOf({ server: "s" })).toBe("list");
+    expect(modeOf({})).toBe("status");
+    expect(modeOf({ tool: "", search: "", describe: "", server: "" })).toBe("status");
+  });
+});
 
 describe("renderMcpCall", () => {
   it("shows each call mode with its target", () => {
@@ -237,6 +249,16 @@ describe("registerMcpTool integration", () => {
     const { tool } = setup();
     const result = await tool.execute("1", { search: "" });
     expect(result.content[0].text).toContain("not connected yet");
+  });
+
+  it("reports a named server's connect failure instead of a missing tool", async () => {
+    sdk.behavior.connect = async () => {
+      throw new Error("boom");
+    };
+    const { tool } = setup();
+    // Qualified name: the named server's failure must surface, not "not found".
+    await expect(tool.execute("1", { tool: "s1__web_search" })).rejects.toThrow(/Failed to connect to MCP server "s1"/);
+    await expect(tool.execute("1", { describe: "s1__web_search" })).rejects.toThrow(/Failed to connect/);
   });
 
   it("lists status without connecting", async () => {
