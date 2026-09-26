@@ -53,6 +53,7 @@ import {
   formatSearchHits,
   loadConfig,
   registerMcpTool,
+  renderMcpCall,
   resolveToolByName,
   serializeCallResult,
   validateServerDef,
@@ -82,6 +83,30 @@ const TWO_TOOLS = [
   { name: "web_search", description: "Search the web", inputSchema: { type: "object", properties: { query: {} }, required: ["query"] } },
   { name: "web_fetch", description: "Fetch a URL", inputSchema: { type: "object", properties: { url: {}, raw: {} } } },
 ];
+
+/** Identity theme: strips styling so assertions see plain text. */
+const THEME = { fg: (_k: string, s: string) => s, bold: (s: string) => s } as never;
+
+describe("renderMcpCall", () => {
+  it("shows each call mode with its target", () => {
+    expect(renderMcpCall({ tool: "web__search" }, THEME)).toContain("call web__search");
+    expect(renderMcpCall({ search: "browser" }, THEME)).toContain('search "browser"');
+    expect(renderMcpCall({ describe: "web__search" }, THEME)).toContain("describe web__search");
+    expect(renderMcpCall({ server: "web" }, THEME)).toContain("list web");
+    expect(renderMcpCall({}, THEME)).toContain("status");
+  });
+
+  it("truncates long search queries", () => {
+    const text = renderMcpCall({ search: "q".repeat(100) }, THEME);
+    expect(text).toContain("...");
+    expect(text.length).toBeLessThan(80);
+  });
+
+  it("tolerates partially streamed arguments", () => {
+    expect(renderMcpCall({ search: "" }, THEME)).toContain("status");
+    expect(renderMcpCall({}, THEME)).toContain("mcp ");
+  });
+});
 
 describe("loadConfig", () => {
   it("returns empty for a missing file", () => {
@@ -198,6 +223,21 @@ describe("registerMcpTool integration", () => {
     registerMcpTool(pi, path);
     return { tool: tools.get("mcp")!, handlers };
   }
+
+  it("tool call rows render the call mode", () => {
+    const { tool } = setup();
+    const renderCall = (tool as unknown as {
+      renderCall: (args: unknown, theme: unknown, context?: unknown) => { render: (width: number) => string[] };
+    }).renderCall;
+    const text = renderCall({ search: "browser" }, THEME, {}).render(200).join("\n");
+    expect(text).toContain('search "browser"');
+  });
+
+  it("treats empty-string arguments as status, matching the renderer", async () => {
+    const { tool } = setup();
+    const result = await tool.execute("1", { search: "" });
+    expect(result.content[0].text).toContain("not connected yet");
+  });
 
   it("lists status without connecting", async () => {
     const { tool } = setup();

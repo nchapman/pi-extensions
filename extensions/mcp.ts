@@ -5,7 +5,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Type } from "typebox";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
+import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 
 export interface ServerDef {
   url?: string;
@@ -133,6 +134,24 @@ export function formatSearchHits(hits: ToolMeta[], total: number): string {
   });
   const head = total > hits.length ? `showing ${hits.length} of ${total} matching tool(s)` : `${total} matching tool(s)`;
   return `${head}:\n${lines.join("\n")}`;
+}
+
+/** One-line display for an `mcp` tool call: the selected mode and target. */
+export function renderMcpCall(args: { tool?: unknown; search?: unknown; describe?: unknown; server?: unknown }, theme: Pick<Theme, "fg" | "bold">): string {
+  const clip = (s: string) => (s.length > 60 ? `${s.slice(0, 57)}...` : s);
+  const str = (v: unknown) => (typeof v === "string" && v ? v : "");
+  const mode =
+    str(args.tool) ? `call ${args.tool}` :
+    str(args.search) ? `search "${clip(str(args.search))}"` :
+    str(args.describe) ? `describe ${args.describe}` :
+    str(args.server) ? `list ${args.server}` :
+    "status";
+  return theme.fg("toolTitle", theme.bold("mcp ")) + theme.fg("accent", mode);
+}
+
+/** Reuse the prior render component when available (pi renderer idiom). */
+function reuseText(context: { lastComponent?: unknown } | undefined): Text {
+  return context?.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
 }
 
 export function registerMcpTool(pi: ExtensionAPI, configPath: string = CONFIG_PATH): void {
@@ -293,14 +312,22 @@ Tool names are "server__tool"; a bare name works when unambiguous. Servers conne
       args: Type.Optional(Type.Record(Type.String(), Type.Unknown(), { description: "Tool call arguments" })),
       server: Type.Optional(Type.String({ description: "Server name to list tools for" })),
     }),
+    renderCall(args, theme, context) {
+      // Arguments stream in partially; the helpers tolerate missing keys.
+      const text = reuseText(context);
+      text.setText(renderMcpCall(args ?? {}, theme));
+      return text;
+    },
     async execute(_id, params, signal) {
-      const mode = params.tool !== undefined
+      // Empty strings read as "not provided" so rendering and behavior agree.
+      const has = (v: string | undefined) => v !== undefined && v !== "";
+      const mode = has(params.tool)
         ? "call"
-        : params.search !== undefined
+        : has(params.search)
           ? "search"
-          : params.describe !== undefined
+          : has(params.describe)
             ? "describe"
-            : params.server !== undefined
+            : has(params.server)
               ? "list"
               : "status";
 

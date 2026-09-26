@@ -25,6 +25,7 @@ import {
   runWithLimit,
   splitFrontmatter,
   summarizeTask,
+  renderSubagentResult,
   type AgentDef,
   type ChildLike,
   type SpawnFn,
@@ -467,12 +468,14 @@ describe("registerSubagentTools", () => {
     const tools = new Map<string, {
       execute: (id: string, params: unknown, signal?: AbortSignal) => Promise<unknown>;
       renderCall?: (args: never, theme: never, context?: never) => unknown;
+      renderResult?: (result: never, options: never, theme: never, context?: never) => unknown;
     }>();
     const pi = {
       registerTool: (t: {
         name: string;
         execute: (id: string, params: unknown, signal?: AbortSignal) => Promise<unknown>;
         renderCall?: (args: never, theme: never, context?: never) => unknown;
+        renderResult?: (result: never, options: never, theme: never, context?: never) => unknown;
       }) =>
         tools.set(t.name, t),
     };
@@ -556,6 +559,73 @@ describe("registerSubagentTools", () => {
     const batch = tools.get("subagents")!.renderCall!({} as never, THEME, context);
     expect(renderPlain(batch as never)).toContain("subagents");
     expect(renderPlain(batch as never)).not.toContain("(0)");
+  });
+
+  it("result rows render status and summary from the tool result", async () => {
+    const calls: string[][] = [];
+    const { pi, tools } = makePi();
+    registerSubagentTools(pi as never, mkdtempSync(join(tmpdir(), "agents-")), spawnReturning([jsonLine("all clear")], calls));
+
+    const result = await tools.get("subagent")!.execute("1", { task: "t" });
+    const rendered = tools.get("subagent")!.renderResult!(
+      result as never,
+      { isPartial: false, expanded: false } as never,
+      THEME,
+      { args: { task: "t" }, isError: false } as never,
+    );
+    expect(renderPlain(rendered as never)).toContain("done (generic)");
+    expect(renderPlain(rendered as never)).toContain("all clear");
+  });
+
+  it("result rows render a running partial with the streamed tail", async () => {
+    const calls: string[][] = [];
+    const { pi, tools } = makePi();
+    registerSubagentTools(pi as never, mkdtempSync(join(tmpdir(), "agents-")), spawnReturning([jsonLine("first"), jsonLine("second")], calls));
+
+    const partials: unknown[] = [];
+    const execute = tools.get("subagent")!.execute as
+      (id: string, params: unknown, signal: undefined, onUpdate: (r: unknown) => void) => Promise<unknown>;
+    await execute("1", { task: "t" }, undefined, (r) => partials.push(r));
+
+    expect(partials.length).toBeGreaterThan(0);
+    const rendered = tools.get("subagent")!.renderResult!(
+      partials[partials.length - 1] as never,
+      { isPartial: true, expanded: false } as never,
+      THEME,
+      { args: { task: "t" }, isError: false } as never,
+    );
+    expect(renderPlain(rendered as never)).toContain("running (generic)");
+    expect(renderPlain(rendered as never)).toContain("second");
+  });
+
+  it("result rows recover the agent name from call arguments on the error path", () => {
+    const { pi, tools } = makePi();
+    registerSubagentTools(pi as never, mkdtempSync(join(tmpdir(), "agents-")));
+
+    // pi clears details on thrown errors; only the call arguments remain.
+    const rendered = tools.get("subagent")!.renderResult!(
+      { content: [{ type: "text", text: 'Agent "ghost" not found' }], details: {} } as never,
+      { isPartial: false, expanded: false } as never,
+      THEME,
+      { args: { agent: "ghost", task: "t" }, isError: true } as never,
+    );
+    expect(renderPlain(rendered as never)).toContain("failed (ghost)");
+    expect(renderPlain(rendered as never)).toContain('Agent "ghost" not found');
+  });
+
+  it("batch result rows render the task count", async () => {
+    const calls: string[][] = [];
+    const { pi, tools } = makePi();
+    registerSubagentTools(pi as never, mkdtempSync(join(tmpdir(), "agents-")), spawnReturning([jsonLine("ok")], calls));
+
+    const result = await tools.get("subagents")!.execute("1", { tasks: [{ task: "t1" }, { task: "t2" }] });
+    const rendered = tools.get("subagents")!.renderResult!(
+      result as never,
+      { isPartial: false, expanded: false } as never,
+      THEME,
+      { args: { tasks: [{ task: "t1" }, { task: "t2" }] }, isError: false } as never,
+    );
+    expect(renderPlain(rendered as never)).toContain("done (2 subagents)");
   });
 
   it("surfaces an error section for an unknown agent without failing the batch", async () => {
@@ -781,5 +851,55 @@ describe("tool call rendering", () => {
 
   it("subagents call without names renders a bare title", () => {
     expect(renderSubagentsCall([], THEME as never)).toBe("subagents");
+  });
+});
+
+describe("renderSubagentResult", () => {
+  const DONE = { isPartial: false, expanded: false, isError: false };
+
+  it("shows a running status with the streamed tail while partial", () => {
+    const text = renderSubagentResult("thinking...\nstill working", { agent: "reviewer" }, { isPartial: true, expanded: false, isError: false }, THEME as never);
+    expect(text).toContain("running (reviewer)...");
+    expect(text).toContain("still working");
+    expect(text).not.toContain("thinking");
+  });
+
+  it("shows a bare running status before any output arrives", () => {
+    const text = renderSubagentResult("", { agent: "reviewer" }, { isPartial: true, expanded: false, isError: false }, THEME as never);
+    expect(text).toBe("running (reviewer)...");
+  });
+
+  it("summarizes a finished single-agent result with its first line", () => {
+    const text = renderSubagentResult("## Summary\nAll good", { agent: "reviewer" }, DONE, THEME as never);
+    expect(text).toContain("done (reviewer)");
+    expect(text).toContain("## Summary");
+    expect(text).not.toContain("All good");
+  });
+
+  it("reports failures with the error's first line, without details (pi clears them)", () => {
+    const text = renderSubagentResult("Agent \"ghost\" not found", {}, { ...DONE, isError: true }, THEME as never);
+    expect(text).toContain("failed");
+    expect(text).toContain('Agent "ghost" not found');
+  });
+
+  it("summarizes a batch result by count, not content", () => {
+    const text = renderSubagentResult("### reviewer\nok", { count: 3 }, DONE, THEME as never);
+    expect(text).toContain("done (3 subagents)");
+    expect(text).not.toContain("### reviewer");
+  });
+
+  it("previews the full reply when expanded and hints at truncation", () => {
+    const body = Array.from({ length: 20 }, (_, i) => `line ${i}`).join("\n");
+    const text = renderSubagentResult(body, { agent: "reviewer" }, { ...DONE, expanded: true }, THEME as never);
+    expect(text).toContain("line 0");
+    expect(text).toContain("line 14");
+    expect(text).not.toContain("line 15");
+    expect(text).toContain("... (5 more lines)");
+  });
+
+  it("truncates long summary lines", () => {
+    const text = renderSubagentResult("x".repeat(200), { agent: "r" }, DONE, THEME as never);
+    expect(text).toContain("...");
+    expect(text.length).toBeLessThanOrEqual("done (r) — ".length + 100);
   });
 });

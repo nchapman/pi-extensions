@@ -359,6 +359,66 @@ export function renderSubagentsCall(agentNames: string[], theme: Pick<Theme, "fg
   return text;
 }
 
+const RESULT_PREVIEW_LINES = 15;
+
+/** Truncate one output line, preserving internal whitespace. */
+function truncateLine(line: string, max: number): string {
+  return line.length <= max ? line : `${line.slice(0, max - 3)}...`;
+}
+
+function firstNonEmptyLine(text: string): string {
+  return text.split("\n").find((l) => l.trim()) ?? "";
+}
+
+function lastNonEmptyLine(text: string): string {
+  const lines = text.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].trim()) return lines[i];
+  }
+  return "";
+}
+
+/** Result-row display for both subagent tools: a status line while running
+ * (with the streamed tail), a summary when done, and an optional preview of
+ * the full reply when expanded. */
+export function renderSubagentResult(
+  text: string,
+  details: unknown,
+  opts: { isPartial: boolean; expanded: boolean; isError: boolean },
+  theme: Pick<Theme, "fg">,
+): string {
+  const d = details as { agent?: string; count?: number } | undefined;
+  if (opts.isPartial) {
+    const status = theme.fg("warning", `running${d?.agent ? ` (${d.agent})` : ""}...`);
+    const tail = lastNonEmptyLine(text);
+    return tail ? `${status}\n${theme.fg("dim", truncateLine(tail, 100))}` : status;
+  }
+  const batch = typeof d?.count === "number";
+  const label = opts.isError
+    ? `failed${d?.agent ? ` (${d.agent})` : ""}`
+    : batch
+      ? `done (${d.count} subagents)`
+      : `done${d?.agent ? ` (${d.agent})` : ""}`;
+  let out = theme.fg(opts.isError ? "error" : "success", label);
+  const summary = firstNonEmptyLine(text);
+  if (!batch && summary && summary !== "(no output)") {
+    out += theme.fg("dim", ` — ${truncateLine(summary, 100)}`);
+  }
+  if (opts.expanded) {
+    const lines = text.split("\n");
+    const shown = lines.slice(0, RESULT_PREVIEW_LINES);
+    out += `\n${shown.map((l) => theme.fg("dim", l)).join("\n")}`;
+    const remaining = lines.length - shown.length;
+    if (remaining > 0) out += `\n${theme.fg("muted", `... (${remaining} more lines)`)}`;
+  }
+  return out;
+}
+
+/** Reuse the prior render component when available (pi renderer idiom). */
+function reuseText(context: { lastComponent?: unknown } | undefined): Text {
+  return context?.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
+}
+
 const taskField = Type.String({ description: "The task to delegate, with full context" });
 const modelField = Type.Optional(Type.String({ description: "Model override (provider/id)" }));
 const taskItem = Type.Object({
@@ -393,8 +453,23 @@ The subagent runs to completion and returns its final response. Use for reviews,
     renderCall(args, theme, context) {
       // Arguments stream in partially; guard until `task` arrives.
       const task = typeof args?.task === "string" ? args.task : "";
-      const text = context?.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
+      const text = reuseText(context);
       text.setText(renderSubagentCall(refLabel(args ?? {}), task, theme));
+      return text;
+    },
+    renderResult(result, options, theme, context) {
+      // On errors pi replaces details with {}; fall back to the call arguments
+      // so the agent name survives every path.
+      const d = result.details as { agent?: string } | undefined;
+      const info = { agent: d?.agent ?? refLabel(context?.args ?? {}) };
+      const text = reuseText(context);
+      text.setText(
+        renderSubagentResult(extractAssistantText(result.content), info, {
+          isPartial: options.isPartial,
+          expanded: options.expanded,
+          isError: context?.isError ?? false,
+        }, theme),
+      );
       return text;
     },
     async execute(_id, params, signal, onUpdate) {
@@ -422,8 +497,24 @@ Each task may instead include agent_md (an inline agent definition) or omit both
     renderCall(args, theme, context) {
       // Arguments stream in partially; guard until `tasks` is a complete array.
       const names = Array.isArray(args?.tasks) ? args.tasks.map((t) => refLabel(t ?? {})) : [];
-      const text = context?.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
+      const text = reuseText(context);
       text.setText(renderSubagentsCall(names, theme));
+      return text;
+    },
+    renderResult(result, options, theme, context) {
+      // Prefer the result's count; fall back to complete call arguments when
+      // pi replaced the details (error path).
+      const d = result.details as { count?: number } | undefined;
+      const tasks = Array.isArray(context?.args?.tasks) ? context.args.tasks : [];
+      const info = { count: d?.count ?? (tasks.length || undefined) };
+      const text = reuseText(context);
+      text.setText(
+        renderSubagentResult(extractAssistantText(result.content), info, {
+          isPartial: options.isPartial,
+          expanded: options.expanded,
+          isError: context?.isError ?? false,
+        }, theme),
+      );
       return text;
     },
     async execute(_id, params, signal) {
