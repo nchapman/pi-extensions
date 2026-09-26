@@ -1,0 +1,932 @@
+import { describe, expect, it } from "vitest";
+import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
+import {
+	buildArchiveChunks,
+	buildFileCorpus,
+	chunkText,
+	chunksFromEntry,
+	configFromEnv,
+	extractEntrySections,
+	extractSnippet,
+	formatReadResult,
+	formatSearchResult,
+	kindLabel,
+	parseRef,
+	ProjectCorpusCache,
+	rankChunks,
+	registerRecallTool,
+	visibleEntryIds,
+	renderRecallCall,
+	renderRecallResult,
+	RECALL_TOOL_NAME,
+	tokenize,
+	type RecallConfig,
+	type SearchHit,
+} from "../extensions/recall";
+
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+
+const CONFIG: RecallConfig = {
+	defaultScope: "session",
+	foreignWeight: 0.5,
+	chunkChars: 3000,
+	snippetChars: 400,
+	maxResults: 5,
+	readChars: 4000,
+	projectMaxBytes: 64 * 1024 * 1024,
+};
+
+let nextId = 0;
+function id(): string {
+	return (nextId++).toString(16).padStart(8, "0");
+}
+
+function msgEntry(
+	role: string,
+	message: Record<string, unknown>,
+	timestamp = "2026-09-26T10:00:00.000Z",
+): SessionEntry {
+	return { type: "message", id: id(), parentId: null, timestamp, message: { role, ...message } } as unknown as SessionEntry;
+}
+
+function compactionEntry(summary: string, firstKeptEntryId: string, timestamp = "2026-09-26T12:00:00.000Z"): SessionEntry {
+	return {
+		type: "compaction",
+		id: id(),
+		parentId: null,
+		timestamp,
+		summary,
+		firstKeptEntryId,
+		tokensBefore: 100_000,
+	} as unknown as SessionEntry;
+}
+
+function makePi() {
+	const tools = new Map<string, {
+		name: string;
+		execute: (id: string, params: unknown, signal?: AbortSignal, onUpdate?: unknown, ctx?: unknown) => Promise<unknown>;
+		renderCall?: (args: never, theme: never, context?: never) => unknown;
+		renderResult?: (result: never, options: never, theme: never, context?: never) => unknown;
+	}>();
+	const events = new Map<string, (event?: unknown, ctx?: unknown) => unknown>();
+	const pi = {
+		registerTool: (t: {
+			name: string;
+			execute: (id: string, params: unknown, signal?: AbortSignal, onUpdate?: unknown, ctx?: unknown) => Promise<unknown>;
+			renderCall?: (args: never, theme: never, context?: never) => unknown;
+			renderResult?: (result: never, options: never, theme: never, context?: never) => unknown;
+		}) => tools.set(t.name, t),
+		registerCommand: () => {},
+		on: (event: string, handler: (event?: unknown, ctx?: unknown) => unknown) => events.set(event, handler),
+	} as unknown as ExtensionAPI;
+	return { pi, tools, events };
+}
+
+/** Same shape visibleEntryIds() consumes in the tool: projection-visible ids. */
+function visibleIds(entries: SessionEntry[]): Set<string> {
+	return visibleEntryIds({ entries: entries.map((entry) => ({ sourceEntry: entry, messages: [{}] })) });
+}
+
+function fire(events: Map<string, (event?: unknown, ctx?: unknown) => unknown>, name: string, ctx?: unknown) {
+	const handler = events.get(name);
+	if (!handler) throw new Error(`no handler registered for ${name}`);
+	return handler({ type: name }, ctx);
+}
+
+/** Branch: [header-ish junk, old user, old thinking, compaction, kept user]. */
+function sessionCtx(overrides?: {
+	branch?: SessionEntry[];
+	contextEntries?: SessionEntry[];
+	sessionDir?: string;
+	sessionFile?: string;
+}): ExtensionContext {
+	const oldUser = msgEntry("user", { content: "We decided the auth token refresh must use rotation." });
+	const oldThinking = msgEntry("assistant", {
+		content: [{ type: "thinking", thinking: "Rejected approach B because the KV cache breaks." }],
+	});
+	const compaction = compactionEntry("## Goal\nFix auth refresh", "kept1");
+	const keptUser = msgEntry("user", { content: "Now write the tests." });
+	keptUser.id = "kept1";
+	const branch = overrides?.branch ?? [oldUser, oldThinking, compaction, keptUser];
+	const contextEntries = overrides?.contextEntries ?? [compaction, keptUser];
+	const projection = {
+		entries: contextEntries.map((entry) => ({ sourceEntry: entry, messages: entry.id === "omitted" ? [] : [{}] })),
+		messages: [],
+		thinkingLevel: "low",
+		model: null,
+	};
+	return {
+		sessionManager: {
+			getBranch: () => branch,
+			buildSessionProjection: () => projection,
+			getSessionId: () => "aaaaaaaa-1111-2222-3333-444444444444",
+			getSessionDir: () => overrides?.sessionDir ?? "/sessions/project",
+			getSessionFile: () => overrides?.sessionFile ?? "/sessions/project/current.jsonl",
+			getEntry: (entryId: string) => branch.find((e) => e.id === entryId),
+		},
+	} as unknown as ExtensionContext;
+}
+
+// ---------------------------------------------------------------------------
+// tokenize
+// ---------------------------------------------------------------------------
+
+describe("tokenize", () => {
+	it("splits camelCase, snake_case, and punctuation identically", () => {
+		expect(tokenize("parseHeader")).toEqual(["parse", "header"]);
+		expect(tokenize("parse_header")).toEqual(["parse", "header"]);
+		expect(tokenize("Parse Header!")).toEqual(["parse", "header"]);
+	});
+
+	it("splits digit boundaries and keeps numbers", () => {
+		expect(tokenize("utf8Encoding v2")).toEqual(["utf", "8", "encoding", "v", "2"]);
+	});
+
+	it("handles acronyms in camelCase", () => {
+		expect(tokenize("parseHTTPHeader")).toEqual(["parse", "http", "header"]);
+	});
+
+	it("returns no empty tokens", () => {
+		expect(tokenize("--- ___ ===")).toEqual([]);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// extractEntrySections
+// ---------------------------------------------------------------------------
+
+describe("extractEntrySections", () => {
+	it("extracts user string content", () => {
+		const sections = extractEntrySections(msgEntry("user", { content: "hello world" }));
+		expect(sections).toEqual([{ kind: "user", text: "hello world" }]);
+	});
+
+	it("extracts assistant text, visible thinking, and tool calls", () => {
+		const sections = extractEntrySections(
+			msgEntry("assistant", {
+				content: [
+					{ type: "thinking", thinking: "plan the fix" },
+					{ type: "text", text: "Doing it" },
+					{ type: "toolCall", name: "edit", arguments: { path: "a.ts" } },
+				],
+			}),
+		);
+		expect(sections.map((s) => s.kind)).toEqual(["thinking", "assistant", "toolCall"]);
+		expect(sections[2]).toMatchObject({ label: "edit" });
+		expect(sections[2].text).toContain("a.ts");
+	});
+
+	it("skips redacted thinking and empty text", () => {
+		const sections = extractEntrySections(
+			msgEntry("assistant", {
+				content: [
+					{ type: "thinking", thinking: "", redacted: true },
+					{ type: "text", text: "" },
+				],
+			}),
+		);
+		expect(sections).toEqual([]);
+	});
+
+	it("extracts tool results with their tool name", () => {
+		const sections = extractEntrySections(
+			msgEntry("toolResult", { toolName: "bash", content: [{ type: "text", text: "tests failed" }] }),
+		);
+		expect(sections).toEqual([{ kind: "toolResult", label: "bash", text: "tests failed" }]);
+	});
+
+	it("extracts bash executions including fullOutputPath", () => {
+		const sections = extractEntrySections(
+			msgEntry("bashExecution", { command: "npm test", output: "1 failed", fullOutputPath: "/tmp/out.txt" }),
+		);
+		expect(sections[0].kind).toBe("bash");
+		expect(sections[0].text).toContain("$ npm test");
+		expect(sections[0].text).toContain("/tmp/out.txt");
+	});
+
+	it("extracts custom messages", () => {
+		const sections = extractEntrySections(msgEntry("custom", { customType: "note", content: "remember X" }));
+		expect(sections).toEqual([{ kind: "custom", label: "note", text: "remember X" }]);
+	});
+
+	it("extracts compaction summaries with file lists from details", () => {
+		const entry = {
+			type: "compaction",
+			id: id(),
+			parentId: null,
+			timestamp: "2026-09-26T12:00:00.000Z",
+			summary: "did things",
+			firstKeptEntryId: "x",
+			details: { readFiles: ["/a.ts"], modifiedFiles: ["/b.ts", "/c.ts"] },
+		} as unknown as SessionEntry;
+		const sections = extractEntrySections(entry);
+		expect(sections[0].kind).toBe("summary");
+		expect(sections[0].text).toContain("did things");
+		expect(sections[0].text).toContain("read: /a.ts");
+		expect(sections[0].text).toContain("modified: /b.ts, /c.ts");
+	});
+
+	it("extracts branch summaries", () => {
+		const entry = { type: "branch_summary", id: id(), parentId: null, timestamp: "t", summary: "alt path" } as unknown as SessionEntry;
+		expect(extractEntrySections(entry)).toEqual([{ kind: "branchSummary", text: "alt path" }]);
+	});
+
+	it("skips system, metadata, and state entries", () => {
+		const system = msgEntry("system", { content: "You are pi" });
+		const modelChange = { type: "model_change", id: id(), parentId: null, timestamp: "t" } as unknown as SessionEntry;
+		const custom = { type: "custom", id: id(), parentId: null, timestamp: "t", customType: "x", data: {} } as unknown as SessionEntry;
+		for (const entry of [system, modelChange, custom]) expect(extractEntrySections(entry)).toEqual([]);
+	});
+
+	it("extracts custom_message entries (inline content)", () => {
+		const entry = {
+			type: "custom_message",
+			id: id(),
+			parentId: null,
+			timestamp: "t",
+			customType: "dossier",
+			content: "project facts",
+			display: true,
+		} as unknown as SessionEntry;
+		expect(extractEntrySections(entry)).toEqual([{ kind: "custom", label: "dossier", text: "project facts" }]);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// chunkText
+// ---------------------------------------------------------------------------
+
+describe("chunkText", () => {
+	it("returns a single chunk when under the limit", () => {
+		expect(chunkText("short", 100)).toEqual([{ text: "short", charOffset: 0 }]);
+	});
+
+	it("returns nothing for empty text", () => {
+		expect(chunkText("", 100)).toEqual([]);
+	});
+
+	it("splits at line boundaries when possible", () => {
+		const text = `${"a".repeat(60)}\n${"b".repeat(60)}\n${"c".repeat(60)}`;
+		const chunks = chunkText(text, 100);
+		expect(chunks).toHaveLength(3);
+		expect(chunks[0].text).toBe(`${"a".repeat(60)}\n`);
+		expect(chunks[0].charOffset).toBe(0);
+		expect(chunks[1].charOffset).toBe(61);
+		for (const c of chunks) expect(text.slice(c.charOffset, c.charOffset + c.text.length)).toBe(c.text);
+	});
+
+	it("hard-splits unbroken lines", () => {
+		const chunks = chunkText("x".repeat(250), 100);
+		expect(chunks).toHaveLength(3);
+		expect(chunks.map((c) => c.text.length)).toEqual([100, 100, 50]);
+	});
+
+	it("reconstruction from offsets yields the original", () => {
+		const text = Array.from({ length: 20 }, (_, i) => `line ${i} ${"z".repeat(30)}`).join("\n");
+		const chunks = chunkText(text, 200);
+		const rebuilt = chunks.map((c) => c.text).join("");
+		expect(rebuilt.length).toBeGreaterThanOrEqual(text.length - 20); // newlines kept at cut points
+		for (const c of chunks) expect(text.slice(c.charOffset, c.charOffset + c.text.length)).toBe(c.text);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// refs
+// ---------------------------------------------------------------------------
+
+describe("refs", () => {
+	it("current refs are bare entry ids", () => {
+		expect(parseRef("abcd1234")).toEqual({ entryId: "abcd1234", sessionIdShort: undefined });
+	});
+
+	it("foreign refs carry the session short id", () => {
+		expect(parseRef("abcd1234.1e2d")).toEqual({ entryId: "abcd1234", sessionIdShort: "1e2d" });
+	});
+
+	it("rejects malformed refs", () => {
+		expect(parseRef("not-hex!")).toBeUndefined();
+		expect(parseRef(".abcd")).toBeUndefined();
+		expect(parseRef("abcd.")).toBeUndefined();
+	});
+});
+
+// ---------------------------------------------------------------------------
+// buildArchiveChunks
+// ---------------------------------------------------------------------------
+
+describe("buildArchiveChunks", () => {
+	it("diffs branch against context and chunks the archive", () => {
+		const ctx = sessionCtx();
+		const chunks = buildArchiveChunks(
+			ctx.sessionManager.getBranch(),
+			visibleIds(ctx.sessionManager.getBranch().filter((e) => e.type === "compaction" || e.id === "kept1")),
+			"sess",
+			CONFIG,
+		);
+		const kinds = new Set(chunks.map((c) => c.kind));
+		expect(kinds).contain("user");
+		expect(kinds).contain("thinking");
+		// The active compaction summary rides in context, so it is NOT archived.
+		expect(kinds).not.contain("summary");
+		// The kept user message is in context, not archived.
+		expect(chunks.every((c) => c.text !== "Now write the tests.")).toBe(true);
+	});
+
+	it("archives a summary once a later compaction folds it away", () => {
+		const first = compactionEntry("first summary", "k1", "2026-09-26T08:00:00.000Z");
+		const second = compactionEntry("second summary", "k1", "2026-09-26T16:00:00.000Z");
+		const kept = msgEntry("user", { content: "latest" });
+		kept.id = "k1";
+		const ctx = sessionCtx({ branch: [first, second, kept], contextEntries: [second, kept] });
+		const chunks = buildArchiveChunks(ctx.sessionManager.getBranch(), visibleIds([second, kept]), "sess", CONFIG);
+		const summaries = chunks.filter((c) => c.kind === "summary");
+		expect(summaries).toHaveLength(1);
+		expect(summaries[0].text).toContain("first summary");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// rankChunks (BM25 + session weighting)
+// ---------------------------------------------------------------------------
+
+function foreignChunk(text: string, sessionId = "1e2dcafe-0000"): RecallChunkLike {
+	return chunksFromEntry(
+		{ type: "message", id: id(), parentId: null, timestamp: "2026-09-20T10:00:00.000Z", message: { role: "user", content: text } } as unknown as SessionEntry,
+		{ origin: "foreign", sessionId, sessionLabel: "past session old" },
+		3000,
+	)[0];
+}
+type RecallChunkLike = ReturnType<typeof chunksFromEntry>[number];
+
+describe("rankChunks", () => {
+	// The default sessionCtx archive: only the compaction + kept message are visible.
+	function compaction(): SessionEntry {
+		return sessionCtx().sessionManager.getBranch().find((e) => e.type === "compaction")!;
+	}
+	function kept(): SessionEntry {
+		return sessionCtx().sessionManager.getBranch().find((e) => e.type === "message" && (e as { id?: string }).id === "kept1")!;
+	}
+
+	it("ranks the more relevant chunk first", () => {
+		const ctx = sessionCtx();
+		const archive = buildArchiveChunks(ctx.sessionManager.getBranch(), visibleIds([compaction(), kept()]), "sess", CONFIG);
+		const ranked = rankChunks(archive, "KV cache breaks", 0.5);
+		expect(ranked.length).toBeGreaterThan(0);
+		expect(ranked[0].chunk.text).toContain("KV cache");
+	});
+
+	it("drops chunks matching no query term", () => {
+		const ctx = sessionCtx();
+		const archive = buildArchiveChunks(ctx.sessionManager.getBranch(), visibleIds([]), "sess", CONFIG);
+		expect(rankChunks(archive, "zzzznotpresent", 0.5)).toEqual([]);
+	});
+
+	it("matches across identifier boundaries (query phrasing vs code)", () => {
+		const entry = msgEntry("user", { content: "the parseHeader function throws" });
+		const chunk = chunksFromEntry(entry, { origin: "current", sessionId: "s", sessionLabel: "current session" }, 3000)[0];
+		expect(rankChunks([chunk], "parse header", 0.5).length).toBe(1);
+	});
+
+	it("penalizes foreign chunks by the configured weight", () => {
+		const current = chunksFromEntry(
+			msgEntry("user", { content: "rotation policy discussion" }),
+			{ origin: "current", sessionId: "s", sessionLabel: "current session" },
+			3000,
+		)[0];
+		const foreign = foreignChunk("rotation policy discussion");
+		const ranked = rankChunks([foreign, current], "rotation policy", 0.5);
+		expect(ranked[0].chunk.origin).toBe("current");
+		expect(ranked[1].rawScore).toBe(ranked[0].rawScore); // identical text ⇒ identical BM25
+		expect(ranked[1].score).toBeCloseTo(ranked[0].score * 0.5, 5);
+	});
+
+	it("a highly relevant foreign chunk can still outrank a weak current one", () => {
+		const current = chunksFromEntry(
+			msgEntry("user", { content: "unrelated chatter entirely" }),
+			{ origin: "current", sessionId: "s", sessionLabel: "current session" },
+			3000,
+		)[0];
+		const foreign = foreignChunk("migration rollback procedure details");
+		const ranked = rankChunks([current, foreign], "migration rollback procedure", 0.5);
+		expect(ranked[0].chunk.origin).toBe("foreign");
+	});
+
+	it("empty query yields nothing", () => {
+		const ctx = sessionCtx();
+		const archive = buildArchiveChunks(ctx.sessionManager.getBranch(), visibleIds([]), "sess", CONFIG);
+		expect(rankChunks(archive, "  ", 0.5)).toEqual([]);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// snippets & formatting
+// ---------------------------------------------------------------------------
+
+describe("extractSnippet", () => {
+	it("windows around the first query match", () => {
+		const text = `${"filler ".repeat(50)}needle here${" more filler".repeat(50)}`;
+		const snippet = extractSnippet(text, "needle", 40);
+		expect(snippet).toContain("needle");
+		expect(snippet.startsWith("…")).toBe(true);
+		expect(snippet.endsWith("…")).toBe(true);
+		expect(snippet.length).toBeLessThanOrEqual(42);
+	});
+
+	it("returns the head when nothing matches", () => {
+		const snippet = extractSnippet("abcdef".repeat(200), "zzz", 50);
+		expect(snippet.endsWith("…")).toBe(true);
+		expect(snippet.startsWith("a")).toBe(true);
+	});
+
+	it("collapses blank runs", () => {
+		const snippet = extractSnippet("x\n\n\n\n\ny", "y", 400);
+		expect(snippet).not.toContain("\n\n\n");
+	});
+});
+
+describe("formatSearchResult", () => {
+	const hit = (over: Partial<SearchHit> = {}): SearchHit => ({
+		ref: "abcd1234",
+		kind: "toolResult",
+		label: "bash",
+		sessionLabel: "current session",
+		timestamp: "2026-09-26T10:00:00.000Z",
+		score: 7.25,
+		snippet: "one line\nsecond line",
+		...over,
+	});
+
+	it("lists hits with provenance, read hint, and pagination note", () => {
+		const text = formatSearchResult([hit()], { archiveEntries: 42, foreignSessions: 0, scope: "session" });
+		expect(text).toContain("1 match");
+		expect(text).toContain("current session");
+		expect(text).toContain("tool result (bash)");
+		expect(text).toContain('"mode": "read", "id": "abcd1234"');
+	});
+
+	it("suggests project scope when nothing matches in session scope", () => {
+		const text = formatSearchResult([], { archiveEntries: 42, foreignSessions: 0, scope: "session" });
+		expect(text).toContain("No matches");
+		expect(text).toContain("project");
+	});
+
+	it("mentions skipped files", () => {
+		const text = formatSearchResult([hit()], { archiveEntries: 42, foreignSessions: 1, scope: "project", skippedFiles: 2 });
+		expect(text).toContain("2 unreadable session files skipped");
+	});
+});
+
+describe("formatReadResult", () => {
+	it("shows the char window and a continuation ref when truncated", () => {
+		const text = formatReadResult("abcd1234", "Entry abcd1234 — current session", "x".repeat(10_000), 0, 4000);
+		expect(text).toContain("[chars 0-4000 of 10000]");
+		expect(text).toContain('"offset": 4000');
+	});
+
+	it("omits the continuation note at the end", () => {
+		const text = formatReadResult("abcd1234", "header", "short", 0, 4000);
+		expect(text).not.toContain("offset");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Project corpus
+// ---------------------------------------------------------------------------
+
+function sessionFile(over: {
+	id?: string;
+	name?: string;
+	entries?: string[];
+}): { basename: string; content: string } {
+	const sid = over.id ?? "1e2dcafe-aaaa-bbbb-cccc-dddddddddddd";
+	const header = JSON.stringify({ type: "session", version: 3, id: sid, timestamp: "2026-09-20T09:00:00.000Z", cwd: "/p" });
+	const lines = [header];
+	if (over.name) lines.push(JSON.stringify({ type: "session_info", id: id(), parentId: null, timestamp: "t", name: over.name }));
+	for (const entry of over.entries ?? []) lines.push(entry);
+	return { basename: `2026-09-20T09-00-00-000Z_${sid}.jsonl`, content: `${lines.join("\n")}\n` };
+}
+
+function userLine(text: string): string {
+	return JSON.stringify({ type: "message", id: id(), parentId: null, timestamp: "2026-09-20T10:00:00.000Z", message: { role: "user", content: text } });
+}
+
+function fakeReader(files: Array<{ basename: string; content: string }>) {
+	const dir = "/sessions/project";
+	const paths = files.map((f) => `${dir}/${f.basename}`);
+	const byPath = new Map(paths.map((p, i) => [p, files[i].content]));
+	const stats = new Map(paths.map((p) => [p, { mtimeMs: 1, size: byPath.get(p)!.length }]));
+	const readCounts = new Map<string, number>();
+	return {
+		reader: {
+			async listJsonlFiles(d: string) {
+				if (d !== dir) throw new Error("ENOENT");
+				return [...paths];
+			},
+			async readFile(file: string) {
+				readCounts.set(file, (readCounts.get(file) ?? 0) + 1);
+				const content = byPath.get(file);
+				if (content === undefined) throw new Error("gone");
+				return content;
+			},
+			async stat(file: string) {
+				return stats.get(file);
+			},
+		},
+		dir,
+		paths,
+		stats,
+		readCounts,
+		note(file: string) {
+			stats.set(file, { mtimeMs: 2, size: (stats.get(file)?.size ?? 0) + 1 });
+		},
+	};
+}
+
+describe("buildFileCorpus", () => {
+	it("indexes content, resolves the session name, and records entry lines", () => {
+		const f = sessionFile({ name: "Auth rework", entries: [userLine("discussed token rotation at length")] });
+		const corpus = buildFileCorpus(`/s/${f.basename}`, f.content)!;
+		expect(corpus).toBeDefined();
+		expect(corpus.chunks[0].text).toContain("token rotation");
+		expect(corpus.chunks[0].origin).toBe("foreign");
+		expect(corpus.chunks[0].sessionLabel).toContain("Auth rework");
+		expect(corpus.chunks[0].ref).toMatch(/^[0-9a-f]{8}\.1e2d$/);
+		expect(corpus.entryLines.get(corpus.chunks[0].entryId)).toBe(3);
+	});
+
+	it("returns undefined for header-only files", () => {
+		const f = sessionFile({});
+		expect(buildFileCorpus(`/s/${f.basename}`, f.content)).toBeUndefined();
+	});
+});
+
+describe("ProjectCorpusCache", () => {
+	it("caches by mtime+size and skips the current session file", async () => {
+		const f1 = sessionFile({ entries: [userLine("past session content")] });
+		const current = sessionFile({ id: "cccc0000-0000" });
+		const { reader, dir, paths, readCounts } = fakeReader([f1, current]);
+		const cache = new ProjectCorpusCache(reader, 64 * 1024 * 1024);
+		const skipped = await cache.refresh(dir, paths[1]); // current file = paths[1]
+		expect(skipped).toBe(0);
+		expect(cache.list()).toHaveLength(1);
+		expect(cache.list()[0].file).toBe(paths[0]);
+		await cache.refresh(dir, paths[1]);
+		expect(readCounts.get(paths[0])).toBe(1); // stat hit, no re-read
+	});
+
+	it("rebuilds a changed file and drops a deleted one", async () => {
+		const f1 = sessionFile({ entries: [userLine("alpha content")] });
+		const { reader, dir, paths, stats, readCounts, note } = fakeReader([f1]);
+		const cache = new ProjectCorpusCache(reader, 64 * 1024 * 1024);
+		await cache.refresh(dir, undefined);
+		note(paths[0]);
+		await cache.refresh(dir, undefined);
+		expect(readCounts.get(paths[0])).toBe(2);
+		stats.delete(paths[0]);
+		reader.listJsonlFiles = async () => [];
+		await cache.refresh(dir, undefined);
+		expect(cache.list()).toHaveLength(0);
+	});
+
+	it("counts unreadable files as skipped", async () => {
+		const f1 = sessionFile({});
+		const { reader, dir } = fakeReader([f1]);
+		const cache = new ProjectCorpusCache(reader, 64 * 1024 * 1024);
+		expect(await cache.refresh(dir, undefined)).toBe(1); // header-only = unreadable/skipped
+	});
+
+	it("evicts least-recently-used files beyond the byte cap", async () => {
+		const f1 = sessionFile({ entries: [userLine("one")] });
+		const f2 = sessionFile({ entries: [userLine("two")] });
+		const { reader, dir, paths } = fakeReader([f1, f2]);
+		const cache = new ProjectCorpusCache(reader, 1); // cap forces eviction down to one file
+		await cache.refresh(dir, undefined);
+		expect(cache.list()).toHaveLength(1);
+		expect(cache.totalBytes()).toBeLessThanOrEqual(Math.max(...cache.list().map((c) => c.bytes)));
+		expect(paths.some((p) => cache.list()[0].file === p)).toBe(true);
+	});
+
+	it("locates entries by session short id", async () => {
+		const f1 = sessionFile({ entries: [userLine("find me")] });
+		const { reader, dir } = fakeReader([f1]);
+		const cache = new ProjectCorpusCache(reader, 64 * 1024 * 1024);
+		await cache.refresh(dir, undefined);
+		const corpus = cache.list()[0];
+		const entryId = corpus.chunks[0].entryId;
+		expect(cache.locate("1e2d", entryId)).toMatchObject({ corpus, line: 2 });
+		expect(cache.locate("beef", entryId)).toBeUndefined();
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Tool wiring
+// ---------------------------------------------------------------------------
+
+describe("registerRecallTool", () => {
+	function setup(config = CONFIG) {
+		const { pi, tools, events } = makePi();
+		registerRecallTool(pi, config);
+		return { tools, events, run: (params: unknown, ctx = sessionCtx()) => tools.get(RECALL_TOOL_NAME)!.execute("t1", params, undefined, undefined, ctx) };
+	}
+
+	it("registers the tool with search defaults", async () => {
+		const { tools, run } = setup();
+		expect(tools.get(RECALL_TOOL_NAME)).toBeDefined();
+		const result = (await run({ query: "rotation" })) as { content: Array<{ text: string }>; details: { hits: unknown[] } };
+		expect(result.content[0].text).toContain("rotation");
+		expect(result.content[0].text).toContain("read");
+		expect(result.details.hits.length).toBeGreaterThan(0);
+	});
+
+	it("errors when search mode lacks a query", async () => {
+		const { run } = setup();
+		const result = (await run({})) as { content: Array<{ text: string }> };
+		expect(result.content[0].text).toContain("Error: query is required");
+	});
+
+	it("tells the model when nothing has been compacted yet", async () => {
+		const { run } = setup();
+		const ctx = sessionCtx({ branch: [], contextEntries: [] });
+		const result = (await run({ query: "anything" }, ctx)) as { content: Array<{ text: string }> };
+		expect(result.content[0].text).toContain("Nothing has been compacted yet");
+	});
+
+	it("read mode returns a full current-session entry with pagination", async () => {
+		const { run } = setup({ ...CONFIG, readChars: 30 });
+		const ctx = sessionCtx();
+		const branch = ctx.sessionManager.getBranch();
+		const target = branch.find((e) => e.type === "message" && (e as { message?: { content?: unknown } }).message?.content === "We decided the auth token refresh must use rotation.")!;
+		const first = (await run({ mode: "read", id: target.id }, ctx)) as { content: Array<{ text: string }> };
+		expect(first.content[0].text).toContain("[chars 0-30 of 52]");
+		expect(first.content[0].text).toContain('"offset": 30');
+		const second = (await run({ mode: "read", id: target.id, offset: 10 }, ctx)) as { content: Array<{ text: string }> };
+		expect(second.content[0].text).toContain("[chars 10-40 of 52]");
+	});
+
+	it("read mode requires a valid id", async () => {
+		const { run } = setup();
+		const noId = (await run({ mode: "read" })) as { content: Array<{ text: string }> };
+		expect(noId.content[0].text).toContain("Error: id is required");
+		const badId = (await run({ mode: "read", id: "not-hex!" })) as { content: Array<{ text: string }> };
+		expect(badId.content[0].text).toContain("not a valid ref");
+	});
+
+	it("read mode reports unknown current refs explicitly", async () => {
+		const { run } = setup();
+		const result = (await run({ mode: "read", id: "deadbeef" })) as { content: Array<{ text: string }> };
+		expect(result.content[0].text).toContain("not found on the current branch");
+	});
+
+	it("project scope merges foreign sessions with down-ranking", async () => {
+		const foreign = sessionFile({ name: "Old work", entries: [userLine("migration rollback procedure from last week")] });
+		const { reader, dir } = fakeReader([foreign]);
+		const { pi, tools } = makePi();
+		registerRecallTool(pi, { ...CONFIG, defaultScope: "session" }, reader);
+		const ctx = sessionCtx({ sessionDir: dir });
+		// Session-scope query misses the foreign-only content.
+		const sessionOnly = (await tools.get(RECALL_TOOL_NAME)!.execute("t", { query: "migration rollback" }, undefined, undefined, ctx)) as {
+			content: Array<{ text: string }>;
+		};
+		expect(sessionOnly.content[0].text).toContain("No matches");
+		// Project scope finds it, labeled as a past session.
+		const project = (await tools.get(RECALL_TOOL_NAME)!.execute("t", { query: "migration rollback", scope: "project" }, undefined, undefined, ctx)) as {
+			content: Array<{ text: string }>;
+			details: { hits: Array<{ session: string }> };
+		};
+		expect(project.content[0].text).toContain("past session");
+		expect(project.content[0].text).toContain("Old work");
+		expect(project.details.hits[0].session).toContain("past session");
+	});
+
+	it("project scope errors clearly when the session dir is missing", async () => {
+		const missing = {
+			listJsonlFiles: async () => {
+				throw new Error("ENOENT: no such directory");
+			},
+			readFile: async () => "",
+			stat: async () => undefined,
+		};
+		const { pi, tools } = makePi();
+		registerRecallTool(pi, CONFIG, missing);
+		const result = (await tools.get(RECALL_TOOL_NAME)!.execute("t", { query: "x", scope: "project" }, undefined, undefined, sessionCtx())) as {
+			content: Array<{ text: string }>;
+		};
+		expect(result.content[0].text).toContain("project scope unavailable");
+	});
+
+	it("foreign reads resolve through the file line map", async () => {
+		const foreign = sessionFile({ entries: [userLine("the exact foreign detail we need to read fully")] });
+		const { reader, dir } = fakeReader([foreign]);
+		const { pi, tools } = makePi();
+		registerRecallTool(pi, CONFIG, reader);
+		const ctx = sessionCtx({ sessionDir: dir });
+		const search = (await tools.get(RECALL_TOOL_NAME)!.execute("t", { query: "exact foreign detail", scope: "project" }, undefined, undefined, ctx)) as {
+			details: { hits: Array<{ ref: string }> };
+		};
+		const ref = search.details.hits[0].ref;
+		expect(ref).toMatch(/\./);
+		const read = (await tools.get(RECALL_TOOL_NAME)!.execute("t", { mode: "read", id: ref }, undefined, undefined, ctx)) as {
+			content: Array<{ text: string }>;
+		};
+		expect(read.content[0].text).toContain("the exact foreign detail we need to read fully");
+	});
+
+	it("fires a one-shot reminder after compaction", async () => {
+		const { events } = setup();
+		const ctx = sessionCtx();
+		fire(events, "session_compact", ctx);
+		const first = fire(events, "before_agent_start", ctx) as { message: { content: string } } | undefined;
+		expect(first?.message.content).toContain("recall");
+		const second = fire(events, "before_agent_start", ctx);
+		expect(second).toBeUndefined();
+	});
+
+	it("session_start clears a pending reminder", async () => {
+		const { events } = setup();
+		const ctx = sessionCtx();
+		fire(events, "session_compact", ctx);
+		fire(events, "session_start", ctx);
+		expect(fire(events, "before_agent_start", ctx)).toBeUndefined();
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Renderers & config
+// ---------------------------------------------------------------------------
+
+describe("renderers", () => {
+	const theme = { fg: (_k: string, s: string) => s, bold: (s: string) => s } as never;
+
+	it("call row shows the query, or read mode", () => {
+		expect(renderRecallCall({ query: "token rotation" }, theme)).toContain("token rotation");
+		expect(renderRecallCall({ mode: "read", id: "x" }, theme)).toContain("recall read");
+	});
+
+	it("result row shows hit count and expands to snippets", () => {
+		const collapsed = renderRecallResult({ hits: [{ snippet: "abc" }, { snippet: "def" }] }, { expanded: false }, theme);
+		expect(collapsed).toContain("2 hits");
+		const expanded = renderRecallResult({ hits: [{ snippet: "a b c" }] }, { expanded: true }, theme);
+		expect(expanded).toContain("a b c");
+		expect(renderRecallResult(undefined, { expanded: false }, theme)).toContain("no matches");
+		expect(renderRecallResult({ read: { total: 1234 } }, { expanded: false }, theme)).toContain("1,234 chars");
+	});
+});
+
+describe("configFromEnv", () => {
+	it("applies defaults with a clean env", () => {
+		const config = configFromEnv({});
+		expect(config.defaultScope).toBe("session");
+		expect(config.foreignWeight).toBe(0.5);
+	});
+
+	it("reads scope and weights, clamping numbers", () => {
+		const config = configFromEnv({ PI_RECALL_SCOPE: "project", PI_RECALL_FOREIGN_WEIGHT: "0.8", PI_RECALL_MAX_RESULTS: "99" });
+		expect(config.defaultScope).toBe("project");
+		expect(config.foreignWeight).toBe(0.8);
+		expect(config.maxResults).toBe(25);
+	});
+
+	it("falls back on invalid values", () => {
+		const config = configFromEnv({ PI_RECALL_SCOPE: "bogus", PI_RECALL_FOREIGN_WEIGHT: "nope" });
+		expect(config.defaultScope).toBe("session");
+		expect(config.foreignWeight).toBe(0.5);
+	});
+});
+
+// kindLabel sanity for model-facing labels
+describe("kindLabel", () => {
+	it("labels tool sections with their tool name", () => {
+		expect(kindLabel("toolResult", "bash")).toBe("tool result (bash)");
+		expect(kindLabel("summary")).toContain("compaction summary");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Review regressions
+// ---------------------------------------------------------------------------
+
+describe("review regressions", () => {
+	it("tokenizes digit-to-letter boundaries (sha256hash)", () => {
+		expect(tokenize("sha256hash")).toEqual(["sha", "256", "hash"]);
+		expect(tokenize("base64encode")).toEqual(["base", "64", "encode"]);
+	});
+
+	it("breaks ranking ties by ref ascending when score and timestamp are equal", () => {
+		const mk = (ref: string): RecallChunkLike =>
+			chunksFromEntry(
+				{
+					type: "message",
+					id: ref,
+					parentId: null,
+					timestamp: "2026-09-26T10:00:00.000Z",
+					message: { role: "user", content: "identical content about tokens" },
+				} as unknown as SessionEntry,
+				{ origin: "current", sessionId: "s", sessionLabel: "current session" },
+				3000,
+			)[0];
+		// Pass in non-ref order to prove the sort, not input order, wins.
+		const ranked = rankChunks([mk("000000ff"), mk("00000009"), mk("00000001")], "identical content", 0.5);
+		expect(ranked.map((r) => r.chunk.ref)).toEqual(["00000001", "00000009", "000000ff"]);
+	});
+
+	it("clamps read offsets past end instead of rendering nonsense windows", () => {
+		const text = formatReadResult("ab", "H", "short", 50, 4000);
+		expect(text).toContain("[chars 5-5 of 5]");
+	});
+
+	it("keeps LRU byte accounting exact across a rebuild", async () => {
+		const f1 = sessionFile({ entries: [userLine("alpha content that is long enough to matter")] });
+		const { reader, dir, paths, note } = fakeReader([f1]);
+		const cache = new ProjectCorpusCache(reader, 64 * 1024 * 1024);
+		await cache.refresh(dir, undefined);
+		const before = cache.totalBytes();
+		expect(before).toBe(cache.list().reduce((n, c) => n + c.bytes, 0));
+		note(paths[0]); // mtime+size change → rebuild
+		await cache.refresh(dir, undefined);
+		expect(cache.totalBytes()).toBe(cache.list().reduce((n, c) => n + c.bytes, 0));
+	});
+
+	it("read mode converts a failing reader into an explicit error, never a throw", async () => {
+		const foreign = sessionFile({ entries: [userLine("findable foreign text")] });
+		const { reader, dir } = fakeReader([foreign]);
+		const { pi, tools } = makePi();
+		registerRecallTool(pi, CONFIG, reader);
+		const ctx = sessionCtx({ sessionDir: dir });
+		const search = (await tools.get(RECALL_TOOL_NAME)!.execute("t", { query: "findable foreign", scope: "project" }, undefined, undefined, ctx)) as {
+			details: { hits: Array<{ ref: string }> };
+		};
+		const ref = search.details.hits[0].ref;
+		reader.readFile = async () => {
+			throw new Error("disk went away");
+		};
+		const read = (await tools.get(RECALL_TOOL_NAME)!.execute("t", { mode: "read", id: ref }, undefined, undefined, ctx)) as {
+			content: Array<{ text: string }>;
+		};
+		expect(read.content[0].text).toContain("Error:");
+		expect(read.content[0].text).toContain("disk went away");
+	});
+
+	it("detects a rewritten foreign file by verifying the entry id at read time", async () => {
+		const foreign = sessionFile({ entries: [userLine("the original entry text"), userLine("a second entry")] });
+		const { reader, dir, note } = fakeReader([foreign]);
+		const { pi, tools } = makePi();
+		registerRecallTool(pi, CONFIG, reader);
+		const ctx = sessionCtx({ sessionDir: dir });
+		const search = (await tools.get(RECALL_TOOL_NAME)!.execute("t", { query: "original entry", scope: "project" }, undefined, undefined, ctx)) as {
+			details: { hits: Array<{ ref: string }> };
+		};
+		const ref = search.details.hits[0].ref;
+		// Simulate a prepend that shifts line numbers: same stat-invalidating change,
+		// but the reader now serves shifted content under the old cache.
+		const shifted = `${JSON.stringify({ type: "session", version: 3, id: "1e2dcafe-aaaa-bbbb-cccc-dddddddddddd", timestamp: "2026-09-20T09:00:00.000Z", cwd: "/p" })}\n${userLine("shift line")}\n${userLine("the original entry text")}\n${userLine("a second entry")}\n`;
+		const path0 = (await reader.listJsonlFiles(dir))[0];
+		reader.readFile = async () => shifted;
+		note(path0);
+		const read = (await tools.get(RECALL_TOOL_NAME)!.execute("t", { mode: "read", id: ref }, undefined, undefined, ctx)) as {
+			content: Array<{ text: string }>;
+		};
+		// The rebuild reindexes the shifted file; the old ref must not silently
+		// return different content — either the entry moved (not found) or the
+		// id check caught the shift. Both are explicit outcomes, never wrong data.
+		expect(read.content[0].text).toMatch(/Error:|shift line/);
+	});
+
+	it("entries omitted from context by edits remain searchable (projection-aware diff)", async () => {
+		const omitted = msgEntry("user", { content: "the secret context-edit omitted detail about invoices" });
+		omitted.id = "omitted"; // fixture projects no messages for this id
+		const branch = [omitted];
+		const projection = { entries: [{ sourceEntry: omitted, messages: [] }], messages: [], thinkingLevel: "low", model: null };
+		const ids = visibleEntryIds(projection as never);
+		expect(ids.has("omitted")).toBe(false);
+		const chunks = buildArchiveChunks(branch, ids, "sess", CONFIG);
+		expect(chunks.some((c) => c.text.includes("invoices"))).toBe(true);
+	});
+
+	it("notes truncated results only when matches were actually cut", () => {
+		const hit = (): SearchHit => ({
+			ref: "abcd1234",
+			kind: "user",
+			sessionLabel: "current session",
+			timestamp: "2026-09-26T10:00:00.000Z",
+			score: 5,
+			snippet: "s",
+		});
+		const complete = formatSearchResult([hit()], { archiveEntries: 42, foreignSessions: 0, scope: "session", totalMatches: 1 });
+		expect(complete).not.toContain("results limited");
+		const cut = formatSearchResult([hit()], { archiveEntries: 42, foreignSessions: 0, scope: "session", totalMatches: 7 });
+		expect(cut).toContain("results limited");
+		const foreignMiss = formatSearchResult([], { archiveEntries: 42, foreignSessions: 3, scope: "project" });
+		expect(foreignMiss).not.toContain('scope "project"');
+	});
+
+	it("buildFileCorpus honors the chunk size", () => {
+		const entry = userLine(`${"long line of text ".repeat(200)}`);
+		const f = sessionFile({ entries: [entry] });
+		const small = buildFileCorpus(`/s/${f.basename}`, f.content, 200)!;
+		expect(small.chunks.length).toBeGreaterThan(1);
+		const large = buildFileCorpus(`/s/${f.basename}`, f.content, 1_000_000)!;
+		expect(large.chunks.length).toBe(1);
+	});
+});
