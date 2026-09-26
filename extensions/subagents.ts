@@ -2,6 +2,7 @@ import { spawn as nodeSpawn } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { parse as parseYaml } from "yaml";
 import { Type } from "typebox";
 import type { AgentToolResult, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -30,49 +31,23 @@ export function parseConcurrency(env: NodeJS.ProcessEnv): number {
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_CONCURRENCY;
 }
 
-type FmValue = string | Record<string, string>;
+/** Frontmatter delimiter: `---` at column 0, tolerant of trailing whitespace. */
+const DELIMITER = /^---[ \t]*$/;
 
-function stripQuotes(value: string): string {
-  if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) return value.slice(1, -1);
-  if (value.length >= 2 && value.startsWith("'") && value.endsWith("'")) return value.slice(1, -1);
-  return value;
-}
-
-function parseFmLines(lines: string[]): Record<string, FmValue> {
-  const out: Record<string, FmValue> = {};
-  let current: string | null = null;
-  for (const line of lines) {
-    const m = line.match(/^(\s*)([A-Za-z0-9_-]+):\s*(.*)$/);
-    if (!m) continue;
-    const indent = m[1].length;
-    const key = m[2];
-    const rawValue = m[3].trim();
-    if (indent === 0) {
-      if (rawValue === "") {
-        out[key] = {};
-        current = key;
-      } else {
-        out[key] = stripQuotes(rawValue);
-        current = null;
-      }
-    } else if (current) {
-      const parent = out[current];
-      if (typeof parent === "object") parent[key] = stripQuotes(rawValue);
-    }
-  }
-  return out;
-}
-
-/** Split YAML-ish frontmatter from the body. Handles CRLF and `---` inside values/body. */
-export function splitFrontmatter(text: string): { fm: Record<string, FmValue>; body: string } {
-  const lines = text.replace(/\r\n?/g, "\n").split("\n");
-  if (lines[0]?.trim() !== "---") return { fm: {}, body: text };
+/** Split YAML frontmatter from the body. Throws on invalid YAML so a broken
+ * tools restriction can never be silently ignored; handles BOM, CRLF, and
+ * `---` inside indented block-scalar content. */
+export function splitFrontmatter(text: string): { fm: Record<string, unknown>; body: string } {
+  const lines = text.replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n").split("\n");
+  if (!DELIMITER.test(lines[0] ?? "")) return { fm: {}, body: text };
   for (let i = 1; i < lines.length; i++) {
-    if (lines[i].trim() === "---") {
-      return {
-        fm: parseFmLines(lines.slice(1, i)),
-        body: lines.slice(i + 1).join("\n").replace(/^\n/, ""),
-      };
+    if (DELIMITER.test(lines[i])) {
+      const parsed = parseYaml(lines.slice(1, i).join("\n"));
+      if (parsed === null || parsed === undefined) return { fm: {}, body: lines.slice(i + 1).join("\n").replace(/^\n/, "") };
+      if (typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("frontmatter must be a YAML mapping of key/value pairs");
+      }
+      return { fm: parsed as Record<string, unknown>, body: lines.slice(i + 1).join("\n").replace(/^\n/, "") };
     }
   }
   // Unterminated frontmatter: treat the whole file as body.
@@ -81,17 +56,44 @@ export function splitFrontmatter(text: string): { fm: Record<string, FmValue>; b
 
 const FALSY = new Set(["", "false", "0", "no", "off"]);
 
-export function resolveTools(fm: Record<string, FmValue>): string[] {
+/** Truthiness for tools-map values, tolerant of YAML booleans and strings. */
+function isEnabled(raw: unknown): boolean {
+  return !FALSY.has(String(raw).trim().toLowerCase());
+}
+
+function warnUnknownTools(kind: string, names: string[]): void {
+  const unknown = names.filter((n) => !BUILTIN_TOOLS.includes(n)).map((n) => `"${n}"`);
+  if (unknown.length > 0) {
+    console.warn(`tools: ignoring unknown ${kind} ${unknown.join(", ")} (known: ${BUILTIN_TOOLS.join(", ")})`);
+  }
+}
+
+/** Tools restriction accepts an allowlist string (`tools: read, bash`), an
+ * allowlist array (`tools: [read, bash]`), or a per-tool enable map
+ * (`tools: {write: false}`); anything else means all built-in tools.
+ * A map entry with no value (`write:`) disables the tool — fail closed. */
+export function resolveTools(fm: Record<string, unknown>): string[] {
   const t = fm.tools;
   if (typeof t === "string" && t.trim()) {
-    const allow = new Set(t.split(",").map((s) => s.trim()).filter(Boolean));
+    const names = t.split(",").map((s) => s.trim()).filter(Boolean);
+    warnUnknownTools("name(s) in", names);
+    const allow = new Set(names);
+    return BUILTIN_TOOLS.filter((b) => allow.has(b));
+  }
+  if (Array.isArray(t)) {
+    const names = t.map(String).map((s) => s.trim()).filter(Boolean);
+    warnUnknownTools("name(s) in", names);
+    const allow = new Set(names);
     return BUILTIN_TOOLS.filter((b) => allow.has(b));
   }
   if (t && typeof t === "object") {
+    const map = t as Record<string, unknown>;
+    warnUnknownTools("key(s) in", Object.keys(map));
     return BUILTIN_TOOLS.filter((b) => {
-      const raw = (t as Record<string, string>)[b];
+      const raw = map[b];
       if (raw === undefined) return true;
-      return !FALSY.has(String(raw).trim().toLowerCase());
+      if (raw === null) return false;
+      return isEnabled(raw);
     });
   }
   return [...BUILTIN_TOOLS];
@@ -149,11 +151,16 @@ export function resolveAgentDef(list: AgentDef[], ref: AgentRef): AgentDef {
   return agentFromText(DEFAULT_AGENT_MD, "generic");
 }
 
-/** Display name for a task item, without resolving the full definition. */
+/** Display name for a task item, without resolving the full definition.
+ * Tolerates unparseable agent_md — the error surfaces when the task runs. */
 export function refLabel(ref: AgentRef): string {
   if (ref.agent) return ref.agent;
-  const fm = splitFrontmatter(ref.agent_md ?? "").fm;
-  return typeof fm.name === "string" && fm.name ? fm.name : "generic";
+  try {
+    const fm = splitFrontmatter(ref.agent_md ?? "").fm;
+    return typeof fm.name === "string" && fm.name ? fm.name : "generic";
+  } catch {
+    return "generic";
+  }
 }
 
 export function loadAgents(dir: string): AgentDef[] {

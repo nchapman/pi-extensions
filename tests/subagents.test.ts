@@ -66,9 +66,9 @@ describe("splitFrontmatter", () => {
     expect(body).toBe("Body here");
   });
 
-  it("parses nested maps", () => {
+  it("parses nested maps with real YAML booleans", () => {
     const { fm } = splitFrontmatter("---\ntools:\n  write: false\n  edit: false\n---\nBody");
-    expect(fm.tools).toEqual({ write: "false", edit: "false" });
+    expect(fm.tools).toEqual({ write: false, edit: false });
   });
 
   it("handles CRLF line endings", () => {
@@ -105,6 +105,37 @@ describe("splitFrontmatter", () => {
     const { fm } = splitFrontmatter('---\ndescription: "a: b"\n---\nBody');
     expect(fm.description).toBe("a: b");
   });
+
+  it("folds block scalars and ignores comments", () => {
+    const { fm } = splitFrontmatter("---\n# a comment\ndescription: >-\n  multi-line\n  description\n---\nBody");
+    expect(fm.description).toBe("multi-line description");
+  });
+
+  it("tolerates a UTF-8 BOM and whitespace-padded delimiters", () => {
+    const bom = "\uFEFF---\nname: x\n--- \nBody";
+    expect(splitFrontmatter(bom)).toEqual({ fm: { name: "x" }, body: "Body" });
+  });
+
+  it("keeps indented --- inside block scalars out of the delimiter scan", () => {
+    const { fm, body } = splitFrontmatter("---\ndescription: |\n  text with --- inside\n---\nBody");
+    expect(fm.description).toBe("text with --- inside\n");
+    expect(body).toBe("Body");
+  });
+
+  it("returns empty fm for an empty or comment-only block", () => {
+    expect(splitFrontmatter("---\n---\nBody").fm).toEqual({});
+    expect(splitFrontmatter("---\n# only a comment\n---\nBody").fm).toEqual({});
+    expect(splitFrontmatter("---\n~\n---\nBody").fm).toEqual({});
+  });
+
+  it("throws on invalid YAML in frontmatter", () => {
+    expect(() => splitFrontmatter("---\nname: [unclosed\n---\nBody")).toThrow();
+  });
+
+  it("throws when frontmatter is not a mapping", () => {
+    expect(() => splitFrontmatter("---\njust a scalar\n---\nBody")).toThrow(/mapping/);
+    expect(() => splitFrontmatter("---\n- a\n- b\n---\nBody")).toThrow(/mapping/);
+  });
 });
 
 describe("agentFromText", () => {
@@ -132,6 +163,38 @@ describe("agentFromText", () => {
     expect(agent.tools).toEqual(["read", "grep"]);
   });
 
+  it("accepts tools as a YAML array", () => {
+    const block = agentFromText("---\ntools:\n  - read\n  - bash\n---\nBody", "x");
+    const flow = agentFromText("---\ntools: [read, bash]\n---\nBody", "x");
+    expect(block.tools).toEqual(["read", "bash"]);
+    expect(flow.tools).toEqual(["read", "bash"]);
+  });
+
+  it("treats quoted no/off as disabled in tools maps", () => {
+    const agent = agentFromText('---\ntools:\n  write: "no"\n  edit: off\n---\nBody', "x");
+    expect(agent.tools).toEqual(["read", "bash", "grep", "find", "ls"]);
+  });
+
+  it("fails closed for map entries with no value", () => {
+    const agent = agentFromText("---\ntools:\n  write:\n---\nBody", "x");
+    expect(agent.tools).not.toContain("write");
+  });
+
+  it("yields no tools for an explicit empty allowlist, all tools for whitespace-only string", () => {
+    const none = agentFromText("---\ntools: []\n---\nBody", "x");
+    expect(none.tools).toEqual([]);
+    const blank = agentFromText('---\ntools: "   "\n---\nBody', "x");
+    expect(blank.tools).toEqual(BUILTIN_TOOLS);
+  });
+
+  it("warns about unknown tool names and keys", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    agentFromText("---\ntools: [reads, bash]\n---\nBody", "x");
+    agentFromText("---\ntools:\n  wriet: false\n---\nBody", "x");
+    expect(warn).toHaveBeenCalledTimes(2);
+    warn.mockRestore();
+  });
+
   it("uses empty-quoted name as fallback", () => {
     const agent = agentFromText('---\nname: ""\n---\nBody', "fallback");
     expect(agent.name).toBe("fallback");
@@ -143,12 +206,23 @@ describe("agentFromText", () => {
     expect(agent.thinking).toBe("high");
     expect(agent.instructions).toBe("Body");
   });
+
+  it("ignores non-string scalar values for name/description", () => {
+    const agent = agentFromText("---\nname: 42\ndescription: [a, b]\n---\nBody", "fallback");
+    expect(agent.name).toBe("fallback");
+    expect(agent.description).toBe("");
+  });
+
+  it("rejects files whose frontmatter does not parse", () => {
+    expect(() => agentFromText("---\nname: [unclosed\n---\nBody", "x")).toThrow();
+  });
 });
 
 describe("loadAgents", () => {
   it("skips unreadable files with a warning and keeps the rest", () => {
     const dir = mkdtempSync(join(tmpdir(), "pi-agents-"));
     writeFileSync(join(dir, "good.md"), "---\ndescription: ok\n---\nBody");
+    writeFileSync(join(dir, "bad.md"), "---\nname: [unclosed\n---\nBody");
     writeFileSync(join(dir, "not-markdown.txt"), "ignore me");
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const agents = loadAgents(dir);
@@ -366,6 +440,10 @@ describe("refLabel", () => {
     expect(refLabel({ agent_md: "---\nname: sql-auditor\n---\nbody" })).toBe("sql-auditor");
     expect(refLabel({ agent_md: "no frontmatter" })).toBe("generic");
     expect(refLabel({})).toBe("generic");
+  });
+
+  it("falls back to generic for unparseable agent_md", () => {
+    expect(refLabel({ agent_md: "---\nname: [unclosed\n---\nbody" })).toBe("generic");
   });
 });
 

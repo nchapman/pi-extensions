@@ -7,7 +7,7 @@ Personal [pi](https://pi.dev) coding agent extensions. Installed as a local pi p
 | Extension | Description |
 |---|---|
 | `extensions/mcp.ts` | MCP gateway on `@modelcontextprotocol/sdk`. One proxy tool: status, search, describe, call. Servers from `~/.pi/agent/mcp.json` connect lazily, tool metadata is cached, connections close on idle (`unref`'d timer + `session_shutdown`) so pi can always exit. |
-| `extensions/subagents.ts` | Subagent delegation. Agents are markdown files in `~/.pi/agent/agents/` (frontmatter: `description`, `tools: {write: false}` restrictions, optional `model`/`thinking`). `subagent` runs one task; `subagents` runs a batch in parallel. Children are headless pi runs (`pi -p --mode json`) with isolated context, custom system prompt, and restricted tools. Timeout via `PI_SUBAGENT_TIMEOUT_MS` (default 10m). |
+| `extensions/subagents.ts` | Subagent delegation. Agents are markdown files in `~/.pi/agent/agents/` (YAML frontmatter via the `yaml` package: `description`, `tools` as string/array/per-tool map, optional `model`/`thinking`). `subagent` runs one task; `subagents` runs a batch in parallel. Children are headless pi runs (`pi -p --mode json`) with isolated context, custom system prompt, and restricted tools. Timeout via `PI_SUBAGENT_TIMEOUT_MS` (default 10m). |
 | `extensions/llamswap.ts` | Registers the local `yeti` and `spark` llamswap gateways (OpenAI-compatible) with dynamic model discovery via `GET /v1/models`. Bounded fetch (15s) with fallback to the last persisted catalog on gateway blips. |
 
 ## Design notes
