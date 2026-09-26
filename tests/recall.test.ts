@@ -22,8 +22,7 @@ import {
 	carryForwardFileLists,
 	effectiveCompactTarget,
 	lastCompactionDetails,
-	mergeSummaryInstructions,
-	SUMMARY_ADDENDUM,
+	buildSummarizationPrompt,
 	shouldAutoCompact,
 	type SummaryFn,
 	registerRecallTool,
@@ -1141,30 +1140,35 @@ describe("context budget", () => {
 	});
 });
 
-describe("summary instructions", () => {
-	it("uses the addendum alone when no user focus exists", () => {
-		expect(mergeSummaryInstructions(SUMMARY_ADDENDUM, undefined)).toBe(SUMMARY_ADDENDUM);
-		expect(mergeSummaryInstructions(SUMMARY_ADDENDUM, "  ")).toBe(SUMMARY_ADDENDUM);
+describe("summarization prompt", () => {
+	it("is the extension's own complete prompt: structure, budget, anchors", () => {
+		const prompt = buildSummarizationPrompt("[User]: do the thing");
+		for (const section of [
+			"## Goal",
+			"## Constraints & Preferences",
+			"## Progress",
+			"### Done",
+			"### In Progress",
+			"### Blocked",
+			"## Key Decisions",
+			"## Next Steps",
+			"## Critical Context",
+		]) {
+			expect(prompt).toContain(section);
+		}
+		expect(prompt).toContain("<conversation>\n[User]: do the thing\n</conversation>");
+		expect(prompt).not.toContain("<previous-summary>");
+		// The hard budget keeps the generation under our output cap.
+		expect(prompt).toContain("under 8,000 characters");
+		expect(prompt).toContain("discarded whole");
+		// Fully owned: nothing rides pi's built-in summarizer prompt.
+		expect(prompt).not.toContain("Additional focus");
 	});
 
-	it("appends user focus after the addendum", () => {
-		const merged = mergeSummaryInstructions(SUMMARY_ADDENDUM, "focus on the auth refactor");
-		expect(merged.startsWith(SUMMARY_ADDENDUM)).toBe(true);
-		expect(merged).toContain("User focus for this compaction: focus on the auth refactor");
-	});
-
-	it("does not duplicate the addendum our own trigger already passed through", () => {
-		const viaTrigger = mergeSummaryInstructions(SUMMARY_ADDENDUM, SUMMARY_ADDENDUM);
-		expect(viaTrigger).toBe(SUMMARY_ADDENDUM);
-	});
-
-	it("enforces a hard output budget well under the summarizer's token cap", () => {
-		// pi cuts summarization at 0.8 × compaction.reserveTokens (13,107 output tokens at the
-		// default 16,384) and discards a length-stopped summary whole — the addendum must keep
-		// the model's output far enough under that cap that reasoning tokens can't push it over.
-		expect(SUMMARY_ADDENDUM).toContain("under 8,000 characters");
-		expect(SUMMARY_ADDENDUM).toContain("discarded whole");
-		expect(SUMMARY_ADDENDUM.length).toBeLessThan(2_500);
+	it("wraps the previous summary as a stale draft, and appends user focus, only when present", () => {
+		const prompt = buildSummarizationPrompt("[User]: hi", "## Goal\n- stale", "focus on auth");
+		expect(prompt).toContain("<previous-summary>\n## Goal\n- stale\n</previous-summary>");
+		expect(prompt).toContain("User focus for this compaction: focus on auth");
 	});
 });
 
@@ -1223,7 +1227,8 @@ describe("auto-compact wiring", () => {
 		registerRecallTool(pi, CONFIG);
 		await fire(events, "agent_settled", ctx);
 		expect(compactCalls).toHaveLength(1);
-		expect(compactCalls[0].customInstructions).toBe(SUMMARY_ADDENDUM);
+		// The trigger passes no customInstructions: summary ownership lives in the hook.
+		expect(compactCalls[0].customInstructions).toBeUndefined();
 		// In-flight: no second trigger until the first completes.
 		await fire(events, "agent_settled", ctx);
 		expect(compactCalls).toHaveLength(1);
@@ -1300,9 +1305,9 @@ describe("compaction summary ownership", () => {
 			type: "session_before_compact",
 			preparation: {
 				firstKeptEntryId: "kept1",
-				messagesToSummarize: [{ role: "user", content: "do the thing" }],
-				turnPrefixMessages: [],
-				isSplitTurn: false,
+				messagesToSummarize: [{ role: "user", content: "older-span work" }],
+				turnPrefixMessages: [{ role: "user", content: "split turn prefix" }],
+				isSplitTurn: true,
 				tokensBefore: 150_000,
 				previousSummary: "## Goal\n- Earlier",
 				fileOps: { read: new Set(["read1.ts"]), written: new Set(["wrote1.ts"]), edited: new Set() },
@@ -1316,49 +1321,141 @@ describe("compaction summary ownership", () => {
 		};
 	}
 
-	function hookCtx() {
+	interface CapturedCall {
+		model: unknown;
+		context: { messages: Array<{ role: string; content: Array<{ type: string; text: string }> }> };
+		options: Record<string, unknown>;
+	}
+
+	function hookCtx(complete?: (model: unknown, context: unknown, options?: unknown) => Promise<unknown>, overrides: Record<string, unknown> = {}) {
 		return {
-			model: { id: "test-model" },
-			modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "sk-test", headers: { "x-test": "1" } }) },
+			model: { id: "test-model", reasoning: false },
+			modelRegistry: {
+				complete: complete ??
+					(async () => {
+						throw new Error("complete must be provided");
+					}),
+			},
 			thinkingLevel: undefined,
+			...overrides,
 		};
 	}
 
-	it("generates the summary with recall-aware instructions and carried file lists", async () => {
-		const calls: unknown[] = [];
-		const summarize: SummaryFn = async (args) => {
-			calls.push(args);
-			return { text: "## Goal\n- Recall-aware summary", usage: { totalTokens: 42 } };
+	function okComplete(calls: CapturedCall[]) {
+		return async (model: unknown, context: unknown, options?: unknown) => {
+			calls.push({ model, context: context as CapturedCall["context"], options: (options ?? {}) as Record<string, unknown> });
+			return { content: [{ type: "text", text: "## Goal\n- Recall-aware summary" }], usage: { totalTokens: 42 }, stopReason: "stop" };
 		};
+	}
+
+	it("generates the summary with the extension's own prompt via modelRegistry.complete", async () => {
+		const calls: CapturedCall[] = [];
 		const { pi, events } = makePi();
-		registerRecallTool(pi, CONFIG, undefined, { summarize });
-		const result = (await fire(events, "session_before_compact", hookCtx(), beforeCompactEvent())) as {
+		registerRecallTool(pi, CONFIG); // default summarize path
+		const result = (await fire(events, "session_before_compact", hookCtx(okComplete(calls)), beforeCompactEvent())) as {
 			compaction: Record<string, unknown>;
 		};
-		const args = calls[0] as { customInstructions: string; apiKey?: string; previousSummary?: string };
-		expect(args.customInstructions.startsWith(SUMMARY_ADDENDUM)).toBe(true);
-		expect(args.apiKey).toBe("sk-test");
-		expect(args.previousSummary).toBe("## Goal\n- Earlier");
+		expect(calls).toHaveLength(1);
+		const [call] = calls;
+		expect(call.model).toEqual({ id: "test-model", reasoning: false });
+		// One user message carrying the whole prompt: serialized conversation is
+		// chronological (older spans, then the split-turn prefix), previous summary
+		// wrapped as a stale draft, our section structure inside.
+		expect(call.context.messages).toHaveLength(1);
+		expect(call.context.messages[0].role).toBe("user");
+		const prompt = call.context.messages[0].content[0].text;
+		expect(prompt.indexOf("older-span work")).toBeLessThan(prompt.indexOf("split turn prefix"));
+		expect(prompt).toContain("<previous-summary>\n## Goal\n- Earlier\n</previous-summary>");
+		expect(prompt).toContain("## Next Steps");
+		expect(prompt).toContain("under 8,000 characters");
+		// pi's own summarizer conventions: one-off prompt (no cache writes), bounded
+		// output, fresh routing id, abortable.
+		expect(call.options.maxTokens).toBe(8192);
+		expect(call.options.cacheRetention).toBe("none");
+		expect(call.options.sessionId).toEqual(expect.any(String));
+		expect(call.options.signal).toBe(SIGNAL);
+		expect(call.options.reasoning).toBeUndefined();
 		expect(result.compaction.summary).toBe("## Goal\n- Recall-aware summary");
 		expect(result.compaction.firstKeptEntryId).toBe("kept1");
 		expect(result.compaction.tokensBefore).toBe(150_000);
+		expect(result.compaction.usage).toEqual({ totalTokens: 42 });
 		// Previous compaction entry has no details → lists come from fileOps alone.
 		expect(result.compaction.details).toEqual({ readFiles: ["read1.ts"], modifiedFiles: ["wrote1.ts"] });
 	});
 
-	it("re-ceives the auto-compact trigger's addendum verbatim, never wrapped as user focus", async () => {
+	it("forwards thinking level only when the model reasons and a level is set", async () => {
+		for (const [model, thinkingLevel, expected] of [
+			[{ id: "test-model", reasoning: true }, "high", "high"],
+			[{ id: "test-model", reasoning: true }, "off", undefined],
+			[{ id: "test-model", reasoning: false }, "high", undefined],
+		] as const) {
+			const calls: CapturedCall[] = [];
+			const { pi, events } = makePi();
+			registerRecallTool(pi, CONFIG);
+			await fire(events, "session_before_compact", hookCtx(okComplete(calls), { model, thinkingLevel }), beforeCompactEvent());
+			expect(calls[0].options.reasoning, `${JSON.stringify(model)} @ ${String(thinkingLevel)}`).toBe(expected);
+		}
+	});
+
+	it("passes /compact focus through as user focus", async () => {
 		const calls: unknown[] = [];
 		const summarize: SummaryFn = async (args) => {
 			calls.push(args);
-			return { text: "## Goal\n- ok", usage: { totalTokens: 1 } };
+			return { text: "s", usage: {} };
 		};
 		const { pi, events } = makePi();
 		registerRecallTool(pi, CONFIG, undefined, { summarize });
-		// The budget trigger passes SUMMARY_ADDENDUM itself as customInstructions.
-		await fire(events, "session_before_compact", hookCtx(), beforeCompactEvent({ customInstructions: SUMMARY_ADDENDUM }));
-		const args = calls[0] as { customInstructions: string };
-		expect(args.customInstructions).toBe(SUMMARY_ADDENDUM);
-		expect(args.customInstructions).not.toContain("User focus");
+		await fire(events, "session_before_compact", hookCtx(), beforeCompactEvent({ customInstructions: "focus on auth" }));
+		expect((calls[0] as { userFocus?: string }).userFocus).toBe("focus on auth");
+	});
+
+	it("falls back on a length-stopped generation, leaving a breadcrumb", async () => {
+		const crumbs: string[] = [];
+		const capped = async () => ({ content: [{ type: "text", text: "partial" }], usage: {}, stopReason: "length" });
+		const { pi, events } = makePi();
+		registerRecallTool(pi, CONFIG, undefined, { logCompactionError: (l) => crumbs.push(l) });
+		expect(await fire(events, "session_before_compact", hookCtx(capped), beforeCompactEvent())).toBeUndefined();
+		expect(crumbs).toEqual([expect.stringContaining("fell back to pi default: summarizer hit the output cap")]);
+	});
+
+	it("falls back on a resolved error completion, keeping its message — even with partial text", async () => {
+		const crumbs: string[] = [];
+		// complete() resolves (never rejects) provider failures, keeping partial content —
+		// that text must never become the session checkpoint.
+		const errored = async () => ({ content: [{ type: "text", text: "truncated mid-sentence" }], usage: {}, stopReason: "error", errorMessage: "500 upstream" });
+		const { pi, events } = makePi();
+		registerRecallTool(pi, CONFIG, undefined, { logCompactionError: (l) => crumbs.push(l) });
+		expect(await fire(events, "session_before_compact", hookCtx(errored), beforeCompactEvent())).toBeUndefined();
+		expect(crumbs).toEqual([expect.stringContaining("fell back to pi default: 500 upstream")]);
+	});
+
+	it("falls back on a resolved aborted completion, staying silent (user cancel)", async () => {
+		const crumbs: string[] = [];
+		const controller = new AbortController();
+		controller.abort();
+		// A real cancel aborts the signal, and complete() then resolves aborted.
+		const aborted = async () => ({ content: [], usage: {}, stopReason: "aborted", errorMessage: "aborted" });
+		const { pi, events } = makePi();
+		registerRecallTool(pi, CONFIG, undefined, { logCompactionError: (l) => crumbs.push(l) });
+		expect(await fire(events, "session_before_compact", hookCtx(aborted), beforeCompactEvent({ signal: controller.signal }))).toBeUndefined();
+		expect(crumbs).toEqual([]);
+	});
+
+	it("falls back when the model emits a tool call instead of a summary", async () => {
+		const crumbs: string[] = [];
+		const tooling = async () => ({ content: [{ type: "toolCall", id: "t1", tool: "recall", args: {} }], usage: {}, stopReason: "toolUse" });
+		const { pi, events } = makePi();
+		registerRecallTool(pi, CONFIG, undefined, { logCompactionError: (l) => crumbs.push(l) });
+		expect(await fire(events, "session_before_compact", hookCtx(tooling), beforeCompactEvent())).toBeUndefined();
+		expect(crumbs).toEqual([expect.stringContaining("fell back to pi default: Summarization attempted to call a tool")]);
+	});
+
+	it("clamps maxTokens to the model's declared output cap", async () => {
+		const calls: CapturedCall[] = [];
+		const { pi, events } = makePi();
+		registerRecallTool(pi, CONFIG);
+		await fire(events, "session_before_compact", hookCtx(okComplete(calls), { model: { id: "small-model", reasoning: false, maxTokens: 2048 } }), beforeCompactEvent());
+		expect(calls[0].options.maxTokens).toBe(2048);
 	});
 
 	it("falls back to pi's default (undefined) on failure, empty text, or missing model — each leaving a breadcrumb; opt-out stays silent", async () => {
@@ -1395,26 +1492,17 @@ describe("compaction summary ownership", () => {
 		expect(quiet).toEqual([]);
 	});
 
-	it("declines when auth resolution fails, leaving a breadcrumb", async () => {
+	it("stays silent on an aborted signal (user cancel, not a failure)", async () => {
 		const crumbs: string[] = [];
-		const summarize: SummaryFn = async () => ({ text: "unused", usage: {} });
-		const ctx = { ...hookCtx(), modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: false, error: "no key configured" }) } };
-		const { pi, events } = makePi();
-		registerRecallTool(pi, CONFIG, undefined, { summarize, logCompactionError: (l) => crumbs.push(l) });
-		expect(await fire(events, "session_before_compact", ctx, beforeCompactEvent())).toBeUndefined();
-		expect(crumbs).toEqual([expect.stringContaining("fell back to pi default: auth unavailable (no key configured)")]);
-	});
-
-	it("merges user focus from /compact into the addendum", async () => {
-		const calls: unknown[] = [];
-		const summarize: SummaryFn = async (args) => {
-			calls.push(args);
-			return { text: "s", usage: {} };
+		const controller = new AbortController();
+		controller.abort();
+		const failing: SummaryFn = async () => {
+			throw new Error("aborted mid-flight");
 		};
 		const { pi, events } = makePi();
-		registerRecallTool(pi, CONFIG, undefined, { summarize });
-		await fire(events, "session_before_compact", hookCtx(), beforeCompactEvent({ customInstructions: "focus on auth" }));
-		expect((calls[0] as { customInstructions: string }).customInstructions).toContain("User focus for this compaction: focus on auth");
+		registerRecallTool(pi, CONFIG, undefined, { summarize: failing, logCompactionError: (l) => crumbs.push(l) });
+		expect(await fire(events, "session_before_compact", hookCtx(), beforeCompactEvent({ signal: controller.signal }))).toBeUndefined();
+		expect(crumbs).toEqual([]);
 	});
 
 	it("config parses the budget knobs", () => {

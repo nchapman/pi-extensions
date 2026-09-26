@@ -40,9 +40,11 @@ import path from "node:path";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
-	generateSummaryWithUsage,
+	convertToLlm,
 	type ExtensionAPI,
 	type ExtensionContext,
+	ModelRegistry,
+	serializeConversation,
 	type SessionEntry,
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
@@ -901,7 +903,6 @@ export function registerRecallTool(
 		}
 		autoCompactInFlight = true;
 		ctx.compact({
-			customInstructions: SUMMARY_ADDENDUM,
 			onComplete: () => (autoCompactInFlight = false),
 			onError: (err) => {
 				autoCompactInFlight = false;
@@ -917,10 +918,12 @@ export function registerRecallTool(
 		logCompactionError(`compaction failed (${event.reason}): ${event.errorMessage ?? "unknown error"}`);
 	});
 
-	// Own the summary: every compaction (ours, manual /compact, pi's backstop)
-	// is generated here with recall-aware instructions through pi's hardened
-	// generateSummary plumbing. Any failure returns undefined so pi's default
-	// summarizer takes over — custom compaction must never block compaction.
+	// Own the summary end to end: every compaction (ours, manual /compact,
+	// pi's backstop) is generated here with the extension's own prompt — pi's
+	// built-in summarizer prompt is never involved, so pi-side prompt changes
+	// cannot reshape our summaries. Any failure returns undefined so pi's
+	// default summarizer takes over — custom compaction must never block
+	// compaction.
 	pi.on("session_before_compact", async (event, ctx) => {
 		if (!config.ownSummaries) return;
 		const model = ctx.model;
@@ -930,21 +933,16 @@ export function registerRecallTool(
 		}
 		const p = event.preparation;
 		try {
-			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-			if (!auth.ok) {
-				logCompactionError(`summary ownership fell back to pi default: auth unavailable (${auth.error})`);
-				return;
-			}
 			const { text, usage } = await summarize({
-				messages: [...p.turnPrefixMessages, ...p.messagesToSummarize],
 				model,
-				reserveTokens: p.settings.reserveTokens,
-				apiKey: auth.apiKey,
-				headers: auth.headers,
-				signal: event.signal,
-				customInstructions: mergeSummaryInstructions(SUMMARY_ADDENDUM, event.customInstructions),
-				previousSummary: p.previousSummary,
+				complete: (m, context, options) => ctx.modelRegistry.complete(m, context, options),
 				thinkingLevel: ctx.thinkingLevel,
+				// Chronological: older spans first, split-turn prefix last, so the
+				// newest state the prompt re-derives sits at the end of the transcript.
+				messages: [...p.messagesToSummarize, ...p.turnPrefixMessages],
+				previousSummary: p.previousSummary,
+				userFocus: event.customInstructions?.trim() || undefined,
+				signal: event.signal,
 			});
 			if (!text.trim()) {
 				logCompactionError("summary ownership fell back to pi default: summarizer returned empty text");
@@ -955,11 +953,13 @@ export function registerRecallTool(
 					summary: text,
 					firstKeptEntryId: p.firstKeptEntryId,
 					tokensBefore: p.tokensBefore,
-					usage: usage as NonNullable<Awaited<ReturnType<typeof generateSummaryWithUsage>>["usage"]>,
+					usage: usage as CompactionUsage,
 					details: carryForwardFileLists(lastCompactionDetails(event.branchEntries), p.fileOps),
 				},
 			};
 		} catch (err) {
+			// An aborted signal is a user cancel, not a failure — stay silent.
+			if (event.signal.aborted) return;
 			logCompactionError(`summary ownership fell back to pi default: ${err instanceof Error ? err.message : String(err)}`);
 			return;
 		}
@@ -1011,25 +1011,83 @@ function reminderMessage(): { message: { customType: string; content: string; di
 const COMPACT_WINDOW_HEADROOM_TOKENS = 4096;
 
 /**
- * Recall-aware instructions folded into every compaction summary we generate.
- * The transcript stays verbatim-searchable, so the summary's job changes from
- * "preserve everything" to "be a working map with searchable anchors".
+ * Output cap for the summarization call. The prompt budgets the summary at
+ * 8,000 characters (~2.7k tokens); the remainder is reasoning headroom, so a
+ * thinking model cannot crowd the text out of the generation.
  */
-export const SUMMARY_ADDENDUM =
-	"The full transcript remains verbatim-searchable via the recall tool, so the past can be summarized tersely: " +
-	"never restate long passages, prefer lists, lead with decisions and their rationale, and preserve exact file paths, " +
-	"identifiers, commands, URLs, and error strings (these are the anchors future recall searches will match). " +
-	"Hard budget: the entire summary must stay under 8,000 characters — the generation is cut off at a fixed token cap, " +
-	"and a cut-off summary is discarded whole. When space is tight, compress Done detail first (it is recall-searchable); " +
-	"never drop or shorten Next Steps, active decisions' rationale, or exact strings still in use. " +
-	"The future is not recoverable — treat Next Steps as the most important section: open with the in-flight action " +
-	"(what was literally being done when compaction fired), then the ordered queue with names, paths, and commands " +
-	"specific enough to resume cold without re-reading anything. Never compress Next Steps for brevity; " +
-	"note open questions and blockers explicitly. " +
-	"When a previous summary is provided, treat it as a stale draft: re-derive volatile facts (current git log and HEAD, " +
-	"test counts, what was just committed, what the user most recently asked) from the newest messages rather than copying them; " +
-	"if the messages disagree with the previous summary, the messages win. Never carry Next Steps forward unchanged — " +
-	"rewrite them from the newest messages, which are where the current task state actually lives.";
+const SUMMARY_MAX_OUTPUT_TOKENS = 8192;
+
+/**
+ * The extension's complete summarization prompt — the only prompt involved.
+ * pi's built-in summarizer prompt is never merged or appended to, so pi-side
+ * prompt changes cannot reshape our summaries. The transcript stays
+ * verbatim-searchable via recall, so the summary's job is to be a working
+ * map with searchable anchors, not an archive.
+ */
+export function buildSummarizationPrompt(
+	conversationText: string,
+	previousSummary?: string,
+	userFocus?: string,
+): string {
+	const sections = [
+		"Summarize the conversation inside <conversation> so the work can continue after these messages are dropped " +
+			"from context. The full transcript remains verbatim-searchable via the recall tool, so this summary is a " +
+			"working map, not an archive: compress the past hard, never restate long passages, prefer lists.",
+		"",
+		"<conversation>",
+		conversationText,
+		"</conversation>",
+	];
+	if (previousSummary) {
+		sections.push("", "<previous-summary>", previousSummary, "</previous-summary>");
+	}
+	sections.push(
+		"",
+		"Use exactly this structure:",
+		"",
+		"## Goal",
+		"[What the user is trying to accomplish — one or two sentences]",
+		"",
+		"## Constraints & Preferences",
+		"- [Requirements and style rules the work must respect]",
+		"",
+		"## Progress",
+		"### Done",
+		"- [x] [Milestones, with commit hashes where they landed]",
+		"### In Progress",
+		"- [ ] [Current work]",
+		"### Blocked",
+		"- [Blockers, or omit this subsection]",
+		"",
+		"## Key Decisions",
+		"- **[Decision]**: [Rationale] — keep every decision still in force",
+		"",
+		"## Next Steps",
+		"1. [The literally in-flight action when compaction fired — what was being done this minute]",
+		"2. [Then the ordered queue: names, paths, and commands specific enough to resume cold without re-reading anything]",
+		"",
+		"## Critical Context",
+		"- [Repo paths, model/tool quirks, and the exact file paths, identifiers, commands, URLs, and error strings " +
+			"still in use — these are the anchors future recall searches will match]",
+		"",
+		"Rules:",
+		"- Preserve exact file paths, identifiers, commands, URLs, and error strings verbatim; compress everything else.",
+		"- The future is not recoverable: treat Next Steps as the most important section. Never compress it for " +
+			"brevity; note open questions and blockers explicitly.",
+		"- The previous summary, when provided, is a stale draft: re-derive volatile facts (current git HEAD and log, " +
+			"test counts, what was just committed, what the user most recently asked) from the newest messages rather " +
+			"than copying them; when they disagree, the messages win. Never carry Next Steps forward unchanged — rewrite " +
+			"them from the newest messages, which are where the current task state actually lives.",
+		"- Hard budget: the entire summary must stay under 8,000 characters — a cut-off generation is discarded whole. " +
+			"When space is tight, compress Done and Critical Context first; never Next Steps, active decisions' rationale, " +
+			"or exact strings still in use.",
+		"- Only summarize what appears in the conversation above; do not infer later events.",
+	);
+	if (userFocus) {
+		sections.push(`- User focus for this compaction: ${userFocus}`);
+	}
+	return sections.join("\n");
+}
 
 /**
  * Effective auto-compaction target: the smaller of the configured target and
@@ -1052,18 +1110,6 @@ export function shouldAutoCompact(
 	if (inFlight || tokens === null) return false;
 	const target = effectiveCompactTarget(configTarget, contextWindow);
 	return target !== undefined && tokens > target;
-}
-
-/**
- * Merge our recall addendum with any user focus instructions (from /compact
- * args or our own trigger). If the user text already carries the addendum
- * (our trigger passes it verbatim), it is returned unchanged.
- */
-export function mergeSummaryInstructions(addendum: string, userInstructions: string | undefined): string {
-	const user = userInstructions?.trim();
-	if (!user) return addendum;
-	if (user.includes(addendum)) return user;
-	return `${addendum}\n\nUser focus for this compaction: ${user}`;
 }
 
 /** File-operation sets as pi's CompactionPreparation provides them. */
@@ -1110,35 +1156,68 @@ export function lastCompactionDetails(branchEntries: SessionEntry[]): unknown {
 	return undefined;
 }
 
-/** Seam for tests: one LLM-backed summarization call, pi's hardened plumbing underneath. */
+/** Boundaries of one model completion, as the extension seam sees it. */
+export type SummaryComplete = ModelRegistry["complete"];
+export type SummaryModel = Parameters<SummaryComplete>[0];
+export type SummaryThinkingLevel = NonNullable<ExtensionContext["thinkingLevel"]>;
+export type CompactionUsage = NonNullable<import("@earendil-works/pi-coding-agent").CompactionEntryDraft["usage"]>;
+
+/** Seam for tests: one summarization call with the extension's own prompt. */
 export interface SummaryFnArgs {
-	messages: Parameters<typeof generateSummaryWithUsage>[0];
-	model: Parameters<typeof generateSummaryWithUsage>[1];
-	reserveTokens: number;
-	apiKey: string | undefined;
-	/** Auth headers as pi's resolver returns them (values may be null = removal markers). */
-	headers: Record<string, string | null> | undefined;
-	signal: AbortSignal;
-	customInstructions: string;
+	model: SummaryModel;
+	complete: SummaryComplete;
+	thinkingLevel: SummaryThinkingLevel | undefined;
+	/** AgentMessages in chronological order — older spans first, split-turn prefix last. */
+	messages: Parameters<typeof convertToLlm>[0];
 	previousSummary: string | undefined;
-	thinkingLevel: Parameters<typeof generateSummaryWithUsage>[8];
+	/** Free-form focus from /compact args; the auto trigger never sets one. */
+	userFocus: string | undefined;
+	signal: AbortSignal;
 }
 export type SummaryFn = (args: SummaryFnArgs) => Promise<{ text: string; usage: unknown }>;
 
-const defaultSummaryFn: SummaryFn = async (args) =>
-	generateSummaryWithUsage(
-		args.messages,
-		args.model,
-		args.reserveTokens,
-		args.apiKey,
-		// pi's generateSummary declares non-nullable headers though its own auth
-		// resolver produces nullable ones — same values its internal path passes.
-		args.headers as Record<string, string> | undefined,
-		args.signal,
-		args.customInstructions,
-		args.previousSummary,
-		args.thinkingLevel,
-	);
+const defaultSummaryFn: SummaryFn = async ({
+	model,
+	complete,
+	thinkingLevel,
+	messages,
+	previousSummary,
+	userFocus,
+	signal,
+}) => {
+	const conversationText = serializeConversation(convertToLlm(messages));
+	const prompt = buildSummarizationPrompt(conversationText, previousSummary, userFocus);
+	const options: NonNullable<Parameters<SummaryComplete>[2]> & { reasoning?: SummaryThinkingLevel } = {
+		maxTokens: Math.min(SUMMARY_MAX_OUTPUT_TOKENS, model.maxTokens > 0 ? model.maxTokens : SUMMARY_MAX_OUTPUT_TOKENS),
+		signal,
+		// One-off prompt: never write to the prompt cache (pi's summarizer does the same).
+		cacheRetention: "none",
+		sessionId: crypto.randomUUID(),
+	};
+	// Mirror pi's summarizer: only forward thinking when the model reasons and a level is set.
+	if (model.reasoning && thinkingLevel && thinkingLevel !== "off") {
+		options.reasoning = thinkingLevel;
+	}
+	const response = await complete(model, { messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }] }, options);
+	// complete() resolves (never rejects) error and abort terminations, keeping any
+	// partial content — a partial text must never become the session checkpoint.
+	// Throwing routes aborts into the hook's silent return and errors into the crumb.
+	if (response.stopReason === "error" || response.stopReason === "aborted") {
+		const failed = response as { errorMessage?: string };
+		throw new Error(failed.errorMessage ?? `summarizer ${response.stopReason}`);
+	}
+	if (response.stopReason === "length") {
+		throw new Error(`summarizer hit the output cap (${options.maxTokens} tokens)`);
+	}
+	if (response.content.some((block) => block.type === "toolCall")) {
+		throw new Error("Summarization attempted to call a tool");
+	}
+	const text = response.content
+		.filter((block): block is { type: "text"; text: string } => block.type === "text")
+		.map((block) => block.text)
+		.join("\n");
+	return { text, usage: response.usage };
+};
 
 // ---------------------------------------------------------------------------
 // Tool internals (kept out of the registration closure for testability)
