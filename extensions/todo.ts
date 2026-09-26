@@ -94,7 +94,11 @@ export function validateTodoList(input: unknown): { todos: TodoItem[]; error?: s
 		};
 	}
 	if (todos.length > MAX_TODOS) {
-		return { todos: [], error: `at most ${MAX_TODOS} todos (got ${todos.length}); split the work or drop stale items` };
+		return { todos: [], error: `at most ${MAX_TODOS} todos (got ${todos.length}); mark stale items cancelled, then replace resolved items` };
+	}
+	const contents = new Set(todos.map((t) => t.content));
+	if (contents.size < todos.length) {
+		return { todos: [], error: "duplicate item content; items must be unique" };
 	}
 	return { todos };
 }
@@ -111,6 +115,16 @@ export function summarizeTodos(todos: TodoItem[]): TodoProgress {
 		total: todos.length,
 		active: todos.find((t) => t.status === "in_progress"),
 	};
+}
+
+/**
+ * Unfinished items from `previous` that vanish from `next`. Whole-list rewrite
+ * makes silent drift possible; rejecting these drops forces the model to carry
+ * its work forward or cancel it explicitly. Resolved items may drop freely.
+ */
+export function droppedUnfinishedItems(previous: TodoItem[], next: TodoItem[]): TodoItem[] {
+	const kept = new Set(next.map((t) => t.content));
+	return previous.filter((t) => (t.status === "pending" || t.status === "in_progress") && !kept.has(t.content));
 }
 
 function clip(text: string, max: number): string {
@@ -309,7 +323,7 @@ export function registerTodoTool(pi: ExtensionAPI): void {
 		name: TODO_TOOL_NAME,
 		label: "Todo",
 		description:
-			"Manage the session task list for multi-step work (3+ distinct steps). Send the FULL list on every call — it replaces the previous list. At most one item may be in_progress; mark an item in_progress immediately before starting it, and completed or cancelled as soon as it is resolved. Skip this tool for simple tasks.",
+			"Record a plan that must outlive the context window. Use for work that will span many tool calls or a likely compaction (multi-file changes, long test/fix loops, migrations), or when the user asks for a plan or visible progress. Skip it when a few tool calls and thinking suffice — do not use it to organize your own thoughts. Send the FULL list on every call (it replaces the previous list); update when items resolve, batching several changes per call; at most one item may be in_progress. Items match by exact text — to reword or abandon one, mark it cancelled and add the replacement; unfinished items cannot be silently dropped.",
 		parameters: TodoParams,
 		async execute(_id, params) {
 			const { todos: next, error } = validateTodoList(params.todos);
@@ -318,6 +332,19 @@ export function registerTodoTool(pi: ExtensionAPI): void {
 				return {
 					content: [{ type: "text", text: `Error: ${error}\nCurrent list:\n${current}` }],
 					details: { todos: [...todos], error } as TodoDetails,
+				};
+			}
+			const dropped = droppedUnfinishedItems(todos, next);
+			if (dropped.length > 0) {
+				const names = dropped.map((t) => `"${t.content}"`).join(", ");
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Error: dropped unfinished item(s): ${names}. Re-include them with identical text, or mark them cancelled (to reword: cancel the old item and add the new one). To clear the list, send all items cancelled.\nCurrent list:\n${renderPlainList(todos)}`,
+						},
+					],
+					details: { todos: [...todos], error: `dropped ${dropped.length} unfinished item(s)` } as TodoDetails,
 				};
 			}
 			todos = next;

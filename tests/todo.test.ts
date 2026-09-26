@@ -13,6 +13,7 @@ import {
 	type TodoDetails,
 	type TodoItem,
 	registerTodoTool,
+	droppedUnfinishedItems,
 } from "../extensions/todo";
 
 const THEME = { fg: (_k: string, s: string) => s, bold: (s: string) => s } as never;
@@ -107,6 +108,11 @@ describe("validateTodoList", () => {
 		expect(error).toBeUndefined();
 	});
 
+	it("rejects duplicate item content", () => {
+		const { error } = validateTodoList([item("a"), item("a", "completed")]);
+		expect(error).toContain("duplicate");
+	});
+
 	it("rejects lists longer than 50 items", () => {
 		const { error } = validateTodoList(Array.from({ length: 51 }, (_, i) => item(`t${i}`)));
 		expect(error).toContain("at most 50");
@@ -117,6 +123,24 @@ describe("summarizeTodos", () => {
 	it("counts completed and cancelled items as resolved", () => {
 		const todos = [item("a", "completed"), item("b", "in_progress"), item("c"), item("d", "cancelled")];
 		expect(summarizeTodos(todos)).toEqual({ resolved: 2, total: 4, active: item("b", "in_progress") });
+	});
+});
+
+describe("droppedUnfinishedItems", () => {
+	it("flags unfinished items missing from the next list", () => {
+		const previous = [item("keep", "in_progress"), item("drop", "pending"), item("done", "completed"), item("cut", "cancelled")];
+		const next = [item("keep", "completed"), item("done", "completed"), item("cut", "cancelled"), item("new")];
+		expect(droppedUnfinishedItems(previous, next)).toEqual([item("drop")]);
+	});
+
+	it("flags reworded unfinished items as drops", () => {
+		const previous = [item("run the tests")];
+		expect(droppedUnfinishedItems(previous, [item("execute the tests")])).toEqual([item("run the tests")]);
+	});
+
+	it("allows resolved items to drop freely", () => {
+		const previous = [item("done", "completed"), item("cut", "cancelled")];
+		expect(droppedUnfinishedItems(previous, [])).toEqual([]);
 	});
 });
 
@@ -324,6 +348,107 @@ describe("registerTodoTool", () => {
 		const notify = vi.fn();
 		await commands.get("todos")!.handler("", { mode: "headless", ui: { notify } });
 		expect(notify).toHaveBeenCalledWith(expect.stringContaining("interactive"), "error");
+	});
+
+	it("rejects updates that silently drop unfinished items", async () => {
+		const { pi, tools } = makePi();
+		registerTodoTool(pi);
+		const tool = tools.get(TODO_TOOL_NAME)!;
+
+		await tool.execute("1", { todos: [item("keep", "in_progress"), item("drop"), item("done", "completed")] });
+		const result = (await tool.execute("2", { todos: [item("keep", "completed"), item("done", "completed")] })) as {
+			content: Array<{ type: string; text: string }>;
+			details: TodoDetails;
+		};
+
+		expect(result.content[0].text).toContain('"drop"');
+		expect(result.content[0].text).toContain("cancelled");
+		// State is unchanged by the rejected update.
+		expect(result.details.todos).toHaveLength(3);
+	});
+
+	it("accepts explicit cancellation and allows clearing a fully resolved list", async () => {
+		const { pi, tools } = makePi();
+		registerTodoTool(pi);
+		const tool = tools.get(TODO_TOOL_NAME)!;
+
+		await tool.execute("1", { todos: [item("a", "in_progress"), item("b")] });
+		const cancelled = (await tool.execute("2", { todos: [item("a", "cancelled"), item("b", "cancelled")] })) as { details: TodoDetails };
+		expect(cancelled.details.error).toBeUndefined();
+
+		const cleared = (await tool.execute("3", { todos: [] })) as { details: TodoDetails };
+		expect(cleared.details.todos).toEqual([]);
+	});
+
+	it("rejects clearing while unfinished items remain, leaving state unchanged", async () => {
+		const { pi, tools } = makePi();
+		registerTodoTool(pi);
+		const tool = tools.get(TODO_TOOL_NAME)!;
+		await tool.execute("1", { todos: [item("a", "in_progress")] });
+
+		const result = (await tool.execute("2", { todos: [] })) as {
+			content: Array<{ type: string; text: string }>;
+			details: TodoDetails;
+		};
+		expect(result.content[0].text).toContain('"a"');
+		expect(result.details.todos).toEqual([item("a", "in_progress")]);
+		expect(result.details.error).toBeDefined();
+	});
+
+	it("supports rewording via cancel-and-replace in one call", async () => {
+		const { pi, tools } = makePi();
+		registerTodoTool(pi);
+		const tool = tools.get(TODO_TOOL_NAME)!;
+		await tool.execute("1", { todos: [item("run the tests")] });
+
+		const result = (await tool.execute("2", {
+			todos: [item("run the tests", "cancelled"), item("run vitest")],		})) as { details: TodoDetails };
+		expect(result.details.error).toBeUndefined();
+		expect(result.details.todos).toEqual([item("run the tests", "cancelled"), item("run vitest")]);
+	});
+
+	it("recovers from the 50-item cap via cancel-then-replace", async () => {
+		const { pi, tools } = makePi();
+		registerTodoTool(pi);
+		const tool = tools.get(TODO_TOOL_NAME)!;
+		const fifty = Array.from({ length: 50 }, (_, i) => item(`t${i}`));
+		await tool.execute("1", { todos: fifty });
+
+		// Adding a 51st item fails validation with actionable advice.
+		const tooMany = (await tool.execute("2", { todos: [...fifty, item("new")] })) as {
+			content: Array<{ type: string; text: string }>;
+		};
+		expect(tooMany.content[0].text).toContain("cancelled, then replace");
+
+		// Cancel one, then replace the resolved slot in the next call.
+		await tool.execute("3", { todos: fifty.map((t, i) => (i === 0 ? item("t0", "cancelled") : t)) });
+		const replaced = (await tool.execute("4", {
+			todos: [...fifty.slice(1), item("new")],
+		})) as { details: TodoDetails };
+		expect(replaced.details.error).toBeUndefined();
+		expect(replaced.details.todos).toHaveLength(50);
+	});
+
+	it("rejected updates do not reset the staleness counter", async () => {
+		const { pi, tools, events } = makePi();
+		registerTodoTool(pi);
+		await tools.get(TODO_TOOL_NAME)!.execute("1", { todos: [item("a", "in_progress")] });
+
+		for (let i = 0; i < REMINDER_MIN_TURNS - 1; i++) fire(events, "before_agent_start");
+		// A rejected update must not count as keeping the plan current.
+		await tools.get(TODO_TOOL_NAME)!.execute("2", { todos: [item("a", "in_progress"), item("b", "in_progress")] });
+		const reminder = fire(events, "before_agent_start") as { message: { content: string } };
+		expect(reminder.message.content).toContain("[>] a");
+	});
+
+	it("instructs models on when the tool is worth using", () => {
+		const { pi, tools } = makePi();
+		registerTodoTool(pi);
+		const description = (tools.get(TODO_TOOL_NAME) as unknown as { description: string }).description;
+		// The usage policy: plans that outlive the context, not thought organization.
+		expect(description).toContain("outlive the context");
+		expect(description).toContain("compaction");
+		expect(description).toContain("Skip it");
 	});
 
 	it("renders the /todos checklist full-screen in TUI mode", async () => {
