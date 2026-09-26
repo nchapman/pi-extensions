@@ -7,10 +7,14 @@ import {
   agentFromText,
   BUILTIN_TOOLS,
   buildChildArgs,
+  DEFAULT_AGENT_MD,
   extractAssistantText,
   loadAgents,
   parseConcurrency,
   parseTimeoutMs,
+  refLabel,
+  registerSubagentTools,
+  resolveAgentDef,
   runChild,
   runWithLimit,
   splitFrontmatter,
@@ -309,5 +313,136 @@ describe("runWithLimit", () => {
     expect(results.map((r: PromiseSettledResult<number>) => (r.status === "fulfilled" ? r.value : `ERR:${(r.reason as Error).message}`))).toEqual([
       10, 20, "ERR:fail-3", 40, 50,
     ]);
+  });
+});
+
+describe("DEFAULT_AGENT_MD", () => {
+  it("parses as a read-only generic agent", () => {
+    const agent = agentFromText(DEFAULT_AGENT_MD, "fallback");
+    expect(agent.name).toBe("generic");
+    expect(agent.tools).not.toContain("write");
+    expect(agent.tools).not.toContain("edit");
+    expect(agent.instructions.trim().length).toBeGreaterThan(50);
+  });
+});
+
+describe("resolveAgentDef", () => {
+  const list: AgentDef[] = [
+    { name: "reviewer", description: "", instructions: "review", tools: ["read"] },
+  ];
+
+  it("resolves a named agent", () => {
+    expect(resolveAgentDef(list, { agent: "reviewer" }).name).toBe("reviewer");
+  });
+
+  it("resolves an inline definition", () => {
+    const agent = resolveAgentDef(list, {
+      agent_md: "---\nname: sql-auditor\nmodel: yeti/foo\ntools: read,bash\n---\nAudit SQL.",
+    });
+    expect(agent.name).toBe("sql-auditor");
+    expect(agent.model).toBe("yeti/foo");
+    expect(agent.tools).toEqual(["read", "bash"]);
+    expect(agent.instructions).toBe("Audit SQL.");
+  });
+
+  it("falls back to the generic default when neither is given", () => {
+    const agent = resolveAgentDef(list, {});
+    expect(agent.name).toBe("generic");
+    expect(agent.tools).not.toContain("write");
+  });
+
+  it("rejects agent and agent_md together", () => {
+    expect(() => resolveAgentDef(list, { agent: "reviewer", agent_md: "---\nx" })).toThrow(/not both/);
+  });
+
+  it("throws for an unknown agent name", () => {
+    expect(() => resolveAgentDef(list, { agent: "nope" })).toThrow(/not found/);
+  });
+});
+
+describe("refLabel", () => {
+  it("labels named, inline, and default refs", () => {
+    expect(refLabel({ agent: "reviewer" })).toBe("reviewer");
+    expect(refLabel({ agent_md: "---\nname: sql-auditor\n---\nbody" })).toBe("sql-auditor");
+    expect(refLabel({ agent_md: "no frontmatter" })).toBe("generic");
+    expect(refLabel({})).toBe("generic");
+  });
+});
+
+describe("registerSubagentTools", () => {
+  function makePi() {
+    const tools = new Map<string, { execute: (id: string, params: unknown, signal?: AbortSignal) => Promise<unknown> }>();
+    const pi = {
+      registerTool: (t: { name: string; execute: (id: string, params: unknown, signal?: AbortSignal) => Promise<unknown> }) =>
+        tools.set(t.name, t),
+    };
+    return { pi: pi as never, tools };
+  }
+
+  function spawnReturning(lines: string[], calls: string[][]) {
+    return (command: string, args: string[], options: { stdio: ["ignore", "pipe", "pipe"] }): ChildLike => {
+      calls.push([command, ...args]);
+      const child = fakeChild();
+      setImmediate(() => {
+        for (const line of lines) child.stdoutEmit(line + "\n");
+        child.close(0);
+      });
+      return child;
+    };
+  }
+
+  function jsonLine(text: string): string {
+    return JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }] } });
+  }
+
+  it("runs a mixed batch: named, inline, and default agents", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agents-"));
+    writeFileSync(join(dir, "reviewer.md"), "---\nname: reviewer\ndescription: d\n---\nReview things.");
+    const calls: string[][] = [];
+    const { pi, tools } = makePi();
+    registerSubagentTools(pi as never, dir, spawnReturning([jsonLine("ok")], calls));
+
+    const result = (await tools.get("subagents")!.execute("1", {
+      tasks: [
+        { agent: "reviewer", task: "t1" },
+        { agent_md: "---\nname: inline-x\n---\nDo x.", task: "t2" },
+        { task: "t3" },
+      ],
+    })) as { content: Array<{ type: string; text: string }> };
+
+    expect(result.content[0].text).toContain("### reviewer\nok");
+    expect(result.content[0].text).toContain("### inline-x\nok");
+    expect(result.content[0].text).toContain("### generic\nok");
+    expect(calls.length).toBe(3);
+    // default agent must not get write/edit tools
+    const defaultArgs = calls[2].join(" ");
+    expect(defaultArgs).not.toContain("write");
+  });
+
+  it("single subagent tool uses the generic default and reports its name", async () => {
+    const calls: string[][] = [];
+    const { pi, tools } = makePi();
+    registerSubagentTools(pi as never, mkdtempSync(join(tmpdir(), "agents-")), spawnReturning([jsonLine("done")], calls));
+
+    const result = (await tools.get("subagent")!.execute("1", { task: "just look" })) as {
+      content: Array<{ type: string; text: string }>;
+      details: { agent: string };
+    };
+    expect(result.content[0].text).toBe("done");
+    expect(result.details.agent).toBe("generic");
+  });
+
+  it("surfaces an error section for an unknown agent without failing the batch", async () => {
+    const calls: string[][] = [];
+    const { pi, tools } = makePi();
+    registerSubagentTools(pi as never, mkdtempSync(join(tmpdir(), "agents-")), spawnReturning([jsonLine("ok")], calls));
+
+    const result = (await tools.get("subagents")!.execute("1", {
+      tasks: [{ agent: "ghost", task: "t" }, { task: "t2" }],
+    })) as { content: Array<{ type: string; text: string }> };
+
+    expect(result.content[0].text).toContain("### ghost\nERROR: Agent \"ghost\" not found");
+    expect(result.content[0].text).toContain("### generic\nok");
+    expect(calls.length).toBe(1);
   });
 });

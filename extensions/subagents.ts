@@ -110,6 +110,52 @@ export function agentFromText(text: string, fallbackName: string): AgentDef {
   };
 }
 
+/** Generic agent used when a call names no agent and supplies no definition. */
+export const DEFAULT_AGENT_MD = `---
+name: generic
+description: General-purpose subagent. Investigates and reports; does not modify files.
+tools:
+  write: false
+  edit: false
+---
+
+You are a focused subagent operating in an isolated pi session. The parent agent delegated a task to you; your reply is the only thing they will see, so make it complete and self-contained.
+
+- Read the task carefully and answer exactly what was asked.
+- Investigate with your tools (read, grep, find, ls, bash) before answering; verify claims against the actual code or data rather than guessing.
+- Do not modify files — you are analysis-oriented by default.
+- Structure the reply for the parent agent: lead with the answer, then supporting details, file paths, and evidence.
+- If the task is ambiguous or cannot be completed, say so plainly and explain what is missing instead of improvising.
+`;
+
+export interface AgentRef {
+  agent?: string;
+  agent_md?: string;
+}
+
+function findAgent(list: AgentDef[], name: string): AgentDef {
+  const agent = list.find((a) => a.name === name);
+  if (!agent) throw new Error(`Agent "${name}" not found. Available: ${list.map((a) => a.name).join(", ") || "(none)"}`);
+  return agent;
+}
+
+/** Resolve a task item to an agent: named file, inline definition, or the generic default. */
+export function resolveAgentDef(list: AgentDef[], ref: AgentRef): AgentDef {
+  if (ref.agent && ref.agent_md) {
+    throw new Error('Provide either "agent" or "agent_md", not both');
+  }
+  if (ref.agent_md) return agentFromText(ref.agent_md, "ad-hoc");
+  if (ref.agent) return findAgent(list, ref.agent);
+  return agentFromText(DEFAULT_AGENT_MD, "generic");
+}
+
+/** Display name for a task item, without resolving the full definition. */
+export function refLabel(ref: AgentRef): string {
+  if (ref.agent) return ref.agent;
+  const fm = splitFrontmatter(ref.agent_md ?? "").fm;
+  return typeof fm.name === "string" && fm.name ? fm.name : "generic";
+}
+
 export function loadAgents(dir: string): AgentDef[] {
   if (!existsSync(dir)) return [];
   const agents: AgentDef[] = [];
@@ -281,24 +327,22 @@ export async function runWithLimit<T>(jobs: Array<() => Promise<T>>, limit: numb
   return results;
 }
 
-const agentField = Type.String({ description: "Agent name" });
 const taskField = Type.String({ description: "The task to delegate, with full context" });
 const modelField = Type.Optional(Type.String({ description: "Model override (provider/id)" }));
-const taskItem = Type.Object({ agent: agentField, task: taskField, model: modelField });
+const taskItem = Type.Object({
+  agent: Type.Optional(Type.String({ description: "Named agent from the available list" })),
+  agent_md: Type.Optional(Type.String({ description: "Inline agent definition: markdown with optional frontmatter (name, description, tools, model, thinking) followed by the system prompt. Takes precedence over the generic default. Provide either agent or agent_md, not both." })),
+  task: taskField,
+  model: modelField,
+});
 
 const AGENTS_DIR = join(homedir(), ".pi/agent/agents");
 
-export function registerSubagentTools(pi: ExtensionAPI, agentsDir: string = AGENTS_DIR): void {
+export function registerSubagentTools(pi: ExtensionAPI, agentsDir: string = AGENTS_DIR, spawnFn: SpawnFn = defaultSpawn): void {
   const agents = loadAgents(agentsDir);
   const agentList = agents.length
     ? agents.map((a) => `- ${a.name}: ${a.description || "(no description)"}`).join("\n")
     : `(no agents found in ${agentsDir})`;
-
-  const findAgent = (list: AgentDef[], name: string): AgentDef => {
-    const agent = list.find((a) => a.name === name);
-    if (!agent) throw new Error(`Agent "${name}" not found. Available: ${list.map((a) => a.name).join(", ") || "(none)"}`);
-    return agent;
-  };
 
   pi.registerTool({
     name: "subagent",
@@ -306,21 +350,23 @@ export function registerSubagentTools(pi: ExtensionAPI, agentsDir: string = AGEN
     description: `Delegate a focused task to a subagent: a fresh pi session with its own context, system prompt, and tool restrictions.
 Available agents:
 ${agentList}
+Alternatively pass agent_md: a full agent definition in markdown (frontmatter + system prompt) for an ad-hoc specialist. With neither, a generic read-only investigator runs.
 The subagent runs to completion and returns its final response. Use for reviews, research, and any work that benefits from an isolated context.`,
     promptSnippet: "Delegate a task to a focused subagent (isolated pi session)",
     promptGuidelines: [
       "Use subagent for self-contained work (reviews, research, audits); the subagent only sees the task text you pass, so include all needed context.",
+      "For a bespoke specialist, pass agent_md with the exact instructions and tool restrictions instead of forcing a named agent to fit.",
     ],
     parameters: taskItem,
     async execute(_id, params, signal, onUpdate) {
       const list = loadAgents(agentsDir);
-      const agent = findAgent(list, params.agent);
+      const agent = resolveAgentDef(list, params);
       const text = await runChild(agent, params.task, params.model, {
         timeoutMs: parseTimeoutMs(process.env),
         onUpdate,
         signal,
-      });
-      return { content: [{ type: "text", text }], details: { agent: params.agent } };
+      }, spawnFn);
+      return { content: [{ type: "text", text }], details: { agent: agent.name } };
     },
   });
 
@@ -329,7 +375,8 @@ The subagent runs to completion and returns its final response. Use for reviews,
     label: "Subagents",
     description: `Run multiple subagents in parallel. Each task gets an isolated pi session.
 Available agents:
-${agentList}`,
+${agentList}
+Each task may instead include agent_md (an inline agent definition) or omit both to use the generic read-only investigator.`,
     parameters: Type.Object({
       tasks: Type.Array(taskItem, { minItems: 1, description: "Tasks to run in parallel" }),
     }),
@@ -338,15 +385,15 @@ ${agentList}`,
       const timeoutMs = parseTimeoutMs(process.env);
       const results = await runWithLimit(
         params.tasks.map((t) => () => {
-          const agent = findAgent(list, t.agent);
-          return runChild(agent, t.task, t.model, { timeoutMs, signal });
+          const agent = resolveAgentDef(list, t);
+          return runChild(agent, t.task, t.model, { timeoutMs, signal }, spawnFn);
         }),
         parseConcurrency(process.env),
       );
       const sections = results.map((r, i) => {
-        const t = params.tasks[i];
+        const label = refLabel(params.tasks[i]);
         const body = r.status === "fulfilled" ? r.value : `ERROR: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`;
-        return `### ${t.agent}\n${body}`;
+        return `### ${label}\n${body}`;
       });
       return { content: [{ type: "text", text: sections.join("\n\n---\n\n") }], details: { count: params.tasks.length } };
     },
