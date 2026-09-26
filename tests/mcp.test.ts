@@ -63,7 +63,16 @@ import {
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 function makePi() {
-  const tools = new Map<string, { execute: (id: string, params: unknown, signal?: AbortSignal) => Promise<{ content: Array<{ type: string; text?: string }> }> }>();
+  const tools = new Map<
+    string,
+    {
+      execute: (
+        id: string,
+        params: unknown,
+        signal?: AbortSignal,
+      ) => Promise<{ content: Array<{ type: string; text?: string }> }>;
+    }
+  >();
   const handlers = new Map<string, () => void>();
   const pi = {
     registerTool: (tool: { name: string; execute: unknown }) => tools.set(tool.name, tool as never),
@@ -81,7 +90,11 @@ function writeConfig(dir: string, servers: Record<string, unknown>): string {
 }
 
 const TWO_TOOLS = [
-  { name: "web_search", description: "Search the web", inputSchema: { type: "object", properties: { query: {} }, required: ["query"] } },
+  {
+    name: "web_search",
+    description: "Search the web",
+    inputSchema: { type: "object", properties: { query: {} }, required: ["query"] },
+  },
   { name: "web_fetch", description: "Fetch a URL", inputSchema: { type: "object", properties: { url: {}, raw: {} } } },
 ];
 
@@ -180,21 +193,36 @@ describe("resolveToolByName", () => {
 
 describe("serializeCallResult", () => {
   it("joins text blocks", () => {
-    expect(serializeCallResult({ content: [{ type: "text", text: "a" }, { type: "text", text: "b" }] })).toBe("a\nb");
+    expect(
+      serializeCallResult({
+        content: [
+          { type: "text", text: "a" },
+          { type: "text", text: "b" },
+        ],
+      }),
+    ).toBe("a\nb");
   });
 
   it("reduces binary blocks to mime summaries", () => {
-    expect(serializeCallResult({ content: [{ type: "image", data: "AAAA", mimeType: "image/png" }] })).toBe("[image: image/png]");
-    expect(serializeCallResult({ content: [{ type: "audio", data: "AAAA", mimeType: "audio/wav" }] })).toBe("[audio: audio/wav]");
+    expect(serializeCallResult({ content: [{ type: "image", data: "AAAA", mimeType: "image/png" }] })).toBe(
+      "[image: image/png]",
+    );
+    expect(serializeCallResult({ content: [{ type: "audio", data: "AAAA", mimeType: "audio/wav" }] })).toBe(
+      "[audio: audio/wav]",
+    );
   });
 
   it("keeps resource text but hides resource blobs", () => {
     expect(serializeCallResult({ content: [{ type: "resource", resource: { uri: "x", text: "body" } }] })).toBe("body");
-    expect(serializeCallResult({ content: [{ type: "resource", resource: { uri: "x", blob: "AAAA" } }] })).toBe("[resource: x (binary)]");
+    expect(serializeCallResult({ content: [{ type: "resource", resource: { uri: "x", blob: "AAAA" } }] })).toBe(
+      "[resource: x (binary)]",
+    );
   });
 
   it("marks errors and handles legacy toolResult", () => {
-    expect(serializeCallResult({ content: [{ type: "text", text: "bad" }], isError: true })).toBe("MCP tool reported an error: bad");
+    expect(serializeCallResult({ content: [{ type: "text", text: "bad" }], isError: true })).toBe(
+      "MCP tool reported an error: bad",
+    );
     expect(serializeCallResult({ toolResult: { ok: false } })).toBe('{"ok":false}');
     expect(serializeCallResult({})).toBe("(no content)");
     expect(serializeCallResult(null)).toBe("(no content)");
@@ -238,9 +266,11 @@ describe("registerMcpTool integration", () => {
 
   it("tool call rows render the call mode", () => {
     const { tool } = setup();
-    const renderCall = (tool as unknown as {
-      renderCall: (args: unknown, theme: unknown, context?: unknown) => { render: (width: number) => string[] };
-    }).renderCall;
+    const renderCall = (
+      tool as unknown as {
+        renderCall: (args: unknown, theme: unknown, context?: unknown) => { render: (width: number) => string[] };
+      }
+    ).renderCall;
     const text = renderCall({ search: "browser" }, THEME, {}).render(200).join("\n");
     expect(text).toContain('search "browser"');
   });
@@ -341,9 +371,7 @@ describe("registerMcpTool integration", () => {
     const calls: unknown[] = [];
     sdk.behavior.listTools = async (p?: unknown) => {
       calls.push(p);
-      return calls.length === 1
-        ? { tools: [TWO_TOOLS[0]], nextCursor: "c1" }
-        : { tools: [TWO_TOOLS[1]] };
+      return calls.length === 1 ? { tools: [TWO_TOOLS[0]], nextCursor: "c1" } : { tools: [TWO_TOOLS[1]] };
     };
     const { tool } = setup();
     const result = await tool.execute("1", { server: "s1" });

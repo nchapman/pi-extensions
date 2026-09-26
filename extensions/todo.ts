@@ -24,14 +24,14 @@ export const REMINDER_MIN_TURNS = 4;
 export type TodoStatus = "pending" | "in_progress" | "completed" | "cancelled";
 
 export interface TodoItem {
-	content: string;
-	status: TodoStatus;
+  content: string;
+  status: TodoStatus;
 }
 
 /** Snapshot carried by every todo tool result (see reconstruct). */
 export interface TodoDetails {
-	todos: TodoItem[];
-	error?: string;
+  todos: TodoItem[];
+  error?: string;
 }
 
 const TODO_STATUSES = ["pending", "in_progress", "completed", "cancelled"] as const;
@@ -40,33 +40,36 @@ const MAX_TODOS = 50;
 
 /** Shape guard shared by streamed arguments and replayed snapshots. */
 function isTodoItem(t: unknown): t is TodoItem {
-	const item = t as { content?: unknown; status?: unknown } | null;
-	return (
-		typeof item?.content === "string" &&
-		item.content.trim() !== "" &&
-		typeof item.status === "string" &&
-		TODO_STATUSES.includes(item.status as TodoStatus)
-	);
+  const item = t as { content?: unknown; status?: unknown } | null;
+  return (
+    typeof item?.content === "string" &&
+    item.content.trim() !== "" &&
+    typeof item.status === "string" &&
+    TODO_STATUSES.includes(item.status as TodoStatus)
+  );
 }
 
 /** Model-facing ASCII markers (UI uses theme-colored glyphs instead). */
 const PLAIN_MARKERS: Record<TodoStatus, string> = {
-	pending: "[ ]",
-	in_progress: "[>]",
-	completed: "[x]",
-	cancelled: "[-]",
+  pending: "[ ]",
+  in_progress: "[>]",
+  completed: "[x]",
+  cancelled: "[-]",
 };
 
 const TodoParams = Type.Object({
-	todos: Type.Array(
-		Type.Object({
-			content: Type.String({ description: "Short imperative task description" }),
-			status: Type.Union(TODO_STATUSES.map((s) => Type.Literal(s)), {
-				description: "At most one item may be in_progress",
-			}),
-		}),
-		{ description: "The full list; replaces the previous list entirely" },
-	),
+  todos: Type.Array(
+    Type.Object({
+      content: Type.String({ description: "Short imperative task description" }),
+      status: Type.Union(
+        TODO_STATUSES.map((s) => Type.Literal(s)),
+        {
+          description: "At most one item may be in_progress",
+        },
+      ),
+    }),
+    { description: "The full list; replaces the previous list entirely" },
+  ),
 });
 
 /**
@@ -74,47 +77,50 @@ const TodoParams = Type.Object({
  * first problem so the model can retry with a corrected list.
  */
 export function validateTodoList(input: unknown): { todos: TodoItem[]; error?: string } {
-	if (!Array.isArray(input)) return { todos: [], error: "todos must be an array" };
-	const todos: TodoItem[] = [];
-	for (const [i, raw] of input.entries()) {
-		const item = raw as { content?: unknown; status?: unknown } | null;
-		if (typeof item?.content !== "string" || item.content.trim() === "") {
-			return { todos: [], error: `todos[${i}].content must be a non-empty string` };
-		}
-		if (typeof item.status !== "string" || !TODO_STATUSES.includes(item.status as TodoStatus)) {
-			return { todos: [], error: `todos[${i}].status must be one of: ${TODO_STATUSES.join(", ")}` };
-		}
-		todos.push({ content: item.content.trim(), status: item.status as TodoStatus });
-	}
-	const active = todos.filter((t) => t.status === "in_progress");
-	if (active.length > 1) {
-		return {
-			todos: [],
-			error: `at most one todo may be in_progress (found ${active.length}); finish or cancel items before starting new ones`,
-		};
-	}
-	if (todos.length > MAX_TODOS) {
-		return { todos: [], error: `at most ${MAX_TODOS} todos (got ${todos.length}); mark stale items cancelled, then replace resolved items` };
-	}
-	const contents = new Set(todos.map((t) => t.content));
-	if (contents.size < todos.length) {
-		return { todos: [], error: "duplicate item content; items must be unique" };
-	}
-	return { todos };
+  if (!Array.isArray(input)) return { todos: [], error: "todos must be an array" };
+  const todos: TodoItem[] = [];
+  for (const [i, raw] of input.entries()) {
+    const item = raw as { content?: unknown; status?: unknown } | null;
+    if (typeof item?.content !== "string" || item.content.trim() === "") {
+      return { todos: [], error: `todos[${i}].content must be a non-empty string` };
+    }
+    if (typeof item.status !== "string" || !TODO_STATUSES.includes(item.status as TodoStatus)) {
+      return { todos: [], error: `todos[${i}].status must be one of: ${TODO_STATUSES.join(", ")}` };
+    }
+    todos.push({ content: item.content.trim(), status: item.status as TodoStatus });
+  }
+  const active = todos.filter((t) => t.status === "in_progress");
+  if (active.length > 1) {
+    return {
+      todos: [],
+      error: `at most one todo may be in_progress (found ${active.length}); finish or cancel items before starting new ones`,
+    };
+  }
+  if (todos.length > MAX_TODOS) {
+    return {
+      todos: [],
+      error: `at most ${MAX_TODOS} todos (got ${todos.length}); mark stale items cancelled, then replace resolved items`,
+    };
+  }
+  const contents = new Set(todos.map((t) => t.content));
+  if (contents.size < todos.length) {
+    return { todos: [], error: "duplicate item content; items must be unique" };
+  }
+  return { todos };
 }
 
 export interface TodoProgress {
-	resolved: number;
-	total: number;
-	active?: TodoItem;
+  resolved: number;
+  total: number;
+  active?: TodoItem;
 }
 
 export function summarizeTodos(todos: TodoItem[]): TodoProgress {
-	return {
-		resolved: todos.filter((t) => t.status === "completed" || t.status === "cancelled").length,
-		total: todos.length,
-		active: todos.find((t) => t.status === "in_progress"),
-	};
+  return {
+    resolved: todos.filter((t) => t.status === "completed" || t.status === "cancelled").length,
+    total: todos.length,
+    active: todos.find((t) => t.status === "in_progress"),
+  };
 }
 
 /**
@@ -123,141 +129,142 @@ export function summarizeTodos(todos: TodoItem[]): TodoProgress {
  * its work forward or cancel it explicitly. Resolved items may drop freely.
  */
 export function droppedUnfinishedItems(previous: TodoItem[], next: TodoItem[]): TodoItem[] {
-	const kept = new Set(next.map((t) => t.content));
-	return previous.filter((t) => (t.status === "pending" || t.status === "in_progress") && !kept.has(t.content));
+  const kept = new Set(next.map((t) => t.content));
+  return previous.filter((t) => (t.status === "pending" || t.status === "in_progress") && !kept.has(t.content));
 }
 
 function clip(text: string, max: number): string {
-	return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
 /** Plain-text checklist for tool results (the model reads content, not details). */
 export function renderPlainList(todos: TodoItem[]): string {
-	const p = summarizeTodos(todos);
-	const header = `${p.resolved}/${p.total} resolved`;
-	return [header, ...todos.map((t) => ` ${PLAIN_MARKERS[t.status]} ${t.content}`)].join("\n");
+  const p = summarizeTodos(todos);
+  const header = `${p.resolved}/${p.total} resolved`;
+  return [header, ...todos.map((t) => ` ${PLAIN_MARKERS[t.status]} ${t.content}`)].join("\n");
 }
 
 /** Reminder injected as a one-shot custom message when the plan goes stale. */
 export function renderReminder(todos: TodoItem[]): string {
-	const p = summarizeTodos(todos);
-	const lines = [
-		`TODO REMINDER — current plan (${p.resolved}/${p.total} resolved):`,
-		...todos.map((t) => ` ${PLAIN_MARKERS[t.status]} ${t.content}`),
-		"Keep statuses current: mark an item in_progress before starting it, completed or cancelled once resolved.",
-	];
-	return lines.join("\n");
+  const p = summarizeTodos(todos);
+  const lines = [
+    `TODO REMINDER — current plan (${p.resolved}/${p.total} resolved):`,
+    ...todos.map((t) => ` ${PLAIN_MARKERS[t.status]} ${t.content}`),
+    "Keep statuses current: mark an item in_progress before starting it, completed or cancelled once resolved.",
+  ];
+  return lines.join("\n");
 }
 
 export interface ReminderState {
-	unfinished: boolean;
-	turnsSinceUpdate: number;
-	compactedSinceUpdate: boolean;
+  unfinished: boolean;
+  turnsSinceUpdate: number;
+  compactedSinceUpdate: boolean;
 }
 
 /** Remind when there is unfinished work the model has neglected (or lost to compaction). */
 export function shouldRemind(state: ReminderState): boolean {
-	return state.unfinished && (state.compactedSinceUpdate || state.turnsSinceUpdate >= REMINDER_MIN_TURNS);
+  return state.unfinished && (state.compactedSinceUpdate || state.turnsSinceUpdate >= REMINDER_MIN_TURNS);
 }
 
 /** Collapsed call row: `todo 2/5 — active item`. */
 export function renderTodoCall(args: { todos?: unknown }, theme: Pick<Theme, "fg" | "bold">): string {
-	if (!Array.isArray(args?.todos)) return theme.fg("toolTitle", theme.bold("todo"));
-	// Items stream in partially (any key order); keep only well-formed ones.
-	const todos = (args.todos as unknown[]).filter(isTodoItem);
-	const p = summarizeTodos(todos);
-	let text = theme.fg("toolTitle", theme.bold("todo ")) + theme.fg("accent", `${p.resolved}/${p.total}`);
-	if (p.active) text += theme.fg("dim", ` — ${clip(p.active.content, 60)}`);
-	return text;
+  if (!Array.isArray(args?.todos)) return theme.fg("toolTitle", theme.bold("todo"));
+  // Items stream in partially (any key order); keep only well-formed ones.
+  const todos = (args.todos as unknown[]).filter(isTodoItem);
+  const p = summarizeTodos(todos);
+  let text = theme.fg("toolTitle", theme.bold("todo ")) + theme.fg("accent", `${p.resolved}/${p.total}`);
+  if (p.active) text += theme.fg("dim", ` — ${clip(p.active.content, 60)}`);
+  return text;
 }
 
 const GLYPHS: Record<TodoStatus, { mark: string; color: "success" | "accent" | "muted" | "dim" }> = {
-	completed: { mark: "✓", color: "success" },
-	in_progress: { mark: "▸", color: "accent" },
-	pending: { mark: "○", color: "muted" },
-	cancelled: { mark: "✗", color: "dim" },
+  completed: { mark: "✓", color: "success" },
+  in_progress: { mark: "▸", color: "accent" },
+  pending: { mark: "○", color: "muted" },
+  cancelled: { mark: "✗", color: "dim" },
 };
 
 /** Result row: one-line progress collapsed; full checklist when expanded. */
 export function renderTodoResult(
-	details: TodoDetails | undefined,
-	options: { expanded: boolean },
-	theme: Pick<Theme, "fg">,
+  details: TodoDetails | undefined,
+  options: { expanded: boolean },
+  theme: Pick<Theme, "fg">,
 ): string {
-	if (details?.error) return theme.fg("error", `✗ ${details.error}`);
-	const todos = details?.todos ?? [];
-	const p = summarizeTodos(todos);
-	if (todos.length === 0) return theme.fg("dim", "no todos");
+  if (details?.error) return theme.fg("error", `✗ ${details.error}`);
+  const todos = details?.todos ?? [];
+  const p = summarizeTodos(todos);
+  if (todos.length === 0) return theme.fg("dim", "no todos");
 
-	let text =
-		theme.fg(p.resolved === p.total ? "success" : "muted", `${p.resolved}/${p.total}`) +
-		(p.active ? theme.fg("accent", ` ▸ ${clip(p.active.content, 60)}`) : "");
-	if (options.expanded) {
-		const list = todos
-			.map((t) => {
-				const g = GLYPHS[t.status];
-				const content = t.status === "in_progress" ? theme.fg("text", t.content) : theme.fg("dim", clip(t.content, 72));
-				return `  ${theme.fg(g.color, g.mark)} ${content}`;
-			})
-			.join("\n");
-		text += `\n${list}`;
-	}
-	return text;
+  let text =
+    theme.fg(p.resolved === p.total ? "success" : "muted", `${p.resolved}/${p.total}`) +
+    (p.active ? theme.fg("accent", ` ▸ ${clip(p.active.content, 60)}`) : "");
+  if (options.expanded) {
+    const list = todos
+      .map((t) => {
+        const g = GLYPHS[t.status];
+        const content = t.status === "in_progress" ? theme.fg("text", t.content) : theme.fg("dim", clip(t.content, 72));
+        return `  ${theme.fg(g.color, g.mark)} ${content}`;
+      })
+      .join("\n");
+    text += `\n${list}`;
+  }
+  return text;
 }
 
 /** Reuse the prior render component when available (pi renderer idiom). */
 function reuseText(context: { lastComponent?: unknown } | undefined): Text {
-	return context?.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
+  return context?.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
 }
 
 /** Full-screen checklist shown by /todos. */
 class TodoListComponent {
-	private cachedWidth?: number;
-	private cachedLines?: string[];
+  private cachedWidth?: number;
+  private cachedLines?: string[];
 
-	constructor(
-		private todos: TodoItem[],
-		private theme: Pick<Theme, "fg">,
-		private onClose: () => void,
-	) {}
+  constructor(
+    private todos: TodoItem[],
+    private theme: Pick<Theme, "fg">,
+    private onClose: () => void,
+  ) {}
 
-	handleInput(data: string): void {
-		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) this.onClose();
-	}
+  handleInput(data: string): void {
+    if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) this.onClose();
+  }
 
-	render(width: number): string[] {
-		if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
-		const th = this.theme;
-		const lines: string[] = [""];
+  render(width: number): string[] {
+    if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
+    const th = this.theme;
+    const lines: string[] = [""];
 
-		const title = th.fg("accent", " Todos ");
-		const header = th.fg("borderMuted", "─".repeat(3)) + title + th.fg("borderMuted", "─".repeat(Math.max(0, width - 10)));
-		lines.push(truncateToWidth(header, width), "");
+    const title = th.fg("accent", " Todos ");
+    const header =
+      th.fg("borderMuted", "─".repeat(3)) + title + th.fg("borderMuted", "─".repeat(Math.max(0, width - 10)));
+    lines.push(truncateToWidth(header, width), "");
 
-		if (this.todos.length === 0) {
-			lines.push(truncateToWidth(`  ${th.fg("dim", "No todos yet. Ask the agent to add some!")}`, width));
-		} else {
-			const p = summarizeTodos(this.todos);
-			lines.push(truncateToWidth(`  ${th.fg("muted", `${p.resolved}/${p.total} resolved`)}`, width), "");
-			for (const t of this.todos) {
-				const g = GLYPHS[t.status];
-				const content = t.status === "in_progress" ? th.fg("text", t.content) : th.fg("dim", t.content);
-				lines.push(truncateToWidth(`  ${th.fg(g.color, g.mark)} ${content}`, width));
-			}
-		}
+    if (this.todos.length === 0) {
+      lines.push(truncateToWidth(`  ${th.fg("dim", "No todos yet. Ask the agent to add some!")}`, width));
+    } else {
+      const p = summarizeTodos(this.todos);
+      lines.push(truncateToWidth(`  ${th.fg("muted", `${p.resolved}/${p.total} resolved`)}`, width), "");
+      for (const t of this.todos) {
+        const g = GLYPHS[t.status];
+        const content = t.status === "in_progress" ? th.fg("text", t.content) : th.fg("dim", t.content);
+        lines.push(truncateToWidth(`  ${th.fg(g.color, g.mark)} ${content}`, width));
+      }
+    }
 
-		lines.push("", truncateToWidth(`  ${th.fg("dim", "Press Escape to close")}`, width), "");
-		this.cachedWidth = width;
-		this.cachedLines = lines;
-		return lines;
-	}
+    lines.push("", truncateToWidth(`  ${th.fg("dim", "Press Escape to close")}`, width), "");
+    this.cachedWidth = width;
+    this.cachedLines = lines;
+    return lines;
+  }
 
-	// Required by pi's Component interface; the width-keyed render cache makes
-	// this a no-op for width changes, but pi may call it for other reasons.
-	invalidate(): void {
-		this.cachedWidth = undefined;
-		this.cachedLines = undefined;
-	}
+  // Required by pi's Component interface; the width-keyed render cache makes
+  // this a no-op for width changes, but pi may call it for other reasons.
+  invalidate(): void {
+    this.cachedWidth = undefined;
+    this.cachedLines = undefined;
+  }
 }
 
 /**
@@ -267,123 +274,123 @@ class TodoListComponent {
  * context no longer contains the plan then, so a reminder is due.
  */
 function reconstructFromSession(ctx: ExtensionContext): { todos: TodoItem[]; planHiddenByCompaction: boolean } {
-	const branch = ctx.sessionManager.getBranch();
-	let lastDetails: TodoDetails | undefined;
-	let lastIndex = -1;
-	for (let i = 0; i < branch.length; i++) {
-		const entry = branch[i];
-		if (entry.type !== "message") continue;
-		const msg = entry.message as { role?: string; toolName?: string; details?: unknown };
-		if (msg.role !== "toolResult" || msg.toolName !== TODO_TOOL_NAME) continue;
-		const d = msg.details as TodoDetails | undefined;
-		if (!Array.isArray(d?.todos)) continue;
-		lastDetails = d;
-		lastIndex = i;
-	}
-	// Filter once — intermediate snapshots are throwaway work.
-	const todos = lastDetails ? lastDetails.todos.filter(isTodoItem) : [];
-	const planHiddenByCompaction = todos.length > 0 && branch.some((e, i) => i > lastIndex && e.type === "compaction");
-	return { todos, planHiddenByCompaction };
+  const branch = ctx.sessionManager.getBranch();
+  let lastDetails: TodoDetails | undefined;
+  let lastIndex = -1;
+  for (let i = 0; i < branch.length; i++) {
+    const entry = branch[i];
+    if (entry.type !== "message") continue;
+    const msg = entry.message as { role?: string; toolName?: string; details?: unknown };
+    if (msg.role !== "toolResult" || msg.toolName !== TODO_TOOL_NAME) continue;
+    const d = msg.details as TodoDetails | undefined;
+    if (!Array.isArray(d?.todos)) continue;
+    lastDetails = d;
+    lastIndex = i;
+  }
+  // Filter once — intermediate snapshots are throwaway work.
+  const todos = lastDetails ? lastDetails.todos.filter(isTodoItem) : [];
+  const planHiddenByCompaction = todos.length > 0 && branch.some((e, i) => i > lastIndex && e.type === "compaction");
+  return { todos, planHiddenByCompaction };
 }
 
 export function registerTodoTool(pi: ExtensionAPI): void {
-	let todos: TodoItem[] = [];
-	let turnsSinceUpdate = 0;
-	let compactedSinceUpdate = false;
+  let todos: TodoItem[] = [];
+  let turnsSinceUpdate = 0;
+  let compactedSinceUpdate = false;
 
-	const adoptBranchState = (ctx: ExtensionContext) => {
-		const state = reconstructFromSession(ctx);
-		todos = state.todos;
-		compactedSinceUpdate = state.planHiddenByCompaction;
-	};
+  const adoptBranchState = (ctx: ExtensionContext) => {
+    const state = reconstructFromSession(ctx);
+    todos = state.todos;
+    compactedSinceUpdate = state.planHiddenByCompaction;
+  };
 
-	pi.on("session_start", (_event, ctx) => {
-		adoptBranchState(ctx);
-	});
-	pi.on("session_tree", (_event, ctx) => {
-		adoptBranchState(ctx);
-	});
-	pi.on("session_compact", () => {
-		compactedSinceUpdate = true;
-	});
+  pi.on("session_start", (_event, ctx) => {
+    adoptBranchState(ctx);
+  });
+  pi.on("session_tree", (_event, ctx) => {
+    adoptBranchState(ctx);
+  });
+  pi.on("session_compact", () => {
+    compactedSinceUpdate = true;
+  });
 
-	pi.on("before_agent_start", () => {
-		turnsSinceUpdate++;
-		const p = summarizeTodos(todos);
-		if (!shouldRemind({ unfinished: p.resolved < p.total, turnsSinceUpdate, compactedSinceUpdate })) return;
-		// Consume the trigger so the reminder fires once, not every turn.
-		turnsSinceUpdate = 0;
-		compactedSinceUpdate = false;
-		return {
-			message: {
-				customType: "todo.reminder",
-				content: renderReminder(todos),
-				display: false,
-			},
-		};
-	});
+  pi.on("before_agent_start", () => {
+    turnsSinceUpdate++;
+    const p = summarizeTodos(todos);
+    if (!shouldRemind({ unfinished: p.resolved < p.total, turnsSinceUpdate, compactedSinceUpdate })) return;
+    // Consume the trigger so the reminder fires once, not every turn.
+    turnsSinceUpdate = 0;
+    compactedSinceUpdate = false;
+    return {
+      message: {
+        customType: "todo.reminder",
+        content: renderReminder(todos),
+        display: false,
+      },
+    };
+  });
 
-	pi.registerTool({
-		name: TODO_TOOL_NAME,
-		label: "Todo",
-		description:
-			"Record a plan that must outlive the context window. Use for work that will span many tool calls or a likely compaction (multi-file changes, long test/fix loops, migrations), or when the user asks for a plan or visible progress. Skip it when a few tool calls and thinking suffice — do not use it to organize your own thoughts. Send the FULL list on every call (it replaces the previous list); update when items resolve, batching several changes per call; at most one item may be in_progress. Items match by exact text — to reword or abandon one, mark it cancelled and add the replacement; unfinished items cannot be silently dropped.",
-		parameters: TodoParams,
-		async execute(_id, params) {
-			const { todos: next, error } = validateTodoList(params.todos);
-			if (error) {
-				const current = todos.length > 0 ? renderPlainList(todos) : "(no todos)";
-				return {
-					content: [{ type: "text", text: `Error: ${error}\nCurrent list:\n${current}` }],
-					details: { todos: [...todos], error } as TodoDetails,
-				};
-			}
-			const dropped = droppedUnfinishedItems(todos, next);
-			if (dropped.length > 0) {
-				const names = dropped.map((t) => `"${t.content}"`).join(", ");
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Error: dropped unfinished item(s): ${names}. Re-include them with identical text, or mark them cancelled (to reword: cancel the old item and add the new one). To clear the list, send all items cancelled.\nCurrent list:\n${renderPlainList(todos)}`,
-						},
-					],
-					details: { todos: [...todos], error: `dropped ${dropped.length} unfinished item(s)` } as TodoDetails,
-				};
-			}
-			todos = next;
-			turnsSinceUpdate = 0;
-			compactedSinceUpdate = false;
-			return {
-				content: [{ type: "text", text: renderPlainList(todos) }],
-				details: { todos: [...todos] } as TodoDetails,
-			};
-		},
-		renderCall(args, theme, context) {
-			// Arguments stream in partially; tolerate a missing todos array.
-			const text = reuseText(context);
-			text.setText(renderTodoCall((args ?? {}) as { todos?: unknown }, theme));
-			return text;
-		},
-		renderResult(result, options, theme, context) {
-			const text = reuseText(context);
-			text.setText(renderTodoResult(result.details as TodoDetails | undefined, { expanded: options.expanded }, theme));
-			return text;
-		},
-	});
+  pi.registerTool({
+    name: TODO_TOOL_NAME,
+    label: "Todo",
+    description:
+      "Record a plan that must outlive the context window. Use for work that will span many tool calls or a likely compaction (multi-file changes, long test/fix loops, migrations), or when the user asks for a plan or visible progress. Skip it when a few tool calls and thinking suffice — do not use it to organize your own thoughts. Send the FULL list on every call (it replaces the previous list); update when items resolve, batching several changes per call; at most one item may be in_progress. Items match by exact text — to reword or abandon one, mark it cancelled and add the replacement; unfinished items cannot be silently dropped.",
+    parameters: TodoParams,
+    async execute(_id, params) {
+      const { todos: next, error } = validateTodoList(params.todos);
+      if (error) {
+        const current = todos.length > 0 ? renderPlainList(todos) : "(no todos)";
+        return {
+          content: [{ type: "text", text: `Error: ${error}\nCurrent list:\n${current}` }],
+          details: { todos: [...todos], error } as TodoDetails,
+        };
+      }
+      const dropped = droppedUnfinishedItems(todos, next);
+      if (dropped.length > 0) {
+        const names = dropped.map((t) => `"${t.content}"`).join(", ");
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error: dropped unfinished item(s): ${names}. Re-include them with identical text, or mark them cancelled (to reword: cancel the old item and add the new one). To clear the list, send all items cancelled.\nCurrent list:\n${renderPlainList(todos)}`,
+            },
+          ],
+          details: { todos: [...todos], error: `dropped ${dropped.length} unfinished item(s)` } as TodoDetails,
+        };
+      }
+      todos = next;
+      turnsSinceUpdate = 0;
+      compactedSinceUpdate = false;
+      return {
+        content: [{ type: "text", text: renderPlainList(todos) }],
+        details: { todos: [...todos] } as TodoDetails,
+      };
+    },
+    renderCall(args, theme, context) {
+      // Arguments stream in partially; tolerate a missing todos array.
+      const text = reuseText(context);
+      text.setText(renderTodoCall((args ?? {}) as { todos?: unknown }, theme));
+      return text;
+    },
+    renderResult(result, options, theme, context) {
+      const text = reuseText(context);
+      text.setText(renderTodoResult(result.details as TodoDetails | undefined, { expanded: options.expanded }, theme));
+      return text;
+    },
+  });
 
-	pi.registerCommand("todos", {
-		description: "Show the current task list",
-		handler: async (_args, ctx) => {
-			if (ctx.mode !== "tui") {
-				ctx.ui.notify("/todos requires interactive mode", "error");
-				return;
-			}
-			await ctx.ui.custom<void>((_tui, theme, _kb, done) => {
-				return new TodoListComponent(todos, theme, () => done());
-			});
-		},
-	});
+  pi.registerCommand("todos", {
+    description: "Show the current task list",
+    handler: async (_args, ctx) => {
+      if (ctx.mode !== "tui") {
+        ctx.ui.notify("/todos requires interactive mode", "error");
+        return;
+      }
+      await ctx.ui.custom<void>((_tui, theme, _kb, done) => {
+        return new TodoListComponent(todos, theme, () => done());
+      });
+    },
+  });
 }
 
 export default registerTodoTool;

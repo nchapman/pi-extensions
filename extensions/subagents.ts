@@ -39,12 +39,18 @@ const DELIMITER = /^---[ \t]*$/;
  * tools restriction can never be silently ignored; handles BOM, CRLF, and
  * `---` inside indented block-scalar content. */
 export function splitFrontmatter(text: string): { fm: Record<string, unknown>; body: string } {
-  const lines = text.replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n").split("\n");
+  const lines = text
+    .replace(/^\uFEFF/, "")
+    .replace(/\r\n?/g, "\n")
+    .split("\n");
   if (!DELIMITER.test(lines[0] ?? "")) return { fm: {}, body: text };
   for (let i = 1; i < lines.length; i++) {
     if (DELIMITER.test(lines[i])) {
       const parsed = parseYaml(lines.slice(1, i).join("\n"));
-      const body = lines.slice(i + 1).join("\n").replace(/^\n/, "");
+      const body = lines
+        .slice(i + 1)
+        .join("\n")
+        .replace(/^\n/, "");
       if (parsed === null || parsed === undefined) return { fm: {}, body };
       if (typeof parsed !== "object" || Array.isArray(parsed)) {
         throw new Error("frontmatter must be a YAML mapping of key/value pairs");
@@ -78,9 +84,15 @@ export function resolveTools(fm: Record<string, unknown>): string[] {
   const t = fm.tools;
   const names =
     typeof t === "string" && t.trim()
-      ? t.split(",").map((s) => s.trim()).filter(Boolean)
+      ? t
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean)
       : Array.isArray(t)
-        ? t.map(String).map((s) => s.trim()).filter(Boolean)
+        ? t
+            .map(String)
+            .map((s) => s.trim())
+            .filter(Boolean)
         : null;
   if (names) {
     warnUnknownTools("name(s) in", names);
@@ -138,7 +150,8 @@ export interface AgentRef {
 
 function findAgent(list: AgentDef[], name: string): AgentDef {
   const agent = list.find((a) => a.name === name);
-  if (!agent) throw new Error(`Agent "${name}" not found. Available: ${list.map((a) => a.name).join(", ") || "(none)"}`);
+  if (!agent)
+    throw new Error(`Agent "${name}" not found. Available: ${list.map((a) => a.name).join(", ") || "(none)"}`);
   return agent;
 }
 
@@ -206,8 +219,7 @@ export interface ChildLike {
 
 export type SpawnFn = (command: string, args: string[], options: { stdio: ["ignore", "pipe", "pipe"] }) => ChildLike;
 
-const defaultSpawn: SpawnFn = (command, args, options) =>
-  nodeSpawn(command, args, options) as unknown as ChildLike;
+const defaultSpawn: SpawnFn = (command, args, options) => nodeSpawn(command, args, options) as unknown as ChildLike;
 
 export interface RunChildOptions {
   timeoutMs?: number;
@@ -218,14 +230,17 @@ export interface RunChildOptions {
 export function buildChildArgs(agent: AgentDef, task: string, model?: string): string[] {
   const args = [
     "-p",
-    "--mode", "json",
+    "--mode",
+    "json",
     "--no-session",
     "--no-extensions",
     "--no-skills",
     "--no-prompt-templates",
     "--no-context-files",
-    "--system-prompt", agent.instructions,
-    "--tools", agent.tools.join(","),
+    "--system-prompt",
+    agent.instructions,
+    "--tools",
+    agent.tools.join(","),
   ];
   const effectiveModel = model ?? agent.model;
   if (effectiveModel) args.push("--model", effectiveModel);
@@ -265,7 +280,10 @@ export function runChild(
           const text = extractAssistantText(event.message.content);
           if (text) {
             lastText = text;
-            onUpdate?.({ content: [{ type: "text", text: lastText }], details: { agent: agent.name, status: "running" } });
+            onUpdate?.({
+              content: [{ type: "text", text: lastText }],
+              details: { agent: agent.name, status: "running" },
+            });
           }
         }
       } catch {
@@ -314,7 +332,10 @@ export function runChild(
       settle(() => {
         if (signal?.aborted) reject(signal.reason ?? new Error(`Subagent "${agent.name}" aborted`));
         else if (code === 0) resolve(lastText || "(no output)");
-        else reject(new Error(`Subagent "${agent.name}" exited with code ${code}: ${stderrBuf.slice(-500) || "no stderr"}`));
+        else
+          reject(
+            new Error(`Subagent "${agent.name}" exited with code ${code}: ${stderrBuf.slice(-500) || "no stderr"}`),
+          );
       });
     });
     child.on("error", (error) => {
@@ -325,7 +346,10 @@ export function runChild(
 }
 
 /** Run jobs with bounded concurrency; results preserve input order. */
-export async function runWithLimit<T>(jobs: Array<() => Promise<T>>, limit: number): Promise<PromiseSettledResult<T>[]> {
+export async function runWithLimit<T>(
+  jobs: Array<() => Promise<T>>,
+  limit: number,
+): Promise<PromiseSettledResult<T>[]> {
   const results: PromiseSettledResult<T>[] = new Array(jobs.length);
   let next = 0;
   const workers = Array.from({ length: Math.max(1, Math.min(limit, jobs.length)) }, async () => {
@@ -361,7 +385,8 @@ export function renderSubagentCall(agentName: string, task: string, theme: Pick<
 
 /** One-line display for a `subagents` batch call: the count and agent names. */
 export function renderSubagentsCall(agentNames: string[], theme: Pick<Theme, "fg" | "bold">): string {
-  const shown = agentNames.slice(0, MAX_RENDERED_NAMES).join(", ") + (agentNames.length > MAX_RENDERED_NAMES ? ", ..." : "");
+  const shown =
+    agentNames.slice(0, MAX_RENDERED_NAMES).join(", ") + (agentNames.length > MAX_RENDERED_NAMES ? ", ..." : "");
   let text = theme.fg("toolTitle", theme.bold(agentNames.length ? `subagents (${agentNames.length})` : "subagents"));
   if (shown) text += theme.fg("accent", ` ${shown}`);
   return text;
@@ -431,14 +456,24 @@ const taskField = Type.String({ description: "The task to delegate, with full co
 const modelField = Type.Optional(Type.String({ description: "Model override (provider/id)" }));
 const taskItem = Type.Object({
   agent: Type.Optional(Type.String({ description: "Named agent from the available list" })),
-  agent_md: Type.Optional(Type.String({ description: "Inline agent definition: markdown with optional frontmatter (name, description, tools, model, thinking) followed by the system prompt. Takes precedence over the generic default. Provide either agent or agent_md, not both." })),
+  agent_md: Type.Optional(
+    Type.String({
+      description:
+        "Inline agent definition: markdown with optional frontmatter (name, description, tools, model, thinking) followed by the system prompt. Takes precedence over the generic default. Provide either agent or agent_md, not both.",
+    }),
+  ),
   task: taskField,
   model: modelField,
 });
 
 const AGENTS_DIR = join(homedir(), ".pi/agent/agents");
 
-export function registerSubagentTools(pi: ExtensionAPI, agentsDir: string = AGENTS_DIR, spawnFn: SpawnFn = defaultSpawn, preloadedAgents?: AgentDef[]): void {
+export function registerSubagentTools(
+  pi: ExtensionAPI,
+  agentsDir: string = AGENTS_DIR,
+  spawnFn: SpawnFn = defaultSpawn,
+  preloadedAgents?: AgentDef[],
+): void {
   const agents = preloadedAgents ?? loadAgents(agentsDir);
   // The description's agent list is fixed at registration, but execute
   // re-reads the directory so edited agent files take effect without
@@ -475,22 +510,33 @@ The subagent runs to completion and returns its final response. Use for reviews,
       const info = { agent: d?.agent ?? refLabel(context?.args ?? {}) };
       const text = reuseText(context);
       text.setText(
-        renderSubagentResult(extractAssistantText(result.content), info, {
-          isPartial: options.isPartial,
-          expanded: options.expanded,
-          isError: context?.isError ?? false,
-        }, theme),
+        renderSubagentResult(
+          extractAssistantText(result.content),
+          info,
+          {
+            isPartial: options.isPartial,
+            expanded: options.expanded,
+            isError: context?.isError ?? false,
+          },
+          theme,
+        ),
       );
       return text;
     },
     async execute(_id, params, signal, onUpdate) {
       const list = loadAgents(agentsDir);
       const agent = resolveAgentDef(list, params);
-      const text = await runChild(agent, params.task, params.model, {
-        timeoutMs: parseTimeoutMs(process.env),
-        onUpdate,
-        signal,
-      }, spawnFn);
+      const text = await runChild(
+        agent,
+        params.task,
+        params.model,
+        {
+          timeoutMs: parseTimeoutMs(process.env),
+          onUpdate,
+          signal,
+        },
+        spawnFn,
+      );
       return { content: [{ type: "text", text }], details: { agent: agent.name } };
     },
   });
@@ -520,11 +566,16 @@ Each task may instead include agent_md (an inline agent definition) or omit both
       const info = { count: d?.count ?? (tasks.length || undefined) };
       const text = reuseText(context);
       text.setText(
-        renderSubagentResult(extractAssistantText(result.content), info, {
-          isPartial: options.isPartial,
-          expanded: options.expanded,
-          isError: context?.isError ?? false,
-        }, theme),
+        renderSubagentResult(
+          extractAssistantText(result.content),
+          info,
+          {
+            isPartial: options.isPartial,
+            expanded: options.expanded,
+            isError: context?.isError ?? false,
+          },
+          theme,
+        ),
       );
       return text;
     },
@@ -540,10 +591,16 @@ Each task may instead include agent_md (an inline agent definition) or omit both
       );
       const sections = results.map((r, i) => {
         const label = refLabel(params.tasks[i]);
-        const body = r.status === "fulfilled" ? r.value : `ERROR: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`;
+        const body =
+          r.status === "fulfilled"
+            ? r.value
+            : `ERROR: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`;
         return `### ${label}\n${body}`;
       });
-      return { content: [{ type: "text", text: sections.join("\n\n---\n\n") }], details: { count: params.tasks.length } };
+      return {
+        content: [{ type: "text", text: sections.join("\n\n---\n\n") }],
+        details: { count: params.tasks.length },
+      };
     },
   });
 }
@@ -564,9 +621,31 @@ export function buildCommandPrompt(agentName: string, task: string): string {
  * from the documented built-in list; may lag pi releases. Also includes
  * `llama`, which collides with a command from pi's bundled llama extension. */
 const RESERVED_COMMAND_NAMES = new Set([
-  "settings", "model", "thinking", "scoped-models", "login", "logout", "llama",
-  "new", "resume", "name", "session", "tree", "fork", "clone", "compact", "import",
-  "copy", "export", "share", "bug", "trust", "reload", "hotkeys", "changelog", "quit",
+  "settings",
+  "model",
+  "thinking",
+  "scoped-models",
+  "login",
+  "logout",
+  "llama",
+  "new",
+  "resume",
+  "name",
+  "session",
+  "tree",
+  "fork",
+  "clone",
+  "compact",
+  "import",
+  "copy",
+  "export",
+  "share",
+  "bug",
+  "trust",
+  "reload",
+  "hotkeys",
+  "changelog",
+  "quit",
 ]);
 
 /** Register one `/name` command per agent. Invoking `/name task` sends a user
@@ -576,15 +655,21 @@ export function registerCommandsForAgents(pi: ExtensionAPI, agents: readonly Age
   const seen = new Set<string>();
   for (const agent of agents) {
     if (!isValidCommandName(agent.name)) {
-      console.warn(`subagents: skipping command for "${agent.name}": name must be a single word (letters, digits, hyphens, underscores)`);
+      console.warn(
+        `subagents: skipping command for "${agent.name}": name must be a single word (letters, digits, hyphens, underscores)`,
+      );
       continue;
     }
     if (RESERVED_COMMAND_NAMES.has(agent.name)) {
-      console.warn(`subagents: skipping command for "${agent.name}": reserved by a pi built-in command; the agent is still available via the subagent tool`);
+      console.warn(
+        `subagents: skipping command for "${agent.name}": reserved by a pi built-in command; the agent is still available via the subagent tool`,
+      );
       continue;
     }
     if (seen.has(agent.name)) {
-      console.warn(`subagents: skipping duplicate command for "${agent.name}"; the subagent tool resolves to the first agent with that name`);
+      console.warn(
+        `subagents: skipping duplicate command for "${agent.name}"; the subagent tool resolves to the first agent with that name`,
+      );
       continue;
     }
     seen.add(agent.name);
@@ -593,7 +678,10 @@ export function registerCommandsForAgents(pi: ExtensionAPI, agents: readonly Age
       handler: async (args, ctx) => {
         const task = args.trim();
         if (!task) {
-          ctx.ui.notify(`Usage: /${agent.name} <task> — ${agent.description || "define a description in the agent's frontmatter"}`, "info");
+          ctx.ui.notify(
+            `Usage: /${agent.name} <task> — ${agent.description || "define a description in the agent's frontmatter"}`,
+            "info",
+          );
           return;
         }
         pi.sendUserMessage(buildCommandPrompt(agent.name, task), { deliverAs: "followUp" });

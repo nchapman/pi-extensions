@@ -72,7 +72,9 @@ export default function (pi: ExtensionAPI) {
           // provider keeps working. Only throw if we have nothing at all.
           const stored = storedToModels(context.stored?.models);
           if (stored.length > 0) return stored;
-          throw new Error(`${name}: model refresh failed (${(error as Error).message}) and no cached catalog available`);
+          throw new Error(
+            `${name}: model refresh failed (${(error as Error).message}) and no cached catalog available`,
+          );
         }
       },
     });

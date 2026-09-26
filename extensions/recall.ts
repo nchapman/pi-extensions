@@ -40,13 +40,13 @@ import path from "node:path";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
-	convertToLlm,
-	type ExtensionAPI,
-	type ExtensionContext,
-	ModelRegistry,
-	serializeConversation,
-	type SessionEntry,
-	type Theme,
+  convertToLlm,
+  type ExtensionAPI,
+  type ExtensionContext,
+  ModelRegistry,
+  serializeConversation,
+  type SessionEntry,
+  type Theme,
 } from "@earendil-works/pi-coding-agent";
 
 export const RECALL_TOOL_NAME = "recall";
@@ -56,95 +56,99 @@ export const RECALL_TOOL_NAME = "recall";
 // ---------------------------------------------------------------------------
 
 export interface RecallConfig {
-	defaultScope: "session" | "project";
-	foreignWeight: number;
-	/** Memory horizon: age (from the archive frontier) at which a chunk's score has halved. */
-	halfLifeHours: number;
-	/** Minimum recency factor so old content fades but never vanishes (1 disables decay). */
-	recencyFloor: number;
-	/** Auto-compact when projected context exceeds this many tokens (0 disables). */
-	compactTargetTokens: number;
-	/** Generate compaction summaries ourselves with recall-aware instructions (PI_RECALL_COMPACT_OWN=0 to opt out). */
-	ownSummaries: boolean;
-	/** Hard character budget for generated summaries (PI_RECALL_SUMMARY_CHARS). */
-	summaryChars: number;
-	/** Thinking for the summarization call: "session" mirrors the session level; or a fixed ThinkingLevel / "off" (PI_RECALL_SUMMARY_THINKING). */
-	summaryThinking: "session" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-	chunkChars: number;
-	snippetChars: number;
-	maxResults: number;
-	readChars: number;
-	projectMaxBytes: number;
+  defaultScope: "session" | "project";
+  foreignWeight: number;
+  /** Memory horizon: age (from the archive frontier) at which a chunk's score has halved. */
+  halfLifeHours: number;
+  /** Minimum recency factor so old content fades but never vanishes (1 disables decay). */
+  recencyFloor: number;
+  /** Auto-compact when projected context exceeds this many tokens (0 disables). */
+  compactTargetTokens: number;
+  /** Generate compaction summaries ourselves with recall-aware instructions (PI_RECALL_COMPACT_OWN=0 to opt out). */
+  ownSummaries: boolean;
+  /** Hard character budget for generated summaries (PI_RECALL_SUMMARY_CHARS). */
+  summaryChars: number;
+  /** Thinking for the summarization call: "session" mirrors the session level; or a fixed ThinkingLevel / "off" (PI_RECALL_SUMMARY_THINKING). */
+  summaryThinking: "session" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+  chunkChars: number;
+  snippetChars: number;
+  maxResults: number;
+  readChars: number;
+  projectMaxBytes: number;
 }
 
 const DEFAULTS: RecallConfig = {
-	defaultScope: "session",
-	foreignWeight: 0.5,
-	halfLifeHours: 4,
-	recencyFloor: 0.25,
-	compactTargetTokens: 131_072,
-	ownSummaries: true,
-	summaryChars: 5_000,
-	summaryThinking: "session",
-	chunkChars: 3000,
-	snippetChars: 400,
-	maxResults: 5,
-	readChars: 4000,
-	projectMaxBytes: 64 * 1024 * 1024,
+  defaultScope: "session",
+  foreignWeight: 0.5,
+  halfLifeHours: 4,
+  recencyFloor: 0.25,
+  compactTargetTokens: 131_072,
+  ownSummaries: true,
+  summaryChars: 5_000,
+  summaryThinking: "session",
+  chunkChars: 3000,
+  snippetChars: 400,
+  maxResults: 5,
+  readChars: 4000,
+  projectMaxBytes: 64 * 1024 * 1024,
 };
 
 function boolFromEnv(env: NodeJS.ProcessEnv, name: string, fallback: boolean): boolean {
-	const raw = env[name];
-	if (raw === undefined || raw.trim() === "") return fallback;
-	const v = raw.trim().toLowerCase();
-	if (["1", "true", "yes", "on"].includes(v)) return true;
-	if (["0", "false", "no", "off"].includes(v)) return false;
-	console.error(`recall: ${name}=${raw} is not a boolean — using ${fallback}`);
-	return fallback;
+  const raw = env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const v = raw.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(v)) return true;
+  if (["0", "false", "no", "off"].includes(v)) return false;
+  console.error(`recall: ${name}=${raw} is not a boolean — using ${fallback}`);
+  return fallback;
 }
 
 function numFromEnv(env: NodeJS.ProcessEnv, name: string, fallback: number, min: number, max: number): number {
-	const raw = env[name];
-	if (raw === undefined || raw.trim() === "") return fallback;
-	const v = Number(raw);
-	if (!Number.isFinite(v)) {
-		console.error(`recall: ${name}=${raw} is not a number — using ${fallback}`);
-		return fallback;
-	}
-	return Math.min(max, Math.max(min, v));
+  const raw = env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const v = Number(raw);
+  if (!Number.isFinite(v)) {
+    console.error(`recall: ${name}=${raw} is not a number — using ${fallback}`);
+    return fallback;
+  }
+  return Math.min(max, Math.max(min, v));
 }
 
 function summaryThinkingFromEnv(env: NodeJS.ProcessEnv): RecallConfig["summaryThinking"] {
-	const raw = env.PI_RECALL_SUMMARY_THINKING?.trim().toLowerCase();
-	if (raw === undefined || raw === "") return DEFAULTS.summaryThinking;
-	const valid = new Set(["session", "off", "minimal", "low", "medium", "high", "xhigh", "max"]);
-	if (!valid.has(raw)) {
-		console.error(`recall: PI_RECALL_SUMMARY_THINKING=${raw} is invalid (session|off|minimal|low|medium|high|xhigh|max) — using session`);
-		return DEFAULTS.summaryThinking;
-	}
-	return raw as RecallConfig["summaryThinking"];
+  const raw = env.PI_RECALL_SUMMARY_THINKING?.trim().toLowerCase();
+  if (raw === undefined || raw === "") return DEFAULTS.summaryThinking;
+  const valid = new Set(["session", "off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+  if (!valid.has(raw)) {
+    console.error(
+      `recall: PI_RECALL_SUMMARY_THINKING=${raw} is invalid (session|off|minimal|low|medium|high|xhigh|max) — using session`,
+    );
+    return DEFAULTS.summaryThinking;
+  }
+  return raw as RecallConfig["summaryThinking"];
 }
 
 export function configFromEnv(env: NodeJS.ProcessEnv = process.env): RecallConfig {
-	const scope = env.PI_RECALL_SCOPE?.trim().toLowerCase();
-	if (scope !== undefined && scope !== "" && scope !== "session" && scope !== "project") {
-		console.error(`recall: PI_RECALL_SCOPE=${scope} is invalid (session|project) — using session`);
-	}
-	return {
-		defaultScope: scope === "project" ? "project" : DEFAULTS.defaultScope,
-		foreignWeight: numFromEnv(env, "PI_RECALL_FOREIGN_WEIGHT", DEFAULTS.foreignWeight, 0, 1),
-		halfLifeHours: numFromEnv(env, "PI_RECALL_HALF_LIFE_HOURS", DEFAULTS.halfLifeHours, 0.1, 1_000_000),
-		recencyFloor: numFromEnv(env, "PI_RECALL_RECENCY_FLOOR", DEFAULTS.recencyFloor, 0, 1),
-		compactTargetTokens: Math.floor(numFromEnv(env, "PI_RECALL_COMPACT_TARGET", DEFAULTS.compactTargetTokens, 0, 10_000_000)),
-		ownSummaries: boolFromEnv(env, "PI_RECALL_COMPACT_OWN", DEFAULTS.ownSummaries),
-		summaryChars: Math.floor(numFromEnv(env, "PI_RECALL_SUMMARY_CHARS", DEFAULTS.summaryChars, 500, 20_000)),
-		summaryThinking: summaryThinkingFromEnv(env),
-		chunkChars: Math.floor(numFromEnv(env, "PI_RECALL_CHUNK_CHARS", DEFAULTS.chunkChars, 500, 100_000)),
-		snippetChars: Math.floor(numFromEnv(env, "PI_RECALL_SNIPPET_CHARS", DEFAULTS.snippetChars, 100, 10_000)),
-		maxResults: Math.floor(numFromEnv(env, "PI_RECALL_MAX_RESULTS", DEFAULTS.maxResults, 1, 25)),
-		readChars: Math.floor(numFromEnv(env, "PI_RECALL_READ_CHARS", DEFAULTS.readChars, 500, 100_000)),
-		projectMaxBytes: Math.floor(numFromEnv(env, "PI_RECALL_PROJECT_MAX_MB", 64, 4, 4096) * 1024 * 1024),
-	};
+  const scope = env.PI_RECALL_SCOPE?.trim().toLowerCase();
+  if (scope !== undefined && scope !== "" && scope !== "session" && scope !== "project") {
+    console.error(`recall: PI_RECALL_SCOPE=${scope} is invalid (session|project) — using session`);
+  }
+  return {
+    defaultScope: scope === "project" ? "project" : DEFAULTS.defaultScope,
+    foreignWeight: numFromEnv(env, "PI_RECALL_FOREIGN_WEIGHT", DEFAULTS.foreignWeight, 0, 1),
+    halfLifeHours: numFromEnv(env, "PI_RECALL_HALF_LIFE_HOURS", DEFAULTS.halfLifeHours, 0.1, 1_000_000),
+    recencyFloor: numFromEnv(env, "PI_RECALL_RECENCY_FLOOR", DEFAULTS.recencyFloor, 0, 1),
+    compactTargetTokens: Math.floor(
+      numFromEnv(env, "PI_RECALL_COMPACT_TARGET", DEFAULTS.compactTargetTokens, 0, 10_000_000),
+    ),
+    ownSummaries: boolFromEnv(env, "PI_RECALL_COMPACT_OWN", DEFAULTS.ownSummaries),
+    summaryChars: Math.floor(numFromEnv(env, "PI_RECALL_SUMMARY_CHARS", DEFAULTS.summaryChars, 500, 20_000)),
+    summaryThinking: summaryThinkingFromEnv(env),
+    chunkChars: Math.floor(numFromEnv(env, "PI_RECALL_CHUNK_CHARS", DEFAULTS.chunkChars, 500, 100_000)),
+    snippetChars: Math.floor(numFromEnv(env, "PI_RECALL_SNIPPET_CHARS", DEFAULTS.snippetChars, 100, 10_000)),
+    maxResults: Math.floor(numFromEnv(env, "PI_RECALL_MAX_RESULTS", DEFAULTS.maxResults, 1, 25)),
+    readChars: Math.floor(numFromEnv(env, "PI_RECALL_READ_CHARS", DEFAULTS.readChars, 500, 100_000)),
+    projectMaxBytes: Math.floor(numFromEnv(env, "PI_RECALL_PROJECT_MAX_MB", 64, 4, 4096) * 1024 * 1024),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -157,13 +161,13 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): RecallConfi
  * digit boundaries, and collapses runs of non-alphanumerics.
  */
 export function tokenize(text: string): string[] {
-	const spaced = text
-		.replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-		.replace(/([A-Za-z])(\d)/g, "$1 $2")
-		.replace(/(\d)([A-Za-z])/g, "$1 $2")
-		.replace(/([A-Z]{2,})([A-Z][a-z])/g, "$1 $2")
-		.toLowerCase();
-	return spaced.split(/[^a-z0-9]+/).filter((t) => t.length > 0);
+  const spaced = text
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/([A-Za-z])(\d)/g, "$1 $2")
+    .replace(/(\d)([A-Za-z])/g, "$1 $2")
+    .replace(/([A-Z]{2,})([A-Z][a-z])/g, "$1 $2")
+    .toLowerCase();
+  return spaced.split(/[^a-z0-9]+/).filter((t) => t.length > 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -171,64 +175,56 @@ export function tokenize(text: string): string[] {
 // ---------------------------------------------------------------------------
 
 export type RecallKind =
-	| "user"
-	| "assistant"
-	| "thinking"
-	| "toolCall"
-	| "toolResult"
-	| "bash"
-	| "summary"
-	| "branchSummary"
-	| "custom";
+  "user" | "assistant" | "thinking" | "toolCall" | "toolResult" | "bash" | "summary" | "branchSummary" | "custom";
 
 export interface EntrySection {
-	kind: RecallKind;
-	/** Tool name for toolCall/toolResult sections; customType for custom. */
-	label?: string;
-	text: string;
+  kind: RecallKind;
+  /** Tool name for toolCall/toolResult sections; customType for custom. */
+  label?: string;
+  text: string;
 }
 
 export function kindLabel(kind: RecallKind, label?: string): string {
-	switch (kind) {
-		case "user":
-			return "user message";
-		case "assistant":
-			return "assistant";
-		case "thinking":
-			return "assistant thinking";
-		case "toolCall":
-			return `tool call${label ? ` (${label})` : ""}`;
-		case "toolResult":
-			return `tool result${label ? ` (${label})` : ""}`;
-		case "bash":
-			return "bash execution";
-		case "summary":
-			return "compaction summary (digest of earlier turns)";
-		case "branchSummary":
-			return "branch summary (digest of an abandoned branch)";
-		case "custom":
-			return `injected context${label ? ` (${label})` : ""}`;
-	}
+  switch (kind) {
+    case "user":
+      return "user message";
+    case "assistant":
+      return "assistant";
+    case "thinking":
+      return "assistant thinking";
+    case "toolCall":
+      return `tool call${label ? ` (${label})` : ""}`;
+    case "toolResult":
+      return `tool result${label ? ` (${label})` : ""}`;
+    case "bash":
+      return "bash execution";
+    case "summary":
+      return "compaction summary (digest of earlier turns)";
+    case "branchSummary":
+      return "branch summary (digest of an abandoned branch)";
+    case "custom":
+      return `injected context${label ? ` (${label})` : ""}`;
+  }
 }
 
 /** Deterministic JSON with sorted keys so equivalent args tokenize stably. */
 function stableStringify(value: unknown): string {
-	if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
-	if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
-	const entries = Object.entries(value as Record<string, unknown>)
-		.filter(([, v]) => v !== undefined)
-		.sort(([a], [b]) => (a < b ? -1 : 1));
-	return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`).join(",")}}`;
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, v]) => v !== undefined)
+    .sort(([a], [b]) => (a < b ? -1 : 1));
+  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`).join(",")}}`;
 }
 
 function textOfBlocks(content: unknown): string {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	const parts: string[] = [];
-	for (const block of content as Array<{ type?: string; text?: string }>) {
-		if (block?.type === "text" && typeof block.text === "string") parts.push(block.text);
-	}
-	return parts.join("\n");
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const parts: string[] = [];
+  for (const block of content as Array<{ type?: string; text?: string }>) {
+    if (block?.type === "text" && typeof block.text === "string") parts.push(block.text);
+  }
+  return parts.join("\n");
 }
 
 /**
@@ -237,79 +233,89 @@ function textOfBlocks(content: unknown): string {
  * plain state entries are skipped — only content a reader would want back.
  */
 export function extractEntrySections(entry: SessionEntry): EntrySection[] {
-	switch (entry.type) {
-		case "message": {
-			const msg = (entry as { message?: { role?: string } }).message;
-			if (!msg || typeof msg !== "object") return [];
-			const m = msg as Record<string, unknown>;
-			switch (m.role) {
-				case "user": {
-					const sections: EntrySection[] = [{ kind: "user", text: textOfBlocks(m.content) }];
-					return sections.filter((sec) => sec.text !== "");
-				}
-				case "assistant": {
-					const sections: EntrySection[] = [];
-					for (const block of (Array.isArray(m.content) ? m.content : []) as Array<Record<string, unknown>>) {
-						if (block?.type === "text" && typeof block.text === "string" && block.text !== "") {
-							sections.push({ kind: "assistant", text: block.text });
-						} else if (block?.type === "thinking" && typeof block.thinking === "string" && block.thinking !== "" && !block.redacted) {
-							sections.push({ kind: "thinking", text: block.thinking });
-						} else if (block?.type === "toolCall" && typeof block.name === "string") {
-							sections.push({ kind: "toolCall", label: block.name, text: `${block.name}(${stableStringify(block.arguments)})` });
-						}
-					}
-					return sections;
-				}
-				case "toolResult": {
-					const text = textOfBlocks(m.content);
-					if (text === "") return [];
-					const sections: EntrySection[] = [
-						{ kind: "toolResult", label: typeof m.toolName === "string" ? m.toolName : undefined, text },
-					];
-					return sections;
-				}
-				case "bashExecution": {
-					const command = typeof m.command === "string" ? m.command : "";
-					const output = typeof m.output === "string" ? m.output : "";
-					const full = typeof m.fullOutputPath === "string" ? `\n(full output at ${m.fullOutputPath})` : "";
-					const sections: EntrySection[] = [{ kind: "bash", text: `$ ${command}\n${output}${full}` }];
-					return sections.filter((sec) => sec.text.trim() !== "$");
-				}
-				case "custom": {
-					const text = textOfBlocks(m.content);
-					if (text === "") return [];
-					const sections: EntrySection[] = [
-						{ kind: "custom", label: typeof m.customType === "string" ? m.customType : undefined, text },
-					];
-					return sections;
-				}
-				default:
-					return []; // system, summary-role projections, unknown roles
-			}
-		}
-		case "compaction": {
-			const e = entry as { summary?: unknown; details?: unknown };
-			let text = typeof e.summary === "string" ? e.summary : "";
-			const files = e.details as { readFiles?: unknown; modifiedFiles?: unknown } | undefined;
-			const lines: string[] = [];
-			if (Array.isArray(files?.readFiles) && files.readFiles.length > 0) lines.push(`read: ${files.readFiles.join(", ")}`);
-			if (Array.isArray(files?.modifiedFiles) && files.modifiedFiles.length > 0)
-				lines.push(`modified: ${files.modifiedFiles.join(", ")}`);
-			if (lines.length > 0) text += `\n${lines.join("\n")}`;
-			return text === "" ? [] : [{ kind: "summary", text }];
-		}
-		case "branch_summary": {
-			const text = (entry as { summary?: unknown }).summary;
-			return typeof text === "string" && text !== "" ? [{ kind: "branchSummary", text }] : [];
-		}
-		case "custom_message": {
-			const text = textOfBlocks((entry as { content?: unknown }).content);
-			if (text === "") return [];
-			return [{ kind: "custom", label: (entry as { customType?: unknown }).customType as string | undefined, text }];
-		}
-		default:
-			return [];
-	}
+  switch (entry.type) {
+    case "message": {
+      const msg = (entry as { message?: { role?: string } }).message;
+      if (!msg || typeof msg !== "object") return [];
+      const m = msg as Record<string, unknown>;
+      switch (m.role) {
+        case "user": {
+          const sections: EntrySection[] = [{ kind: "user", text: textOfBlocks(m.content) }];
+          return sections.filter((sec) => sec.text !== "");
+        }
+        case "assistant": {
+          const sections: EntrySection[] = [];
+          for (const block of (Array.isArray(m.content) ? m.content : []) as Array<Record<string, unknown>>) {
+            if (block?.type === "text" && typeof block.text === "string" && block.text !== "") {
+              sections.push({ kind: "assistant", text: block.text });
+            } else if (
+              block?.type === "thinking" &&
+              typeof block.thinking === "string" &&
+              block.thinking !== "" &&
+              !block.redacted
+            ) {
+              sections.push({ kind: "thinking", text: block.thinking });
+            } else if (block?.type === "toolCall" && typeof block.name === "string") {
+              sections.push({
+                kind: "toolCall",
+                label: block.name,
+                text: `${block.name}(${stableStringify(block.arguments)})`,
+              });
+            }
+          }
+          return sections;
+        }
+        case "toolResult": {
+          const text = textOfBlocks(m.content);
+          if (text === "") return [];
+          const sections: EntrySection[] = [
+            { kind: "toolResult", label: typeof m.toolName === "string" ? m.toolName : undefined, text },
+          ];
+          return sections;
+        }
+        case "bashExecution": {
+          const command = typeof m.command === "string" ? m.command : "";
+          const output = typeof m.output === "string" ? m.output : "";
+          const full = typeof m.fullOutputPath === "string" ? `\n(full output at ${m.fullOutputPath})` : "";
+          const sections: EntrySection[] = [{ kind: "bash", text: `$ ${command}\n${output}${full}` }];
+          return sections.filter((sec) => sec.text.trim() !== "$");
+        }
+        case "custom": {
+          const text = textOfBlocks(m.content);
+          if (text === "") return [];
+          const sections: EntrySection[] = [
+            { kind: "custom", label: typeof m.customType === "string" ? m.customType : undefined, text },
+          ];
+          return sections;
+        }
+        default:
+          return []; // system, summary-role projections, unknown roles
+      }
+    }
+    case "compaction": {
+      const e = entry as { summary?: unknown; details?: unknown };
+      let text = typeof e.summary === "string" ? e.summary : "";
+      const files = e.details as { readFiles?: unknown; modifiedFiles?: unknown } | undefined;
+      const lines: string[] = [];
+      if (Array.isArray(files?.readFiles) && files.readFiles.length > 0)
+        lines.push(`read: ${files.readFiles.join(", ")}`);
+      if (Array.isArray(files?.modifiedFiles) && files.modifiedFiles.length > 0)
+        lines.push(`modified: ${files.modifiedFiles.join(", ")}`);
+      if (lines.length > 0) text += `\n${lines.join("\n")}`;
+      return text === "" ? [] : [{ kind: "summary", text }];
+    }
+    case "branch_summary": {
+      const text = (entry as { summary?: unknown }).summary;
+      return typeof text === "string" && text !== "" ? [{ kind: "branchSummary", text }] : [];
+    }
+    case "custom_message": {
+      const text = textOfBlocks((entry as { content?: unknown }).content);
+      if (text === "") return [];
+      return [{ kind: "custom", label: (entry as { customType?: unknown }).customType as string | undefined, text }];
+    }
+    default:
+      return [];
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -317,8 +323,8 @@ export function extractEntrySections(entry: SessionEntry): EntrySection[] {
 // ---------------------------------------------------------------------------
 
 export interface TextChunk {
-	text: string;
-	charOffset: number;
+  text: string;
+  charOffset: number;
 }
 
 /**
@@ -326,72 +332,72 @@ export interface TextChunk {
  * Long unbroken lines are hard-split. Offsets index into the original text.
  */
 export function chunkText(text: string, maxChars: number): TextChunk[] {
-	if (text.length <= maxChars) return text === "" ? [] : [{ text, charOffset: 0 }];
-	const chunks: TextChunk[] = [];
-	let offset = 0;
-	while (offset < text.length) {
-		if (text.length - offset <= maxChars) {
-			chunks.push({ text: text.slice(offset), charOffset: offset });
-			break;
-		}
-		const window = text.slice(offset, offset + maxChars);
-		const lastNewline = window.lastIndexOf("\n");
-		const cut = lastNewline > maxChars * 0.5 ? offset + lastNewline + 1 : offset + maxChars;
-		chunks.push({ text: text.slice(offset, cut), charOffset: offset });
-		offset = cut;
-	}
-	return chunks;
+  if (text.length <= maxChars) return text === "" ? [] : [{ text, charOffset: 0 }];
+  const chunks: TextChunk[] = [];
+  let offset = 0;
+  while (offset < text.length) {
+    if (text.length - offset <= maxChars) {
+      chunks.push({ text: text.slice(offset), charOffset: offset });
+      break;
+    }
+    const window = text.slice(offset, offset + maxChars);
+    const lastNewline = window.lastIndexOf("\n");
+    const cut = lastNewline > maxChars * 0.5 ? offset + lastNewline + 1 : offset + maxChars;
+    chunks.push({ text: text.slice(offset, cut), charOffset: offset });
+    offset = cut;
+  }
+  return chunks;
 }
 
 /** A single indexable unit: one chunk of one section of one entry. */
 export interface RecallChunk {
-	ref: string; // stable read reference (entryId, or entryId.sess for foreign)
-	entryId: string;
-	origin: "current" | "foreign";
-	sessionLabel: string; // "current session" or "past session <name> <date>"
-	kind: RecallKind;
-	label?: string;
-	timestamp: string;
-	text: string;
+  ref: string; // stable read reference (entryId, or entryId.sess for foreign)
+  entryId: string;
+  origin: "current" | "foreign";
+  sessionLabel: string; // "current session" or "past session <name> <date>"
+  kind: RecallKind;
+  label?: string;
+  timestamp: string;
+  text: string;
 }
 
 function makeRef(entryId: string, origin: "current" | "foreign", sessionId: string): string {
-	if (origin === "current") return entryId;
-	return `${entryId}.${sessionId.slice(0, 4)}`;
+  if (origin === "current") return entryId;
+  return `${entryId}.${sessionId.slice(0, 4)}`;
 }
 
 /** Parse a ref back into its locating parts; undefined when malformed. */
 export function parseRef(ref: string): { entryId: string; sessionIdShort?: string } | undefined {
-	const idx = ref.indexOf(".");
-	// Entry ids are hex (possibly full UUID fallbacks) and never contain dots.
-	const parts = idx === -1 ? [ref] : [ref.slice(0, idx), ref.slice(idx + 1)];
-	if (parts[0] === "" || /[^0-9a-f-]/i.test(parts[0])) return undefined;
-	if (parts.length === 2 && (parts[1] === "" || /[^0-9a-f-]/i.test(parts[1]))) return undefined;
-	return { entryId: parts[0], sessionIdShort: parts[1] };
+  const idx = ref.indexOf(".");
+  // Entry ids are hex (possibly full UUID fallbacks) and never contain dots.
+  const parts = idx === -1 ? [ref] : [ref.slice(0, idx), ref.slice(idx + 1)];
+  if (parts[0] === "" || /[^0-9a-f-]/i.test(parts[0])) return undefined;
+  if (parts.length === 2 && (parts[1] === "" || /[^0-9a-f-]/i.test(parts[1]))) return undefined;
+  return { entryId: parts[0], sessionIdShort: parts[1] };
 }
 
 /** Chunk every indexable section of one entry. */
 export function chunksFromEntry(
-	entry: SessionEntry,
-	meta: { origin: "current" | "foreign"; sessionId: string; sessionLabel: string },
-	chunkChars: number,
+  entry: SessionEntry,
+  meta: { origin: "current" | "foreign"; sessionId: string; sessionLabel: string },
+  chunkChars: number,
 ): RecallChunk[] {
-	const chunks: RecallChunk[] = [];
-	for (const section of extractEntrySections(entry)) {
-		for (const piece of chunkText(section.text, chunkChars)) {
-			chunks.push({
-				ref: makeRef(entry.id, meta.origin, meta.sessionId),
-				entryId: entry.id,
-				origin: meta.origin,
-				sessionLabel: meta.sessionLabel,
-				kind: section.kind,
-				label: section.label,
-				timestamp: entry.timestamp,
-				text: piece.text,
-			});
-		}
-	}
-	return chunks;
+  const chunks: RecallChunk[] = [];
+  for (const section of extractEntrySections(entry)) {
+    for (const piece of chunkText(section.text, chunkChars)) {
+      chunks.push({
+        ref: makeRef(entry.id, meta.origin, meta.sessionId),
+        entryId: entry.id,
+        origin: meta.origin,
+        sessionLabel: meta.sessionLabel,
+        kind: section.kind,
+        label: section.label,
+        timestamp: entry.timestamp,
+        text: piece.text,
+      });
+    }
+  }
+  return chunks;
 }
 
 /**
@@ -402,30 +408,34 @@ export function chunksFromEntry(
  * later compaction folds them away, and edit-omitted entries stay searchable.
  */
 export function buildArchiveChunks(
-	branch: SessionEntry[],
-	visibleEntryIds: Set<string>,
-	sessionId: string,
-	config: Pick<RecallConfig, "chunkChars">,
+  branch: SessionEntry[],
+  visibleEntryIds: Set<string>,
+  sessionId: string,
+  config: Pick<RecallConfig, "chunkChars">,
 ): RecallChunk[] {
-	const inContext = visibleEntryIds;
-	const chunks: RecallChunk[] = [];
-	for (const entry of branch) {
-		if (inContext.has(entry.id)) continue;
-		chunks.push(...chunksFromEntry(entry, { origin: "current", sessionId, sessionLabel: "current session" }, config.chunkChars));
-	}
-	return chunks;
+  const inContext = visibleEntryIds;
+  const chunks: RecallChunk[] = [];
+  for (const entry of branch) {
+    if (inContext.has(entry.id)) continue;
+    chunks.push(
+      ...chunksFromEntry(entry, { origin: "current", sessionId, sessionLabel: "current session" }, config.chunkChars),
+    );
+  }
+  return chunks;
 }
 
 /**
  * Entry ids the model can currently see: projection entries that still
  * contribute messages (non-empty = not omitted by compaction or context edit).
  */
-export function visibleEntryIds(projection: { entries: Array<{ sourceEntry: SessionEntry; messages: unknown[] }> }): Set<string> {
-	const ids = new Set<string>();
-	for (const projected of projection.entries) {
-		if (projected.messages.length > 0) ids.add(projected.sourceEntry.id);
-	}
-	return ids;
+export function visibleEntryIds(projection: {
+  entries: Array<{ sourceEntry: SessionEntry; messages: unknown[] }>;
+}): Set<string> {
+  const ids = new Set<string>();
+  for (const projected of projection.entries) {
+    if (projected.messages.length > 0) ids.add(projected.sourceEntry.id);
+  }
+  return ids;
 }
 
 // ---------------------------------------------------------------------------
@@ -436,30 +446,30 @@ const BM25_K1 = 1.2;
 const BM25_B = 0.75;
 
 export interface ScoredChunk {
-	chunk: RecallChunk;
-	score: number; // weighted, decayed, descending sort key
-	rawScore: number; // unweighted BM25
-	recencyFactor: number; // 1 at the frontier, halving per half-life, floored
+  chunk: RecallChunk;
+  score: number; // weighted, decayed, descending sort key
+  rawScore: number; // unweighted BM25
+  recencyFactor: number; // 1 at the frontier, halving per half-life, floored
 }
 
 interface ChunkTerms {
-	tf: Map<string, number>;
-	length: number;
+  tf: Map<string, number>;
+  length: number;
 }
 
 function indexChunks(chunks: RecallChunk[]): { terms: ChunkTerms[]; df: Map<string, number>; avgLength: number } {
-	const terms: ChunkTerms[] = [];
-	const df = new Map<string, number>();
-	let total = 0;
-	for (const chunk of chunks) {
-		const tokens = tokenize(chunk.text);
-		const tf = new Map<string, number>();
-		for (const t of tokens) tf.set(t, (tf.get(t) ?? 0) + 1);
-		for (const t of tf.keys()) df.set(t, (df.get(t) ?? 0) + 1);
-		terms.push({ tf, length: tokens.length });
-		total += tokens.length;
-	}
-	return { terms, df, avgLength: chunks.length === 0 ? 0 : total / chunks.length };
+  const terms: ChunkTerms[] = [];
+  const df = new Map<string, number>();
+  let total = 0;
+  for (const chunk of chunks) {
+    const tokens = tokenize(chunk.text);
+    const tf = new Map<string, number>();
+    for (const t of tokens) tf.set(t, (tf.get(t) ?? 0) + 1);
+    for (const t of tf.keys()) df.set(t, (df.get(t) ?? 0) + 1);
+    terms.push({ tf, length: tokens.length });
+    total += tokens.length;
+  }
+  return { terms, df, avgLength: chunks.length === 0 ? 0 : total / chunks.length };
 }
 
 /**
@@ -472,57 +482,58 @@ function indexChunks(chunks: RecallChunk[]): { terms: ChunkTerms[]; df: Map<stri
  * toward newer entries, then by ref for stability.
  */
 export function rankChunks(
-	chunks: RecallChunk[],
-	query: string,
-	foreignWeight: number,
-	halfLifeHours: number = DEFAULTS.halfLifeHours,
-	recencyFloor: number = DEFAULTS.recencyFloor,
+  chunks: RecallChunk[],
+  query: string,
+  foreignWeight: number,
+  halfLifeHours: number = DEFAULTS.halfLifeHours,
+  recencyFloor: number = DEFAULTS.recencyFloor,
 ): ScoredChunk[] {
-	const queryTokens = [...new Set(tokenize(query))];
-	if (queryTokens.length === 0 || chunks.length === 0) return [];
-	const frontier = (() => {
-		let newest = -Infinity;
-		for (const c of chunks) newest = Math.max(newest, tsMs(c.timestamp));
-		return newest;
-	})();
-	const halfLifeMs = halfLifeHours * 3_600_000;
-	const { terms, df, avgLength } = indexChunks(chunks);
-	const N = chunks.length;
-	const results: ScoredChunk[] = [];
-	for (let i = 0; i < N; i++) {
-		const { tf, length } = terms[i];
-		if (length === 0) continue;
-		let score = 0;
-		let matched = false;
-		for (const t of queryTokens) {
-			const f = tf.get(t);
-			if (!f) continue;
-			matched = true;
-			const idf = Math.log(1 + (N - (df.get(t) ?? 0) + 0.5) / ((df.get(t) ?? 0) + 0.5));
-			score += (idf * (f * (BM25_K1 + 1))) / (f + BM25_K1 * (1 - BM25_B + (BM25_B * length) / avgLength));
-		}
-		if (!matched) continue;
-		const chunk = chunks[i];
-		const weight = chunk.origin === "current" ? 1 : foreignWeight;
-		const recency = recencyFactor(frontier - tsMs(chunk.timestamp), halfLifeMs, recencyFloor);
-		results.push({ chunk, score: score * weight * recency, rawScore: score, recencyFactor: recency });
-	}
-	results.sort(
-		(a, b) => b.score - a.score || b.chunk.timestamp.localeCompare(a.chunk.timestamp) || a.chunk.ref.localeCompare(b.chunk.ref),
-	);
-	return results;
+  const queryTokens = [...new Set(tokenize(query))];
+  if (queryTokens.length === 0 || chunks.length === 0) return [];
+  const frontier = (() => {
+    let newest = -Infinity;
+    for (const c of chunks) newest = Math.max(newest, tsMs(c.timestamp));
+    return newest;
+  })();
+  const halfLifeMs = halfLifeHours * 3_600_000;
+  const { terms, df, avgLength } = indexChunks(chunks);
+  const N = chunks.length;
+  const results: ScoredChunk[] = [];
+  for (let i = 0; i < N; i++) {
+    const { tf, length } = terms[i];
+    if (length === 0) continue;
+    let score = 0;
+    let matched = false;
+    for (const t of queryTokens) {
+      const f = tf.get(t);
+      if (!f) continue;
+      matched = true;
+      const idf = Math.log(1 + (N - (df.get(t) ?? 0) + 0.5) / ((df.get(t) ?? 0) + 0.5));
+      score += (idf * (f * (BM25_K1 + 1))) / (f + BM25_K1 * (1 - BM25_B + (BM25_B * length) / avgLength));
+    }
+    if (!matched) continue;
+    const chunk = chunks[i];
+    const weight = chunk.origin === "current" ? 1 : foreignWeight;
+    const recency = recencyFactor(frontier - tsMs(chunk.timestamp), halfLifeMs, recencyFloor);
+    results.push({ chunk, score: score * weight * recency, rawScore: score, recencyFactor: recency });
+  }
+  results.sort(
+    (a, b) =>
+      b.score - a.score || b.chunk.timestamp.localeCompare(a.chunk.timestamp) || a.chunk.ref.localeCompare(b.chunk.ref),
+  );
+  return results;
 }
 
 /** Parse an ISO timestamp to epoch ms; malformed or missing → -Infinity (treated as oldest). */
 function tsMs(timestamp: string): number {
-	const ms = Date.parse(timestamp);
-	return Number.isNaN(ms) ? Number.NEGATIVE_INFINITY : ms;
+  const ms = Date.parse(timestamp);
+  return Number.isNaN(ms) ? Number.NEGATIVE_INFINITY : ms;
 }
 
 /** Exponential memory decay: 1 at the frontier, halving per half-life, never below the floor. */
 export function recencyFactor(ageMs: number, halfLifeMs: number, floor: number): number {
-	if (!Number.isFinite(ageMs) || ageMs <= 0) return ageMs === 0 ? 1 : floor;
-	return Math.max(floor, 0.5 ** (ageMs / halfLifeMs));
+  if (!Number.isFinite(ageMs) || ageMs <= 0) return ageMs === 0 ? 1 : floor;
+  return Math.max(floor, 0.5 ** (ageMs / halfLifeMs));
 }
 
 // ---------------------------------------------------------------------------
@@ -534,97 +545,101 @@ export function recencyFactor(ageMs: number, halfLifeMs: number, floor: number):
  * preferring token-boundary matches so "parse" does not hit "sparse".
  */
 export function extractSnippet(text: string, query: string, maxChars: number): string {
-	const queryTokens = [...new Set(tokenize(query))].sort((a, b) => b.length - a.length);
-	const lower = text.toLowerCase();
-	let at = -1;
-	for (const t of queryTokens) {
-		// Word-boundary match only, so "parse" does not window on "sparse".
-		for (let i = lower.indexOf(t); i !== -1; i = lower.indexOf(t, i + 1)) {
-			const before = i === 0 ? " " : lower[i - 1];
-			const after = i + t.length >= lower.length ? " " : lower[i + t.length];
-			if (/[a-z0-9]/.test(before) || /[a-z0-9]/.test(after)) continue;
-			if (at === -1 || i < at) at = i;
-			break;
-		}
-	}
-	let start = 0;
-	let end = Math.min(text.length, maxChars);
-	if (at !== -1) {
-		start = Math.max(0, at - Math.floor(maxChars / 3));
-		end = Math.min(text.length, start + maxChars);
-		start = Math.max(0, end - maxChars);
-	}
-	let snippet = text.slice(start, end).replace(/\n{3,}/g, "\n\n").trim();
-	if (snippet === "") snippet = "(empty)";
-	const prefix = start > 0 ? "…" : "";
-	const suffix = end < text.length ? "…" : "";
-	return `${prefix}${snippet}${suffix}`;
+  const queryTokens = [...new Set(tokenize(query))].sort((a, b) => b.length - a.length);
+  const lower = text.toLowerCase();
+  let at = -1;
+  for (const t of queryTokens) {
+    // Word-boundary match only, so "parse" does not window on "sparse".
+    for (let i = lower.indexOf(t); i !== -1; i = lower.indexOf(t, i + 1)) {
+      const before = i === 0 ? " " : lower[i - 1];
+      const after = i + t.length >= lower.length ? " " : lower[i + t.length];
+      if (/[a-z0-9]/.test(before) || /[a-z0-9]/.test(after)) continue;
+      if (at === -1 || i < at) at = i;
+      break;
+    }
+  }
+  let start = 0;
+  let end = Math.min(text.length, maxChars);
+  if (at !== -1) {
+    start = Math.max(0, at - Math.floor(maxChars / 3));
+    end = Math.min(text.length, start + maxChars);
+    start = Math.max(0, end - maxChars);
+  }
+  let snippet = text
+    .slice(start, end)
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  if (snippet === "") snippet = "(empty)";
+  const prefix = start > 0 ? "…" : "";
+  const suffix = end < text.length ? "…" : "";
+  return `${prefix}${snippet}${suffix}`;
 }
 
 function shortDate(iso: string): string {
-	const d = new Date(iso);
-	return Number.isNaN(d.getTime()) ? iso : d.toISOString().slice(0, 16).replace("T", " ");
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? iso : d.toISOString().slice(0, 16).replace("T", " ");
 }
 
 export interface SearchHit {
-	ref: string;
-	kind: RecallKind;
-	label?: string;
-	sessionLabel: string;
-	timestamp: string;
-	score: number;
-	/** Recency multiplier already folded into score; surfaced so ranking is explainable. */
-	recencyFactor?: number;
-	snippet: string;
+  ref: string;
+  kind: RecallKind;
+  label?: string;
+  sessionLabel: string;
+  timestamp: string;
+  score: number;
+  /** Recency multiplier already folded into score; surfaced so ranking is explainable. */
+  recencyFactor?: number;
+  snippet: string;
 }
 
 export function formatSearchResult(
-	hits: SearchHit[],
-	meta: {
-		archiveEntries: number;
-		foreignSessions: number;
-		scope: "session" | "project";
-		skippedFiles?: number;
-		totalMatches?: number;
-	},
+  hits: SearchHit[],
+  meta: {
+    archiveEntries: number;
+    foreignSessions: number;
+    scope: "session" | "project";
+    skippedFiles?: number;
+    totalMatches?: number;
+  },
 ): string {
-	const lines: string[] = [];
-	if (hits.length === 0) {
-		const where =
-			meta.scope === "project"
-				? `this session's compacted history plus ${meta.foreignSessions} past session${meta.foreignSessions === 1 ? "" : "s"}`
-				: "this session's compacted history";
-		const advice = meta.scope === "session" ? `, or scope "project" for past sessions in this directory` : "";
-		lines.push(`No matches in ${where}. Try broader terms${advice}.`);
-	} else {
-		lines.push(`Top ${hits.length} match${hits.length === 1 ? "" : "es"} (of ${meta.archiveEntries} archived entries searched):`);
-		for (const [i, hit] of hits.entries()) {
-			lines.push(
-				`${i + 1}. ${hit.sessionLabel} · ${kindLabel(hit.kind, hit.label)} · ${shortDate(hit.timestamp)} · score ${hit.score.toFixed(1)}${
-					hit.recencyFactor !== undefined && hit.recencyFactor < 0.95 ? ` (recency ×${hit.recencyFactor.toFixed(2)})` : ""
-				}`,
-			);
-			lines.push(`   ${hit.snippet.split("\n").join("\n   ")}`);
-			lines.push(`   full entry: recall { "mode": "read", "id": "${hit.ref}" }`);
-		}
-	}
-	const skipped = meta.skippedFiles ? ` (${meta.skippedFiles} unreadable session file${meta.skippedFiles === 1 ? "" : "s"} skipped)` : "";
-	const limited = (meta.totalMatches ?? hits.length) > hits.length ? "results limited; " : "";
-	return `${lines.join("\n")}${skipped}\n(${limited}verbatim excerpts — older context may have changed since)`;
+  const lines: string[] = [];
+  if (hits.length === 0) {
+    const where =
+      meta.scope === "project"
+        ? `this session's compacted history plus ${meta.foreignSessions} past session${meta.foreignSessions === 1 ? "" : "s"}`
+        : "this session's compacted history";
+    const advice = meta.scope === "session" ? `, or scope "project" for past sessions in this directory` : "";
+    lines.push(`No matches in ${where}. Try broader terms${advice}.`);
+  } else {
+    lines.push(
+      `Top ${hits.length} match${hits.length === 1 ? "" : "es"} (of ${meta.archiveEntries} archived entries searched):`,
+    );
+    for (const [i, hit] of hits.entries()) {
+      lines.push(
+        `${i + 1}. ${hit.sessionLabel} · ${kindLabel(hit.kind, hit.label)} · ${shortDate(hit.timestamp)} · score ${hit.score.toFixed(1)}${
+          hit.recencyFactor !== undefined && hit.recencyFactor < 0.95
+            ? ` (recency ×${hit.recencyFactor.toFixed(2)})`
+            : ""
+        }`,
+      );
+      lines.push(`   ${hit.snippet.split("\n").join("\n   ")}`);
+      lines.push(`   full entry: recall { "mode": "read", "id": "${hit.ref}" }`);
+    }
+  }
+  const skipped = meta.skippedFiles
+    ? ` (${meta.skippedFiles} unreadable session file${meta.skippedFiles === 1 ? "" : "s"} skipped)`
+    : "";
+  const limited = (meta.totalMatches ?? hits.length) > hits.length ? "results limited; " : "";
+  return `${lines.join("\n")}${skipped}\n(${limited}verbatim excerpts — older context may have changed since)`;
 }
 
-export function formatReadResult(
-	ref: string,
-	header: string,
-	text: string,
-	offset: number,
-	maxChars: number,
-): string {
-	offset = Math.min(Math.max(0, offset), text.length); // offset past end reads empty, not nonsense
-	const slice = text.slice(offset, offset + maxChars);
-	const end = Math.min(text.length, offset + slice.length);
-	const more = end < text.length ? `\n[truncated — continue with { "mode": "read", "id": "${ref}", "offset": ${end} }]` : "";
-	return `${header}\n[chars ${offset}-${end} of ${text.length}]\n${slice}${more}`;
+export function formatReadResult(ref: string, header: string, text: string, offset: number, maxChars: number): string {
+  offset = Math.min(Math.max(0, offset), text.length); // offset past end reads empty, not nonsense
+  const slice = text.slice(offset, offset + maxChars);
+  const end = Math.min(text.length, offset + slice.length);
+  const more =
+    end < text.length ? `\n[truncated — continue with { "mode": "read", "id": "${ref}", "offset": ${end} }]` : "";
+  return `${header}\n[chars ${offset}-${end} of ${text.length}]\n${slice}${more}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -632,79 +647,95 @@ export function formatReadResult(
 // ---------------------------------------------------------------------------
 
 export interface ProjectReader {
-	listJsonlFiles(dir: string): Promise<string[]>;
-	readFile(file: string): Promise<string>;
-	stat(file: string): Promise<{ mtimeMs: number; size: number } | undefined>;
+  listJsonlFiles(dir: string): Promise<string[]>;
+  readFile(file: string): Promise<string>;
+  stat(file: string): Promise<{ mtimeMs: number; size: number } | undefined>;
 }
 
 export const fsProjectReader: ProjectReader = {
-	async listJsonlFiles(dir) {
-		const names = await fsp.readdir(dir);
-		return names.filter((n) => n.endsWith(".jsonl")).map((n) => path.join(dir, n));
-	},
-	async readFile(file) {
-		return fsp.readFile(file, "utf8");
-	},
-	async stat(file) {
-		try {
-			const s = await fsp.stat(file);
-			return { mtimeMs: s.mtimeMs, size: s.size };
-		} catch {
-			return undefined;
-		}
-	},
+  async listJsonlFiles(dir) {
+    const names = await fsp.readdir(dir);
+    return names.filter((n) => n.endsWith(".jsonl")).map((n) => path.join(dir, n));
+  },
+  async readFile(file) {
+    return fsp.readFile(file, "utf8");
+  },
+  async stat(file) {
+    try {
+      const s = await fsp.stat(file);
+      return { mtimeMs: s.mtimeMs, size: s.size };
+    } catch {
+      return undefined;
+    }
+  },
 };
 
 export interface FileCorpus {
-	file: string;
-	mtimeMs: number;
-	size: number;
-	sessionId: string;
-	label: string;
-	chunks: RecallChunk[];
-	entryLines: Map<string, number>;
-	bytes: number;
+  file: string;
+  mtimeMs: number;
+  size: number;
+  sessionId: string;
+  label: string;
+  chunks: RecallChunk[];
+  entryLines: Map<string, number>;
+  bytes: number;
 }
 
 /** Parse one session file into chunks + per-entry line numbers. */
-export function buildFileCorpus(file: string, content: string, chunkChars = 3000, labelMax = 40): FileCorpus | undefined {
-	const lines = content.split("\n");
-	let sessionId = path.basename(file, ".jsonl");
-	let sessionDate = "";
-	let name: string | undefined;
-	const chunks: RecallChunk[] = [];
-	const entryLines = new Map<string, number>();
-	let bytes = 0;
-	for (let i = 0; i < lines.length; i++) {
-		const line = lines[i].trim();
-		if (line === "") continue;
-		let parsed: unknown;
-		try {
-			parsed = JSON.parse(line);
-		} catch {
-			continue; // tolerate trailing partial writes
-		}
-		const entry = parsed as { type?: string; id?: string; timestamp?: string; cwd?: string; name?: string; summary?: string };
-		if (entry?.type === "session") {
-			if (typeof entry.id === "string" && entry.id !== "") sessionId = entry.id;
-			if (typeof entry.timestamp === "string") sessionDate = entry.timestamp.slice(0, 10);
-			continue;
-		}
-		if (entry?.type === "session_info" && typeof entry.name === "string" && entry.name !== "") {
-			name = entry.name;
-			continue;
-		}
-		if (typeof entry?.id !== "string" || entry.id === "") continue;
-		entryLines.set(entry.id, i + 1);
-		const sessionEntry = parsed as SessionEntry;
-		const label = `past session ${name ? `"${name.slice(0, labelMax)}" ` : ""}${sessionDate}`;
-		for (const chunk of chunksFromEntry(sessionEntry, { origin: "foreign", sessionId, sessionLabel: label }, chunkChars)) {
-			chunks.push(chunk);
-			bytes += chunk.text.length;
-		}
-	}
-	if (entryLines.size === 0) return undefined; // header-only / empty session
-	return { file, mtimeMs: 0, size: content.length, sessionId, label: name ?? sessionId, chunks, entryLines, bytes };
+export function buildFileCorpus(
+  file: string,
+  content: string,
+  chunkChars = 3000,
+  labelMax = 40,
+): FileCorpus | undefined {
+  const lines = content.split("\n");
+  let sessionId = path.basename(file, ".jsonl");
+  let sessionDate = "";
+  let name: string | undefined;
+  const chunks: RecallChunk[] = [];
+  const entryLines = new Map<string, number>();
+  let bytes = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (line === "") continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      continue; // tolerate trailing partial writes
+    }
+    const entry = parsed as {
+      type?: string;
+      id?: string;
+      timestamp?: string;
+      cwd?: string;
+      name?: string;
+      summary?: string;
+    };
+    if (entry?.type === "session") {
+      if (typeof entry.id === "string" && entry.id !== "") sessionId = entry.id;
+      if (typeof entry.timestamp === "string") sessionDate = entry.timestamp.slice(0, 10);
+      continue;
+    }
+    if (entry?.type === "session_info" && typeof entry.name === "string" && entry.name !== "") {
+      name = entry.name;
+      continue;
+    }
+    if (typeof entry?.id !== "string" || entry.id === "") continue;
+    entryLines.set(entry.id, i + 1);
+    const sessionEntry = parsed as SessionEntry;
+    const label = `past session ${name ? `"${name.slice(0, labelMax)}" ` : ""}${sessionDate}`;
+    for (const chunk of chunksFromEntry(
+      sessionEntry,
+      { origin: "foreign", sessionId, sessionLabel: label },
+      chunkChars,
+    )) {
+      chunks.push(chunk);
+      bytes += chunk.text.length;
+    }
+  }
+  if (entryLines.size === 0) return undefined; // header-only / empty session
+  return { file, mtimeMs: 0, size: content.length, sessionId, label: name ?? sessionId, chunks, entryLines, bytes };
 }
 
 /**
@@ -714,101 +745,101 @@ export function buildFileCorpus(file: string, content: string, chunkChars = 3000
  * them distinguishable.
  */
 export class ProjectCorpusCache {
-	private files = new Map<string, FileCorpus>();
-	private bytes = 0;
+  private files = new Map<string, FileCorpus>();
+  private bytes = 0;
 
-	constructor(
-		private reader: ProjectReader,
-		private maxBytes: number,
-		private chunkChars = 3000,
-	) {}
+  constructor(
+    private reader: ProjectReader,
+    private maxBytes: number,
+    private chunkChars = 3000,
+  ) {}
 
-	list(): FileCorpus[] {
-		return [...this.files.values()];
-	}
+  list(): FileCorpus[] {
+    return [...this.files.values()];
+  }
 
-	totalBytes(): number {
-		return this.bytes;
-	}
+  totalBytes(): number {
+    return this.bytes;
+  }
 
-	/** Drop a file from the cache (or erase a tombstone). */
-	private evict(file: string) {
-		const corpus = this.files.get(file);
-		if (corpus) {
-			this.bytes -= corpus.bytes;
-			this.files.delete(file);
-		}
-	}
+  /** Drop a file from the cache (or erase a tombstone). */
+  private evict(file: string) {
+    const corpus = this.files.get(file);
+    if (corpus) {
+      this.bytes -= corpus.bytes;
+      this.files.delete(file);
+    }
+  }
 
-	private insert(corpus: FileCorpus) {
-		this.evict(corpus.file); // adjusts bytes when replacing a stale build
-		this.files.set(corpus.file, corpus); // re-insert = most recently used
-		this.bytes += corpus.bytes;
-		while (this.bytes > this.maxBytes && this.files.size > 1) {
-			const oldest = this.files.keys().next().value;
-			if (oldest === undefined) break;
-			this.evict(oldest);
-		}
-	}
+  private insert(corpus: FileCorpus) {
+    this.evict(corpus.file); // adjusts bytes when replacing a stale build
+    this.files.set(corpus.file, corpus); // re-insert = most recently used
+    this.bytes += corpus.bytes;
+    while (this.bytes > this.maxBytes && this.files.size > 1) {
+      const oldest = this.files.keys().next().value;
+      if (oldest === undefined) break;
+      this.evict(oldest);
+    }
+  }
 
-	/**
-	 * Ensure the cache reflects the session directory: new or changed files
-	 * are (re)built, gone files dropped. Returns how many files were
-	 * unreadable (skipped).
-	 */
-	async refresh(dir: string, skipFile: string | undefined): Promise<number> {
-		const files = await this.reader.listJsonlFiles(dir);
-		const present = new Set(files);
-		for (const cached of [...this.files.keys()]) if (!present.has(cached)) this.evict(cached);
-		let skipped = 0;
-		for (const file of files) {
-			if (file === skipFile) continue; // current session is covered in-memory, branch-correct
-			const stat = await this.reader.stat(file);
-			if (stat === undefined) {
-				skipped++;
-				this.evict(file);
-				continue;
-			}
-			const cached = this.files.get(file);
-			if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
-				this.insert(cached); // touch LRU without re-reading
-				continue;
-			}
-			try {
-				const content = await this.reader.readFile(file);
-				const corpus = buildFileCorpus(file, content, this.chunkChars);
-				if (corpus === undefined) {
-					skipped++;
-					this.evict(file);
-					continue;
-				}
-				this.evict(file);
-				corpus.mtimeMs = stat.mtimeMs;
-				corpus.size = stat.size;
-				this.insert(corpus);
-			} catch {
-				skipped++;
-				this.evict(file);
-			}
-		}
-		return skipped;
-	}
+  /**
+   * Ensure the cache reflects the session directory: new or changed files
+   * are (re)built, gone files dropped. Returns how many files were
+   * unreadable (skipped).
+   */
+  async refresh(dir: string, skipFile: string | undefined): Promise<number> {
+    const files = await this.reader.listJsonlFiles(dir);
+    const present = new Set(files);
+    for (const cached of [...this.files.keys()]) if (!present.has(cached)) this.evict(cached);
+    let skipped = 0;
+    for (const file of files) {
+      if (file === skipFile) continue; // current session is covered in-memory, branch-correct
+      const stat = await this.reader.stat(file);
+      if (stat === undefined) {
+        skipped++;
+        this.evict(file);
+        continue;
+      }
+      const cached = this.files.get(file);
+      if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+        this.insert(cached); // touch LRU without re-reading
+        continue;
+      }
+      try {
+        const content = await this.reader.readFile(file);
+        const corpus = buildFileCorpus(file, content, this.chunkChars);
+        if (corpus === undefined) {
+          skipped++;
+          this.evict(file);
+          continue;
+        }
+        this.evict(file);
+        corpus.mtimeMs = stat.mtimeMs;
+        corpus.size = stat.size;
+        this.insert(corpus);
+      } catch {
+        skipped++;
+        this.evict(file);
+      }
+    }
+    return skipped;
+  }
 
-	/** Locate a foreign entry's raw line for read mode. */
-	locate(refSessionShort: string, entryId: string): { corpus: FileCorpus; line: number } | undefined {
-		for (const corpus of this.files.values()) {
-			if (!corpus.sessionId.startsWith(refSessionShort)) continue;
-			const line = corpus.entryLines.get(entryId);
-			if (line !== undefined) return { corpus, line };
-		}
-		return undefined;
-	}
+  /** Locate a foreign entry's raw line for read mode. */
+  locate(refSessionShort: string, entryId: string): { corpus: FileCorpus; line: number } | undefined {
+    for (const corpus of this.files.values()) {
+      if (!corpus.sessionId.startsWith(refSessionShort)) continue;
+      const line = corpus.entryLines.get(entryId);
+      if (line !== undefined) return { corpus, line };
+    }
+    return undefined;
+  }
 
-	/** Read one entry line from a cached file through the injected reader. */
-	async readEntryLine(corpus: FileCorpus, line: number): Promise<string | undefined> {
-		const raw = await this.reader.readFile(corpus.file);
-		return raw.split("\n")[line - 1];
-	}
+  /** Read one entry line from a cached file through the injected reader. */
+  async readEntryLine(corpus: FileCorpus, line: number): Promise<string | undefined> {
+    const raw = await this.reader.readFile(corpus.file);
+    return raw.split("\n")[line - 1];
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -816,222 +847,257 @@ export class ProjectCorpusCache {
 // ---------------------------------------------------------------------------
 
 const RecallParams = Type.Object({
-	query: Type.Optional(Type.String({ description: "Search terms (search mode). Plain words, identifiers, or exact strings like file paths and error messages" })),
-	mode: Type.Optional(Type.Union([Type.Literal("search"), Type.Literal("read")], { description: '"search" (default) ranks archived chunks; "read" returns one full entry' })),
-	scope: Type.Optional(Type.Union([Type.Literal("session"), Type.Literal("project")], { description: '"session" (default): this session\'s compacted history; "project": also past sessions in this directory (labeled, down-ranked)' })),
-	id: Type.Optional(Type.String({ description: "Entry ref from a previous recall result (read mode)" })),
-	offset: Type.Optional(Type.Number({ description: "Char offset to continue a long read (read mode, default 0)" })),
-	limit: Type.Optional(Type.Number({ description: "Max results (search mode, default 5)" })),
+  query: Type.Optional(
+    Type.String({
+      description:
+        "Search terms (search mode). Plain words, identifiers, or exact strings like file paths and error messages",
+    }),
+  ),
+  mode: Type.Optional(
+    Type.Union([Type.Literal("search"), Type.Literal("read")], {
+      description: '"search" (default) ranks archived chunks; "read" returns one full entry',
+    }),
+  ),
+  scope: Type.Optional(
+    Type.Union([Type.Literal("session"), Type.Literal("project")], {
+      description:
+        '"session" (default): this session\'s compacted history; "project": also past sessions in this directory (labeled, down-ranked)',
+    }),
+  ),
+  id: Type.Optional(Type.String({ description: "Entry ref from a previous recall result (read mode)" })),
+  offset: Type.Optional(Type.Number({ description: "Char offset to continue a long read (read mode, default 0)" })),
+  limit: Type.Optional(Type.Number({ description: "Max results (search mode, default 5)" })),
 });
 
 const REMINDER_TEXT =
-	"Compaction summarized earlier history. Re-orient before continuing: confirm the current task and the immediate next action from the most recent messages you can see (the summary may lag the newest work); if either is unclear, search the transcript with `recall` rather than guessing. " +
-	"Compacted turns remain verbatim-searchable via `recall` (decisions, prior attempts, file paths, command outputs).";
+  "Compaction summarized earlier history. Re-orient before continuing: confirm the current task and the immediate next action from the most recent messages you can see (the summary may lag the newest work); if either is unclear, search the transcript with `recall` rather than guessing. " +
+  "Compacted turns remain verbatim-searchable via `recall` (decisions, prior attempts, file paths, command outputs).";
 
 function reuseText(context: { lastComponent?: unknown } | undefined): Text {
-	return context?.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
+  return context?.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
 }
 
 function clip(text: string, max: number): string {
-	return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
 /** Collapsed call row: `recall — query…`. */
-export function renderRecallCall(args: { query?: unknown; mode?: unknown; id?: unknown }, theme: Pick<Theme, "fg" | "bold">): string {
-	if (args?.mode === "read" || (!args?.query && args?.id)) return theme.fg("toolTitle", theme.bold("recall read"));
-	const q = typeof args?.query === "string" ? args.query : "";
-	return theme.fg("toolTitle", theme.bold("recall ")) + theme.fg("dim", clip(q, 60));
+export function renderRecallCall(
+  args: { query?: unknown; mode?: unknown; id?: unknown },
+  theme: Pick<Theme, "fg" | "bold">,
+): string {
+  if (args?.mode === "read" || (!args?.query && args?.id)) return theme.fg("toolTitle", theme.bold("recall read"));
+  const q = typeof args?.query === "string" ? args.query : "";
+  return theme.fg("toolTitle", theme.bold("recall ")) + theme.fg("dim", clip(q, 60));
 }
 
 /** Result row: `n hits` collapsed; hit lines when expanded. */
 export function renderRecallResult(
-	details: { hits?: Array<{ snippet: string }>; read?: { total: number } } | undefined,
-	options: { expanded: boolean },
-	theme: Pick<Theme, "fg">,
+  details: { hits?: Array<{ snippet: string }>; read?: { total: number } } | undefined,
+  options: { expanded: boolean },
+  theme: Pick<Theme, "fg">,
 ): string {
-	if (details?.read) return theme.fg("muted", `read · ${details.read.total.toLocaleString()} chars`);
-	const hits = details?.hits ?? [];
-	if (hits.length === 0) return theme.fg("dim", "no matches");
-	let text = theme.fg("muted", `${hits.length} hit${hits.length === 1 ? "" : "s"}`);
-	if (options.expanded) {
-		const lines = hits.map((h) => `  ${theme.fg("dim", clip(h.snippet.replace(/\s+/g, " "), 88))}`);
-		text += `\n${lines.join("\n")}`;
-	}
-	return text;
+  if (details?.read) return theme.fg("muted", `read · ${details.read.total.toLocaleString()} chars`);
+  const hits = details?.hits ?? [];
+  if (hits.length === 0) return theme.fg("dim", "no matches");
+  let text = theme.fg("muted", `${hits.length} hit${hits.length === 1 ? "" : "s"}`);
+  if (options.expanded) {
+    const lines = hits.map((h) => `  ${theme.fg("dim", clip(h.snippet.replace(/\s+/g, " "), 88))}`);
+    text += `\n${lines.join("\n")}`;
+  }
+  return text;
 }
 
 export interface RecallDetails {
-	mode: "search" | "read";
-	scope: "session" | "project";
-	hits?: Array<{ ref: string; kind: string; session: string; score: number; snippet: string }>;
-	read?: { ref: string; total: number };
+  mode: "search" | "read";
+  scope: "session" | "project";
+  hits?: Array<{ ref: string; kind: string; session: string; score: number; snippet: string }>;
+  read?: { ref: string; total: number };
 }
 
 /** Full text of one entry for read mode (all sections, unchunked). */
 function entryFullText(entry: SessionEntry): string {
-	return extractEntrySections(entry)
-		.map((s) => (s.kind === "toolCall" || s.kind === "toolResult" ? `[${kindLabel(s.kind, s.label)}]\n${s.text}` : s.text))
-		.join("\n\n");
+  return extractEntrySections(entry)
+    .map((s) =>
+      s.kind === "toolCall" || s.kind === "toolResult" ? `[${kindLabel(s.kind, s.label)}]\n${s.text}` : s.text,
+    )
+    .join("\n\n");
 }
 
 export function registerRecallTool(
-	pi: ExtensionAPI,
-	config: RecallConfig = configFromEnv(),
-	reader: ProjectReader = fsProjectReader,
-	deps: { summarize?: SummaryFn; logCompactionError?: (line: string) => void; retryDelayMs?: number } = {},
+  pi: ExtensionAPI,
+  config: RecallConfig = configFromEnv(),
+  reader: ProjectReader = fsProjectReader,
+  deps: { summarize?: SummaryFn; logCompactionError?: (line: string) => void; retryDelayMs?: number } = {},
 ): void {
-	let reminderPending = false;
-	let autoCompactInFlight = false;
-	const corpusCache = new ProjectCorpusCache(reader, config.projectMaxBytes, config.chunkChars);
-	const summarize = deps.summarize ?? defaultSummaryFn;
-	// Breadcrumb for compaction failures — ctx.compact() failures are otherwise
-	// invisible (async, no UI surface). One line per failure, never throws.
-	const logCompactionError =
-		deps.logCompactionError ??
-		((line: string) => {
-			// Promise form: diagnostics must never throw or block the extension.
-			void fsp.appendFile(`${process.env.HOME ?? "~"}/.pi/agent/recall-compaction-errors.log`, `${new Date().toISOString()} ${line}\n`).catch(() => {});
-		});
+  let reminderPending = false;
+  let autoCompactInFlight = false;
+  const corpusCache = new ProjectCorpusCache(reader, config.projectMaxBytes, config.chunkChars);
+  const summarize = deps.summarize ?? defaultSummaryFn;
+  // Breadcrumb for compaction failures — ctx.compact() failures are otherwise
+  // invisible (async, no UI surface). One line per failure, never throws.
+  const logCompactionError =
+    deps.logCompactionError ??
+    ((line: string) => {
+      // Promise form: diagnostics must never throw or block the extension.
+      void fsp
+        .appendFile(
+          `${process.env.HOME ?? "~"}/.pi/agent/recall-compaction-errors.log`,
+          `${new Date().toISOString()} ${line}\n`,
+        )
+        .catch(() => {});
+    });
 
-	pi.on("session_start", () => {
-		reminderPending = false;
-		autoCompactInFlight = false;
-	});
-	pi.on("session_compact", () => {
-		reminderPending = true;
-		autoCompactInFlight = false;
-	});
+  pi.on("session_start", () => {
+    reminderPending = false;
+    autoCompactInFlight = false;
+  });
+  pi.on("session_compact", () => {
+    reminderPending = true;
+    autoCompactInFlight = false;
+  });
 
-	pi.on("before_agent_start", (_event, _ctx) => {
-		// One-shot post-compaction reminder. Budget triggering deliberately lives
-		// on agent_settled instead: ctx.compact() begins with abort()+waitForIdle(),
-		// which is only safe once the agent is idle — calling it here would race
-		// the very run this event is starting.
-		if (!reminderPending) return;
-		reminderPending = false;
-		return reminderMessage();
-	});
+  pi.on("before_agent_start", (_event, _ctx) => {
+    // One-shot post-compaction reminder. Budget triggering deliberately lives
+    // on agent_settled instead: ctx.compact() begins with abort()+waitForIdle(),
+    // which is only safe once the agent is idle — calling it here would race
+    // the very run this event is starting.
+    if (!reminderPending) return;
+    reminderPending = false;
+    return reminderMessage();
+  });
 
-	// Context budget: auto-compact between turns, once the run has fully settled
-	// (idle — nothing to abort, nothing to race). pi's own near-limit threshold
-	// stays as the mid-run backstop. PI_RECALL_COMPACT_TARGET=0 disables.
-	pi.on("agent_settled", (_event, ctx) => {
-		const usage = ctx.getContextUsage();
-		if (!shouldAutoCompact(usage?.tokens ?? null, usage?.contextWindow ?? 0, config.compactTargetTokens, autoCompactInFlight)) {
-			return;
-		}
-		autoCompactInFlight = true;
-		ctx.compact({
-			onComplete: () => (autoCompactInFlight = false),
-			onError: (err) => {
-				autoCompactInFlight = false;
-				logCompactionError(`budget trigger failed: ${err instanceof Error ? err.message : String(err)}`);
-			},
-		});
-	});
+  // Context budget: auto-compact between turns, once the run has fully settled
+  // (idle — nothing to abort, nothing to race). pi's own near-limit threshold
+  // stays as the mid-run backstop. PI_RECALL_COMPACT_TARGET=0 disables.
+  pi.on("agent_settled", (_event, ctx) => {
+    const usage = ctx.getContextUsage();
+    if (
+      !shouldAutoCompact(
+        usage?.tokens ?? null,
+        usage?.contextWindow ?? 0,
+        config.compactTargetTokens,
+        autoCompactInFlight,
+      )
+    ) {
+      return;
+    }
+    autoCompactInFlight = true;
+    ctx.compact({
+      onComplete: () => (autoCompactInFlight = false),
+      onError: (err) => {
+        autoCompactInFlight = false;
+        logCompactionError(`budget trigger failed: ${err instanceof Error ? err.message : String(err)}`);
+      },
+    });
+  });
 
-	// pi-side compaction failures (any trigger, including the default summarizer
-	// fallback path) — aborted=true is a user cancel, not a failure.
-	pi.on("session_compact_failed", (event) => {
-		if (event.aborted) return;
-		logCompactionError(`compaction failed (${event.reason}): ${event.errorMessage ?? "unknown error"}`);
-	});
+  // pi-side compaction failures (any trigger, including the default summarizer
+  // fallback path) — aborted=true is a user cancel, not a failure.
+  pi.on("session_compact_failed", (event) => {
+    if (event.aborted) return;
+    logCompactionError(`compaction failed (${event.reason}): ${event.errorMessage ?? "unknown error"}`);
+  });
 
-	// Own the summary end to end: every compaction (ours, manual /compact,
-	// pi's backstop) is generated here with the extension's own prompt — pi's
-	// built-in summarizer prompt is never involved, so pi-side prompt changes
-	// cannot reshape our summaries. Failure ladder mirrors pi's own confidence:
-	// transient provider failures retry in place (the same 3-attempt budget pi
-	// gives its own summarizer); deterministic failures fall back to pi's
-	// default — custom compaction must never block compaction.
-	pi.on("session_before_compact", async (event, ctx) => {
-		if (!config.ownSummaries) return;
-		const model = ctx.model;
-		if (!model) {
-			logCompactionError("summary ownership fell back to pi default: no model on session context");
-			return;
-		}
-		const p = event.preparation;
-		try {
-			const { text, usage } = await retryTransient(
-				() =>
-					summarize({
-						model,
-						complete: (m, context, options) => ctx.modelRegistry.complete(m, context, options),
-						// "session" mirrors the session's thinking level (pi's own summarizer behavior);
-						// a pinned level — including "off", which disables thinking at the API level
-						// for providers like zai — frees the whole output cap for summary text.
-						thinkingLevel: config.summaryThinking === "session" ? ctx.thinkingLevel : config.summaryThinking,
-						// Chronological: older spans first, split-turn prefix last, so the
-						// newest state the prompt re-derives sits at the end of the transcript.
-						messages: [...p.messagesToSummarize, ...p.turnPrefixMessages],
-						previousSummary: p.previousSummary,
-						userFocus: event.customInstructions?.trim() || undefined,
-						// Tight target: recall makes the summary a map, not the archive.
-						budgetChars: config.summaryChars,
-						signal: event.signal,
-					}),
-				SUMMARY_RETRY_ATTEMPTS,
-				deps.retryDelayMs ?? 1000,
-				event.signal,
-			);
-			if (!text.trim()) {
-				logCompactionError("summary ownership fell back to pi default: summarizer returned empty text");
-				return;
-			}
-			return {
-				compaction: {
-					summary: text,
-					firstKeptEntryId: p.firstKeptEntryId,
-					tokensBefore: p.tokensBefore,
-					usage: usage as CompactionUsage,
-					details: carryForwardFileLists(lastCompactionDetails(event.branchEntries), p.fileOps),
-				},
-			};
-		} catch (err) {
-			// An aborted signal is a user cancel, not a failure — stay silent.
-			if (event.signal.aborted) return;
-			logCompactionError(`summary ownership fell back to pi default: ${err instanceof Error ? err.message : String(err)}`);
-			return;
-		}
-	});
+  // Own the summary end to end: every compaction (ours, manual /compact,
+  // pi's backstop) is generated here with the extension's own prompt — pi's
+  // built-in summarizer prompt is never involved, so pi-side prompt changes
+  // cannot reshape our summaries. Failure ladder mirrors pi's own confidence:
+  // transient provider failures retry in place (the same 3-attempt budget pi
+  // gives its own summarizer); deterministic failures fall back to pi's
+  // default — custom compaction must never block compaction.
+  pi.on("session_before_compact", async (event, ctx) => {
+    if (!config.ownSummaries) return;
+    const model = ctx.model;
+    if (!model) {
+      logCompactionError("summary ownership fell back to pi default: no model on session context");
+      return;
+    }
+    const p = event.preparation;
+    try {
+      const { text, usage } = await retryTransient(
+        () =>
+          summarize({
+            model,
+            complete: (m, context, options) => ctx.modelRegistry.complete(m, context, options),
+            // "session" mirrors the session's thinking level (pi's own summarizer behavior);
+            // a pinned level — including "off", which disables thinking at the API level
+            // for providers like zai — frees the whole output cap for summary text.
+            thinkingLevel: config.summaryThinking === "session" ? ctx.thinkingLevel : config.summaryThinking,
+            // Chronological: older spans first, split-turn prefix last, so the
+            // newest state the prompt re-derives sits at the end of the transcript.
+            messages: [...p.messagesToSummarize, ...p.turnPrefixMessages],
+            previousSummary: p.previousSummary,
+            userFocus: event.customInstructions?.trim() || undefined,
+            // Tight target: recall makes the summary a map, not the archive.
+            budgetChars: config.summaryChars,
+            signal: event.signal,
+          }),
+        SUMMARY_RETRY_ATTEMPTS,
+        deps.retryDelayMs ?? 1000,
+        event.signal,
+      );
+      if (!text.trim()) {
+        logCompactionError("summary ownership fell back to pi default: summarizer returned empty text");
+        return;
+      }
+      return {
+        compaction: {
+          summary: text,
+          firstKeptEntryId: p.firstKeptEntryId,
+          tokensBefore: p.tokensBefore,
+          usage: usage as CompactionUsage,
+          details: carryForwardFileLists(lastCompactionDetails(event.branchEntries), p.fileOps),
+        },
+      };
+    } catch (err) {
+      // An aborted signal is a user cancel, not a failure — stay silent.
+      if (event.signal.aborted) return;
+      logCompactionError(
+        `summary ownership fell back to pi default: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return;
+    }
+  });
 
-	pi.registerTool({
-		name: RECALL_TOOL_NAME,
-		label: "Recall",
-		description:
-			"Search conversation history that is no longer in your context (compacted away). Compaction keeps only a summary in context — the verbatim messages remain on disk and this tool retrieves them. Use it when you need earlier details you cannot see: decisions, prior failed attempts, file paths, command outputs, error strings. mode 'search' (default) takes a query and returns ranked verbatim excerpts with provenance; mode 'read' takes an id from a prior result and returns the full entry. scope 'session' (default) searches this session's compacted history; scope 'project' also searches past sessions in this directory (labeled and down-ranked). Prefer recall over re-deriving or guessing at earlier state.",
-		promptSnippet: "recall — search compacted-away session history verbatim (scope 'project' adds past sessions)",
-		parameters: RecallParams,
-		async execute(_id, params, _signal, _onUpdate, ctx) {
-			const mode = params.mode ?? "search";
-			if (mode === "read") {
-				const details = await readEntry(params, ctx, corpusCache, config);
-				return { content: [{ type: "text", text: details.text }], details: details.details };
-			}
-			return search(params, ctx, corpusCache, config);
-		},
-		renderCall(args, theme, context) {
-			const text = reuseText(context);
-			text.setText(renderRecallCall((args ?? {}) as { query?: unknown; mode?: unknown; id?: unknown }, theme));
-			return text;
-		},
-		renderResult(result, options, theme, context) {
-			const text = reuseText(context);
-			text.setText(renderRecallResult(result.details as RecallDetails | undefined, { expanded: options.expanded }, theme));
-			return text;
-		},
-	});
+  pi.registerTool({
+    name: RECALL_TOOL_NAME,
+    label: "Recall",
+    description:
+      "Search conversation history that is no longer in your context (compacted away). Compaction keeps only a summary in context — the verbatim messages remain on disk and this tool retrieves them. Use it when you need earlier details you cannot see: decisions, prior failed attempts, file paths, command outputs, error strings. mode 'search' (default) takes a query and returns ranked verbatim excerpts with provenance; mode 'read' takes an id from a prior result and returns the full entry. scope 'session' (default) searches this session's compacted history; scope 'project' also searches past sessions in this directory (labeled and down-ranked). Prefer recall over re-deriving or guessing at earlier state.",
+    promptSnippet: "recall — search compacted-away session history verbatim (scope 'project' adds past sessions)",
+    parameters: RecallParams,
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const mode = params.mode ?? "search";
+      if (mode === "read") {
+        const details = await readEntry(params, ctx, corpusCache, config);
+        return { content: [{ type: "text", text: details.text }], details: details.details };
+      }
+      return search(params, ctx, corpusCache, config);
+    },
+    renderCall(args, theme, context) {
+      const text = reuseText(context);
+      text.setText(renderRecallCall((args ?? {}) as { query?: unknown; mode?: unknown; id?: unknown }, theme));
+      return text;
+    },
+    renderResult(result, options, theme, context) {
+      const text = reuseText(context);
+      text.setText(
+        renderRecallResult(result.details as RecallDetails | undefined, { expanded: options.expanded }, theme),
+      );
+      return text;
+    },
+  });
 }
 
 function reminderMessage(): { message: { customType: string; content: string; display: boolean } } {
-	return {
-		message: {
-			customType: "recall.reminder",
-			content: REMINDER_TEXT,
-			display: false,
-		},
-	};
+  return {
+    message: {
+      customType: "recall.reminder",
+      content: REMINDER_TEXT,
+      display: false,
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1054,25 +1120,34 @@ const SUMMARY_MAX_OUTPUT_TOKENS = 8192;
 const SUMMARY_RETRY_ATTEMPTS = 3;
 
 function isRetryableSummaryError(e: unknown): boolean {
-	return e instanceof Error && (e as Error & { retryable?: unknown }).retryable === true;
+  return e instanceof Error && (e as Error & { retryable?: unknown }).retryable === true;
 }
 
 /** Retry transient failures (flagged by defaultSummaryFn) with exponential backoff. Abort during backoff rethrows the original error. */
-async function retryTransient<T>(fn: () => Promise<T>, attempts: number, baseDelayMs: number, signal?: AbortSignal): Promise<T> {
-	for (let attempt = 1; ; attempt++) {
-		try {
-			return await fn();
-		} catch (e) {
-			if (!isRetryableSummaryError(e) || attempt >= attempts || signal?.aborted) throw e;
-			await new Promise<void>((resolve, reject) => {
-				const timer = setTimeout(resolve, baseDelayMs * 2 ** (attempt - 1));
-				signal?.addEventListener("abort", () => {
-					clearTimeout(timer);
-					reject(e);
-				}, { once: true });
-			});
-		}
-	}
+async function retryTransient<T>(
+  fn: () => Promise<T>,
+  attempts: number,
+  baseDelayMs: number,
+  signal?: AbortSignal,
+): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      if (!isRetryableSummaryError(e) || attempt >= attempts || signal?.aborted) throw e;
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(resolve, baseDelayMs * 2 ** (attempt - 1));
+        signal?.addEventListener(
+          "abort",
+          () => {
+            clearTimeout(timer);
+            reject(e);
+          },
+          { once: true },
+        );
+      });
+    }
+  }
 }
 
 /**
@@ -1083,69 +1158,71 @@ async function retryTransient<T>(fn: () => Promise<T>, attempts: number, baseDel
  * map with searchable anchors, not an archive.
  */
 export function buildSummarizationPrompt(
-	conversationText: string,
-	previousSummary?: string,
-	userFocus?: string,
-	budgetChars: number = DEFAULTS.summaryChars,
+  conversationText: string,
+  previousSummary?: string,
+  userFocus?: string,
+  budgetChars: number = DEFAULTS.summaryChars,
 ): string {
-	const sections = [
-		"Summarize the conversation inside <conversation> so the work can continue after these messages are dropped " +
-			"from context. The full transcript remains verbatim-searchable via the recall tool, so this summary is a " +
-			"working map, not an archive: compress the past hard, never restate long passages, prefer lists.",
-		"",
-		"<conversation>",
-		conversationText,
-		"</conversation>",
-	];
-	if (previousSummary) {
-		sections.push("", "<previous-summary>", previousSummary, "</previous-summary>");
-	}
-	sections.push(
-		"",
-		"Use exactly this structure:",
-		"",
-		"## Goal",
-		"[What the user is trying to accomplish — one or two sentences]",
-		"",
-		"## Constraints & Preferences",
-		"- [Requirements and style rules the work must respect]",
-		"",
-		"## Progress",
-		"### Done",
-		"- [x] [Milestones, with commit hashes where they landed]",
-		"### In Progress",
-		"- [ ] [Current work]",
-		"### Blocked",
-		"- [Blockers, or omit this subsection]",
-		"",
-		"## Key Decisions",
-		"- **[Decision]**: [Rationale] — keep every decision still in force",
-		"",
-		"## Next Steps",
-		"1. [The literally in-flight action when compaction fired — what was being done this minute]",
-		"2. [Then the ordered queue: names, paths, and commands specific enough to resume cold without re-reading anything]",
-		"",
-		"## Critical Context",
-		"- [Repo paths, model/tool quirks, and the exact file paths, identifiers, commands, URLs, and error strings " +
-			"still in use — these are the anchors future recall searches will match]",
-		"",
-		"Rules:",
-		"- Preserve exact file paths, identifiers, commands, URLs, and error strings verbatim; compress everything else.",
-		"- The future is not recoverable: treat Next Steps as the most important section. Never compress it for " +
-			"brevity; note open questions and blockers explicitly.",
-		"- The previous summary, when provided, is a stale draft: re-derive volatile facts (current git HEAD and log, " +
-			"test counts, what was just committed, what the user most recently asked) from the newest messages rather " +
-			"than copying them; when they disagree, the messages win. Never carry Next Steps forward unchanged — rewrite " +
-			"them from the newest messages, which are where the current task state actually lives.",
-		"- Hard budget: the entire summary must stay under " + budgetChars.toLocaleString("en-US") + " characters — a cut-off generation is discarded whole. " +
-			"When space is tight, compress Done and Critical Context first; never Next Steps, active decisions' rationale, " +
-			"or exact strings still in use.",
-		"- Only summarize what appears in the conversation above; do not infer later events.",
-	);
-	if (userFocus) {
-		sections.push(`- User focus for this compaction: ${userFocus}`);
-	}
-	return sections.join("\n");
+  const sections = [
+    "Summarize the conversation inside <conversation> so the work can continue after these messages are dropped " +
+      "from context. The full transcript remains verbatim-searchable via the recall tool, so this summary is a " +
+      "working map, not an archive: compress the past hard, never restate long passages, prefer lists.",
+    "",
+    "<conversation>",
+    conversationText,
+    "</conversation>",
+  ];
+  if (previousSummary) {
+    sections.push("", "<previous-summary>", previousSummary, "</previous-summary>");
+  }
+  sections.push(
+    "",
+    "Use exactly this structure:",
+    "",
+    "## Goal",
+    "[What the user is trying to accomplish — one or two sentences]",
+    "",
+    "## Constraints & Preferences",
+    "- [Requirements and style rules the work must respect]",
+    "",
+    "## Progress",
+    "### Done",
+    "- [x] [Milestones, with commit hashes where they landed]",
+    "### In Progress",
+    "- [ ] [Current work]",
+    "### Blocked",
+    "- [Blockers, or omit this subsection]",
+    "",
+    "## Key Decisions",
+    "- **[Decision]**: [Rationale] — keep every decision still in force",
+    "",
+    "## Next Steps",
+    "1. [The literally in-flight action when compaction fired — what was being done this minute]",
+    "2. [Then the ordered queue: names, paths, and commands specific enough to resume cold without re-reading anything]",
+    "",
+    "## Critical Context",
+    "- [Repo paths, model/tool quirks, and the exact file paths, identifiers, commands, URLs, and error strings " +
+      "still in use — these are the anchors future recall searches will match]",
+    "",
+    "Rules:",
+    "- Preserve exact file paths, identifiers, commands, URLs, and error strings verbatim; compress everything else.",
+    "- The future is not recoverable: treat Next Steps as the most important section. Never compress it for " +
+      "brevity; note open questions and blockers explicitly.",
+    "- The previous summary, when provided, is a stale draft: re-derive volatile facts (current git HEAD and log, " +
+      "test counts, what was just committed, what the user most recently asked) from the newest messages rather " +
+      "than copying them; when they disagree, the messages win. Never carry Next Steps forward unchanged — rewrite " +
+      "them from the newest messages, which are where the current task state actually lives.",
+    "- Hard budget: the entire summary must stay under " +
+      budgetChars.toLocaleString("en-US") +
+      " characters — a cut-off generation is discarded whole. " +
+      "When space is tight, compress Done and Critical Context first; never Next Steps, active decisions' rationale, " +
+      "or exact strings still in use.",
+    "- Only summarize what appears in the conversation above; do not infer later events.",
+  );
+  if (userFocus) {
+    sections.push(`- User focus for this compaction: ${userFocus}`);
+  }
+  return sections.join("\n");
 }
 
 /**
@@ -1154,28 +1231,28 @@ export function buildSummarizationPrompt(
  * by config, or a window too small to reason about).
  */
 export function effectiveCompactTarget(configTarget: number, contextWindow: number): number | undefined {
-	if (configTarget <= 0) return undefined;
-	if (!Number.isFinite(contextWindow) || contextWindow <= COMPACT_WINDOW_HEADROOM_TOKENS) return undefined;
-	return Math.min(configTarget, Math.floor(contextWindow - COMPACT_WINDOW_HEADROOM_TOKENS));
+  if (configTarget <= 0) return undefined;
+  if (!Number.isFinite(contextWindow) || contextWindow <= COMPACT_WINDOW_HEADROOM_TOKENS) return undefined;
+  return Math.min(configTarget, Math.floor(contextWindow - COMPACT_WINDOW_HEADROOM_TOKENS));
 }
 
 /** Whether the extension should trigger compaction before the next turn starts. */
 export function shouldAutoCompact(
-	tokens: number | null,
-	contextWindow: number,
-	configTarget: number,
-	inFlight: boolean,
+  tokens: number | null,
+  contextWindow: number,
+  configTarget: number,
+  inFlight: boolean,
 ): boolean {
-	if (inFlight || tokens === null) return false;
-	const target = effectiveCompactTarget(configTarget, contextWindow);
-	return target !== undefined && tokens > target;
+  if (inFlight || tokens === null) return false;
+  const target = effectiveCompactTarget(configTarget, contextWindow);
+  return target !== undefined && tokens > target;
 }
 
 /** File-operation sets as pi's CompactionPreparation provides them. */
 export interface FileOpsLike {
-	read: Iterable<string>;
-	written: Iterable<string>;
-	edited: Iterable<string>;
+  read: Iterable<string>;
+  written: Iterable<string>;
+  edited: Iterable<string>;
 }
 
 /**
@@ -1184,35 +1261,32 @@ export interface FileOpsLike {
  * extension owns its chain). Same shape as pi's CompactionDetails.
  */
 export function carryForwardFileLists(
-	previousDetails: unknown,
-	fileOps: FileOpsLike,
+  previousDetails: unknown,
+  fileOps: FileOpsLike,
 ): { readFiles: string[]; modifiedFiles: string[] } {
-	const prev = previousDetails as { readFiles?: unknown; modifiedFiles?: unknown } | null | undefined;
-	const prevRead = Array.isArray(prev?.readFiles) ? (prev!.readFiles as unknown[]) : [];
-	const prevModified = Array.isArray(prev?.modifiedFiles) ? (prev!.modifiedFiles as unknown[]) : [];
-	const modified = new Set<string>([
-		...prevModified.filter((f): f is string => typeof f === "string"),
-		...fileOps.edited,
-		...fileOps.written,
-	]);
-	const read = new Set<string>([
-		...prevRead.filter((f): f is string => typeof f === "string"),
-		...fileOps.read,
-	]);
-	for (const f of modified) read.delete(f);
-	return {
-		readFiles: [...read].sort(),
-		modifiedFiles: [...modified].sort(),
-	};
+  const prev = previousDetails as { readFiles?: unknown; modifiedFiles?: unknown } | null | undefined;
+  const prevRead = Array.isArray(prev?.readFiles) ? (prev!.readFiles as unknown[]) : [];
+  const prevModified = Array.isArray(prev?.modifiedFiles) ? (prev!.modifiedFiles as unknown[]) : [];
+  const modified = new Set<string>([
+    ...prevModified.filter((f): f is string => typeof f === "string"),
+    ...fileOps.edited,
+    ...fileOps.written,
+  ]);
+  const read = new Set<string>([...prevRead.filter((f): f is string => typeof f === "string"), ...fileOps.read]);
+  for (const f of modified) read.delete(f);
+  return {
+    readFiles: [...read].sort(),
+    modifiedFiles: [...modified].sort(),
+  };
 }
 
 /** Details of the most recent compaction entry on the branch, if any. */
 export function lastCompactionDetails(branchEntries: SessionEntry[]): unknown {
-	for (let i = branchEntries.length - 1; i >= 0; i--) {
-		const entry = branchEntries[i] as SessionEntry & { details?: unknown };
-		if (entry.type === "compaction") return entry.details;
-	}
-	return undefined;
+  for (let i = branchEntries.length - 1; i >= 0; i--) {
+    const entry = branchEntries[i] as SessionEntry & { details?: unknown };
+    if (entry.type === "compaction") return entry.details;
+  }
+  return undefined;
 }
 
 /** Boundaries of one model completion, as the extension seam sees it. */
@@ -1223,174 +1297,219 @@ export type CompactionUsage = NonNullable<import("@earendil-works/pi-coding-agen
 
 /** Seam for tests: one summarization call with the extension's own prompt. */
 export interface SummaryFnArgs {
-	model: SummaryModel;
-	complete: SummaryComplete;
-	thinkingLevel: SummaryThinkingLevel | undefined;
-	/** AgentMessages in chronological order — older spans first, split-turn prefix last. */
-	messages: Parameters<typeof convertToLlm>[0];
-	previousSummary: string | undefined;
-	/** Free-form focus from /compact args; the auto trigger never sets one. */
-	userFocus: string | undefined;
-	/** Hard character budget for the summary (PI_RECALL_SUMMARY_CHARS, default 5,000). */
-	budgetChars: number;
-	signal: AbortSignal;
+  model: SummaryModel;
+  complete: SummaryComplete;
+  thinkingLevel: SummaryThinkingLevel | undefined;
+  /** AgentMessages in chronological order — older spans first, split-turn prefix last. */
+  messages: Parameters<typeof convertToLlm>[0];
+  previousSummary: string | undefined;
+  /** Free-form focus from /compact args; the auto trigger never sets one. */
+  userFocus: string | undefined;
+  /** Hard character budget for the summary (PI_RECALL_SUMMARY_CHARS, default 5,000). */
+  budgetChars: number;
+  signal: AbortSignal;
 }
 export type SummaryFn = (args: SummaryFnArgs) => Promise<{ text: string; usage: unknown }>;
 
 const defaultSummaryFn: SummaryFn = async ({
-	model,
-	complete,
-	thinkingLevel,
-	messages,
-	previousSummary,
-	userFocus,
-	budgetChars,
-	signal,
+  model,
+  complete,
+  thinkingLevel,
+  messages,
+  previousSummary,
+  userFocus,
+  budgetChars,
+  signal,
 }) => {
-	const conversationText = serializeConversation(convertToLlm(messages));
-	const prompt = buildSummarizationPrompt(conversationText, previousSummary, userFocus, budgetChars);
-	const options: NonNullable<Parameters<SummaryComplete>[2]> & { reasoning?: SummaryThinkingLevel } = {
-		maxTokens: Math.min(SUMMARY_MAX_OUTPUT_TOKENS, model.maxTokens > 0 ? model.maxTokens : SUMMARY_MAX_OUTPUT_TOKENS),
-		signal,
-		// One-off prompt: never write to the prompt cache (pi's summarizer does the same).
-		cacheRetention: "none",
-		sessionId: crypto.randomUUID(),
-	};
-	// Mirror pi's summarizer: only forward thinking when the model reasons and a level is set.
-	if (model.reasoning && thinkingLevel && thinkingLevel !== "off") {
-		options.reasoning = thinkingLevel;
-	}
-	const response = await complete(model, { messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }] }, options);
-	// complete() resolves (never rejects) error and abort terminations, keeping any
-	// partial content — a partial text must never become the session checkpoint.
-	// Throwing routes aborts into the hook's silent return and errors into the crumb.
-	if (response.stopReason === "error" || response.stopReason === "aborted") {
-		const failed = response as { errorMessage?: string };
-		const err = new Error(failed.errorMessage ?? `summarizer ${response.stopReason}`);
-		// Provider failures are transient until proven otherwise — flagged so the
-		// hook retries in place instead of handing the summary to pi's default.
-		if (response.stopReason === "error") Object.assign(err, { retryable: true });
-		throw err;
-	}
-	if (response.stopReason === "length") {
-		throw new Error(`summarizer hit the output cap (${options.maxTokens} tokens)`);
-	}
-	if (response.content.some((block) => block.type === "toolCall")) {
-		throw new Error("Summarization attempted to call a tool");
-	}
-	const text = response.content
-		.filter((block): block is { type: "text"; text: string } => block.type === "text")
-		.map((block) => block.text)
-		.join("\n");
-	return { text, usage: response.usage };
+  const conversationText = serializeConversation(convertToLlm(messages));
+  const prompt = buildSummarizationPrompt(conversationText, previousSummary, userFocus, budgetChars);
+  const options: NonNullable<Parameters<SummaryComplete>[2]> & { reasoning?: SummaryThinkingLevel } = {
+    maxTokens: Math.min(SUMMARY_MAX_OUTPUT_TOKENS, model.maxTokens > 0 ? model.maxTokens : SUMMARY_MAX_OUTPUT_TOKENS),
+    signal,
+    // One-off prompt: never write to the prompt cache (pi's summarizer does the same).
+    cacheRetention: "none",
+    sessionId: crypto.randomUUID(),
+  };
+  // Mirror pi's summarizer: only forward thinking when the model reasons and a level is set.
+  if (model.reasoning && thinkingLevel && thinkingLevel !== "off") {
+    options.reasoning = thinkingLevel;
+  }
+  const response = await complete(
+    model,
+    { messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }] },
+    options,
+  );
+  // complete() resolves (never rejects) error and abort terminations, keeping any
+  // partial content — a partial text must never become the session checkpoint.
+  // Throwing routes aborts into the hook's silent return and errors into the crumb.
+  if (response.stopReason === "error" || response.stopReason === "aborted") {
+    const failed = response as { errorMessage?: string };
+    const err = new Error(failed.errorMessage ?? `summarizer ${response.stopReason}`);
+    // Provider failures are transient until proven otherwise — flagged so the
+    // hook retries in place instead of handing the summary to pi's default.
+    if (response.stopReason === "error") Object.assign(err, { retryable: true });
+    throw err;
+  }
+  if (response.stopReason === "length") {
+    throw new Error(`summarizer hit the output cap (${options.maxTokens} tokens)`);
+  }
+  if (response.content.some((block) => block.type === "toolCall")) {
+    throw new Error("Summarization attempted to call a tool");
+  }
+  const text = response.content
+    .filter((block): block is { type: "text"; text: string } => block.type === "text")
+    .map((block) => block.text)
+    .join("\n");
+  return { text, usage: response.usage };
 };
 
 // ---------------------------------------------------------------------------
 // Tool internals (kept out of the registration closure for testability)
 // ---------------------------------------------------------------------------
 
-function errorResult(text: string, details: RecallDetails): { content: Array<{ type: "text"; text: string }>; details: RecallDetails } {
-	return { content: [{ type: "text", text: `Error: ${text}` }], details };
+function errorResult(
+  text: string,
+  details: RecallDetails,
+): { content: Array<{ type: "text"; text: string }>; details: RecallDetails } {
+  return { content: [{ type: "text", text: `Error: ${text}` }], details };
 }
 
 async function search(
-	params: { query?: string; scope?: "session" | "project"; limit?: number },
-	ctx: ExtensionContext,
-	corpusCache: ProjectCorpusCache,
-	config: RecallConfig,
+  params: { query?: string; scope?: "session" | "project"; limit?: number },
+  ctx: ExtensionContext,
+  corpusCache: ProjectCorpusCache,
+  config: RecallConfig,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: RecallDetails }> {
-	const query = params.query?.trim() ?? "";
-	const scope = params.scope ?? config.defaultScope;
-	const limit = Math.floor(
-		typeof params.limit === "number" && Number.isFinite(params.limit) ? Math.min(25, Math.max(1, params.limit)) : config.maxResults,
-	);
-	const details: RecallDetails = { mode: "search", scope };
-	if (query === "") {
-		return errorResult("query is required in search mode (use mode 'read' with an id to fetch a full entry)", details);
-	}
+  const query = params.query?.trim() ?? "";
+  const scope = params.scope ?? config.defaultScope;
+  const limit = Math.floor(
+    typeof params.limit === "number" && Number.isFinite(params.limit)
+      ? Math.min(25, Math.max(1, params.limit))
+      : config.maxResults,
+  );
+  const details: RecallDetails = { mode: "search", scope };
+  if (query === "") {
+    return errorResult("query is required in search mode (use mode 'read' with an id to fetch a full entry)", details);
+  }
 
-	const sm = ctx.sessionManager;
-	const archiveChunks = buildArchiveChunks(sm.getBranch(), visibleEntryIds(sm.buildSessionProjection()), sm.getSessionId(), config);
-	if (archiveChunks.length === 0 && scope === "session") {
-		const text =
-			"Nothing has been compacted yet — your full history is still in context, no archive to search. (Scope 'project' searches past sessions.)";
-		return { content: [{ type: "text", text }], details };
-	}
+  const sm = ctx.sessionManager;
+  const archiveChunks = buildArchiveChunks(
+    sm.getBranch(),
+    visibleEntryIds(sm.buildSessionProjection()),
+    sm.getSessionId(),
+    config,
+  );
+  if (archiveChunks.length === 0 && scope === "session") {
+    const text =
+      "Nothing has been compacted yet — your full history is still in context, no archive to search. (Scope 'project' searches past sessions.)";
+    return { content: [{ type: "text", text }], details };
+  }
 
-	let foreignSessions = 0;
-	let skippedFiles = 0;
-	let allChunks = archiveChunks;
-	if (scope === "project") {
-		const dir = sm.getSessionDir();
-		let corpora: FileCorpus[] = [];
-		try {
-			skippedFiles = await corpusCache.refresh(dir, sm.getSessionFile());
-			corpora = corpusCache.list();
-		} catch (err) {
-			return errorResult(`project scope unavailable: ${err instanceof Error ? err.message : String(err)}`, details);
-		}
-		foreignSessions = corpora.length;
-		allChunks = [...archiveChunks, ...corpora.flatMap((c) => c.chunks)];
-	}
+  let foreignSessions = 0;
+  let skippedFiles = 0;
+  let allChunks = archiveChunks;
+  if (scope === "project") {
+    const dir = sm.getSessionDir();
+    let corpora: FileCorpus[] = [];
+    try {
+      skippedFiles = await corpusCache.refresh(dir, sm.getSessionFile());
+      corpora = corpusCache.list();
+    } catch (err) {
+      return errorResult(`project scope unavailable: ${err instanceof Error ? err.message : String(err)}`, details);
+    }
+    foreignSessions = corpora.length;
+    allChunks = [...archiveChunks, ...corpora.flatMap((c) => c.chunks)];
+  }
 
-	const rankedAll = rankChunks(allChunks, query, config.foreignWeight, config.halfLifeHours, config.recencyFloor);
-	const ranked = rankedAll.slice(0, limit);
-	const hits: SearchHit[] = ranked.map((r) => ({
-		ref: r.chunk.ref,
-		kind: r.chunk.kind,
-		label: r.chunk.label,
-		sessionLabel: r.chunk.sessionLabel,
-		timestamp: r.chunk.timestamp,
-		score: r.score,
-		recencyFactor: r.recencyFactor,
-		snippet: extractSnippet(r.chunk.text, query, config.snippetChars),
-	}));
-	const archiveEntries = new Set(allChunks.map((c) => c.ref)).size;
-	const text = formatSearchResult(hits, { archiveEntries, foreignSessions, scope, skippedFiles, totalMatches: rankedAll.length });
-	return {
-		content: [{ type: "text", text }],
-		details: { ...details, hits: hits.map((h) => ({ ref: h.ref, kind: h.kind, session: h.sessionLabel, score: h.score, snippet: h.snippet })) },
-	};
+  const rankedAll = rankChunks(allChunks, query, config.foreignWeight, config.halfLifeHours, config.recencyFloor);
+  const ranked = rankedAll.slice(0, limit);
+  const hits: SearchHit[] = ranked.map((r) => ({
+    ref: r.chunk.ref,
+    kind: r.chunk.kind,
+    label: r.chunk.label,
+    sessionLabel: r.chunk.sessionLabel,
+    timestamp: r.chunk.timestamp,
+    score: r.score,
+    recencyFactor: r.recencyFactor,
+    snippet: extractSnippet(r.chunk.text, query, config.snippetChars),
+  }));
+  const archiveEntries = new Set(allChunks.map((c) => c.ref)).size;
+  const text = formatSearchResult(hits, {
+    archiveEntries,
+    foreignSessions,
+    scope,
+    skippedFiles,
+    totalMatches: rankedAll.length,
+  });
+  return {
+    content: [{ type: "text", text }],
+    details: {
+      ...details,
+      hits: hits.map((h) => ({
+        ref: h.ref,
+        kind: h.kind,
+        session: h.sessionLabel,
+        score: h.score,
+        snippet: h.snippet,
+      })),
+    },
+  };
 }
 
 /** Resolve the project cache through the injected reader (test seam). */
 async function readEntry(
-	params: { id?: string; offset?: number },
-	ctx: ExtensionContext,
-	corpusCache: ProjectCorpusCache,
-	config: RecallConfig,
+  params: { id?: string; offset?: number },
+  ctx: ExtensionContext,
+  corpusCache: ProjectCorpusCache,
+  config: RecallConfig,
 ): Promise<{ text: string; details: RecallDetails }> {
-	const details: RecallDetails = { mode: "read", scope: "session" };
-	const ref = params.id?.trim() ?? "";
-	if (ref === "") return { text: "Error: id is required in read mode (take it from a search result)", details };
-	const parsed = parseRef(ref);
-	if (parsed === undefined) return { text: `Error: "${ref}" is not a valid ref — use the id value from a recall search result`, details };
-	const offset = Math.floor(
-		typeof params.offset === "number" && Number.isFinite(params.offset) && params.offset >= 0 ? params.offset : 0,
-	);
+  const details: RecallDetails = { mode: "read", scope: "session" };
+  const ref = params.id?.trim() ?? "";
+  if (ref === "") return { text: "Error: id is required in read mode (take it from a search result)", details };
+  const parsed = parseRef(ref);
+  if (parsed === undefined)
+    return { text: `Error: "${ref}" is not a valid ref — use the id value from a recall search result`, details };
+  const offset = Math.floor(
+    typeof params.offset === "number" && Number.isFinite(params.offset) && params.offset >= 0 ? params.offset : 0,
+  );
 
-	const sm = ctx.sessionManager;
-	if (parsed.sessionIdShort === undefined) {
-		const entry = sm.getEntry(parsed.entryId);
-		if (entry === undefined) {
-			return { text: `Error: entry ${ref} not found on the current branch (refs are branch-local; search again after rewinds)`, details };
-		}
-		const text = entryFullText(entry);
-		return {
-			text: formatReadResult(ref, `Entry ${ref} — current session · ${entry.timestamp}`, text, offset, config.readChars),
-			details: { ...details, read: { ref, total: text.length } },
-		};
-	}
+  const sm = ctx.sessionManager;
+  if (parsed.sessionIdShort === undefined) {
+    const entry = sm.getEntry(parsed.entryId);
+    if (entry === undefined) {
+      return {
+        text: `Error: entry ${ref} not found on the current branch (refs are branch-local; search again after rewinds)`,
+        details,
+      };
+    }
+    const text = entryFullText(entry);
+    return {
+      text: formatReadResult(
+        ref,
+        `Entry ${ref} — current session · ${entry.timestamp}`,
+        text,
+        offset,
+        config.readChars,
+      ),
+      details: { ...details, read: { ref, total: text.length } },
+    };
+  }
 
-	// Foreign ref: refresh cache (cheap once warm) then read the exact line.
-	const located = await locateForeignEntry(corpusCache, sm, parsed);
-	if (typeof located === "string") return { text: `Error: ${located}`, details };
-	const { entry, corpus } = located;
-	const text = entryFullText(entry);
-	return {
-		text: formatReadResult(ref, `Entry ${parsed.entryId} — past session ${corpus.label} · ${entry.timestamp}`, text, offset, config.readChars),
-		details: { ...details, scope: "project", read: { ref, total: text.length } },
-	};
+  // Foreign ref: refresh cache (cheap once warm) then read the exact line.
+  const located = await locateForeignEntry(corpusCache, sm, parsed);
+  if (typeof located === "string") return { text: `Error: ${located}`, details };
+  const { entry, corpus } = located;
+  const text = entryFullText(entry);
+  return {
+    text: formatReadResult(
+      ref,
+      `Entry ${parsed.entryId} — past session ${corpus.label} · ${entry.timestamp}`,
+      text,
+      offset,
+      config.readChars,
+    ),
+    details: { ...details, scope: "project", read: { ref, total: text.length } },
+  };
 }
 
 /**
@@ -1400,33 +1519,33 @@ async function readEntry(
  * returns a model-facing message instead of throwing.
  */
 async function locateForeignEntry(
-	corpusCache: ProjectCorpusCache,
-	sm: ExtensionContext["sessionManager"],
-	parsed: { entryId: string; sessionIdShort?: string },
+  corpusCache: ProjectCorpusCache,
+  sm: ExtensionContext["sessionManager"],
+  parsed: { entryId: string; sessionIdShort?: string },
 ): Promise<{ entry: SessionEntry; corpus: FileCorpus } | string> {
-	try {
-		await corpusCache.refresh(sm.getSessionDir(), sm.getSessionFile());
-	} catch (err) {
-		return `project scope unavailable: ${err instanceof Error ? err.message : String(err)}`;
-	}
-	const located = corpusCache.locate(parsed.sessionIdShort ?? "", parsed.entryId);
-	if (located === undefined) {
-		return `entry ${parsed.entryId}.${parsed.sessionIdShort} not found in past sessions (refs are stable per session file; search again to refresh)`;
-	}
-	let entryLine: string | undefined;
-	try {
-		entryLine = await corpusCache.readEntryLine(located.corpus, located.line);
-	} catch (err) {
-		return `session file unreadable: ${err instanceof Error ? err.message : String(err)}`;
-	}
-	if (entryLine === undefined) return "session file changed since indexing — search again to refresh refs";
-	try {
-		const entry = JSON.parse(entryLine) as SessionEntry;
-		if (entry.id !== parsed.entryId) return "session file changed since indexing — search again to refresh refs";
-		return { entry, corpus: located.corpus };
-	} catch {
-		return `session file line ${located.line} is unreadable`;
-	}
+  try {
+    await corpusCache.refresh(sm.getSessionDir(), sm.getSessionFile());
+  } catch (err) {
+    return `project scope unavailable: ${err instanceof Error ? err.message : String(err)}`;
+  }
+  const located = corpusCache.locate(parsed.sessionIdShort ?? "", parsed.entryId);
+  if (located === undefined) {
+    return `entry ${parsed.entryId}.${parsed.sessionIdShort} not found in past sessions (refs are stable per session file; search again to refresh)`;
+  }
+  let entryLine: string | undefined;
+  try {
+    entryLine = await corpusCache.readEntryLine(located.corpus, located.line);
+  } catch (err) {
+    return `session file unreadable: ${err instanceof Error ? err.message : String(err)}`;
+  }
+  if (entryLine === undefined) return "session file changed since indexing — search again to refresh refs";
+  try {
+    const entry = JSON.parse(entryLine) as SessionEntry;
+    if (entry.id !== parsed.entryId) return "session file changed since indexing — search again to refresh refs";
+    return { entry, corpus: located.corpus };
+  } catch {
+    return `session file line ${located.line} is unreadable`;
+  }
 }
 
 export default registerRecallTool;

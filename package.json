@@ -20,12 +20,15 @@
 	"devDependencies": {
 		"@earendil-works/pi-coding-agent": "0.87.1",
 		"@vitest/coverage-v8": "^5.0.2",
+		"prettier": "^3.9.9",
 		"typescript": "^5",
 		"vitest": "^5.0.2"
 	},
 	"scripts": {
 		"test": "vitest run",
 		"check": "tsc --noEmit && vitest run",
-		"test:coverage": "vitest run --coverage"
+		"test:coverage": "vitest run --coverage",
+		"format": "prettier --write extensions tests",
+		"check:format": "prettier --check extensions tests"
 	}
 }

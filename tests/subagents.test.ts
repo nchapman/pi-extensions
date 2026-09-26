@@ -310,8 +310,18 @@ describe("runChild", () => {
     const child = fakeChild();
     const spawnFn: SpawnFn = () => child;
     const promise = runChild(AGENT, "task", undefined, { timeoutMs: 5000 }, spawnFn);
-    child.stdoutEmit(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "first" }] } }) + "\n");
-    child.stdoutEmit(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "final" }] } }) + "\n");
+    child.stdoutEmit(
+      JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "first" }] },
+      }) + "\n",
+    );
+    child.stdoutEmit(
+      JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "final" }] },
+      }) + "\n",
+    );
     child.close(0);
     await expect(promise).resolves.toBe("final");
   });
@@ -319,8 +329,18 @@ describe("runChild", () => {
   it("keeps earlier text when the final message has only tool calls", async () => {
     const child = fakeChild();
     const promise = runChild(AGENT, "task", undefined, { timeoutMs: 5000 }, () => child);
-    child.stdoutEmit(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "useful" }] } }) + "\n");
-    child.stdoutEmit(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", name: "bash" }] } }) + "\n");
+    child.stdoutEmit(
+      JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "useful" }] },
+      }) + "\n",
+    );
+    child.stdoutEmit(
+      JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "toolCall", name: "bash" }] },
+      }) + "\n",
+    );
     child.close(0);
     await expect(promise).resolves.toBe("useful");
   });
@@ -328,7 +348,12 @@ describe("runChild", () => {
   it("parses a final line without trailing newline", async () => {
     const child = fakeChild();
     const promise = runChild(AGENT, "task", undefined, { timeoutMs: 5000 }, () => child);
-    child.stdoutEmit(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "last-line" }] } }));
+    child.stdoutEmit(
+      JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "last-line" }] },
+      }),
+    );
     child.close(0);
     await expect(promise).resolves.toBe("last-line");
   });
@@ -367,12 +392,29 @@ describe("runChild", () => {
   it("streams updates via onUpdate", async () => {
     const child = fakeChild();
     const updates: string[] = [];
-    const promise = runChild(AGENT, "task", undefined, {
-      timeoutMs: 5000,
-      onUpdate: (p: { content: Array<{ type: string; text?: string }> }) => updates.push((p.content[0] as { text: string }).text),
-    }, () => child);
-    child.stdoutEmit(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "wip" }] } }) + "\n");
-    child.stdoutEmit(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }] } }) + "\n");
+    const promise = runChild(
+      AGENT,
+      "task",
+      undefined,
+      {
+        timeoutMs: 5000,
+        onUpdate: (p: { content: Array<{ type: string; text?: string }> }) =>
+          updates.push((p.content[0] as { text: string }).text),
+      },
+      () => child,
+    );
+    child.stdoutEmit(
+      JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "wip" }] },
+      }) + "\n",
+    );
+    child.stdoutEmit(
+      JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "done" }] },
+      }) + "\n",
+    );
     child.close(0);
     await promise;
     expect(updates).toEqual(["wip", "done"]);
@@ -400,9 +442,11 @@ describe("runWithLimit", () => {
     });
     const results = await runWithLimit(jobs, 2);
     expect(peak).toBeLessThanOrEqual(2);
-    expect(results.map((r: PromiseSettledResult<number>) => (r.status === "fulfilled" ? r.value : `ERR:${(r.reason as Error).message}`))).toEqual([
-      10, 20, "ERR:fail-3", 40, 50,
-    ]);
+    expect(
+      results.map((r: PromiseSettledResult<number>) =>
+        r.status === "fulfilled" ? r.value : `ERR:${(r.reason as Error).message}`,
+      ),
+    ).toEqual([10, 20, "ERR:fail-3", 40, 50]);
   });
 });
 
@@ -417,9 +461,7 @@ describe("DEFAULT_AGENT_MD", () => {
 });
 
 describe("resolveAgentDef", () => {
-  const list: AgentDef[] = [
-    { name: "reviewer", description: "", instructions: "review", tools: ["read"] },
-  ];
+  const list: AgentDef[] = [{ name: "reviewer", description: "", instructions: "review", tools: ["read"] }];
 
   it("resolves a named agent", () => {
     expect(resolveAgentDef(list, { agent: "reviewer" }).name).toBe("reviewer");
@@ -465,19 +507,21 @@ describe("refLabel", () => {
 
 describe("registerSubagentTools", () => {
   function makePi() {
-    const tools = new Map<string, {
-      execute: (id: string, params: unknown, signal?: AbortSignal) => Promise<unknown>;
-      renderCall?: (args: never, theme: never, context?: never) => unknown;
-      renderResult?: (result: never, options: never, theme: never, context?: never) => unknown;
-    }>();
+    const tools = new Map<
+      string,
+      {
+        execute: (id: string, params: unknown, signal?: AbortSignal) => Promise<unknown>;
+        renderCall?: (args: never, theme: never, context?: never) => unknown;
+        renderResult?: (result: never, options: never, theme: never, context?: never) => unknown;
+      }
+    >();
     const pi = {
       registerTool: (t: {
         name: string;
         execute: (id: string, params: unknown, signal?: AbortSignal) => Promise<unknown>;
         renderCall?: (args: never, theme: never, context?: never) => unknown;
         renderResult?: (result: never, options: never, theme: never, context?: never) => unknown;
-      }) =>
-        tools.set(t.name, t),
+      }) => tools.set(t.name, t),
     };
     return { pi: pi as never, tools };
   }
@@ -525,7 +569,11 @@ describe("registerSubagentTools", () => {
   it("single subagent tool uses the generic default and reports its name", async () => {
     const calls: string[][] = [];
     const { pi, tools } = makePi();
-    registerSubagentTools(pi as never, mkdtempSync(join(tmpdir(), "agents-")), spawnReturning([jsonLine("done")], calls));
+    registerSubagentTools(
+      pi as never,
+      mkdtempSync(join(tmpdir(), "agents-")),
+      spawnReturning([jsonLine("done")], calls),
+    );
 
     const result = (await tools.get("subagent")!.execute("1", { task: "just look" })) as {
       content: Array<{ type: string; text: string }>;
@@ -564,7 +612,11 @@ describe("registerSubagentTools", () => {
   it("result rows render status and summary from the tool result", async () => {
     const calls: string[][] = [];
     const { pi, tools } = makePi();
-    registerSubagentTools(pi as never, mkdtempSync(join(tmpdir(), "agents-")), spawnReturning([jsonLine("all clear")], calls));
+    registerSubagentTools(
+      pi as never,
+      mkdtempSync(join(tmpdir(), "agents-")),
+      spawnReturning([jsonLine("all clear")], calls),
+    );
 
     const result = await tools.get("subagent")!.execute("1", { task: "t" });
     const rendered = tools.get("subagent")!.renderResult!(
@@ -580,11 +632,19 @@ describe("registerSubagentTools", () => {
   it("result rows render a running partial with the streamed tail", async () => {
     const calls: string[][] = [];
     const { pi, tools } = makePi();
-    registerSubagentTools(pi as never, mkdtempSync(join(tmpdir(), "agents-")), spawnReturning([jsonLine("first"), jsonLine("second")], calls));
+    registerSubagentTools(
+      pi as never,
+      mkdtempSync(join(tmpdir(), "agents-")),
+      spawnReturning([jsonLine("first"), jsonLine("second")], calls),
+    );
 
     const partials: unknown[] = [];
-    const execute = tools.get("subagent")!.execute as
-      (id: string, params: unknown, signal: undefined, onUpdate: (r: unknown) => void) => Promise<unknown>;
+    const execute = tools.get("subagent")!.execute as (
+      id: string,
+      params: unknown,
+      signal: undefined,
+      onUpdate: (r: unknown) => void,
+    ) => Promise<unknown>;
     await execute("1", { task: "t" }, undefined, (r) => partials.push(r));
 
     expect(partials.length).toBeGreaterThan(0);
@@ -637,7 +697,7 @@ describe("registerSubagentTools", () => {
       tasks: [{ agent: "ghost", task: "t" }, { task: "t2" }],
     })) as { content: Array<{ type: string; text: string }> };
 
-    expect(result.content[0].text).toContain("### ghost\nERROR: Agent \"ghost\" not found");
+    expect(result.content[0].text).toContain('### ghost\nERROR: Agent "ghost" not found');
     expect(result.content[0].text).toContain("### generic\nok");
     expect(calls.length).toBe(1);
   });
@@ -720,7 +780,9 @@ describe("registerSubagentCommands", () => {
   });
 
   it("sends a delegation user message when invoked with a task", async () => {
-    const dir = agentsDirWith({ "code-reviewer.md": "---\nname: code-reviewer\ndescription: Reviews code.\n---\nBody." });
+    const dir = agentsDirWith({
+      "code-reviewer.md": "---\nname: code-reviewer\ndescription: Reviews code.\n---\nBody.",
+    });
     const { pi, commands, sendUserMessage, ctx } = makePi();
     registerSubagentCommands(pi, dir);
 
@@ -734,7 +796,9 @@ describe("registerSubagentCommands", () => {
   });
 
   it("notifies usage instead of sending when invoked without a task", async () => {
-    const dir = agentsDirWith({ "code-reviewer.md": "---\nname: code-reviewer\ndescription: Reviews code.\n---\nBody." });
+    const dir = agentsDirWith({
+      "code-reviewer.md": "---\nname: code-reviewer\ndescription: Reviews code.\n---\nBody.",
+    });
     const { pi, commands, sendUserMessage, notify, ctx } = makePi();
     registerSubagentCommands(pi, dir);
 
@@ -784,7 +848,12 @@ describe("registerSubagentCommands", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
       const first: AgentDef = { name: "reviewer", description: "first", instructions: "A", tools: [...BUILTIN_TOOLS] };
-      const second: AgentDef = { name: "reviewer", description: "second", instructions: "B", tools: [...BUILTIN_TOOLS] };
+      const second: AgentDef = {
+        name: "reviewer",
+        description: "second",
+        instructions: "B",
+        tools: [...BUILTIN_TOOLS],
+      };
       const { pi, commands } = makePi();
       registerCommandsForAgents(pi, [first, second]);
 
@@ -858,14 +927,24 @@ describe("renderSubagentResult", () => {
   const DONE = { isPartial: false, expanded: false, isError: false };
 
   it("shows a running status with the streamed tail while partial", () => {
-    const text = renderSubagentResult("thinking...\nstill working", { agent: "reviewer" }, { isPartial: true, expanded: false, isError: false }, THEME as never);
+    const text = renderSubagentResult(
+      "thinking...\nstill working",
+      { agent: "reviewer" },
+      { isPartial: true, expanded: false, isError: false },
+      THEME as never,
+    );
     expect(text).toContain("running (reviewer)...");
     expect(text).toContain("still working");
     expect(text).not.toContain("thinking");
   });
 
   it("shows a bare running status before any output arrives", () => {
-    const text = renderSubagentResult("", { agent: "reviewer" }, { isPartial: true, expanded: false, isError: false }, THEME as never);
+    const text = renderSubagentResult(
+      "",
+      { agent: "reviewer" },
+      { isPartial: true, expanded: false, isError: false },
+      THEME as never,
+    );
     expect(text).toBe("running (reviewer)...");
   });
 
@@ -877,7 +956,7 @@ describe("renderSubagentResult", () => {
   });
 
   it("reports failures with the error's first line, without details (pi clears them)", () => {
-    const text = renderSubagentResult("Agent \"ghost\" not found", {}, { ...DONE, isError: true }, THEME as never);
+    const text = renderSubagentResult('Agent "ghost" not found', {}, { ...DONE, isError: true }, THEME as never);
     expect(text).toContain("failed");
     expect(text).toContain('Agent "ghost" not found');
   });

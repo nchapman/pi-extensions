@@ -53,7 +53,14 @@ describe("storedToModels", () => {
     const [model] = storedToModels([
       { id: "qwen", name: "Qwen", reasoning: true, input: ["text", "image"], contextWindow: 131072, maxTokens: 8192 },
     ]);
-    expect(model).toMatchObject({ id: "qwen", name: "Qwen", reasoning: true, input: ["text", "image"], contextWindow: 131072, maxTokens: 8192 });
+    expect(model).toMatchObject({
+      id: "qwen",
+      name: "Qwen",
+      reasoning: true,
+      input: ["text", "image"],
+      contextWindow: 131072,
+      maxTokens: 8192,
+    });
   });
 });
 
@@ -69,12 +76,18 @@ describe("fetchProviderModels", () => {
   });
 
   it("throws on a non-2xx response", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse({ error: "down" }, 503)));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse({ error: "down" }, 503)),
+    );
     await expect(fetchProviderModels("http://yeti:8080/v1", new AbortController().signal)).rejects.toThrow("503");
   });
 
   it("throws when the catalog is empty", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse({ data: [] })));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse({ data: [] })),
+    );
     await expect(fetchProviderModels("http://yeti:8080/v1", new AbortController().signal)).rejects.toThrow("no models");
   });
 });
@@ -96,16 +109,24 @@ describe("registerLlamswap", () => {
   });
 
   it("refreshModels serves the fetched catalog", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse({ data: [{ id: "llama" }] })));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse({ data: [{ id: "llama" }] })),
+    );
     const { pi, providers } = makePi();
     registerLlamswap(pi);
 
-    const models = (await providers.get("yeti")!.refreshModels({ signal: new AbortController().signal, stored: undefined })) as { id: string }[];
+    const models = (await providers
+      .get("yeti")!
+      .refreshModels({ signal: new AbortController().signal, stored: undefined })) as { id: string }[];
     expect(models.map((m) => m.id)).toEqual(["llama"]);
   });
 
   it("refreshModels falls back to the stored catalog on gateway failure", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse({}, 500)));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse({}, 500)),
+    );
     const { pi, providers } = makePi();
     registerLlamswap(pi);
 
@@ -119,7 +140,10 @@ describe("registerLlamswap", () => {
   });
 
   it("refreshModels throws when the gateway fails and no catalog is stored", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse({}, 500)));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse({}, 500)),
+    );
     const { pi, providers } = makePi();
     registerLlamswap(pi);
 

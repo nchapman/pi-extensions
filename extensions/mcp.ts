@@ -88,9 +88,13 @@ export function resolveToolByName(known: ToolMeta[], tool: string): ToolMeta {
     : known.filter((t) => t.name === tool || t.qualified === tool);
   if (candidates.length === 1) return candidates[0];
   if (candidates.length === 0) {
-    throw new Error(`Tool "${tool}" not found. Known tools: ${known.map((t) => t.qualified).join(", ") || "none (servers not connected yet)"}`);
+    throw new Error(
+      `Tool "${tool}" not found. Known tools: ${known.map((t) => t.qualified).join(", ") || "none (servers not connected yet)"}`,
+    );
   }
-  throw new Error(`Tool "${tool}" is ambiguous. Use the qualified name: ${candidates.map((t) => t.qualified).join(", ")}`);
+  throw new Error(
+    `Tool "${tool}" is ambiguous. Use the qualified name: ${candidates.map((t) => t.qualified).join(", ")}`,
+  );
 }
 
 interface ContentBlock {
@@ -105,7 +109,8 @@ export function serializeCallResult(result: unknown): string {
   const parts: string[] = [];
   for (const block of r?.content ?? []) {
     if (block.type === "text") parts.push(block.text ?? "");
-    else if (block.type === "image" || block.type === "audio") parts.push(`[${block.type}: ${block.mimeType ?? "unknown"}]`);
+    else if (block.type === "image" || block.type === "audio")
+      parts.push(`[${block.type}: ${block.mimeType ?? "unknown"}]`);
     else if (block.type === "resource") {
       const res = block.resource ?? {};
       parts.push(res.text != null ? res.text : `[resource: ${res.uri ?? "unknown"}${res.blob ? " (binary)" : ""}]`);
@@ -132,28 +137,49 @@ export function formatSearchHits(hits: ToolMeta[], total: number): string {
     const desc = t.description ? ` — ${t.description}` : "";
     return `- ${t.qualified}${desc}\n  params: ${formatParamNames(t.inputSchema)}`;
   });
-  const head = total > hits.length ? `showing ${hits.length} of ${total} matching tool(s)` : `${total} matching tool(s)`;
+  const head =
+    total > hits.length ? `showing ${hits.length} of ${total} matching tool(s)` : `${total} matching tool(s)`;
   return `${head}:\n${lines.join("\n")}`;
 }
 
 /** Shared mode precedence: empty strings read as "not provided" so rendering
  * and behavior agree. */
-export function modeOf(args: { tool?: unknown; search?: unknown; describe?: unknown; server?: unknown }): "call" | "search" | "describe" | "list" | "status" {
+export function modeOf(args: {
+  tool?: unknown;
+  search?: unknown;
+  describe?: unknown;
+  server?: unknown;
+}): "call" | "search" | "describe" | "list" | "status" {
   const has = (v: unknown) => typeof v === "string" && v !== "";
-  return has(args.tool) ? "call" : has(args.search) ? "search" : has(args.describe) ? "describe" : has(args.server) ? "list" : "status";
+  return has(args.tool)
+    ? "call"
+    : has(args.search)
+      ? "search"
+      : has(args.describe)
+        ? "describe"
+        : has(args.server)
+          ? "list"
+          : "status";
 }
 
 /** One-line display for an `mcp` tool call: the selected mode and target. */
-export function renderMcpCall(args: { tool?: unknown; search?: unknown; describe?: unknown; server?: unknown }, theme: Pick<Theme, "fg" | "bold">): string {
+export function renderMcpCall(
+  args: { tool?: unknown; search?: unknown; describe?: unknown; server?: unknown },
+  theme: Pick<Theme, "fg" | "bold">,
+): string {
   const clip = (s: string) => (s.length > 60 ? `${s.slice(0, 57)}...` : s);
   const str = (v: unknown) => (typeof v === "string" && v ? v : "");
   const mode = modeOf(args);
   const target =
-    mode === "call" ? `call ${args.tool}` :
-    mode === "search" ? `search "${clip(str(args.search))}"` :
-    mode === "describe" ? `describe ${args.describe}` :
-    mode === "list" ? `list ${args.server}` :
-    "status";
+    mode === "call"
+      ? `call ${args.tool}`
+      : mode === "search"
+        ? `search "${clip(str(args.search))}"`
+        : mode === "describe"
+          ? `describe ${args.describe}`
+          : mode === "list"
+            ? `list ${args.server}`
+            : "status";
   return theme.fg("toolTitle", theme.bold("mcp ")) + theme.fg("accent", target);
 }
 
@@ -201,7 +227,10 @@ export function registerMcpTool(pi: ExtensionAPI, configPath: string = CONFIG_PA
     state.idleTimer.unref();
   }
 
-  async function listAllTools(client: Client, serverName: string): Promise<Array<{ name: string; description?: string; inputSchema?: unknown }>> {
+  async function listAllTools(
+    client: Client,
+    serverName: string,
+  ): Promise<Array<{ name: string; description?: string; inputSchema?: unknown }>> {
     const tools: Array<{ name: string; description?: string; inputSchema?: unknown }> = [];
     let cursor: string | undefined;
     do {
@@ -219,7 +248,9 @@ export function registerMcpTool(pi: ExtensionAPI, configPath: string = CONFIG_PA
   async function ensureConnected(name: string): Promise<ServerState> {
     const state = servers.get(name);
     if (!state) {
-      throw new Error(`Server "${name}" is not configured. Configured servers: ${[...servers.keys()].join(", ") || "(none)"}`);
+      throw new Error(
+        `Server "${name}" is not configured. Configured servers: ${[...servers.keys()].join(", ") || "(none)"}`,
+      );
     }
     if (state.shuttingDown) throw new Error("MCP is shutting down");
     if (state.invalid) throw new Error(`Server "${name}" has invalid config: ${state.invalid}`);
@@ -351,7 +382,9 @@ Tool names are "server__tool"; a bare name works when unambiguous. Servers conne
         const lines: string[] = [];
         if (configError) lines.push(`config error (${configPath}): ${configError}`);
         for (const [name, state] of servers) {
-          const kind = state.def.url ? `http ${state.def.url}` : `stdio ${state.def.command} ${state.def.args?.join(" ") ?? ""}`;
+          const kind = state.def.url
+            ? `http ${state.def.url}`
+            : `stdio ${state.def.command} ${state.def.args?.join(" ") ?? ""}`;
           const status = state.invalid
             ? `invalid config (${state.invalid})`
             : state.tools
@@ -376,9 +409,8 @@ Tool names are "server__tool"; a bare name works when unambiguous. Servers conne
         const q = (s: string) => s.toLowerCase().includes(query);
         const matching = allTools().filter((t) => q(t.name) || q(t.qualified) || q(t.description ?? ""));
         const hits = matching.slice(0, MAX_SEARCH_RESULTS);
-        const body = matching.length === 0
-          ? `No tools matching "${params.search}".`
-          : formatSearchHits(hits, matching.length);
+        const body =
+          matching.length === 0 ? `No tools matching "${params.search}".` : formatSearchHits(hits, matching.length);
         return reply(body + unreachableNote(failed));
       }
 
@@ -397,7 +429,10 @@ Tool names are "server__tool"; a bare name works when unambiguous. Servers conne
       state.activeCalls++;
       try {
         const result = await withTimeout(
-          state.client!.callTool({ name: tool.name, arguments: params.args ?? {} }, undefined, { timeout: CALL_TIMEOUT_MS, signal }),
+          state.client!.callTool({ name: tool.name, arguments: params.args ?? {} }, undefined, {
+            timeout: CALL_TIMEOUT_MS,
+            signal,
+          }),
           CALL_TIMEOUT_MS + 5_000,
           `Call ${tool.qualified}`,
         );
