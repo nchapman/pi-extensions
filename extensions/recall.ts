@@ -808,7 +808,7 @@ const RecallParams = Type.Object({
 });
 
 const REMINDER_TEXT =
-	"Compaction summarized earlier history. Re-orient before continuing: confirm the current task and the immediate next action (the summary's Next Steps); if either is unclear, search the transcript with `recall` rather than guessing. " +
+	"Compaction summarized earlier history. Re-orient before continuing: confirm the current task and the immediate next action from the most recent messages you can see (the summary may lag the newest work); if either is unclear, search the transcript with `recall` rather than guessing. " +
 	"Compacted turns remain verbatim-searchable via `recall` (decisions, prior attempts, file paths, command outputs).";
 
 function reuseText(context: { lastComponent?: unknown } | undefined): Text {
@@ -995,7 +995,11 @@ export const SUMMARY_ADDENDUM =
 	"The future is not recoverable — treat Next Steps as the most important section: open with the in-flight action " +
 	"(what was literally being done when compaction fired), then the ordered queue with names, paths, and commands " +
 	"specific enough to resume cold without re-reading anything. Never compress Next Steps for brevity; " +
-	"note open questions and blockers explicitly.";
+	"note open questions and blockers explicitly. " +
+	"When a previous summary is provided, treat it as a stale draft: re-derive volatile facts (current git log and HEAD, " +
+	"test counts, what was just committed, what the user most recently asked) from the newest messages rather than copying them; " +
+	"if the messages disagree with the previous summary, the messages win. Never carry Next Steps forward unchanged — " +
+	"rewrite them from the newest messages, which are where the current task state actually lives.";
 
 /**
  * Effective auto-compaction target: the smaller of the configured target and

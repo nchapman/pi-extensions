@@ -754,9 +754,10 @@ describe("registerRecallTool", () => {
 		await fire(events, "session_compact", ctx);
 		const first = (await fire(events, "before_agent_start", ctx)) as { message: { content: string } } | undefined;
 		expect(first?.message.content).toContain("recall");
-		// Not-miss-a-beat contract: the reminder forces re-orientation, not just awareness.
+		// Not-miss-a-beat contract: the reminder forces re-orientation from the freshest
+		// ground truth (kept messages), not just the possibly-stale summary.
 		expect(first?.message.content).toContain("Re-orient");
-		expect(first?.message.content).toContain("Next Steps");
+		expect(first?.message.content).toContain("most recent messages");
 		const second = await fire(events, "before_agent_start", ctx);
 		expect(second).toBeUndefined();
 	});
