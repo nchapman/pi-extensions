@@ -46,6 +46,7 @@ const CONFIG: RecallConfig = {
 	recencyFloor: 0.25,
 	compactTargetTokens: 131_072,
 	ownSummaries: true,
+	summaryThinking: "session",
 	chunkChars: 3000,
 	snippetChars: 400,
 	maxResults: 5,
@@ -1511,6 +1512,42 @@ describe("compaction summary ownership", () => {
 		expect(configFromEnv({ PI_RECALL_COMPACT_TARGET: "nope" }).compactTargetTokens).toBe(131_072);
 		expect(configFromEnv({ PI_RECALL_COMPACT_OWN: "0" }).ownSummaries).toBe(false);
 		expect(configFromEnv({ PI_RECALL_COMPACT_OWN: "nope" }).ownSummaries).toBe(true); // invalid → default with warning
+	});
+
+	it("config parses the summary-thinking knob", () => {
+		expect(configFromEnv({}).summaryThinking).toBe("session");
+		expect(configFromEnv({ PI_RECALL_SUMMARY_THINKING: "off" }).summaryThinking).toBe("off");
+		expect(configFromEnv({ PI_RECALL_SUMMARY_THINKING: "low" }).summaryThinking).toBe("low");
+		expect(configFromEnv({ PI_RECALL_SUMMARY_THINKING: "HIGH" }).summaryThinking).toBe("high");
+		expect(configFromEnv({ PI_RECALL_SUMMARY_THINKING: "turbo" }).summaryThinking).toBe("session"); // invalid → default
+	});
+
+	it("pins the summarization thinking level independently of the session", async () => {
+		const cases = [
+			["off", { id: "test-model", reasoning: true }, "off"],
+			["low", { id: "test-model", reasoning: true }, "low"],
+		] as const;
+		for (const [knob, model, expectedLevel] of cases) {
+			const calls: unknown[] = [];
+			const summarize: SummaryFn = async (args) => {
+				calls.push(args);
+				return { text: "s", usage: {} };
+			};
+			const { pi, events } = makePi();
+			registerRecallTool(pi, { ...CONFIG, summaryThinking: knob }, undefined, { summarize });
+			await fire(events, "session_before_compact", { ...hookCtx(), model, thinkingLevel: "high" }, beforeCompactEvent());
+			expect((calls[0] as { thinkingLevel?: string }).thinkingLevel, knob).toBe(expectedLevel);
+		}
+		// Default mirrors the session level.
+		const calls: unknown[] = [];
+		const summarize: SummaryFn = async (args) => {
+			calls.push(args);
+			return { text: "s", usage: {} };
+		};
+		const { pi, events } = makePi();
+		registerRecallTool(pi, CONFIG, undefined, { summarize });
+		await fire(events, "session_before_compact", { ...hookCtx(), model: { id: "test-model", reasoning: true }, thinkingLevel: "high" }, beforeCompactEvent());
+		expect((calls[0] as { thinkingLevel?: string }).thinkingLevel).toBe("high");
 	});
 });
 

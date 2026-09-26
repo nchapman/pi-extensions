@@ -66,6 +66,8 @@ export interface RecallConfig {
 	compactTargetTokens: number;
 	/** Generate compaction summaries ourselves with recall-aware instructions (PI_RECALL_COMPACT_OWN=0 to opt out). */
 	ownSummaries: boolean;
+	/** Thinking for the summarization call: "session" mirrors the session level; or a fixed ThinkingLevel / "off" (PI_RECALL_SUMMARY_THINKING). */
+	summaryThinking: "session" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	chunkChars: number;
 	snippetChars: number;
 	maxResults: number;
@@ -80,6 +82,7 @@ const DEFAULTS: RecallConfig = {
 	recencyFloor: 0.25,
 	compactTargetTokens: 131_072,
 	ownSummaries: true,
+	summaryThinking: "session",
 	chunkChars: 3000,
 	snippetChars: 400,
 	maxResults: 5,
@@ -108,6 +111,17 @@ function numFromEnv(env: NodeJS.ProcessEnv, name: string, fallback: number, min:
 	return Math.min(max, Math.max(min, v));
 }
 
+function summaryThinkingFromEnv(env: NodeJS.ProcessEnv): RecallConfig["summaryThinking"] {
+	const raw = env.PI_RECALL_SUMMARY_THINKING?.trim().toLowerCase();
+	if (raw === undefined || raw === "") return DEFAULTS.summaryThinking;
+	const valid = new Set(["session", "off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+	if (!valid.has(raw)) {
+		console.error(`recall: PI_RECALL_SUMMARY_THINKING=${raw} is invalid (session|off|minimal|low|medium|high|xhigh|max) — using session`);
+		return DEFAULTS.summaryThinking;
+	}
+	return raw as RecallConfig["summaryThinking"];
+}
+
 export function configFromEnv(env: NodeJS.ProcessEnv = process.env): RecallConfig {
 	const scope = env.PI_RECALL_SCOPE?.trim().toLowerCase();
 	if (scope !== undefined && scope !== "" && scope !== "session" && scope !== "project") {
@@ -120,6 +134,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): RecallConfi
 		recencyFloor: numFromEnv(env, "PI_RECALL_RECENCY_FLOOR", DEFAULTS.recencyFloor, 0, 1),
 		compactTargetTokens: Math.floor(numFromEnv(env, "PI_RECALL_COMPACT_TARGET", DEFAULTS.compactTargetTokens, 0, 10_000_000)),
 		ownSummaries: boolFromEnv(env, "PI_RECALL_COMPACT_OWN", DEFAULTS.ownSummaries),
+		summaryThinking: summaryThinkingFromEnv(env),
 		chunkChars: Math.floor(numFromEnv(env, "PI_RECALL_CHUNK_CHARS", DEFAULTS.chunkChars, 500, 100_000)),
 		snippetChars: Math.floor(numFromEnv(env, "PI_RECALL_SNIPPET_CHARS", DEFAULTS.snippetChars, 100, 10_000)),
 		maxResults: Math.floor(numFromEnv(env, "PI_RECALL_MAX_RESULTS", DEFAULTS.maxResults, 1, 25)),
@@ -936,7 +951,10 @@ export function registerRecallTool(
 			const { text, usage } = await summarize({
 				model,
 				complete: (m, context, options) => ctx.modelRegistry.complete(m, context, options),
-				thinkingLevel: ctx.thinkingLevel,
+				// "session" mirrors the session's thinking level (pi's own summarizer behavior);
+				// a pinned level — including "off", which disables thinking at the API level
+				// for providers like zai — frees the whole output cap for summary text.
+				thinkingLevel: config.summaryThinking === "session" ? ctx.thinkingLevel : config.summaryThinking,
 				// Chronological: older spans first, split-turn prefix last, so the
 				// newest state the prompt re-derives sits at the end of the transcript.
 				messages: [...p.messagesToSummarize, ...p.turnPrefixMessages],
