@@ -15,6 +15,13 @@ import {
 	ProjectCorpusCache,
 	rankChunks,
 	recencyFactor,
+	carryForwardFileLists,
+	effectiveCompactTarget,
+	lastCompactionDetails,
+	mergeSummaryInstructions,
+	SUMMARY_ADDENDUM,
+	shouldAutoCompact,
+	type SummaryFn,
 	registerRecallTool,
 	visibleEntryIds,
 	renderRecallCall,
@@ -34,6 +41,8 @@ const CONFIG: RecallConfig = {
 	foreignWeight: 0.5,
 	halfLifeHours: 4,
 	recencyFloor: 0.25,
+	compactTargetTokens: 131_072,
+	ownSummaries: true,
 	chunkChars: 3000,
 	snippetChars: 400,
 	maxResults: 5,
@@ -92,10 +101,10 @@ function visibleIds(entries: SessionEntry[]): Set<string> {
 	return visibleEntryIds({ entries: entries.map((entry) => ({ sourceEntry: entry, messages: [{}] })) });
 }
 
-function fire(events: Map<string, (event?: unknown, ctx?: unknown) => unknown>, name: string, ctx?: unknown) {
+async function fire(events: Map<string, (event?: unknown, ctx?: unknown) => unknown>, name: string, ctx?: unknown, event?: unknown) {
 	const handler = events.get(name);
 	if (!handler) throw new Error(`no handler registered for ${name}`);
-	return handler({ type: name }, ctx);
+	return handler(event ?? { type: name }, ctx);
 }
 
 /** Branch: [header-ish junk, old user, old thinking, compaction, kept user]. */
@@ -121,6 +130,8 @@ function sessionCtx(overrides?: {
 		model: null,
 	};
 	return {
+		getContextUsage: () => undefined,
+		compact: () => {},
 		sessionManager: {
 			getBranch: () => branch,
 			buildSessionProjection: () => projection,
@@ -740,19 +751,19 @@ describe("registerRecallTool", () => {
 	it("fires a one-shot reminder after compaction", async () => {
 		const { events } = setup();
 		const ctx = sessionCtx();
-		fire(events, "session_compact", ctx);
-		const first = fire(events, "before_agent_start", ctx) as { message: { content: string } } | undefined;
+		await fire(events, "session_compact", ctx);
+		const first = (await fire(events, "before_agent_start", ctx)) as { message: { content: string } } | undefined;
 		expect(first?.message.content).toContain("recall");
-		const second = fire(events, "before_agent_start", ctx);
+		const second = await fire(events, "before_agent_start", ctx);
 		expect(second).toBeUndefined();
 	});
 
 	it("session_start clears a pending reminder", async () => {
 		const { events } = setup();
 		const ctx = sessionCtx();
-		fire(events, "session_compact", ctx);
-		fire(events, "session_start", ctx);
-		expect(fire(events, "before_agent_start", ctx)).toBeUndefined();
+		await fire(events, "session_compact", ctx);
+		await fire(events, "session_start", ctx);
+		expect(await fire(events, "before_agent_start", ctx)).toBeUndefined();
 	});
 });
 
@@ -892,6 +903,254 @@ describe("recency decay", () => {
 
 function isoAdd(iso: string, days: number): string {
 	return new Date(Date.parse(iso) + days * 86_400_000).toISOString();
+}
+
+// ---------------------------------------------------------------------------
+// Context budget & compaction ownership
+// ---------------------------------------------------------------------------
+
+describe("context budget", () => {
+	it("effectiveCompactTarget picks the smaller of config target and window headroom", () => {
+		expect(effectiveCompactTarget(131_072, 200_000)).toBe(131_072);
+		expect(effectiveCompactTarget(131_072, 100_000)).toBe(95_904); // window-bound
+		expect(effectiveCompactTarget(500_000, 200_000)).toBe(195_904); // big target clamps to window
+		expect(effectiveCompactTarget(0, 200_000)).toBeUndefined(); // disabled
+		expect(effectiveCompactTarget(131_072, 4096)).toBeUndefined(); // window nonsense
+		expect(effectiveCompactTarget(131_072, 4097)).toBe(1); // boundary: just above headroom
+		expect(effectiveCompactTarget(131_072, 0)).toBeUndefined();
+	});
+
+	it("shouldAutoCompact gates on tokens, target, and in-flight state", () => {
+		expect(shouldAutoCompact(150_000, 200_000, 131_072, false)).toBe(true);
+		expect(shouldAutoCompact(100_000, 200_000, 131_072, false)).toBe(false);
+		expect(shouldAutoCompact(null, 200_000, 131_072, false)).toBe(false); // tokens unknown
+		expect(shouldAutoCompact(150_000, 200_000, 131_072, true)).toBe(false); // already compacting
+		expect(shouldAutoCompact(150_000, 200_000, 0, false)).toBe(false); // disabled
+	});
+});
+
+describe("summary instructions", () => {
+	it("uses the addendum alone when no user focus exists", () => {
+		expect(mergeSummaryInstructions(SUMMARY_ADDENDUM, undefined)).toBe(SUMMARY_ADDENDUM);
+		expect(mergeSummaryInstructions(SUMMARY_ADDENDUM, "  ")).toBe(SUMMARY_ADDENDUM);
+	});
+
+	it("appends user focus after the addendum", () => {
+		const merged = mergeSummaryInstructions(SUMMARY_ADDENDUM, "focus on the auth refactor");
+		expect(merged.startsWith(SUMMARY_ADDENDUM)).toBe(true);
+		expect(merged).toContain("User focus for this compaction: focus on the auth refactor");
+	});
+
+	it("does not duplicate the addendum our own trigger already passed through", () => {
+		const viaTrigger = mergeSummaryInstructions(SUMMARY_ADDENDUM, SUMMARY_ADDENDUM);
+		expect(viaTrigger).toBe(SUMMARY_ADDENDUM);
+	});
+});
+
+describe("file-list carry-forward", () => {
+	const ops = (read: string[], written: string[], edited: string[]) => ({ read: new Set(read), written: new Set(written), edited: new Set(edited) });
+
+	it("derives lists from current operations alone", () => {
+		expect(carryForwardFileLists(undefined, ops(["a", "c"], ["d"], ["b"]))).toEqual({
+			readFiles: ["a", "c"],
+			modifiedFiles: ["b", "d"],
+		});
+	});
+
+	it("unions with the previous compaction's lists and drops reads that became modified", () => {
+		const prev = { readFiles: ["a", "old.txt"], modifiedFiles: ["b"] };
+		expect(carryForwardFileLists(prev, ops(["a", "c"], ["d"], []))).toEqual({
+			readFiles: ["a", "c", "old.txt"],
+			modifiedFiles: ["b", "d"],
+		});
+	});
+
+	it("drops a previously-read file that is now modified (lands only in modifiedFiles)", () => {
+		expect(carryForwardFileLists({ readFiles: ["a"], modifiedFiles: [] }, ops([], ["a"], []))).toEqual({
+			readFiles: [],
+			modifiedFiles: ["a"],
+		});
+	});
+
+	it("ignores malformed previous details", () => {
+		expect(carryForwardFileLists("nonsense", ops(["a"], [], []))).toEqual({ readFiles: ["a"], modifiedFiles: [] });
+	});
+
+	it("lastCompactionDetails finds the most recent compaction entry", () => {
+		const c1 = compactionEntry("one", "k1");
+		(c1 as { details?: unknown }).details = { readFiles: ["one.txt"], modifiedFiles: [] };
+		const c2 = compactionEntry("two", "k2");
+		(c2 as { details?: unknown }).details = { readFiles: ["two.txt"], modifiedFiles: [] };
+		expect(lastCompactionDetails([c1, msgEntry("user", { content: "hi" }), c2])).toEqual({ readFiles: ["two.txt"], modifiedFiles: [] });
+		expect(lastCompactionDetails([msgEntry("user", { content: "hi" })])).toBeUndefined();
+	});
+});
+
+describe("auto-compact wiring", () => {
+	function setup(usage: { tokens: number | null; contextWindow: number } | undefined) {
+		const compactCalls: Array<Record<string, unknown>> = [];
+		const ctx = {
+			getContextUsage: () => usage,
+			compact: (opts: Record<string, unknown>) => compactCalls.push(opts),
+		};
+		return { ctx, compactCalls };
+	}
+
+	it("triggers compaction once when projected context exceeds the target", async () => {
+		const { ctx, compactCalls } = setup({ tokens: 150_000, contextWindow: 200_000 });
+		const { pi, events } = makePi();
+		registerRecallTool(pi, CONFIG);
+		await fire(events, "before_agent_start", ctx);
+		expect(compactCalls).toHaveLength(1);
+		expect(compactCalls[0].customInstructions).toBe(SUMMARY_ADDENDUM);
+		// In-flight: no second trigger until the first completes.
+		await fire(events, "before_agent_start", ctx);
+		expect(compactCalls).toHaveLength(1);
+		(onCompleteOf(compactCalls[0]) as () => void)();
+		await fire(events, "before_agent_start", ctx);
+		expect(compactCalls).toHaveLength(2);
+	});
+
+	it("does not trigger below the target, on unknown tokens, or when disabled", async () => {
+		const below = setup({ tokens: 100_000, contextWindow: 200_000 });
+		const { pi, events } = makePi();
+		registerRecallTool(pi, CONFIG);
+		await fire(events, "before_agent_start", below.ctx);
+		expect(below.compactCalls).toHaveLength(0);
+
+		const unknown = setup({ tokens: null, contextWindow: 200_000 });
+		await fire(events, "before_agent_start", unknown.ctx);
+		expect(unknown.compactCalls).toHaveLength(0);
+
+		const disabled = setup({ tokens: 190_000, contextWindow: 200_000 });
+		const off = makePi();
+		registerRecallTool(off.pi, { ...CONFIG, compactTargetTokens: 0 });
+		await fire(off.events, "before_agent_start", disabled.ctx);
+		expect(disabled.compactCalls).toHaveLength(0);
+	});
+
+	it("session_compact clears the in-flight flag", async () => {
+		const { ctx, compactCalls } = setup({ tokens: 150_000, contextWindow: 200_000 });
+		const { pi, events } = makePi();
+		registerRecallTool(pi, CONFIG);
+		await fire(events, "before_agent_start", ctx);
+		expect(compactCalls).toHaveLength(1);
+		await fire(events, "session_compact", ctx);
+		await fire(events, "before_agent_start", ctx);
+		expect(compactCalls).toHaveLength(2);
+	});
+});
+
+describe("compaction summary ownership", () => {
+	const SIGNAL = new AbortController().signal;
+
+	function beforeCompactEvent(overrides: Record<string, unknown> = {}) {
+		return {
+			type: "session_before_compact",
+			preparation: {
+				firstKeptEntryId: "kept1",
+				messagesToSummarize: [{ role: "user", content: "do the thing" }],
+				turnPrefixMessages: [],
+				isSplitTurn: false,
+				tokensBefore: 150_000,
+				previousSummary: "## Goal\n- Earlier",
+				fileOps: { read: new Set(["read1.ts"]), written: new Set(["wrote1.ts"]), edited: new Set() },
+				settings: { enabled: true, reserveTokens: 16_384, keepRecentTokens: 20_000 },
+			},
+			branchEntries: [compactionEntry("old summary", "k0")],
+			reason: "threshold",
+			willRetry: false,
+			signal: SIGNAL,
+			...overrides,
+		};
+	}
+
+	function hookCtx() {
+		return {
+			model: { id: "test-model" },
+			modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "sk-test", headers: { "x-test": "1" } }) },
+			thinkingLevel: undefined,
+		};
+	}
+
+	it("generates the summary with recall-aware instructions and carried file lists", async () => {
+		const calls: unknown[] = [];
+		const summarize: SummaryFn = async (args) => {
+			calls.push(args);
+			return { text: "## Goal\n- Recall-aware summary", usage: { totalTokens: 42 } };
+		};
+		const { pi, events } = makePi();
+		registerRecallTool(pi, CONFIG, undefined, { summarize });
+		const result = (await fire(events, "session_before_compact", hookCtx(), beforeCompactEvent())) as {
+			compaction: Record<string, unknown>;
+		};
+		const args = calls[0] as { customInstructions: string; apiKey?: string; previousSummary?: string };
+		expect(args.customInstructions.startsWith(SUMMARY_ADDENDUM)).toBe(true);
+		expect(args.apiKey).toBe("sk-test");
+		expect(args.previousSummary).toBe("## Goal\n- Earlier");
+		expect(result.compaction.summary).toBe("## Goal\n- Recall-aware summary");
+		expect(result.compaction.firstKeptEntryId).toBe("kept1");
+		expect(result.compaction.tokensBefore).toBe(150_000);
+		// Previous compaction entry has no details → lists come from fileOps alone.
+		expect(result.compaction.details).toEqual({ readFiles: ["read1.ts"], modifiedFiles: ["wrote1.ts"] });
+	});
+
+	it("falls back to pi's default (undefined) on failure, empty text, missing model, or opt-out", async () => {
+		const failing: SummaryFn = async () => {
+			throw new Error("model exploded");
+		};
+		const a = makePi();
+		registerRecallTool(a.pi, CONFIG, undefined, { summarize: failing });
+		expect(await fire(a.events, "session_before_compact", hookCtx(), beforeCompactEvent())).toBeUndefined();
+
+		const empty: SummaryFn = async () => ({ text: "   ", usage: {} });
+		const b = makePi();
+		registerRecallTool(b.pi, CONFIG, undefined, { summarize: empty });
+		expect(await fire(b.events, "session_before_compact", hookCtx(), beforeCompactEvent())).toBeUndefined();
+
+		const c = makePi();
+		registerRecallTool(c.pi, CONFIG);
+		expect(await fire(c.events, "session_before_compact", { ...hookCtx(), model: undefined }, beforeCompactEvent())).toBeUndefined();
+
+		const never: SummaryFn = async () => {
+			throw new Error("must not be called");
+		};
+		const d = makePi();
+		registerRecallTool(d.pi, { ...CONFIG, ownSummaries: false }, undefined, { summarize: never });
+		expect(await fire(d.events, "session_before_compact", hookCtx(), beforeCompactEvent())).toBeUndefined();
+	});
+
+	it("declines when auth resolution fails", async () => {
+		const summarize: SummaryFn = async () => ({ text: "unused", usage: {} });
+		const ctx = { ...hookCtx(), modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: false }) } };
+		const { pi, events } = makePi();
+		registerRecallTool(pi, CONFIG, undefined, { summarize });
+		expect(await fire(events, "session_before_compact", ctx, beforeCompactEvent())).toBeUndefined();
+	});
+
+	it("merges user focus from /compact into the addendum", async () => {
+		const calls: unknown[] = [];
+		const summarize: SummaryFn = async (args) => {
+			calls.push(args);
+			return { text: "s", usage: {} };
+		};
+		const { pi, events } = makePi();
+		registerRecallTool(pi, CONFIG, undefined, { summarize });
+		await fire(events, "session_before_compact", hookCtx(), beforeCompactEvent({ customInstructions: "focus on auth" }));
+		expect((calls[0] as { customInstructions: string }).customInstructions).toContain("User focus for this compaction: focus on auth");
+	});
+
+	it("config parses the budget knobs", () => {
+		expect(configFromEnv({ PI_RECALL_COMPACT_TARGET: "60000" }).compactTargetTokens).toBe(60000);
+		expect(configFromEnv({ PI_RECALL_COMPACT_TARGET: "0" }).compactTargetTokens).toBe(0);
+		expect(configFromEnv({ PI_RECALL_COMPACT_TARGET: "nope" }).compactTargetTokens).toBe(131_072);
+		expect(configFromEnv({ PI_RECALL_COMPACT_OWN: "0" }).ownSummaries).toBe(false);
+		expect(configFromEnv({ PI_RECALL_COMPACT_OWN: "nope" }).ownSummaries).toBe(true); // invalid → default with warning
+	});
+});
+
+function onCompleteOf(call: Record<string, unknown>): unknown {
+	return call.onComplete;
 }
 
 // ---------------------------------------------------------------------------

@@ -25,13 +25,27 @@
  *   always model-initiated, so cross-session context can't leak in ambiently.
  * - Cache invariants hold by construction: a plain tool whose results ride at
  *   the tail; no context rewrites, no system-prompt churn, one promptSnippet.
+ * - The extension owns the context budget and the summary: auto-compaction
+ *   fires when projected context exceeds a target (default 128k, well below
+ *   the reasoning-reliability cliff; PI_RECALL_COMPACT_TARGET, 0 disables)
+ *   with pi's near-limit threshold as the mid-run safety net, and every
+ *   compaction — manual /compact included — is summarized through
+ *   session_before_compact with recall-aware instructions (terse working map,
+ *   searchable anchors) via pi's generateSummary plumbing, falling back to
+ *   pi's default summarizer on any failure (PI_RECALL_COMPACT_OWN=0 opts out).
  */
 
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import type { ExtensionAPI, ExtensionContext, SessionEntry, Theme } from "@earendil-works/pi-coding-agent";
+import {
+	generateSummaryWithUsage,
+	type ExtensionAPI,
+	type ExtensionContext,
+	type SessionEntry,
+	type Theme,
+} from "@earendil-works/pi-coding-agent";
 
 export const RECALL_TOOL_NAME = "recall";
 
@@ -46,6 +60,10 @@ export interface RecallConfig {
 	halfLifeHours: number;
 	/** Minimum recency factor so old content fades but never vanishes (1 disables decay). */
 	recencyFloor: number;
+	/** Auto-compact when projected context exceeds this many tokens (0 disables). */
+	compactTargetTokens: number;
+	/** Generate compaction summaries ourselves with recall-aware instructions (PI_RECALL_COMPACT_OWN=0 to opt out). */
+	ownSummaries: boolean;
 	chunkChars: number;
 	snippetChars: number;
 	maxResults: number;
@@ -58,12 +76,24 @@ const DEFAULTS: RecallConfig = {
 	foreignWeight: 0.5,
 	halfLifeHours: 4,
 	recencyFloor: 0.25,
+	compactTargetTokens: 131_072,
+	ownSummaries: true,
 	chunkChars: 3000,
 	snippetChars: 400,
 	maxResults: 5,
 	readChars: 4000,
 	projectMaxBytes: 64 * 1024 * 1024,
 };
+
+function boolFromEnv(env: NodeJS.ProcessEnv, name: string, fallback: boolean): boolean {
+	const raw = env[name];
+	if (raw === undefined || raw.trim() === "") return fallback;
+	const v = raw.trim().toLowerCase();
+	if (["1", "true", "yes", "on"].includes(v)) return true;
+	if (["0", "false", "no", "off"].includes(v)) return false;
+	console.error(`recall: ${name}=${raw} is not a boolean — using ${fallback}`);
+	return fallback;
+}
 
 function numFromEnv(env: NodeJS.ProcessEnv, name: string, fallback: number, min: number, max: number): number {
 	const raw = env[name];
@@ -86,6 +116,8 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): RecallConfi
 		foreignWeight: numFromEnv(env, "PI_RECALL_FOREIGN_WEIGHT", DEFAULTS.foreignWeight, 0, 1),
 		halfLifeHours: numFromEnv(env, "PI_RECALL_HALF_LIFE_HOURS", DEFAULTS.halfLifeHours, 0.1, 1_000_000),
 		recencyFloor: numFromEnv(env, "PI_RECALL_RECENCY_FLOOR", DEFAULTS.recencyFloor, 0, 1),
+		compactTargetTokens: Math.floor(numFromEnv(env, "PI_RECALL_COMPACT_TARGET", DEFAULTS.compactTargetTokens, 0, 10_000_000)),
+		ownSummaries: boolFromEnv(env, "PI_RECALL_COMPACT_OWN", DEFAULTS.ownSummaries),
 		chunkChars: Math.floor(numFromEnv(env, "PI_RECALL_CHUNK_CHARS", DEFAULTS.chunkChars, 500, 100_000)),
 		snippetChars: Math.floor(numFromEnv(env, "PI_RECALL_SNIPPET_CHARS", DEFAULTS.snippetChars, 100, 10_000)),
 		maxResults: Math.floor(numFromEnv(env, "PI_RECALL_MAX_RESULTS", DEFAULTS.maxResults, 1, 25)),
@@ -828,26 +860,81 @@ export function registerRecallTool(
 	pi: ExtensionAPI,
 	config: RecallConfig = configFromEnv(),
 	reader: ProjectReader = fsProjectReader,
+	deps: { summarize?: SummaryFn } = {},
 ): void {
 	let reminderPending = false;
+	let autoCompactInFlight = false;
 	const corpusCache = new ProjectCorpusCache(reader, config.projectMaxBytes, config.chunkChars);
+	const summarize = deps.summarize ?? defaultSummaryFn;
 
 	pi.on("session_start", () => {
 		reminderPending = false;
+		autoCompactInFlight = false;
 	});
 	pi.on("session_compact", () => {
 		reminderPending = true;
+		autoCompactInFlight = false;
 	});
-	pi.on("before_agent_start", () => {
-		if (!reminderPending) return;
-		reminderPending = false;
-		return {
-			message: {
-				customType: "recall.reminder",
-				content: REMINDER_TEXT,
-				display: false,
-			},
-		};
+
+	pi.on("before_agent_start", (_event, ctx) => {
+		// One-shot post-compaction reminder.
+		let message: ReturnType<typeof reminderMessage> | undefined;
+		if (reminderPending) {
+			reminderPending = false;
+			message = reminderMessage();
+		}
+		// Context budget: auto-compact before the turn starts once projected
+		// context exceeds the target (PI_RECALL_COMPACT_TARGET, 0 disables).
+		// pi's own near-limit threshold remains the mid-run safety net.
+		const usage = ctx.getContextUsage();
+		if (shouldAutoCompact(usage?.tokens ?? null, usage?.contextWindow ?? 0, config.compactTargetTokens, autoCompactInFlight)) {
+			autoCompactInFlight = true;
+			ctx.compact({
+				customInstructions: SUMMARY_ADDENDUM,
+				onComplete: () => (autoCompactInFlight = false),
+				onError: () => (autoCompactInFlight = false),
+			});
+		}
+		return message;
+	});
+
+	// Own the summary: every compaction (ours, manual /compact, pi's backstop)
+	// is generated here with recall-aware instructions through pi's hardened
+	// generateSummary plumbing. Any failure returns undefined so pi's default
+	// summarizer takes over — custom compaction must never block compaction.
+	pi.on("session_before_compact", async (event, ctx) => {
+		if (!config.ownSummaries) return;
+		const model = ctx.model;
+		if (!model) return;
+		const p = event.preparation;
+		try {
+			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+			if (!auth.ok) return;
+			const { text, usage } = await summarize({
+				messages: [...p.turnPrefixMessages, ...p.messagesToSummarize],
+				model,
+				reserveTokens: p.settings.reserveTokens,
+				apiKey: auth.apiKey,
+				headers: auth.headers,
+				signal: event.signal,
+				customInstructions: mergeSummaryInstructions(SUMMARY_ADDENDUM, event.customInstructions),
+				previousSummary: p.previousSummary,
+				thinkingLevel: ctx.thinkingLevel,
+			});
+			if (!text.trim()) return;
+			return {
+				compaction: {
+					summary: text,
+					firstKeptEntryId: p.firstKeptEntryId,
+					tokensBefore: p.tokensBefore,
+					usage: usage as NonNullable<Awaited<ReturnType<typeof generateSummaryWithUsage>>["usage"]>,
+					details: carryForwardFileLists(lastCompactionDetails(event.branchEntries), p.fileOps),
+				},
+			};
+		} catch (err) {
+			console.error(`recall: custom summary failed — using pi's default (${err instanceof Error ? err.message : String(err)})`);
+			return;
+		}
 	});
 
 	pi.registerTool({
@@ -877,6 +964,143 @@ export function registerRecallTool(
 		},
 	});
 }
+
+function reminderMessage(): { message: { customType: string; content: string; display: boolean } } {
+	return {
+		message: {
+			customType: "recall.reminder",
+			content: REMINDER_TEXT,
+			display: false,
+		},
+	};
+}
+
+// ---------------------------------------------------------------------------
+// Context budget & compaction ownership
+// ---------------------------------------------------------------------------
+
+/** Never plan to fill the window: headroom kept when clamping the target. */
+const COMPACT_WINDOW_HEADROOM_TOKENS = 4096;
+
+/**
+ * Recall-aware instructions folded into every compaction summary we generate.
+ * The transcript stays verbatim-searchable, so the summary's job changes from
+ * "preserve everything" to "be a working map with searchable anchors".
+ */
+export const SUMMARY_ADDENDUM =
+	"The full transcript remains verbatim-searchable via the recall tool, so brevity is safe — never restate long passages. " +
+	"Write this summary as a working map, not a narrative: lead with decisions and their rationale; " +
+	"preserve exact file paths, identifiers, commands, URLs, and error strings (these are the anchors future recall searches will match); " +
+	"prefer terse lists; note open questions and current state, not history.";
+
+/**
+ * Effective auto-compaction target: the smaller of the configured target and
+ * what the window can hold. `undefined` means "do not auto-compact" (disabled
+ * by config, or a window too small to reason about).
+ */
+export function effectiveCompactTarget(configTarget: number, contextWindow: number): number | undefined {
+	if (configTarget <= 0) return undefined;
+	if (!Number.isFinite(contextWindow) || contextWindow <= COMPACT_WINDOW_HEADROOM_TOKENS) return undefined;
+	return Math.min(configTarget, Math.floor(contextWindow - COMPACT_WINDOW_HEADROOM_TOKENS));
+}
+
+/** Whether the extension should trigger compaction before the next turn starts. */
+export function shouldAutoCompact(
+	tokens: number | null,
+	contextWindow: number,
+	configTarget: number,
+	inFlight: boolean,
+): boolean {
+	if (inFlight || tokens === null) return false;
+	const target = effectiveCompactTarget(configTarget, contextWindow);
+	return target !== undefined && tokens > target;
+}
+
+/**
+ * Merge our recall addendum with any user focus instructions (from /compact
+ * args or our own trigger). If the user text already carries the addendum
+ * (our trigger passes it verbatim), it is returned unchanged.
+ */
+export function mergeSummaryInstructions(addendum: string, userInstructions: string | undefined): string {
+	const user = userInstructions?.trim();
+	if (!user) return addendum;
+	if (user.includes(addendum)) return user;
+	return `${addendum}\n\nUser focus for this compaction: ${user}`;
+}
+
+/** File-operation sets as pi's CompactionPreparation provides them. */
+export interface FileOpsLike {
+	read: Iterable<string>;
+	written: Iterable<string>;
+	edited: Iterable<string>;
+}
+
+/**
+ * File lists for the compaction entry's details, carrying forward the previous
+ * compaction's lists (pi only carries its own summaries' lists forward, so the
+ * extension owns its chain). Same shape as pi's CompactionDetails.
+ */
+export function carryForwardFileLists(
+	previousDetails: unknown,
+	fileOps: FileOpsLike,
+): { readFiles: string[]; modifiedFiles: string[] } {
+	const prev = previousDetails as { readFiles?: unknown; modifiedFiles?: unknown } | null | undefined;
+	const prevRead = Array.isArray(prev?.readFiles) ? (prev!.readFiles as unknown[]) : [];
+	const prevModified = Array.isArray(prev?.modifiedFiles) ? (prev!.modifiedFiles as unknown[]) : [];
+	const modified = new Set<string>([
+		...prevModified.filter((f): f is string => typeof f === "string"),
+		...fileOps.edited,
+		...fileOps.written,
+	]);
+	const read = new Set<string>([
+		...prevRead.filter((f): f is string => typeof f === "string"),
+		...fileOps.read,
+	]);
+	for (const f of modified) read.delete(f);
+	return {
+		readFiles: [...read].sort(),
+		modifiedFiles: [...modified].sort(),
+	};
+}
+
+/** Details of the most recent compaction entry on the branch, if any. */
+export function lastCompactionDetails(branchEntries: SessionEntry[]): unknown {
+	for (let i = branchEntries.length - 1; i >= 0; i--) {
+		const entry = branchEntries[i] as SessionEntry & { details?: unknown };
+		if (entry.type === "compaction") return entry.details;
+	}
+	return undefined;
+}
+
+/** Seam for tests: one LLM-backed summarization call, pi's hardened plumbing underneath. */
+export interface SummaryFnArgs {
+	messages: Parameters<typeof generateSummaryWithUsage>[0];
+	model: Parameters<typeof generateSummaryWithUsage>[1];
+	reserveTokens: number;
+	apiKey: string | undefined;
+	/** Auth headers as pi's resolver returns them (values may be null = removal markers). */
+	headers: Record<string, string | null> | undefined;
+	signal: AbortSignal;
+	customInstructions: string;
+	previousSummary: string | undefined;
+	thinkingLevel: Parameters<typeof generateSummaryWithUsage>[8];
+}
+export type SummaryFn = (args: SummaryFnArgs) => Promise<{ text: string; usage: unknown }>;
+
+const defaultSummaryFn: SummaryFn = async (args) =>
+	generateSummaryWithUsage(
+		args.messages,
+		args.model,
+		args.reserveTokens,
+		args.apiKey,
+		// pi's generateSummary declares non-nullable headers though its own auth
+		// resolver produces nullable ones — same values its internal path passes.
+		args.headers as Record<string, string> | undefined,
+		args.signal,
+		args.customInstructions,
+		args.previousSummary,
+		args.thinkingLevel,
+	);
 
 // ---------------------------------------------------------------------------
 // Tool internals (kept out of the registration closure for testability)
