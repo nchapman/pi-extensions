@@ -5,23 +5,38 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
   agentFromText,
+  buildCommandPrompt,
   BUILTIN_TOOLS,
   buildChildArgs,
   DEFAULT_AGENT_MD,
   extractAssistantText,
+  isValidCommandName,
   loadAgents,
   parseConcurrency,
   parseTimeoutMs,
   refLabel,
+  registerCommandsForAgents,
+  registerSubagentCommands,
   registerSubagentTools,
+  renderSubagentCall,
+  renderSubagentsCall,
   resolveAgentDef,
   runChild,
   runWithLimit,
   splitFrontmatter,
+  summarizeTask,
   type AgentDef,
   type ChildLike,
   type SpawnFn,
 } from "../extensions/subagents";
+
+/** Identity theme: strips styling so assertions see plain text. */
+const THEME = { fg: (_k: string, s: string) => s, bold: (s: string) => s } as never;
+
+/** Render a tool-call component to plain text for assertions. */
+function renderPlain(component: { render: (width: number) => string[] }): string {
+  return component.render(200).join("\n");
+}
 
 const AGENT: AgentDef = {
   name: "reviewer",
@@ -449,9 +464,16 @@ describe("refLabel", () => {
 
 describe("registerSubagentTools", () => {
   function makePi() {
-    const tools = new Map<string, { execute: (id: string, params: unknown, signal?: AbortSignal) => Promise<unknown> }>();
+    const tools = new Map<string, {
+      execute: (id: string, params: unknown, signal?: AbortSignal) => Promise<unknown>;
+      renderCall?: (args: never, theme: never, context?: never) => unknown;
+    }>();
     const pi = {
-      registerTool: (t: { name: string; execute: (id: string, params: unknown, signal?: AbortSignal) => Promise<unknown> }) =>
+      registerTool: (t: {
+        name: string;
+        execute: (id: string, params: unknown, signal?: AbortSignal) => Promise<unknown>;
+        renderCall?: (args: never, theme: never, context?: never) => unknown;
+      }) =>
         tools.set(t.name, t),
     };
     return { pi: pi as never, tools };
@@ -510,6 +532,32 @@ describe("registerSubagentTools", () => {
     expect(result.details.agent).toBe("generic");
   });
 
+  it("tool call rows render the agent name from the call arguments", () => {
+    const dir = mkdtempSync(join(tmpdir(), "agents-"));
+    writeFileSync(join(dir, "reviewer.md"), "---\nname: reviewer\ndescription: d\n---\nBody.");
+    const { pi, tools } = makePi();
+    registerSubagentTools(pi as never, dir);
+
+    const single = tools.get("subagent")!.renderCall!({ agent: "reviewer", task: "t" } as never, THEME);
+    expect(renderPlain(single as never)).toContain("reviewer");
+
+    const batch = tools.get("subagents")!.renderCall!({ tasks: [{ agent: "reviewer", task: "t" }] } as never, THEME);
+    expect(renderPlain(batch as never)).toContain("reviewer");
+  });
+
+  it("tool call rows tolerate partially streamed arguments", () => {
+    const { pi, tools } = makePi();
+    registerSubagentTools(pi as never, mkdtempSync(join(tmpdir(), "agents-")));
+
+    const context = { lastComponent: undefined } as never;
+    const single = tools.get("subagent")!.renderCall!({} as never, THEME, context);
+    expect(renderPlain(single as never)).toContain("subagent ");
+
+    const batch = tools.get("subagents")!.renderCall!({} as never, THEME, context);
+    expect(renderPlain(batch as never)).toContain("subagents");
+    expect(renderPlain(batch as never)).not.toContain("(0)");
+  });
+
   it("surfaces an error section for an unknown agent without failing the batch", async () => {
     const calls: string[][] = [];
     const { pi, tools } = makePi();
@@ -522,5 +570,216 @@ describe("registerSubagentTools", () => {
     expect(result.content[0].text).toContain("### ghost\nERROR: Agent \"ghost\" not found");
     expect(result.content[0].text).toContain("### generic\nok");
     expect(calls.length).toBe(1);
+  });
+});
+
+describe("isValidCommandName", () => {
+  it("accepts single-word names", () => {
+    expect(isValidCommandName("code-reviewer")).toBe(true);
+    expect(isValidCommandName("sme2")).toBe(true);
+    expect(isValidCommandName("_private")).toBe(true);
+  });
+
+  it("rejects names with spaces or empty names", () => {
+    expect(isValidCommandName("two words")).toBe(false);
+    expect(isValidCommandName("")).toBe(false);
+    expect(isValidCommandName("-leading")).toBe(false);
+    expect(isValidCommandName("a/b")).toBe(false);
+  });
+});
+
+describe("buildCommandPrompt", () => {
+  it("names the agent and embeds the task", () => {
+    const prompt = buildCommandPrompt("reviewer", "check the auth flow");
+    expect(prompt).toContain('"reviewer"');
+    expect(prompt).toContain("check the auth flow");
+    expect(prompt).toContain("only sees what you send");
+  });
+});
+
+describe("registerSubagentCommands", () => {
+  interface Registered {
+    description?: string;
+    handler: (args: string, ctx: { ui: { notify: (msg: string, type?: string) => void } }) => Promise<void>;
+  }
+
+  function makePi() {
+    const commands = new Map<string, Registered>();
+    const sendUserMessage = vi.fn();
+    const notify = vi.fn();
+    const ctx = { ui: { notify } };
+    const pi = {
+      registerCommand: (name: string, opts: Registered) => commands.set(name, opts),
+      sendUserMessage,
+    };
+    return { pi: pi as never, commands, sendUserMessage, notify, ctx: ctx as never };
+  }
+
+  function agentsDirWith(files: Record<string, string>): string {
+    const dir = mkdtempSync(join(tmpdir(), "agents-"));
+    for (const [name, text] of Object.entries(files)) writeFileSync(join(dir, name), text);
+    return dir;
+  }
+
+  it("registers one command per agent file, keyed by name with frontmatter description", () => {
+    const dir = agentsDirWith({
+      "code-reviewer.md": "---\nname: code-reviewer\ndescription: Reviews code.\n---\nBody.",
+      "sme.md": "---\nname: subject-matter-expert\ndescription: Deep expertise.\n---\nBody.",
+    });
+    const { pi, commands } = makePi();
+    registerSubagentCommands(pi, dir);
+
+    expect([...commands.keys()].sort()).toEqual(["code-reviewer", "subject-matter-expert"]);
+    expect(commands.get("code-reviewer")!.description).toBe("Reviews code.");
+  });
+
+  it("falls back to a generic description when frontmatter omits one", () => {
+    const dir = agentsDirWith({ "worker.md": "---\nname: worker\n---\nBody." });
+    const { pi, commands } = makePi();
+    registerSubagentCommands(pi, dir);
+
+    expect(commands.get("worker")!.description).toBe("Delegate a task to the worker subagent");
+  });
+
+  it("filename is the fallback command name", () => {
+    const dir = agentsDirWith({ "lint.md": "---\ndescription: Lints.\n---\nBody." });
+    const { pi, commands } = makePi();
+    registerSubagentCommands(pi, dir);
+
+    expect(commands.has("lint")).toBe(true);
+  });
+
+  it("sends a delegation user message when invoked with a task", async () => {
+    const dir = agentsDirWith({ "code-reviewer.md": "---\nname: code-reviewer\ndescription: Reviews code.\n---\nBody." });
+    const { pi, commands, sendUserMessage, ctx } = makePi();
+    registerSubagentCommands(pi, dir);
+
+    await commands.get("code-reviewer")!.handler("  review src/auth.ts  ", ctx);
+
+    expect(sendUserMessage).toHaveBeenCalledTimes(1);
+    const [message, options] = sendUserMessage.mock.calls[0] as [string, { deliverAs?: string }];
+    expect(message).toContain('"code-reviewer"');
+    expect(message).toContain("review src/auth.ts");
+    expect(options?.deliverAs).toBe("followUp");
+  });
+
+  it("notifies usage instead of sending when invoked without a task", async () => {
+    const dir = agentsDirWith({ "code-reviewer.md": "---\nname: code-reviewer\ndescription: Reviews code.\n---\nBody." });
+    const { pi, commands, sendUserMessage, notify, ctx } = makePi();
+    registerSubagentCommands(pi, dir);
+
+    await commands.get("code-reviewer")!.handler("   ", ctx);
+
+    expect(sendUserMessage).not.toHaveBeenCalled();
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify.mock.calls[0][0]).toContain("Usage: /code-reviewer <task>");
+    expect(notify.mock.calls[0][0]).toContain("Reviews code.");
+  });
+
+  it("skips agents whose names are not valid command names", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const dir = agentsDirWith({
+        "weird.md": "---\nname: two words\ndescription: d\n---\nBody.",
+        "fine.md": "---\nname: fine\ndescription: d\n---\nBody.",
+      });
+      const { pi, commands } = makePi();
+      registerSubagentCommands(pi, dir);
+
+      expect([...commands.keys()]).toEqual(["fine"]);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('"two words"'));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("skips agent names reserved by pi built-in commands", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const dir = agentsDirWith({
+        "copy.md": "---\nname: copy\ndescription: A copywriter.\n---\nBody.",
+        "fine.md": "---\nname: fine\ndescription: d\n---\nBody.",
+      });
+      const { pi, commands } = makePi();
+      registerSubagentCommands(pi, dir);
+
+      expect([...commands.keys()]).toEqual(["fine"]);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("reserved"));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("registers the first command for a duplicated agent name and skips the rest", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const first: AgentDef = { name: "reviewer", description: "first", instructions: "A", tools: [...BUILTIN_TOOLS] };
+      const second: AgentDef = { name: "reviewer", description: "second", instructions: "B", tools: [...BUILTIN_TOOLS] };
+      const { pi, commands } = makePi();
+      registerCommandsForAgents(pi, [first, second]);
+
+      expect([...commands.keys()]).toEqual(["reviewer"]);
+      expect(commands.get("reviewer")!.description).toBe("first");
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("duplicate"));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("registers nothing when the agents directory is empty or missing", () => {
+    const { pi, commands } = makePi();
+    registerSubagentCommands(pi, mkdtempSync(join(tmpdir(), "agents-")));
+    expect(commands.size).toBe(0);
+
+    registerSubagentCommands(pi, join(tmpdir(), "does-not-exist-xyz"));
+    expect(commands.size).toBe(0);
+  });
+});
+
+describe("summarizeTask", () => {
+  it("passes short tasks through", () => {
+    expect(summarizeTask("review src/auth.ts")).toBe("review src/auth.ts");
+  });
+
+  it("collapses whitespace to one line", () => {
+    expect(summarizeTask("line one\n   line two\t\ttab")).toBe("line one line two tab");
+  });
+
+  it("truncates long tasks with an ellipsis", () => {
+    const out = summarizeTask("x".repeat(100));
+    expect(out.length).toBe(72);
+    expect(out.endsWith("...")).toBe(true);
+  });
+});
+
+describe("tool call rendering", () => {
+  it("subagent call shows the named agent and task summary", () => {
+    const text = renderSubagentCall("code-reviewer", "review the staged changes", THEME as never);
+    expect(text).toContain("subagent ");
+    expect(text).toContain("code-reviewer");
+    expect(text).toContain("review the staged changes");
+  });
+
+  it("subagent call truncates long tasks", () => {
+    const text = renderSubagentCall("reviewer", `${"y".repeat(100)}\nmore`, THEME as never);
+    expect(text.length).toBeLessThanOrEqual("subagent ".length + "reviewer".length + 3 + 72);
+    expect(text).toContain("...");
+  });
+
+  it("subagents call shows the count and every agent name", () => {
+    const text = renderSubagentsCall(["reviewer", "generic", "inline-x"], THEME as never);
+    expect(text).toContain("subagents (3)");
+    expect(text).toContain("reviewer, generic, inline-x");
+  });
+
+  it("subagents call caps the name list", () => {
+    const text = renderSubagentsCall(["a", "b", "c", "d", "e"], THEME as never);
+    expect(text).toContain("subagents (5)");
+    expect(text).toContain("a, b, c, d, ...");
+    expect(text).not.toContain(" e");
+  });
+
+  it("subagents call without names renders a bare title", () => {
+    expect(renderSubagentsCall([], THEME as never)).toBe("subagents");
   });
 });

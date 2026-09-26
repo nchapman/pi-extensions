@@ -3,8 +3,9 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import type { AgentToolResult, ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 
 export const BUILTIN_TOOLS = ["read", "write", "edit", "bash", "grep", "find", "ls"];
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
@@ -334,6 +335,30 @@ export async function runWithLimit<T>(jobs: Array<() => Promise<T>>, limit: numb
   return results;
 }
 
+/** Collapse a task to a single display line, capped for tool-call rows. */
+export function summarizeTask(task: string, max = 72): string {
+  const oneLine = task.trim().replace(/\s+/g, " ");
+  return oneLine.length <= max ? oneLine : `${oneLine.slice(0, max - 3)}...`;
+}
+
+const MAX_RENDERED_NAMES = 4;
+
+/** One-line display for a `subagent` tool call: the agent's name and task. */
+export function renderSubagentCall(agentName: string, task: string, theme: Pick<Theme, "fg" | "bold">): string {
+  let text = theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("accent", agentName);
+  const summary = summarizeTask(task);
+  if (summary) text += theme.fg("dim", ` — ${summary}`);
+  return text;
+}
+
+/** One-line display for a `subagents` batch call: the count and agent names. */
+export function renderSubagentsCall(agentNames: string[], theme: Pick<Theme, "fg" | "bold">): string {
+  const shown = agentNames.slice(0, MAX_RENDERED_NAMES).join(", ") + (agentNames.length > MAX_RENDERED_NAMES ? ", ..." : "");
+  let text = theme.fg("toolTitle", theme.bold(agentNames.length ? `subagents (${agentNames.length})` : "subagents"));
+  if (shown) text += theme.fg("accent", ` ${shown}`);
+  return text;
+}
+
 const taskField = Type.String({ description: "The task to delegate, with full context" });
 const modelField = Type.Optional(Type.String({ description: "Model override (provider/id)" }));
 const taskItem = Type.Object({
@@ -345,8 +370,8 @@ const taskItem = Type.Object({
 
 const AGENTS_DIR = join(homedir(), ".pi/agent/agents");
 
-export function registerSubagentTools(pi: ExtensionAPI, agentsDir: string = AGENTS_DIR, spawnFn: SpawnFn = defaultSpawn): void {
-  const agents = loadAgents(agentsDir);
+export function registerSubagentTools(pi: ExtensionAPI, agentsDir: string = AGENTS_DIR, spawnFn: SpawnFn = defaultSpawn, preloadedAgents?: AgentDef[]): void {
+  const agents = preloadedAgents ?? loadAgents(agentsDir);
   const agentList = agents.length
     ? agents.map((a) => `- ${a.name}: ${a.description || "(no description)"}`).join("\n")
     : `(no agents found in ${agentsDir})`;
@@ -365,6 +390,13 @@ The subagent runs to completion and returns its final response. Use for reviews,
       "For a bespoke specialist, pass agent_md with the exact instructions and tool restrictions instead of forcing a named agent to fit.",
     ],
     parameters: taskItem,
+    renderCall(args, theme, context) {
+      // Arguments stream in partially; guard until `task` arrives.
+      const task = typeof args?.task === "string" ? args.task : "";
+      const text = context?.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
+      text.setText(renderSubagentCall(refLabel(args ?? {}), task, theme));
+      return text;
+    },
     async execute(_id, params, signal, onUpdate) {
       const list = loadAgents(agentsDir);
       const agent = resolveAgentDef(list, params);
@@ -387,6 +419,13 @@ Each task may instead include agent_md (an inline agent definition) or omit both
     parameters: Type.Object({
       tasks: Type.Array(taskItem, { minItems: 1, description: "Tasks to run in parallel" }),
     }),
+    renderCall(args, theme, context) {
+      // Arguments stream in partially; guard until `tasks` is a complete array.
+      const names = Array.isArray(args?.tasks) ? args.tasks.map((t) => refLabel(t ?? {})) : [];
+      const text = context?.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
+      text.setText(renderSubagentsCall(names, theme));
+      return text;
+    },
     async execute(_id, params, signal) {
       const list = loadAgents(agentsDir);
       const timeoutMs = parseTimeoutMs(process.env);
@@ -407,6 +446,67 @@ Each task may instead include agent_md (an inline agent definition) or omit both
   });
 }
 
+/** Command names must be a single word: letters, digits, hyphens, underscores. */
+export function isValidCommandName(name: string): boolean {
+  return /^[A-Za-z0-9_][A-Za-z0-9_-]*$/.test(name);
+}
+
+/** User message sent by an agent command. Generic across agents — the agent's
+ * own definition carries its instructions, so only the task varies. */
+export function buildCommandPrompt(agentName: string, task: string): string {
+  return `Delegate the task below to the "${agentName}" subagent using the subagent tool — pass the text verbatim as the task. The subagent only sees what you send, so include all context it needs (files, diffs, errors, constraints):\n\n${task}`;
+}
+
+/** pi's built-in commands take precedence over extension commands with the
+ * same name, so registering these would produce unreachable commands. Derived
+ * from the documented built-in list; may lag pi releases. Also includes
+ * `llama`, which collides with a command from pi's bundled llama extension. */
+const RESERVED_COMMAND_NAMES = new Set([
+  "settings", "model", "thinking", "scoped-models", "login", "logout", "llama",
+  "new", "resume", "name", "session", "tree", "fork", "clone", "compact", "import",
+  "copy", "export", "share", "bug", "trust", "reload", "hotkeys", "changelog", "quit",
+]);
+
+/** Register one `/name` command per agent. Invoking `/name task` sends a user
+ * message that delegates `task` to that subagent. Pure over the agent list so
+ * callers control discovery and ordering. */
+export function registerCommandsForAgents(pi: ExtensionAPI, agents: readonly AgentDef[]): void {
+  const seen = new Set<string>();
+  for (const agent of agents) {
+    if (!isValidCommandName(agent.name)) {
+      console.warn(`subagents: skipping command for "${agent.name}": name must be a single word (letters, digits, hyphens, underscores)`);
+      continue;
+    }
+    if (RESERVED_COMMAND_NAMES.has(agent.name)) {
+      console.warn(`subagents: skipping command for "${agent.name}": reserved by a pi built-in command; the agent is still available via the subagent tool`);
+      continue;
+    }
+    if (seen.has(agent.name)) {
+      console.warn(`subagents: skipping duplicate command for "${agent.name}"; the subagent tool resolves to the first agent with that name`);
+      continue;
+    }
+    seen.add(agent.name);
+    pi.registerCommand(agent.name, {
+      description: agent.description || `Delegate a task to the ${agent.name} subagent`,
+      handler: async (args, ctx) => {
+        const task = args.trim();
+        if (!task) {
+          ctx.ui.notify(`Usage: /${agent.name} <task> — ${agent.description || "define a description in the agent's frontmatter"}`, "info");
+          return;
+        }
+        pi.sendUserMessage(buildCommandPrompt(agent.name, task), { deliverAs: "followUp" });
+      },
+    });
+  }
+}
+
+/** Register commands for every agent discovered in `agentsDir`. */
+export function registerSubagentCommands(pi: ExtensionAPI, agentsDir: string = AGENTS_DIR): void {
+  registerCommandsForAgents(pi, loadAgents(agentsDir));
+}
+
 export default function (pi: ExtensionAPI) {
-  registerSubagentTools(pi);
+  const agents = loadAgents(AGENTS_DIR);
+  registerSubagentTools(pi, AGENTS_DIR, defaultSpawn, agents);
+  registerCommandsForAgents(pi, agents);
 }
