@@ -469,9 +469,9 @@ describe("rankChunks", () => {
 
 	it("skips chunks that tokenized to nothing instead of dividing by zero", () => {
 		const chunk = {
-			ref: "aaaaaaaa", entryId: "aaaaaaaa", origin: "current", sessionId: "s",
+			ref: "aaaaaaaa", entryId: "aaaaaaaa", origin: "current",
 			sessionLabel: "current session", kind: "user", timestamp: "2026-09-26T10:00:00.000Z",
-			text: "   ", charOffset: 0,
+			text: "   ",
 		} as never;
 		expect(rankChunks([chunk as never], "auth", 0.5)).toEqual([]);
 	});
@@ -800,6 +800,36 @@ describe("registerRecallTool", () => {
 		expect(first.content[0].text).toContain('"offset": 30');
 		const second = (await run({ mode: "read", id: target.id, offset: 10 }, ctx)) as { content: Array<{ text: string }> };
 		expect(second.content[0].text).toContain("[chars 10-40 of 52]");
+		const clamped = (await run({ mode: "read", id: target.id, offset: -5 }, ctx)) as { content: Array<{ text: string }> };
+		expect(clamped.content[0].text).toContain("[chars 0-30 of 52]"); // negative offset sanitizes to 0
+	});
+
+	it("clamps the limit param into [1, 25] with the config default as fallback", async () => {
+		const { run } = setup();
+		const archived1 = msgEntry("user", { content: "we chose rotation for tokens" }, "2026-09-26T09:00:00.000Z");
+		const archived2 = msgEntry("user", { content: "rotation confirmed later" }, "2026-09-26T09:30:00.000Z");
+		const kept = msgEntry("user", { content: "current turn" }, "2026-09-26T11:00:00.000Z");
+		const ctx = sessionCtx({ branch: [archived1, archived2, kept], contextEntries: [kept] });
+		const all = (await run({ query: "rotation" }, ctx)) as { details: { hits: unknown[] } }; // default limit (5)
+		expect(all.details.hits).toHaveLength(2);
+		const zero = (await run({ query: "rotation", limit: 0 }, ctx)) as { details: { hits: unknown[] } };
+		expect(zero.details.hits).toHaveLength(1); // floored to 1
+		const negative = (await run({ query: "rotation", limit: -3 }, ctx)) as { details: { hits: unknown[] } };
+		expect(negative.details.hits).toHaveLength(1);
+	});
+
+	it("honors defaultScope: 'project' without an explicit scope param", async () => {
+		const foreign = sessionFile({ entries: [userLine("the uniquely findable foreign thing")] });
+		const { reader, dir } = fakeReader([foreign]);
+		const { pi, tools } = makePi();
+		registerRecallTool(pi, { ...CONFIG, defaultScope: "project" }, reader);
+		const ctx = sessionCtx({ sessionDir: dir });
+		const result = (await tools.get(RECALL_TOOL_NAME)!.execute("t", { query: "uniquely findable" }, undefined, undefined, ctx)) as {
+			content: Array<{ text: string }>;
+			details: { scope: string; hits: Array<{ ref: string }> };
+		};
+		expect(result.details.scope).toBe("project");
+		expect(result.details.hits[0].ref).toContain("."); // dotted = foreign-session ref
 	});
 
 	it("read mode requires a valid id", async () => {
@@ -1107,6 +1137,7 @@ describe("context budget", () => {
 		expect(shouldAutoCompact(null, 200_000, 131_072, false)).toBe(false); // tokens unknown
 		expect(shouldAutoCompact(150_000, 200_000, 131_072, true)).toBe(false); // already compacting
 		expect(shouldAutoCompact(150_000, 200_000, 0, false)).toBe(false); // disabled
+		expect(shouldAutoCompact(131_072, 200_000, 131_072, false)).toBe(false); // exactly at target: not over
 	});
 });
 
@@ -1287,6 +1318,21 @@ describe("compaction summary ownership", () => {
 		expect(result.compaction.details).toEqual({ readFiles: ["read1.ts"], modifiedFiles: ["wrote1.ts"] });
 	});
 
+	it("re-ceives the auto-compact trigger's addendum verbatim, never wrapped as user focus", async () => {
+		const calls: unknown[] = [];
+		const summarize: SummaryFn = async (args) => {
+			calls.push(args);
+			return { text: "## Goal\n- ok", usage: { totalTokens: 1 } };
+		};
+		const { pi, events } = makePi();
+		registerRecallTool(pi, CONFIG, undefined, { summarize });
+		// The budget trigger passes SUMMARY_ADDENDUM itself as customInstructions.
+		await fire(events, "session_before_compact", hookCtx(), beforeCompactEvent({ customInstructions: SUMMARY_ADDENDUM }));
+		const args = calls[0] as { customInstructions: string };
+		expect(args.customInstructions).toBe(SUMMARY_ADDENDUM);
+		expect(args.customInstructions).not.toContain("User focus");
+	});
+
 	it("falls back to pi's default (undefined) on failure, empty text, missing model, or opt-out", async () => {
 		const failing: SummaryFn = async () => {
 			throw new Error("model exploded");
@@ -1429,10 +1475,9 @@ describe("review regressions", () => {
 		const read = (await tools.get(RECALL_TOOL_NAME)!.execute("t", { mode: "read", id: ref }, undefined, undefined, ctx)) as {
 			content: Array<{ text: string }>;
 		};
-		// The rebuild reindexes the shifted file; the old ref must not silently
-		// return different content — either the entry moved (not found) or the
-		// id check caught the shift. Both are explicit outcomes, never wrong data.
-		expect(read.content[0].text).toMatch(/Error:|shift line/);
+		// The rebuild reindexes the shifted file with fresh entry ids, so the old ref
+		// must miss — never silently return the shifted entry under the old ref.
+		expect(read.content[0].text).toContain("Error:");
 	});
 
 	it("reports an unreadable session line instead of throwing bad JSON", async () => {

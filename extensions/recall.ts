@@ -327,15 +327,11 @@ export interface RecallChunk {
 	ref: string; // stable read reference (entryId, or entryId.sess for foreign)
 	entryId: string;
 	origin: "current" | "foreign";
-	sessionId: string; // current session id, or the foreign session's id
 	sessionLabel: string; // "current session" or "past session <name> <date>"
-	file?: string; // session file path for foreign chunks
-	line?: number; // 1-based line of the entry in its file (foreign reads)
 	kind: RecallKind;
 	label?: string;
 	timestamp: string;
 	text: string;
-	charOffset: number;
 }
 
 function makeRef(entryId: string, origin: "current" | "foreign", sessionId: string): string {
@@ -356,7 +352,7 @@ export function parseRef(ref: string): { entryId: string; sessionIdShort?: strin
 /** Chunk every indexable section of one entry. */
 export function chunksFromEntry(
 	entry: SessionEntry,
-	meta: { origin: "current" | "foreign"; sessionId: string; sessionLabel: string; file?: string; line?: number },
+	meta: { origin: "current" | "foreign"; sessionId: string; sessionLabel: string },
 	chunkChars: number,
 ): RecallChunk[] {
 	const chunks: RecallChunk[] = [];
@@ -366,15 +362,11 @@ export function chunksFromEntry(
 				ref: makeRef(entry.id, meta.origin, meta.sessionId),
 				entryId: entry.id,
 				origin: meta.origin,
-				sessionId: meta.sessionId,
 				sessionLabel: meta.sessionLabel,
-				file: meta.file,
-				line: meta.line,
 				kind: section.kind,
 				label: section.label,
 				timestamp: entry.timestamp,
 				text: piece.text,
-				charOffset: piece.charOffset,
 			});
 		}
 	}
@@ -467,7 +459,11 @@ export function rankChunks(
 ): ScoredChunk[] {
 	const queryTokens = [...new Set(tokenize(query))];
 	if (queryTokens.length === 0 || chunks.length === 0) return [];
-	const frontier = Math.max(...chunks.map((c) => tsMs(c.timestamp)));
+	const frontier = (() => {
+		let newest = -Infinity;
+		for (const c of chunks) newest = Math.max(newest, tsMs(c.timestamp));
+		return newest;
+	})();
 	const halfLifeMs = halfLifeHours * 3_600_000;
 	const { terms, df, avgLength } = indexChunks(chunks);
 	const N = chunks.length;
@@ -681,7 +677,7 @@ export function buildFileCorpus(file: string, content: string, chunkChars = 3000
 		entryLines.set(entry.id, i + 1);
 		const sessionEntry = parsed as SessionEntry;
 		const label = `past session ${name ? `"${name.slice(0, labelMax)}" ` : ""}${sessionDate}`;
-		for (const chunk of chunksFromEntry(sessionEntry, { origin: "foreign", sessionId, sessionLabel: label, file }, chunkChars)) {
+		for (const chunk of chunksFromEntry(sessionEntry, { origin: "foreign", sessionId, sessionLabel: label }, chunkChars)) {
 			chunks.push(chunk);
 			bytes += chunk.text.length;
 		}
@@ -1149,7 +1145,8 @@ async function search(
 		const dir = sm.getSessionDir();
 		let corpora: FileCorpus[] = [];
 		try {
-			({ corpora, skipped: skippedFiles } = await refreshProjectCache(corpusCache, dir, sm.getSessionFile()));
+			skippedFiles = await corpusCache.refresh(dir, sm.getSessionFile());
+			corpora = corpusCache.list();
 		} catch (err) {
 			return errorResult(`project scope unavailable: ${err instanceof Error ? err.message : String(err)}`, details);
 		}
@@ -1178,15 +1175,6 @@ async function search(
 }
 
 /** Resolve the project cache through the injected reader (test seam). */
-async function refreshProjectCache(
-	cache: ProjectCorpusCache,
-	dir: string,
-	skipFile: string | undefined,
-): Promise<{ corpora: FileCorpus[]; skipped: number }> {
-	const skipped = await cache.refresh(dir, skipFile);
-	return { corpora: cache.list(), skipped };
-}
-
 async function readEntry(
 	params: { id?: string; offset?: number },
 	ctx: ExtensionContext,
