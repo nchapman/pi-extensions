@@ -1157,6 +1157,15 @@ describe("summary instructions", () => {
 		const viaTrigger = mergeSummaryInstructions(SUMMARY_ADDENDUM, SUMMARY_ADDENDUM);
 		expect(viaTrigger).toBe(SUMMARY_ADDENDUM);
 	});
+
+	it("enforces a hard output budget well under the summarizer's token cap", () => {
+		// pi cuts summarization at 0.8 × compaction.reserveTokens (13,107 output tokens at the
+		// default 16,384) and discards a length-stopped summary whole — the addendum must keep
+		// the model's output far enough under that cap that reasoning tokens can't push it over.
+		expect(SUMMARY_ADDENDUM).toContain("under 8,000 characters");
+		expect(SUMMARY_ADDENDUM).toContain("discarded whole");
+		expect(SUMMARY_ADDENDUM.length).toBeLessThan(2_500);
+	});
 });
 
 describe("file-list carry-forward", () => {

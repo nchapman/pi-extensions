@@ -1019,6 +1019,9 @@ export const SUMMARY_ADDENDUM =
 	"The full transcript remains verbatim-searchable via the recall tool, so the past can be summarized tersely: " +
 	"never restate long passages, prefer lists, lead with decisions and their rationale, and preserve exact file paths, " +
 	"identifiers, commands, URLs, and error strings (these are the anchors future recall searches will match). " +
+	"Hard budget: the entire summary must stay under 8,000 characters — the generation is cut off at a fixed token cap, " +
+	"and a cut-off summary is discarded whole. When space is tight, compress Done detail first (it is recall-searchable); " +
+	"never drop or shorten Next Steps, active decisions' rationale, or exact strings still in use. " +
 	"The future is not recoverable — treat Next Steps as the most important section: open with the in-flight action " +
 	"(what was literally being done when compaction fired), then the ordered queue with names, paths, and commands " +
 	"specific enough to resume cold without re-reading anything. Never compress Next Steps for brevity; " +
