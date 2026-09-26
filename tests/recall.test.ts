@@ -46,6 +46,7 @@ const CONFIG: RecallConfig = {
 	recencyFloor: 0.25,
 	compactTargetTokens: 131_072,
 	ownSummaries: true,
+	summaryChars: 5_000,
 	summaryThinking: "session",
 	chunkChars: 3000,
 	snippetChars: 400,
@@ -1160,7 +1161,7 @@ describe("summarization prompt", () => {
 		expect(prompt).toContain("<conversation>\n[User]: do the thing\n</conversation>");
 		expect(prompt).not.toContain("<previous-summary>");
 		// The hard budget keeps the generation under our output cap.
-		expect(prompt).toContain("under 8,000 characters");
+		expect(prompt).toContain("under 5,000 characters");
 		expect(prompt).toContain("discarded whole");
 		// Fully owned: nothing rides pi's built-in summarizer prompt.
 		expect(prompt).not.toContain("Additional focus");
@@ -1368,7 +1369,7 @@ describe("compaction summary ownership", () => {
 		expect(prompt.indexOf("older-span work")).toBeLessThan(prompt.indexOf("split turn prefix"));
 		expect(prompt).toContain("<previous-summary>\n## Goal\n- Earlier\n</previous-summary>");
 		expect(prompt).toContain("## Next Steps");
-		expect(prompt).toContain("under 8,000 characters");
+		expect(prompt).toContain("under 5,000 characters");
 		// pi's own summarizer conventions: one-off prompt (no cache writes), bounded
 		// output, fresh routing id, abortable.
 		expect(call.options.maxTokens).toBe(8192);
@@ -1451,6 +1452,73 @@ describe("compaction summary ownership", () => {
 		expect(crumbs).toEqual([expect.stringContaining("fell back to pi default: Summarization attempted to call a tool")]);
 	});
 
+	it("plumbs the configured character budget into the prompt", async () => {
+		const calls: CapturedCall[] = [];
+		const { pi, events } = makePi();
+		registerRecallTool(pi, { ...CONFIG, summaryChars: 3_000 });
+		await fire(events, "session_before_compact", hookCtx(okComplete(calls)), beforeCompactEvent());
+		const prompt = (calls[0].context.messages[0].content as { type: string; text: string }[])[0].text;
+		expect(prompt).toContain("under 3,000 characters");
+	});
+
+	it("retries a transient provider failure in place and keeps ownership", async () => {
+		const crumbs: string[] = [];
+		let calls = 0;
+		const flaky = async () => {
+			calls++;
+			if (calls === 1) return { content: [], usage: {}, stopReason: "error", errorMessage: "connection error" };
+			return { content: [{ type: "text", text: "our summary" }], usage: {}, stopReason: "stop" };
+		};
+		const { pi, events } = makePi();
+		registerRecallTool(pi, CONFIG, undefined, { logCompactionError: (l) => crumbs.push(l), retryDelayMs: 0 });
+		const result = (await fire(events, "session_before_compact", hookCtx(flaky), beforeCompactEvent())) as { compaction: { summary: string } };
+		expect(calls).toBe(2);
+		expect(result.compaction.summary).toBe("our summary");
+		expect(crumbs).toEqual([]);
+	});
+
+	it("gives up after three transient attempts and falls back with a crumb", async () => {
+		const crumbs: string[] = [];
+		let calls = 0;
+		const alwaysDown = async () => {
+			calls++;
+			return { content: [], usage: {}, stopReason: "error", errorMessage: "connection error" };
+		};
+		const { pi, events } = makePi();
+		registerRecallTool(pi, CONFIG, undefined, { logCompactionError: (l) => crumbs.push(l), retryDelayMs: 0 });
+		expect(await fire(events, "session_before_compact", hookCtx(alwaysDown), beforeCompactEvent())).toBeUndefined();
+		expect(calls).toBe(3);
+		expect(crumbs).toEqual([expect.stringContaining("fell back to pi default: connection error")]);
+	});
+
+	it("does not retry deterministic failures (output cap)", async () => {
+		const crumbs: string[] = [];
+		let calls = 0;
+		const capped = async () => {
+			calls++;
+			return { content: [{ type: "text", text: "partial" }], usage: {}, stopReason: "length" };
+		};
+		const { pi, events } = makePi();
+		registerRecallTool(pi, CONFIG, undefined, { logCompactionError: (l) => crumbs.push(l), retryDelayMs: 0 });
+		expect(await fire(events, "session_before_compact", hookCtx(capped), beforeCompactEvent())).toBeUndefined();
+		expect(calls).toBe(1);
+		expect(crumbs).toEqual([expect.stringContaining("fell back to pi default: summarizer hit the output cap")]);
+	});
+
+	it("does not retry custom summarize seams (unflagged errors)", async () => {
+		const crumbs: string[] = [];
+		let calls = 0;
+		const summarize: SummaryFn = async () => {
+			calls++;
+			throw new Error("custom seam failure");
+		};
+		const { pi, events } = makePi();
+		registerRecallTool(pi, CONFIG, undefined, { summarize, logCompactionError: (l) => crumbs.push(l), retryDelayMs: 0 });
+		expect(await fire(events, "session_before_compact", hookCtx(), beforeCompactEvent())).toBeUndefined();
+		expect(calls).toBe(1);
+		expect(crumbs).toEqual([expect.stringContaining("fell back to pi default: custom seam failure")]);
+	});
+
 	it("clamps maxTokens to the model's declared output cap", async () => {
 		const calls: CapturedCall[] = [];
 		const { pi, events } = makePi();
@@ -1520,6 +1588,13 @@ describe("compaction summary ownership", () => {
 		expect(configFromEnv({ PI_RECALL_SUMMARY_THINKING: "low" }).summaryThinking).toBe("low");
 		expect(configFromEnv({ PI_RECALL_SUMMARY_THINKING: "HIGH" }).summaryThinking).toBe("high");
 		expect(configFromEnv({ PI_RECALL_SUMMARY_THINKING: "turbo" }).summaryThinking).toBe("session"); // invalid → default
+	});
+
+	it("config parses the summary character budget", () => {
+		expect(configFromEnv({}).summaryChars).toBe(5_000);
+		expect(configFromEnv({ PI_RECALL_SUMMARY_CHARS: "3000" }).summaryChars).toBe(3_000);
+		expect(configFromEnv({ PI_RECALL_SUMMARY_CHARS: "10" }).summaryChars).toBe(500); // clamped
+		expect(configFromEnv({ PI_RECALL_SUMMARY_CHARS: "999999" }).summaryChars).toBe(20_000); // clamped
 	});
 
 	it("pins the summarization thinking level independently of the session", async () => {

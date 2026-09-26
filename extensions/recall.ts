@@ -66,6 +66,8 @@ export interface RecallConfig {
 	compactTargetTokens: number;
 	/** Generate compaction summaries ourselves with recall-aware instructions (PI_RECALL_COMPACT_OWN=0 to opt out). */
 	ownSummaries: boolean;
+	/** Hard character budget for generated summaries (PI_RECALL_SUMMARY_CHARS). */
+	summaryChars: number;
 	/** Thinking for the summarization call: "session" mirrors the session level; or a fixed ThinkingLevel / "off" (PI_RECALL_SUMMARY_THINKING). */
 	summaryThinking: "session" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	chunkChars: number;
@@ -82,6 +84,7 @@ const DEFAULTS: RecallConfig = {
 	recencyFloor: 0.25,
 	compactTargetTokens: 131_072,
 	ownSummaries: true,
+	summaryChars: 5_000,
 	summaryThinking: "session",
 	chunkChars: 3000,
 	snippetChars: 400,
@@ -134,6 +137,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): RecallConfi
 		recencyFloor: numFromEnv(env, "PI_RECALL_RECENCY_FLOOR", DEFAULTS.recencyFloor, 0, 1),
 		compactTargetTokens: Math.floor(numFromEnv(env, "PI_RECALL_COMPACT_TARGET", DEFAULTS.compactTargetTokens, 0, 10_000_000)),
 		ownSummaries: boolFromEnv(env, "PI_RECALL_COMPACT_OWN", DEFAULTS.ownSummaries),
+		summaryChars: Math.floor(numFromEnv(env, "PI_RECALL_SUMMARY_CHARS", DEFAULTS.summaryChars, 500, 20_000)),
 		summaryThinking: summaryThinkingFromEnv(env),
 		chunkChars: Math.floor(numFromEnv(env, "PI_RECALL_CHUNK_CHARS", DEFAULTS.chunkChars, 500, 100_000)),
 		snippetChars: Math.floor(numFromEnv(env, "PI_RECALL_SNIPPET_CHARS", DEFAULTS.snippetChars, 100, 10_000)),
@@ -874,7 +878,7 @@ export function registerRecallTool(
 	pi: ExtensionAPI,
 	config: RecallConfig = configFromEnv(),
 	reader: ProjectReader = fsProjectReader,
-	deps: { summarize?: SummaryFn; logCompactionError?: (line: string) => void } = {},
+	deps: { summarize?: SummaryFn; logCompactionError?: (line: string) => void; retryDelayMs?: number } = {},
 ): void {
 	let reminderPending = false;
 	let autoCompactInFlight = false;
@@ -936,9 +940,10 @@ export function registerRecallTool(
 	// Own the summary end to end: every compaction (ours, manual /compact,
 	// pi's backstop) is generated here with the extension's own prompt — pi's
 	// built-in summarizer prompt is never involved, so pi-side prompt changes
-	// cannot reshape our summaries. Any failure returns undefined so pi's
-	// default summarizer takes over — custom compaction must never block
-	// compaction.
+	// cannot reshape our summaries. Failure ladder mirrors pi's own confidence:
+	// transient provider failures retry in place (the same 3-attempt budget pi
+	// gives its own summarizer); deterministic failures fall back to pi's
+	// default — custom compaction must never block compaction.
 	pi.on("session_before_compact", async (event, ctx) => {
 		if (!config.ownSummaries) return;
 		const model = ctx.model;
@@ -948,20 +953,28 @@ export function registerRecallTool(
 		}
 		const p = event.preparation;
 		try {
-			const { text, usage } = await summarize({
-				model,
-				complete: (m, context, options) => ctx.modelRegistry.complete(m, context, options),
-				// "session" mirrors the session's thinking level (pi's own summarizer behavior);
-				// a pinned level — including "off", which disables thinking at the API level
-				// for providers like zai — frees the whole output cap for summary text.
-				thinkingLevel: config.summaryThinking === "session" ? ctx.thinkingLevel : config.summaryThinking,
-				// Chronological: older spans first, split-turn prefix last, so the
-				// newest state the prompt re-derives sits at the end of the transcript.
-				messages: [...p.messagesToSummarize, ...p.turnPrefixMessages],
-				previousSummary: p.previousSummary,
-				userFocus: event.customInstructions?.trim() || undefined,
-				signal: event.signal,
-			});
+			const { text, usage } = await retryTransient(
+				() =>
+					summarize({
+						model,
+						complete: (m, context, options) => ctx.modelRegistry.complete(m, context, options),
+						// "session" mirrors the session's thinking level (pi's own summarizer behavior);
+						// a pinned level — including "off", which disables thinking at the API level
+						// for providers like zai — frees the whole output cap for summary text.
+						thinkingLevel: config.summaryThinking === "session" ? ctx.thinkingLevel : config.summaryThinking,
+						// Chronological: older spans first, split-turn prefix last, so the
+						// newest state the prompt re-derives sits at the end of the transcript.
+						messages: [...p.messagesToSummarize, ...p.turnPrefixMessages],
+						previousSummary: p.previousSummary,
+						userFocus: event.customInstructions?.trim() || undefined,
+						// Tight target: recall makes the summary a map, not the archive.
+						budgetChars: config.summaryChars,
+						signal: event.signal,
+					}),
+				SUMMARY_RETRY_ATTEMPTS,
+				deps.retryDelayMs ?? 1000,
+				event.signal,
+			);
 			if (!text.trim()) {
 				logCompactionError("summary ownership fell back to pi default: summarizer returned empty text");
 				return;
@@ -1029,11 +1042,38 @@ function reminderMessage(): { message: { customType: string; content: string; di
 const COMPACT_WINDOW_HEADROOM_TOKENS = 4096;
 
 /**
- * Output cap for the summarization call. The prompt budgets the summary at
- * 8,000 characters (~2.7k tokens); the remainder is reasoning headroom, so a
- * thinking model cannot crowd the text out of the generation.
+ * Output cap for the summarization request — a backstop, not a target. The
+ * prompt budgets the summary at summaryChars (default 5,000 ≈ 1.7k tokens);
+ * the wide gap is reasoning headroom (thinking tokens share the output
+ * budget), so a thinking model cannot crowd the text into a length-stop.
+ * A length-stop means the text was cut mid-sentence and is discarded whole.
  */
 const SUMMARY_MAX_OUTPUT_TOKENS = 8192;
+
+/** Mirror pi's own confidence in its summarizer (maxRetries ?? 3): transient failures retry in place; only deterministic ones fall back. */
+const SUMMARY_RETRY_ATTEMPTS = 3;
+
+function isRetryableSummaryError(e: unknown): boolean {
+	return e instanceof Error && (e as Error & { retryable?: unknown }).retryable === true;
+}
+
+/** Retry transient failures (flagged by defaultSummaryFn) with exponential backoff. Abort during backoff rethrows the original error. */
+async function retryTransient<T>(fn: () => Promise<T>, attempts: number, baseDelayMs: number, signal?: AbortSignal): Promise<T> {
+	for (let attempt = 1; ; attempt++) {
+		try {
+			return await fn();
+		} catch (e) {
+			if (!isRetryableSummaryError(e) || attempt >= attempts || signal?.aborted) throw e;
+			await new Promise<void>((resolve, reject) => {
+				const timer = setTimeout(resolve, baseDelayMs * 2 ** (attempt - 1));
+				signal?.addEventListener("abort", () => {
+					clearTimeout(timer);
+					reject(e);
+				}, { once: true });
+			});
+		}
+	}
+}
 
 /**
  * The extension's complete summarization prompt — the only prompt involved.
@@ -1046,6 +1086,7 @@ export function buildSummarizationPrompt(
 	conversationText: string,
 	previousSummary?: string,
 	userFocus?: string,
+	budgetChars: number = DEFAULTS.summaryChars,
 ): string {
 	const sections = [
 		"Summarize the conversation inside <conversation> so the work can continue after these messages are dropped " +
@@ -1096,7 +1137,7 @@ export function buildSummarizationPrompt(
 			"test counts, what was just committed, what the user most recently asked) from the newest messages rather " +
 			"than copying them; when they disagree, the messages win. Never carry Next Steps forward unchanged — rewrite " +
 			"them from the newest messages, which are where the current task state actually lives.",
-		"- Hard budget: the entire summary must stay under 8,000 characters — a cut-off generation is discarded whole. " +
+		"- Hard budget: the entire summary must stay under " + budgetChars.toLocaleString("en-US") + " characters — a cut-off generation is discarded whole. " +
 			"When space is tight, compress Done and Critical Context first; never Next Steps, active decisions' rationale, " +
 			"or exact strings still in use.",
 		"- Only summarize what appears in the conversation above; do not infer later events.",
@@ -1190,6 +1231,8 @@ export interface SummaryFnArgs {
 	previousSummary: string | undefined;
 	/** Free-form focus from /compact args; the auto trigger never sets one. */
 	userFocus: string | undefined;
+	/** Hard character budget for the summary (PI_RECALL_SUMMARY_CHARS, default 5,000). */
+	budgetChars: number;
 	signal: AbortSignal;
 }
 export type SummaryFn = (args: SummaryFnArgs) => Promise<{ text: string; usage: unknown }>;
@@ -1201,10 +1244,11 @@ const defaultSummaryFn: SummaryFn = async ({
 	messages,
 	previousSummary,
 	userFocus,
+	budgetChars,
 	signal,
 }) => {
 	const conversationText = serializeConversation(convertToLlm(messages));
-	const prompt = buildSummarizationPrompt(conversationText, previousSummary, userFocus);
+	const prompt = buildSummarizationPrompt(conversationText, previousSummary, userFocus, budgetChars);
 	const options: NonNullable<Parameters<SummaryComplete>[2]> & { reasoning?: SummaryThinkingLevel } = {
 		maxTokens: Math.min(SUMMARY_MAX_OUTPUT_TOKENS, model.maxTokens > 0 ? model.maxTokens : SUMMARY_MAX_OUTPUT_TOKENS),
 		signal,
@@ -1222,7 +1266,11 @@ const defaultSummaryFn: SummaryFn = async ({
 	// Throwing routes aborts into the hook's silent return and errors into the crumb.
 	if (response.stopReason === "error" || response.stopReason === "aborted") {
 		const failed = response as { errorMessage?: string };
-		throw new Error(failed.errorMessage ?? `summarizer ${response.stopReason}`);
+		const err = new Error(failed.errorMessage ?? `summarizer ${response.stopReason}`);
+		// Provider failures are transient until proven otherwise — flagged so the
+		// hook retries in place instead of handing the summary to pi's default.
+		if (response.stopReason === "error") Object.assign(err, { retryable: true });
+		throw err;
 	}
 	if (response.stopReason === "length") {
 		throw new Error(`summarizer hit the output cap (${options.maxTokens} tokens)`);
