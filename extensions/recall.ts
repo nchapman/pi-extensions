@@ -10,9 +10,14 @@
  *   compaction folds them away, and edit-omitted entries stay searchable, all
  *   from one set-diff with zero bookkeeping.
  * - Ranking is hand-rolled BM25 over line-aligned chunks (~3k chars) with
- *   identifier-aware tokenization (`parseHeader` matches "parse header").
- *   Lexical match is deliberate: recall returns verbatim text, the regime
- *   where models are strongest (NoLiMa), and every hit carries provenance.
+ *   identifier-aware tokenization (`parseHeader` matches "parse header"),
+ *   multiplied by a memory-horizon recency decay (score halves every
+ *   `PI_RECALL_HALF_LIFE_HOURS` measured from the archive frontier, floored
+ *   at `PI_RECALL_RECENCY_FLOOR`) — so the latest decision about a topic
+ *   outranks older discussions of it, while rare distinctive terms from far
+ *   back still surface. Lexical match is deliberate: recall returns verbatim
+ *   text, the regime where models are strongest (NoLiMa), and every hit
+ *   carries provenance.
  * - Scope `session` (default) indexes the in-memory branch on demand — always
  *   fresh, branch/rewind-correct, nothing persisted. Scope `project` adds
  *   sibling session files from the cwd-scoped session directory, labeled and
@@ -37,6 +42,10 @@ export const RECALL_TOOL_NAME = "recall";
 export interface RecallConfig {
 	defaultScope: "session" | "project";
 	foreignWeight: number;
+	/** Memory horizon: age (from the archive frontier) at which a chunk's score has halved. */
+	halfLifeHours: number;
+	/** Minimum recency factor so old content fades but never vanishes (1 disables decay). */
+	recencyFloor: number;
 	chunkChars: number;
 	snippetChars: number;
 	maxResults: number;
@@ -47,6 +56,8 @@ export interface RecallConfig {
 const DEFAULTS: RecallConfig = {
 	defaultScope: "session",
 	foreignWeight: 0.5,
+	halfLifeHours: 4,
+	recencyFloor: 0.25,
 	chunkChars: 3000,
 	snippetChars: 400,
 	maxResults: 5,
@@ -73,6 +84,8 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): RecallConfi
 	return {
 		defaultScope: scope === "project" ? "project" : DEFAULTS.defaultScope,
 		foreignWeight: numFromEnv(env, "PI_RECALL_FOREIGN_WEIGHT", DEFAULTS.foreignWeight, 0, 1),
+		halfLifeHours: numFromEnv(env, "PI_RECALL_HALF_LIFE_HOURS", DEFAULTS.halfLifeHours, 0.1, 1_000_000),
+		recencyFloor: numFromEnv(env, "PI_RECALL_RECENCY_FLOOR", DEFAULTS.recencyFloor, 0, 1),
 		chunkChars: Math.floor(numFromEnv(env, "PI_RECALL_CHUNK_CHARS", DEFAULTS.chunkChars, 500, 100_000)),
 		snippetChars: Math.floor(numFromEnv(env, "PI_RECALL_SNIPPET_CHARS", DEFAULTS.snippetChars, 100, 10_000)),
 		maxResults: Math.floor(numFromEnv(env, "PI_RECALL_MAX_RESULTS", DEFAULTS.maxResults, 1, 25)),
@@ -379,8 +392,9 @@ const BM25_B = 0.75;
 
 export interface ScoredChunk {
 	chunk: RecallChunk;
-	score: number; // weighted, descending sort key
+	score: number; // weighted, decayed, descending sort key
 	rawScore: number; // unweighted BM25
+	recencyFactor: number; // 1 at the frontier, halving per half-life, floored
 }
 
 interface ChunkTerms {
@@ -405,16 +419,24 @@ function indexChunks(chunks: RecallChunk[]): { terms: ChunkTerms[]; df: Map<stri
 
 /**
  * Rank chunks against a query with BM25, then apply the session weight
- * (current = 1.0, foreign = config.foreignWeight). Chunks matching no query
- * term are dropped. Ties break toward newer entries, then by ref for stability.
+ * (current = 1.0, foreign = config.foreignWeight) and a memory-horizon
+ * recency decay: score × 0.5^(age / halfLife), floored. Age is measured from
+ * the archive frontier (newest chunk in the corpus), NOT wall clock — so
+ * ordering stays correct across pauses and ranking stays deterministic for
+ * repeated queries. Chunks matching no query term are dropped. Ties break
+ * toward newer entries, then by ref for stability.
  */
 export function rankChunks(
 	chunks: RecallChunk[],
 	query: string,
 	foreignWeight: number,
+	halfLifeHours: number = DEFAULTS.halfLifeHours,
+	recencyFloor: number = DEFAULTS.recencyFloor,
 ): ScoredChunk[] {
 	const queryTokens = [...new Set(tokenize(query))];
 	if (queryTokens.length === 0 || chunks.length === 0) return [];
+	const frontier = Math.max(...chunks.map((c) => tsMs(c.timestamp)));
+	const halfLifeMs = halfLifeHours * 3_600_000;
 	const { terms, df, avgLength } = indexChunks(chunks);
 	const N = chunks.length;
 	const results: ScoredChunk[] = [];
@@ -433,12 +455,25 @@ export function rankChunks(
 		if (!matched) continue;
 		const chunk = chunks[i];
 		const weight = chunk.origin === "current" ? 1 : foreignWeight;
-		results.push({ chunk, score: score * weight, rawScore: score });
+		const recency = recencyFactor(frontier - tsMs(chunk.timestamp), halfLifeMs, recencyFloor);
+		results.push({ chunk, score: score * weight * recency, rawScore: score, recencyFactor: recency });
 	}
 	results.sort(
 		(a, b) => b.score - a.score || b.chunk.timestamp.localeCompare(a.chunk.timestamp) || a.chunk.ref.localeCompare(b.chunk.ref),
 	);
 	return results;
+}
+
+/** Parse an ISO timestamp to epoch ms; malformed or missing → -Infinity (treated as oldest). */
+function tsMs(timestamp: string): number {
+	const ms = Date.parse(timestamp);
+	return Number.isNaN(ms) ? Number.NEGATIVE_INFINITY : ms;
+}
+
+/** Exponential memory decay: 1 at the frontier, halving per half-life, never below the floor. */
+export function recencyFactor(ageMs: number, halfLifeMs: number, floor: number): number {
+	if (!Number.isFinite(ageMs) || ageMs <= 0) return ageMs === 0 ? 1 : floor;
+	return Math.max(floor, 0.5 ** (ageMs / halfLifeMs));
 }
 
 // ---------------------------------------------------------------------------
@@ -489,6 +524,8 @@ export interface SearchHit {
 	sessionLabel: string;
 	timestamp: string;
 	score: number;
+	/** Recency multiplier already folded into score; surfaced so ranking is explainable. */
+	recencyFactor?: number;
 	snippet: string;
 }
 
@@ -514,7 +551,9 @@ export function formatSearchResult(
 		lines.push(`Top ${hits.length} match${hits.length === 1 ? "" : "es"} (of ${meta.archiveEntries} archived entries searched):`);
 		for (const [i, hit] of hits.entries()) {
 			lines.push(
-				`${i + 1}. ${hit.sessionLabel} · ${kindLabel(hit.kind, hit.label)} · ${shortDate(hit.timestamp)} · score ${hit.score.toFixed(1)}`,
+				`${i + 1}. ${hit.sessionLabel} · ${kindLabel(hit.kind, hit.label)} · ${shortDate(hit.timestamp)} · score ${hit.score.toFixed(1)}${
+					hit.recencyFactor !== undefined && hit.recencyFactor < 0.95 ? ` (recency ×${hit.recencyFactor.toFixed(2)})` : ""
+				}`,
 			);
 			lines.push(`   ${hit.snippet.split("\n").join("\n   ")}`);
 			lines.push(`   full entry: recall { "mode": "read", "id": "${hit.ref}" }`);
@@ -886,7 +925,7 @@ async function search(
 		allChunks = [...archiveChunks, ...corpora.flatMap((c) => c.chunks)];
 	}
 
-	const rankedAll = rankChunks(allChunks, query, config.foreignWeight);
+	const rankedAll = rankChunks(allChunks, query, config.foreignWeight, config.halfLifeHours, config.recencyFloor);
 	const ranked = rankedAll.slice(0, limit);
 	const hits: SearchHit[] = ranked.map((r) => ({
 		ref: r.chunk.ref,
@@ -895,6 +934,7 @@ async function search(
 		sessionLabel: r.chunk.sessionLabel,
 		timestamp: r.chunk.timestamp,
 		score: r.score,
+		recencyFactor: r.recencyFactor,
 		snippet: extractSnippet(r.chunk.text, query, config.snippetChars),
 	}));
 	const archiveEntries = new Set(allChunks.map((c) => c.ref)).size;

@@ -14,6 +14,7 @@ import {
 	parseRef,
 	ProjectCorpusCache,
 	rankChunks,
+	recencyFactor,
 	registerRecallTool,
 	visibleEntryIds,
 	renderRecallCall,
@@ -31,6 +32,8 @@ import {
 const CONFIG: RecallConfig = {
 	defaultScope: "session",
 	foreignWeight: 0.5,
+	halfLifeHours: 4,
+	recencyFloor: 0.25,
 	chunkChars: 3000,
 	snippetChars: 400,
 	maxResults: 5,
@@ -396,7 +399,8 @@ describe("rankChunks", () => {
 			3000,
 		)[0];
 		const foreign = foreignChunk("rotation policy discussion");
-		const ranked = rankChunks([foreign, current], "rotation policy", 0.5);
+		// Recency decay disabled (floor 1) so this test isolates session weighting.
+		const ranked = rankChunks([foreign, current], "rotation policy", 0.5, 1e9, 1);
 		expect(ranked[0].chunk.origin).toBe("current");
 		expect(ranked[1].rawScore).toBe(ranked[0].rawScore); // identical text ⇒ identical BM25
 		expect(ranked[1].score).toBeCloseTo(ranked[0].score * 0.5, 5);
@@ -802,6 +806,93 @@ describe("kindLabel", () => {
 		expect(kindLabel("summary")).toContain("compaction summary");
 	});
 });
+
+
+
+// ---------------------------------------------------------------------------
+// Recency decay (memory horizon)
+// ---------------------------------------------------------------------------
+
+describe("recency decay", () => {
+	const NOW = "2026-09-26T18:00:00.000Z";
+	const chunkAt = (text: string, iso: string) =>
+		chunksFromEntry(msgEntry("user", { content: text }, iso), { origin: "current", sessionId: "s", sessionLabel: "current session" }, 3000)[0];
+
+	it("recencyFactor halves per half-life and never drops below the floor", () => {
+		const H = 4 * 3_600_000;
+		expect(recencyFactor(0, H, 0.25)).toBe(1);
+		expect(recencyFactor(H, H, 0.25)).toBeCloseTo(0.5, 6);
+		expect(recencyFactor(2 * H, H, 0.25)).toBeCloseTo(0.25, 6); // exactly at floor
+		expect(recencyFactor(200 * H, H, 0.25)).toBe(0.25); // floored, not zero
+		expect(recencyFactor(Number.NaN, H, 0.25)).toBe(0.25);
+		expect(recencyFactor(-1, H, 0.25)).toBe(0.25); // future/invalid → oldest-safe
+	});
+
+	it("the latest of three same-topic decisions wins", () => {
+		const old = chunkAt("we decided to use a sidecar index for recall", "2026-09-26T06:00:00.000Z");
+		const mid = chunkAt("we decided to use the set-diff for recall instead of a sidecar", "2026-09-26T09:00:00.000Z");
+		const late = chunkAt("final decision: set-diff plus projection visibility for recall", "2026-09-26T12:00:00.000Z");
+		const ranked = rankChunks([old, mid, late], "decision recall", 0.5, 4, 0.25);
+		expect(ranked[0].chunk.text).toContain("final decision");
+		expect(ranked.map((r) => r.chunk.timestamp)).toEqual([...ranked.map((r) => r.chunk.timestamp)].sort().reverse());
+	});
+
+	it("a verbose old discussion loses to a terse recent decision despite higher raw BM25", () => {
+		const verbose = chunkAt(
+			"cache cache cache policy policy. " + "cache policy details. ".repeat(40),
+			"2026-09-26T02:00:00.000Z",
+		);
+		const terse = chunkAt("cache policy: keep manual compaction", NOW);
+		const ranked = rankChunks([verbose, terse], "cache policy", 0.5, 4, 0.25);
+		expect(ranked[0].chunk.text).toContain("manual compaction");
+		expect(ranked[0].rawScore).toBeLessThan(ranked[1].rawScore); // recency flipped it
+	});
+
+	it("a distinctive old term still beats a vague recent mention (floor keeps old content findable)", () => {
+		const old = chunkAt("the zephyrhead traceback pointed at line 88", "2026-09-01T10:00:00.000Z");
+		const recent = chunkAt("we looked at a traceback earlier", NOW);
+		const ranked = rankChunks([old, recent], "zephyrhead traceback", 0.5, 4, 0.25);
+		expect(ranked[0].chunk.text).toContain("zephyrhead");
+	});
+
+	it("ages are measured from the archive frontier, not wall clock (weekend-safe)", () => {
+		const make = (shiftDays: number) => [
+			chunkAt("first pass at the ranking design", isoAdd("2026-09-22T10:00:00.000Z", shiftDays)),
+			chunkAt("second pass at the ranking design", isoAdd("2026-09-26T10:00:00.000Z", shiftDays)),
+		];
+		const thisWeek = rankChunks(make(0), "ranking design", 0.5, 4, 0.25);
+		const afterWeekend = rankChunks(make(30), "ranking design", 0.5, 4, 0.25);
+		// Identical relative positions along the continuum ⇒ identical scores,
+		// no matter how far the whole archive sits in the past.
+		expect(afterWeekend[0].score).toBeCloseTo(thisWeek[0].score, 9);
+		expect(afterWeekend[0].chunk.text).toContain("second pass");
+	});
+
+	it("search output annotates decayed hits and omits the note for frontier hits", () => {
+		const withFactor = formatSearchResult(
+			[{ ref: "a1", kind: "user", sessionLabel: "current session", timestamp: NOW, score: 4.2, recencyFactor: 0.62, snippet: "s" }],
+			{ archiveEntries: 10, foreignSessions: 0, scope: "session", totalMatches: 1 },
+		);
+		expect(withFactor).toContain("(recency ×0.62)");
+		const frontier = formatSearchResult(
+			[{ ref: "a1", kind: "user", sessionLabel: "current session", timestamp: NOW, score: 4.2, recencyFactor: 1, snippet: "s" }],
+			{ archiveEntries: 10, foreignSessions: 0, scope: "session", totalMatches: 1 },
+		);
+		expect(frontier).not.toContain("recency");
+	});
+
+	it("config parses the new knobs with clamps", () => {
+		expect(configFromEnv({ PI_RECALL_HALF_LIFE_HOURS: "12" }).halfLifeHours).toBe(12);
+		expect(configFromEnv({ PI_RECALL_RECENCY_FLOOR: "0.4" }).recencyFloor).toBe(0.4);
+		expect(configFromEnv({ PI_RECALL_HALF_LIFE_HOURS: "0" }).halfLifeHours).toBeCloseTo(0.1, 9); // clamped to min
+		expect(configFromEnv({ PI_RECALL_RECENCY_FLOOR: "5" }).recencyFloor).toBe(1); // clamped to max (decay off)
+		expect(configFromEnv({ PI_RECALL_RECENCY_FLOOR: "nope" }).recencyFloor).toBe(0.25); // invalid → default
+	});
+});
+
+function isoAdd(iso: string, days: number): string {
+	return new Date(Date.parse(iso) + days * 86_400_000).toISOString();
+}
 
 // ---------------------------------------------------------------------------
 // Review regressions
