@@ -1,0 +1,14 @@
+{
+  "name": "pi-extensions",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./extensions"]
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.87.1",
+    "typescript": "^5"
+  }
+}
