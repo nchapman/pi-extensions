@@ -1208,36 +1208,44 @@ describe("auto-compact wiring", () => {
 		return { ctx, compactCalls };
 	}
 
-	it("triggers compaction once when projected context exceeds the target", async () => {
+	it("triggers compaction once when the settled context exceeds the target", async () => {
 		const { ctx, compactCalls } = setup({ tokens: 150_000, contextWindow: 200_000 });
 		const { pi, events } = makePi();
 		registerRecallTool(pi, CONFIG);
-		await fire(events, "before_agent_start", ctx);
+		await fire(events, "agent_settled", ctx);
 		expect(compactCalls).toHaveLength(1);
 		expect(compactCalls[0].customInstructions).toBe(SUMMARY_ADDENDUM);
 		// In-flight: no second trigger until the first completes.
-		await fire(events, "before_agent_start", ctx);
+		await fire(events, "agent_settled", ctx);
 		expect(compactCalls).toHaveLength(1);
 		(onCompleteOf(compactCalls[0]) as () => void)();
-		await fire(events, "before_agent_start", ctx);
+		await fire(events, "agent_settled", ctx);
 		expect(compactCalls).toHaveLength(2);
+	});
+
+	it("never triggers from before_agent_start even over budget — ctx.compact() would abort/race the starting run", async () => {
+		const { ctx, compactCalls } = setup({ tokens: 190_000, contextWindow: 200_000 });
+		const { pi, events } = makePi();
+		registerRecallTool(pi, CONFIG);
+		await fire(events, "before_agent_start", ctx);
+		expect(compactCalls).toHaveLength(0);
 	});
 
 	it("does not trigger below the target, on unknown tokens, or when disabled", async () => {
 		const below = setup({ tokens: 100_000, contextWindow: 200_000 });
 		const { pi, events } = makePi();
 		registerRecallTool(pi, CONFIG);
-		await fire(events, "before_agent_start", below.ctx);
+		await fire(events, "agent_settled", below.ctx);
 		expect(below.compactCalls).toHaveLength(0);
 
 		const unknown = setup({ tokens: null, contextWindow: 200_000 });
-		await fire(events, "before_agent_start", unknown.ctx);
+		await fire(events, "agent_settled", unknown.ctx);
 		expect(unknown.compactCalls).toHaveLength(0);
 
 		const disabled = setup({ tokens: 190_000, contextWindow: 200_000 });
 		const off = makePi();
 		registerRecallTool(off.pi, { ...CONFIG, compactTargetTokens: 0 });
-		await fire(off.events, "before_agent_start", disabled.ctx);
+		await fire(off.events, "agent_settled", disabled.ctx);
 		expect(disabled.compactCalls).toHaveLength(0);
 	});
 
@@ -1245,22 +1253,33 @@ describe("auto-compact wiring", () => {
 		const { ctx, compactCalls } = setup({ tokens: 150_000, contextWindow: 200_000 });
 		const { pi, events } = makePi();
 		registerRecallTool(pi, CONFIG);
-		await fire(events, "before_agent_start", ctx);
+		await fire(events, "agent_settled", ctx);
 		expect(compactCalls).toHaveLength(1);
 		await fire(events, "session_compact", ctx);
-		await fire(events, "before_agent_start", ctx);
+		await fire(events, "agent_settled", ctx);
 		expect(compactCalls).toHaveLength(2);
 	});
 
-	it("a failed compaction clears the in-flight flag via onError", async () => {
+	it("a failed compaction clears the in-flight flag via onError and leaves a breadcrumb", async () => {
+		const crumbs: string[] = [];
 		const { ctx, compactCalls } = setup({ tokens: 150_000, contextWindow: 200_000 });
 		const { pi, events } = makePi();
-		registerRecallTool(pi, CONFIG);
-		await fire(events, "before_agent_start", ctx);
+		registerRecallTool(pi, CONFIG, undefined, { logCompactionError: (line) => crumbs.push(line) });
+		await fire(events, "agent_settled", ctx);
 		expect(compactCalls).toHaveLength(1);
-		(compactCalls[0].onError as () => void)();
-		await fire(events, "before_agent_start", ctx);
+		(compactCalls[0].onError as (err: Error) => void)(new Error("auth expired"));
+		expect(crumbs).toEqual([expect.stringContaining("budget trigger failed: auth expired")]);
+		await fire(events, "agent_settled", ctx);
 		expect(compactCalls).toHaveLength(2);
+	});
+
+	it("session_compact_failed appends a breadcrumb unless the user cancelled", async () => {
+		const crumbs: string[] = [];
+		const { pi, events } = makePi();
+		registerRecallTool(pi, CONFIG, undefined, { logCompactionError: (line) => crumbs.push(line) });
+		await fire(events, "session_compact_failed", undefined, { type: "session_compact_failed", reason: "threshold", errorMessage: "summarizer blew up", aborted: false });
+		await fire(events, "session_compact_failed", undefined, { type: "session_compact_failed", reason: "manual", aborted: true });
+		expect(crumbs).toEqual([expect.stringContaining("compaction failed (threshold): summarizer blew up")]);
 	});
 });
 

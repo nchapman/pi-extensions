@@ -857,12 +857,20 @@ export function registerRecallTool(
 	pi: ExtensionAPI,
 	config: RecallConfig = configFromEnv(),
 	reader: ProjectReader = fsProjectReader,
-	deps: { summarize?: SummaryFn } = {},
+	deps: { summarize?: SummaryFn; logCompactionError?: (line: string) => void } = {},
 ): void {
 	let reminderPending = false;
 	let autoCompactInFlight = false;
 	const corpusCache = new ProjectCorpusCache(reader, config.projectMaxBytes, config.chunkChars);
 	const summarize = deps.summarize ?? defaultSummaryFn;
+	// Breadcrumb for compaction failures — ctx.compact() failures are otherwise
+	// invisible (async, no UI surface). One line per failure, never throws.
+	const logCompactionError =
+		deps.logCompactionError ??
+		((line: string) => {
+			// Promise form: diagnostics must never throw or block the extension.
+			void fsp.appendFile(`${process.env.HOME ?? "~"}/.pi/agent/recall-compaction-errors.log`, `${new Date().toISOString()} ${line}\n`).catch(() => {});
+		});
 
 	pi.on("session_start", () => {
 		reminderPending = false;
@@ -873,26 +881,40 @@ export function registerRecallTool(
 		autoCompactInFlight = false;
 	});
 
-	pi.on("before_agent_start", (_event, ctx) => {
-		// One-shot post-compaction reminder.
-		let message: ReturnType<typeof reminderMessage> | undefined;
-		if (reminderPending) {
-			reminderPending = false;
-			message = reminderMessage();
-		}
-		// Context budget: auto-compact before the turn starts once projected
-		// context exceeds the target (PI_RECALL_COMPACT_TARGET, 0 disables).
-		// pi's own near-limit threshold remains the mid-run safety net.
+	pi.on("before_agent_start", (_event, _ctx) => {
+		// One-shot post-compaction reminder. Budget triggering deliberately lives
+		// on agent_settled instead: ctx.compact() begins with abort()+waitForIdle(),
+		// which is only safe once the agent is idle — calling it here would race
+		// the very run this event is starting.
+		if (!reminderPending) return;
+		reminderPending = false;
+		return reminderMessage();
+	});
+
+	// Context budget: auto-compact between turns, once the run has fully settled
+	// (idle — nothing to abort, nothing to race). pi's own near-limit threshold
+	// stays as the mid-run backstop. PI_RECALL_COMPACT_TARGET=0 disables.
+	pi.on("agent_settled", (_event, ctx) => {
 		const usage = ctx.getContextUsage();
-		if (shouldAutoCompact(usage?.tokens ?? null, usage?.contextWindow ?? 0, config.compactTargetTokens, autoCompactInFlight)) {
-			autoCompactInFlight = true;
-			ctx.compact({
-				customInstructions: SUMMARY_ADDENDUM,
-				onComplete: () => (autoCompactInFlight = false),
-				onError: () => (autoCompactInFlight = false),
-			});
+		if (!shouldAutoCompact(usage?.tokens ?? null, usage?.contextWindow ?? 0, config.compactTargetTokens, autoCompactInFlight)) {
+			return;
 		}
-		return message;
+		autoCompactInFlight = true;
+		ctx.compact({
+			customInstructions: SUMMARY_ADDENDUM,
+			onComplete: () => (autoCompactInFlight = false),
+			onError: (err) => {
+				autoCompactInFlight = false;
+				logCompactionError(`budget trigger failed: ${err instanceof Error ? err.message : String(err)}`);
+			},
+		});
+	});
+
+	// pi-side compaction failures (any trigger, including the default summarizer
+	// fallback path) — aborted=true is a user cancel, not a failure.
+	pi.on("session_compact_failed", (event) => {
+		if (event.aborted) return;
+		logCompactionError(`compaction failed (${event.reason}): ${event.errorMessage ?? "unknown error"}`);
 	});
 
 	// Own the summary: every compaction (ours, manual /compact, pi's backstop)
