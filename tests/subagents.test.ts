@@ -483,7 +483,7 @@ describe("registerSubagentTools", () => {
   }
 
   function spawnReturning(lines: string[], calls: string[][]) {
-    return (command: string, args: string[], options: { stdio: ["ignore", "pipe", "pipe"] }): ChildLike => {
+    return (command: string, args: string[], _options: { stdio: ["ignore", "pipe", "pipe"] }): ChildLike => {
       calls.push([command, ...args]);
       const child = fakeChild();
       setImmediate(() => {

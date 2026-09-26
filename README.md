@@ -34,7 +34,7 @@ The through-line: **keep the parent agent's context small** and **fail explicitl
 
 ```sh
 npm install        # once
-npm run check      # typecheck + full test suite
+npm run check      # typecheck (with lint-grade strict flags) + full test suite
 npm test           # vitest only
 npx tsc --noEmit   # typecheck only
 ```

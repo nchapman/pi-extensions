@@ -23,7 +23,7 @@ vi.mock("@modelcontextprotocol/sdk/client/index.js", () => ({
     constructor(public info: unknown) {
       sdk.instances.push(this);
     }
-    connect(t: unknown) {
+    connect(_t: unknown) {
       return sdk.behavior.connect();
     }
     listTools(p?: unknown) {
