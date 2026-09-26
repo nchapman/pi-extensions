@@ -1352,37 +1352,48 @@ describe("compaction summary ownership", () => {
 		expect(args.customInstructions).not.toContain("User focus");
 	});
 
-	it("falls back to pi's default (undefined) on failure, empty text, missing model, or opt-out", async () => {
+	it("falls back to pi's default (undefined) on failure, empty text, or missing model — each leaving a breadcrumb; opt-out stays silent", async () => {
+		const crumbs: string[] = [];
 		const failing: SummaryFn = async () => {
 			throw new Error("model exploded");
 		};
 		const a = makePi();
-		registerRecallTool(a.pi, CONFIG, undefined, { summarize: failing });
+		registerRecallTool(a.pi, CONFIG, undefined, { summarize: failing, logCompactionError: (l) => crumbs.push(l) });
 		expect(await fire(a.events, "session_before_compact", hookCtx(), beforeCompactEvent())).toBeUndefined();
 
 		const empty: SummaryFn = async () => ({ text: "   ", usage: {} });
 		const b = makePi();
-		registerRecallTool(b.pi, CONFIG, undefined, { summarize: empty });
+		registerRecallTool(b.pi, CONFIG, undefined, { summarize: empty, logCompactionError: (l) => crumbs.push(l) });
 		expect(await fire(b.events, "session_before_compact", hookCtx(), beforeCompactEvent())).toBeUndefined();
 
 		const c = makePi();
-		registerRecallTool(c.pi, CONFIG);
+		registerRecallTool(c.pi, CONFIG, undefined, { logCompactionError: (l) => crumbs.push(l) });
 		expect(await fire(c.events, "session_before_compact", { ...hookCtx(), model: undefined }, beforeCompactEvent())).toBeUndefined();
+
+		expect(crumbs).toEqual([
+			expect.stringContaining("fell back to pi default: model exploded"),
+			expect.stringContaining("fell back to pi default: summarizer returned empty text"),
+			expect.stringContaining("fell back to pi default: no model on session context"),
+		]);
 
 		const never: SummaryFn = async () => {
 			throw new Error("must not be called");
 		};
+		const quiet: string[] = [];
 		const d = makePi();
-		registerRecallTool(d.pi, { ...CONFIG, ownSummaries: false }, undefined, { summarize: never });
+		registerRecallTool(d.pi, { ...CONFIG, ownSummaries: false }, undefined, { summarize: never, logCompactionError: (l) => quiet.push(l) });
 		expect(await fire(d.events, "session_before_compact", hookCtx(), beforeCompactEvent())).toBeUndefined();
+		expect(quiet).toEqual([]);
 	});
 
-	it("declines when auth resolution fails", async () => {
+	it("declines when auth resolution fails, leaving a breadcrumb", async () => {
+		const crumbs: string[] = [];
 		const summarize: SummaryFn = async () => ({ text: "unused", usage: {} });
-		const ctx = { ...hookCtx(), modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: false }) } };
+		const ctx = { ...hookCtx(), modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: false, error: "no key configured" }) } };
 		const { pi, events } = makePi();
-		registerRecallTool(pi, CONFIG, undefined, { summarize });
+		registerRecallTool(pi, CONFIG, undefined, { summarize, logCompactionError: (l) => crumbs.push(l) });
 		expect(await fire(events, "session_before_compact", ctx, beforeCompactEvent())).toBeUndefined();
+		expect(crumbs).toEqual([expect.stringContaining("fell back to pi default: auth unavailable (no key configured)")]);
 	});
 
 	it("merges user focus from /compact into the addendum", async () => {

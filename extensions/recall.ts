@@ -924,11 +924,17 @@ export function registerRecallTool(
 	pi.on("session_before_compact", async (event, ctx) => {
 		if (!config.ownSummaries) return;
 		const model = ctx.model;
-		if (!model) return;
+		if (!model) {
+			logCompactionError("summary ownership fell back to pi default: no model on session context");
+			return;
+		}
 		const p = event.preparation;
 		try {
 			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-			if (!auth.ok) return;
+			if (!auth.ok) {
+				logCompactionError(`summary ownership fell back to pi default: auth unavailable (${auth.error})`);
+				return;
+			}
 			const { text, usage } = await summarize({
 				messages: [...p.turnPrefixMessages, ...p.messagesToSummarize],
 				model,
@@ -940,7 +946,10 @@ export function registerRecallTool(
 				previousSummary: p.previousSummary,
 				thinkingLevel: ctx.thinkingLevel,
 			});
-			if (!text.trim()) return;
+			if (!text.trim()) {
+				logCompactionError("summary ownership fell back to pi default: summarizer returned empty text");
+				return;
+			}
 			return {
 				compaction: {
 					summary: text,
@@ -951,7 +960,7 @@ export function registerRecallTool(
 				},
 			};
 		} catch (err) {
-			console.error(`recall: custom summary failed — using pi's default (${err instanceof Error ? err.message : String(err)})`);
+			logCompactionError(`summary ownership fell back to pi default: ${err instanceof Error ? err.message : String(err)}`);
 			return;
 		}
 	});
