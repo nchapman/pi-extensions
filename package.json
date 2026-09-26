@@ -3,9 +3,13 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": [
+      "./extensions"
+    ]
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.1",
@@ -13,6 +17,11 @@
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.87.1",
-    "typescript": "^5"
+    "typescript": "^5",
+    "vitest": "^5.0.2"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "check": "tsc --noEmit && vitest run"
   }
 }
