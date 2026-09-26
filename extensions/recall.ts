@@ -808,7 +808,8 @@ const RecallParams = Type.Object({
 });
 
 const REMINDER_TEXT =
-	"Compaction summarized earlier history. Those turns are still searchable verbatim with the `recall` tool — use it when you need details from before the summary (decisions, prior attempts, file paths, command outputs).";
+	"Compaction summarized earlier history. Re-orient before continuing: confirm the current task and the immediate next action (the summary's Next Steps); if either is unclear, search the transcript with `recall` rather than guessing. " +
+	"Compacted turns remain verbatim-searchable via `recall` (decisions, prior attempts, file paths, command outputs).";
 
 function reuseText(context: { lastComponent?: unknown } | undefined): Text {
 	return context?.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
@@ -988,10 +989,13 @@ const COMPACT_WINDOW_HEADROOM_TOKENS = 4096;
  * "preserve everything" to "be a working map with searchable anchors".
  */
 export const SUMMARY_ADDENDUM =
-	"The full transcript remains verbatim-searchable via the recall tool, so brevity is safe — never restate long passages. " +
-	"Write this summary as a working map, not a narrative: lead with decisions and their rationale; " +
-	"preserve exact file paths, identifiers, commands, URLs, and error strings (these are the anchors future recall searches will match); " +
-	"prefer terse lists; note open questions and current state, not history.";
+	"The full transcript remains verbatim-searchable via the recall tool, so the past can be summarized tersely: " +
+	"never restate long passages, prefer lists, lead with decisions and their rationale, and preserve exact file paths, " +
+	"identifiers, commands, URLs, and error strings (these are the anchors future recall searches will match). " +
+	"The future is not recoverable — treat Next Steps as the most important section: open with the in-flight action " +
+	"(what was literally being done when compaction fired), then the ordered queue with names, paths, and commands " +
+	"specific enough to resume cold without re-reading anything. Never compress Next Steps for brevity; " +
+	"note open questions and blockers explicitly.";
 
 /**
  * Effective auto-compaction target: the smaller of the configured target and

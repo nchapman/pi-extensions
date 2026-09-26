@@ -754,6 +754,9 @@ describe("registerRecallTool", () => {
 		await fire(events, "session_compact", ctx);
 		const first = (await fire(events, "before_agent_start", ctx)) as { message: { content: string } } | undefined;
 		expect(first?.message.content).toContain("recall");
+		// Not-miss-a-beat contract: the reminder forces re-orientation, not just awareness.
+		expect(first?.message.content).toContain("Re-orient");
+		expect(first?.message.content).toContain("Next Steps");
 		const second = await fire(events, "before_agent_start", ctx);
 		expect(second).toBeUndefined();
 	});
