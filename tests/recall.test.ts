@@ -1,11 +1,15 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import {
 	buildArchiveChunks,
 	buildFileCorpus,
 	chunkText,
 	chunksFromEntry,
 	configFromEnv,
+	fsProjectReader,
 	extractEntrySections,
 	extractSnippet,
 	formatReadResult,
@@ -177,6 +181,17 @@ describe("extractEntrySections", () => {
 		expect(sections).toEqual([{ kind: "user", text: "hello world" }]);
 	});
 
+	it("treats non-string, non-array content as empty", () => {
+		expect(extractEntrySections(msgEntry("user", { content: 42 }))).toEqual([]);
+	});
+
+	it("drops tool results, custom messages, and inline custom messages with empty text", () => {
+		expect(extractEntrySections(msgEntry("toolResult", { toolName: "bash", content: "" }))).toEqual([]);
+		expect(extractEntrySections(msgEntry("custom", { customType: "note", content: "" }))).toEqual([]);
+		const inline = { type: "custom_message", id: id(), parentId: null, timestamp: "t", customType: "n", content: "" } as unknown as SessionEntry;
+		expect(extractEntrySections(inline)).toEqual([]);
+	});
+
 	it("extracts assistant text, visible thinking, and tool calls", () => {
 		const sections = extractEntrySections(
 			msgEntry("assistant", {
@@ -265,6 +280,20 @@ describe("extractEntrySections", () => {
 			display: true,
 		} as unknown as SessionEntry;
 		expect(extractEntrySections(entry)).toEqual([{ kind: "custom", label: "dossier", text: "project facts" }]);
+	});
+
+	it("stringifies tool-call arguments deterministically (sorted keys, arrays kept, undefined dropped)", () => {
+		const sections = extractEntrySections(
+			msgEntry("assistant", {
+				content: [{ type: "toolCall", name: "edit", arguments: { z: 1, a: ["x", "y"], nested: { d: 2, c: 3 }, skip: undefined } }],
+			}),
+		);
+		expect(sections[0].text).toBe('edit({"a":["x","y"],"nested":{"c":3,"d":2},"z":1})');
+	});
+
+	it("returns nothing for messages without a message object", () => {
+		const entry = { type: "message", id: id(), parentId: null, timestamp: "t" } as unknown as SessionEntry;
+		expect(extractEntrySections(entry)).toEqual([]);
 	});
 });
 
@@ -433,6 +462,19 @@ describe("rankChunks", () => {
 		const archive = buildArchiveChunks(ctx.sessionManager.getBranch(), visibleIds([]), "sess", CONFIG);
 		expect(rankChunks(archive, "  ", 0.5)).toEqual([]);
 	});
+
+	it("empty corpus yields nothing", () => {
+		expect(rankChunks([], "auth", 0.5)).toEqual([]);
+	});
+
+	it("skips chunks that tokenized to nothing instead of dividing by zero", () => {
+		const chunk = {
+			ref: "aaaaaaaa", entryId: "aaaaaaaa", origin: "current", sessionId: "s",
+			sessionLabel: "current session", kind: "user", timestamp: "2026-09-26T10:00:00.000Z",
+			text: "   ", charOffset: 0,
+		} as never;
+		expect(rankChunks([chunk as never], "auth", 0.5)).toEqual([]);
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -449,10 +491,21 @@ describe("extractSnippet", () => {
 		expect(snippet.length).toBeLessThanOrEqual(42);
 	});
 
+	it("ignores substring hits without word boundaries", () => {
+		const text = `${"filler ".repeat(50)}sparse data${" more filler".repeat(50)}`;
+		const snippet = extractSnippet(text, "parse", 40);
+		expect(snippet.startsWith("f")).toBe(true); // head window, not windowed on "sparse"
+	});
+
 	it("returns the head when nothing matches", () => {
 		const snippet = extractSnippet("abcdef".repeat(200), "zzz", 50);
 		expect(snippet.endsWith("…")).toBe(true);
 		expect(snippet.startsWith("a")).toBe(true);
+	});
+
+	it("marks blank or empty text explicitly instead of rendering an empty window", () => {
+		expect(extractSnippet("", "query", 50)).toBe("(empty)");
+		expect(extractSnippet("   \n  ", "query", 50)).toBe("(empty)");
 	});
 
 	it("collapses blank runs", () => {
@@ -575,6 +628,22 @@ describe("buildFileCorpus", () => {
 		const f = sessionFile({});
 		expect(buildFileCorpus(`/s/${f.basename}`, f.content)).toBeUndefined();
 	});
+
+	it("falls back to the filename id and blank date when header fields are missing", () => {
+		const header = JSON.stringify({ type: "session", version: 3 }); // no id, no timestamp
+		const file = "/s/2026-01-02T03-04-05-000Z_abc.jsonl";
+		const corpus = buildFileCorpus(file, `${header}\n${userLine("content")}\n`);
+		expect(corpus?.sessionId).toBe("2026-01-02T03-04-05-000Z_abc");
+		expect(corpus?.chunks[0].sessionLabel).toBe("past session ");
+	});
+
+	it("tolerates partially written and id-less lines", () => {
+		const f = sessionFile({ entries: [userLine("kept content")] });
+		const content = [f.content.split("\n")[0], "{not json…", JSON.stringify({ type: "message", timestamp: "t" }), f.content.trim().split("\n")[1]].join("\n");
+		const corpus = buildFileCorpus(`/s/${f.basename}`, content)!;
+		expect(corpus.chunks).toHaveLength(1); // only the well-formed, id-bearing entry
+		expect(corpus.chunks[0].text).toContain("kept content");
+	});
 });
 
 describe("ProjectCorpusCache", () => {
@@ -613,14 +682,49 @@ describe("ProjectCorpusCache", () => {
 	});
 
 	it("evicts least-recently-used files beyond the byte cap", async () => {
-		const f1 = sessionFile({ entries: [userLine("one")] });
-		const f2 = sessionFile({ entries: [userLine("two")] });
-		const { reader, dir, paths } = fakeReader([f1, f2]);
+		// Distinct session ids: identical ids would collapse fakeReader's path map
+		// into one file and turn this test into a vacuous single-file pass.
+		const f1 = sessionFile({ id: "11111111-aaaa-bbbb-cccc-dddddddddddd", entries: [userLine("one")] });
+		const f2 = sessionFile({ id: "22222222-aaaa-bbbb-cccc-dddddddddddd", entries: [userLine("two")] });
+		const { reader, dir } = fakeReader([f1, f2]);
 		const cache = new ProjectCorpusCache(reader, 1); // cap forces eviction down to one file
 		await cache.refresh(dir, undefined);
+		const survivors = cache.list();
+		expect(survivors).toHaveLength(1);
+		// The most recently inserted file survives; the older one was evicted.
+		expect(survivors[0].file).toContain("22222222-aaaa-bbbb-cccc-dddddddddddd");
+		expect(cache.totalBytes()).toBe(survivors[0].bytes);
+	});
+
+	it("refresh of an unchanged file touches LRU without re-reading", async () => {
+		const f1 = sessionFile({ entries: [userLine("stable content")] });
+		const { reader, dir, paths, readCounts } = fakeReader([f1]);
+		const cache = new ProjectCorpusCache(reader, 64 * 1024 * 1024);
+		await cache.refresh(dir, undefined);
+		await cache.refresh(dir, undefined); // stat-identical: no re-read
+		expect(readCounts.get(paths[0])).toBe(1);
+	});
+
+	it("counts a vanished file (stat miss) as skipped and evicts it", async () => {
+		const f1 = sessionFile({ entries: [userLine("content")] });
+		const { reader, dir } = fakeReader([f1]);
+		const cache = new ProjectCorpusCache(reader, 64 * 1024 * 1024);
+		await cache.refresh(dir, undefined);
 		expect(cache.list()).toHaveLength(1);
-		expect(cache.totalBytes()).toBeLessThanOrEqual(Math.max(...cache.list().map((c) => c.bytes)));
-		expect(paths.some((p) => cache.list()[0].file === p)).toBe(true);
+		reader.stat = async () => undefined; // listed but unstat-able
+		expect(await cache.refresh(dir, undefined)).toBe(1);
+		expect(cache.list()).toHaveLength(0);
+	});
+
+	it("counts an unreadable file (read throws) as skipped and evicts it", async () => {
+		const f1 = sessionFile({ entries: [userLine("content")] });
+		const { reader, dir } = fakeReader([f1]);
+		const cache = new ProjectCorpusCache(reader, 64 * 1024 * 1024);
+		reader.readFile = async () => {
+			throw new Error("permission denied");
+		};
+		expect(await cache.refresh(dir, undefined)).toBe(1);
+		expect(cache.list()).toHaveLength(0);
 	});
 
 	it("locates entries by session short id", async () => {
@@ -632,6 +736,24 @@ describe("ProjectCorpusCache", () => {
 		const entryId = corpus.chunks[0].entryId;
 		expect(cache.locate("1e2d", entryId)).toMatchObject({ corpus, line: 2 });
 		expect(cache.locate("beef", entryId)).toBeUndefined();
+	});
+});
+
+// The real filesystem seam behind the injected ProjectReader.
+describe("fsProjectReader", () => {
+	it("lists only .jsonl files, reads content, and tolerates missing stats", async () => {
+		const dir = await mkdtemp(`${tmpdir()}/recall-reader-`);
+		try {
+			await writeFile(`${dir}/a.jsonl`, "{}\n");
+			await writeFile(`${dir}/notes.txt`, "not a session");
+			const names = await fsProjectReader.listJsonlFiles(dir);
+			expect(names).toEqual([`${dir}/a.jsonl`]);
+			expect(await fsProjectReader.readFile(names[0])).toBe("{}\n");
+			expect((await fsProjectReader.stat(names[0]))?.size).toBe(3);
+			expect(await fsProjectReader.stat(`${dir}/gone.jsonl`)).toBeUndefined();
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -781,6 +903,30 @@ describe("renderers", () => {
 	it("call row shows the query, or read mode", () => {
 		expect(renderRecallCall({ query: "token rotation" }, theme)).toContain("token rotation");
 		expect(renderRecallCall({ mode: "read", id: "x" }, theme)).toContain("recall read");
+		expect(renderRecallCall({ query: 42 }, theme)).not.toContain("42"); // non-string query renders bare
+	});
+
+	it("clips long queries in the collapsed call row", () => {
+		const row = renderRecallCall({ query: "x".repeat(100) }, theme);
+		expect(row).toContain("…");
+		expect(row.length).toBeLessThan(100);
+	});
+
+	it("registered render adapters reuse the previous Text component in place", () => {
+		const { pi, tools } = makePi();
+		registerRecallTool(pi, CONFIG);
+		const tool = tools.get(RECALL_TOOL_NAME)!;
+		const callCtx: { lastComponent?: unknown } = {};
+		const first = tool.renderCall!({ query: "auth" } as never, theme as never, callCtx as never);
+		expect(first).toBeInstanceOf(Text);
+		callCtx.lastComponent = first;
+		const second = tool.renderCall!({ query: "tokens" } as never, theme as never, callCtx as never);
+		expect(second).toBe(first); // same component object, updated in place
+		const resultCtx: { lastComponent?: unknown } = {};
+		const resultA = tool.renderResult!({ details: { hits: [{ snippet: "a" }] } } as never, { expanded: true } as never, theme as never, resultCtx as never);
+		expect(resultA).toBeInstanceOf(Text);
+		resultCtx.lastComponent = resultA;
+		expect(tool.renderResult!({ details: { hits: [] } } as never, { expanded: true } as never, theme as never, resultCtx as never)).toBe(resultA);
 	});
 
 	it("result row shows hit count and expands to snippets", () => {
@@ -812,6 +958,24 @@ describe("configFromEnv", () => {
 		expect(config.defaultScope).toBe("session");
 		expect(config.foreignWeight).toBe(0.5);
 	});
+
+	it("non-boolean flag values fall back with an explicit error", () => {
+		const err = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			const config = configFromEnv({ PI_RECALL_COMPACT_OWN: "maybe" });
+			expect(config.ownSummaries).toBe(true); // default preserved
+			expect(err).toHaveBeenCalledWith(expect.stringContaining("PI_RECALL_COMPACT_OWN=maybe"));
+		} finally {
+			err.mockRestore();
+		}
+	});
+
+	it("parses truthy and falsy flag spellings", () => {
+		expect(configFromEnv({ PI_RECALL_COMPACT_OWN: "1" }).ownSummaries).toBe(true);
+		expect(configFromEnv({ PI_RECALL_COMPACT_OWN: "true" }).ownSummaries).toBe(true);
+		expect(configFromEnv({ PI_RECALL_COMPACT_OWN: "0" }).ownSummaries).toBe(false);
+		expect(configFromEnv({ PI_RECALL_COMPACT_OWN: "no" }).ownSummaries).toBe(false);
+	});
 });
 
 // kindLabel sanity for model-facing labels
@@ -819,6 +983,19 @@ describe("kindLabel", () => {
 	it("labels tool sections with their tool name", () => {
 		expect(kindLabel("toolResult", "bash")).toBe("tool result (bash)");
 		expect(kindLabel("summary")).toContain("compaction summary");
+	});
+
+	it("labels every entry kind, with and without optional labels", () => {
+		expect(kindLabel("user")).toBe("user message");
+		expect(kindLabel("assistant")).toBe("assistant");
+		expect(kindLabel("thinking")).toBe("assistant thinking");
+		expect(kindLabel("toolCall", "edit")).toBe("tool call (edit)");
+		expect(kindLabel("toolCall")).toBe("tool call");
+		expect(kindLabel("toolResult")).toBe("tool result");
+		expect(kindLabel("bash")).toBe("bash execution");
+		expect(kindLabel("branchSummary")).toContain("branch summary");
+		expect(kindLabel("custom", "todo")).toBe("injected context (todo)");
+		expect(kindLabel("custom")).toBe("injected context");
 	});
 });
 
@@ -1043,6 +1220,17 @@ describe("auto-compact wiring", () => {
 		await fire(events, "before_agent_start", ctx);
 		expect(compactCalls).toHaveLength(2);
 	});
+
+	it("a failed compaction clears the in-flight flag via onError", async () => {
+		const { ctx, compactCalls } = setup({ tokens: 150_000, contextWindow: 200_000 });
+		const { pi, events } = makePi();
+		registerRecallTool(pi, CONFIG);
+		await fire(events, "before_agent_start", ctx);
+		expect(compactCalls).toHaveLength(1);
+		(compactCalls[0].onError as () => void)();
+		await fire(events, "before_agent_start", ctx);
+		expect(compactCalls).toHaveLength(2);
+	});
 });
 
 describe("compaction summary ownership", () => {
@@ -1245,6 +1433,70 @@ describe("review regressions", () => {
 		// return different content — either the entry moved (not found) or the
 		// id check caught the shift. Both are explicit outcomes, never wrong data.
 		expect(read.content[0].text).toMatch(/Error:|shift line/);
+	});
+
+	it("reports an unreadable session line instead of throwing bad JSON", async () => {
+		const foreign = sessionFile({ entries: [userLine("findable foreign text")] });
+		const { reader, dir } = fakeReader([foreign]);
+		const { pi, tools } = makePi();
+		registerRecallTool(pi, CONFIG, reader);
+		const ctx = sessionCtx({ sessionDir: dir });
+		const search = (await tools.get(RECALL_TOOL_NAME)!.execute("t", { query: "findable foreign", scope: "project" }, undefined, undefined, ctx)) as {
+			details: { hits: Array<{ ref: string }> };
+		};
+		const ref = search.details.hits[0].ref;
+		reader.readFile = async () => "not json at all\n"; // line 1 is garbage
+		const read = (await tools.get(RECALL_TOOL_NAME)!.execute("t", { mode: "read", id: ref }, undefined, undefined, ctx)) as {
+			content: Array<{ text: string }>;
+		};
+		expect(read.content[0].text).toContain("Error:");
+		expect(read.content[0].text).toMatch(/unreadable|changed since indexing/);
+	});
+
+	it("read mode converts a refresh failure into an explicit project-scope error", async () => {
+		const foreign = sessionFile({ entries: [userLine("findable foreign text")] });
+		const { reader, dir } = fakeReader([foreign]);
+		const { pi, tools } = makePi();
+		registerRecallTool(pi, CONFIG, reader);
+		const ctx = sessionCtx({ sessionDir: dir });
+		const search = (await tools.get(RECALL_TOOL_NAME)!.execute("t", { query: "findable foreign", scope: "project" }, undefined, undefined, ctx)) as {
+			details: { hits: Array<{ ref: string }> };
+		};
+		const ref = search.details.hits[0].ref;
+		reader.listJsonlFiles = async () => {
+			throw new Error("ENOENT: no such directory");
+		};
+		const read = (await tools.get(RECALL_TOOL_NAME)!.execute("t", { mode: "read", id: ref }, undefined, undefined, ctx)) as {
+			content: Array<{ text: string }>;
+		};
+		expect(read.content[0].text).toContain("Error:");
+		expect(read.content[0].text).toContain("project scope unavailable");
+	});
+
+	it("read mode detects a truncated file and a swapped entry id at the indexed line", async () => {
+		const foreign = sessionFile({ entries: [userLine("the target entry")] });
+		const { reader, dir } = fakeReader([foreign]);
+		const { pi, tools } = makePi();
+		registerRecallTool(pi, CONFIG, reader);
+		const ctx = sessionCtx({ sessionDir: dir });
+		const search = (await tools.get(RECALL_TOOL_NAME)!.execute("t", { query: "target entry", scope: "project" }, undefined, undefined, ctx)) as {
+			details: { hits: Array<{ ref: string }> };
+		};
+		const ref = search.details.hits[0].ref;
+
+		// Truncation: indexed line 2 no longer exists (stats unchanged, cache not rebuilt).
+		reader.readFile = async () => JSON.stringify({ type: "session", version: 3, id: "1e2dcafe-aaaa-bbbb-cccc-dddddddddddd" });
+		const truncated = (await tools.get(RECALL_TOOL_NAME)!.execute("t", { mode: "read", id: ref }, undefined, undefined, ctx)) as {
+			content: Array<{ text: string }>;
+		};
+		expect(truncated.content[0].text).toContain("changed since indexing");
+
+		// Swap: line 2 parses but holds a different entry id — never return wrong data.
+		reader.readFile = async () => `${JSON.stringify({ type: "session", version: 3, id: "1e2dcafe-aaaa-bbbb-cccc-dddddddddddd" })}\n${userLine("a different entry")}\n`;
+		const swapped = (await tools.get(RECALL_TOOL_NAME)!.execute("t", { mode: "read", id: ref }, undefined, undefined, ctx)) as {
+			content: Array<{ text: string }>;
+		};
+		expect(swapped.content[0].text).toContain("changed since indexing");
 	});
 
 	it("entries omitted from context by edits remain searchable (projection-aware diff)", async () => {
