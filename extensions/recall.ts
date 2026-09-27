@@ -1316,6 +1316,9 @@ export function buildSummarizationPrompt(
     "### Blocked",
     "- [Blockers, or omit this subsection]",
     "",
+    "### Dead Ends",
+    "- [Approaches tried and abandoned, and why they failed — or omit this subsection]",
+    "",
     "## Key Decisions",
     "- **[Decision]**: [Rationale] — keep every decision still in force",
     "",
@@ -1331,6 +1334,8 @@ export function buildSummarizationPrompt(
     "- Preserve exact file paths, identifiers, commands, URLs, and error strings verbatim; compress everything else.",
     "- The future is not recoverable: treat Next Steps as the most important section. Never compress it for " +
       "brevity; note open questions and blockers explicitly.",
+    "- Never drop a dead end silently: record each abandoned approach with the reason it failed — a summary " +
+      "that forgets one invites retrying it after compaction.",
     "- The current todo plan is re-attached verbatim below the summary after generation; do not include a " +
       "## Current Plan section yourself — plan statuses live only in that appended copy.",
     "- The previous summary, when provided, is a stale draft: re-derive volatile facts (current git HEAD and log, " +

@@ -1328,12 +1328,15 @@ describe("summarization prompt", () => {
       "### Done",
       "### In Progress",
       "### Blocked",
+      "### Dead Ends",
       "## Key Decisions",
       "## Next Steps",
       "## Critical Context",
     ]) {
       expect(prompt).toContain(section);
     }
+    // Dead ends are load-bearing: forgetting one invites retrying it.
+    expect(prompt).toContain("invites retrying");
     expect(prompt).toContain("<conversation>\n[User]: do the thing\n</conversation>");
     expect(prompt).not.toContain("<previous-summary>");
     // The hard budget keeps the generation under our output cap.
