@@ -26,8 +26,9 @@
  * - Cache invariants hold by construction: a plain tool whose results ride at
  *   the tail; no context rewrites, no system-prompt churn, one promptSnippet.
  * - The extension owns the context budget and the summary: auto-compaction
- *   fires when projected context exceeds a target (default 128k, well below
- *   the reasoning-reliability cliff; PI_RECALL_COMPACT_TARGET, 0 disables) —
+ *   fires when projected context exceeds a target (default 200k, raised from
+ *   128k — note 200k sits inside the measured 128–256k reasoning-reliability
+ *   cliff band; PI_RECALL_COMPACT_TARGET, 0 disables) —
  *   via a turn_end boundary draft mid-run (a continuously busy agent never
  *   settles, so a settled-only trigger drifts to pi's near-limit backstop)
  *   and from agent_settled when idle, with pi's near-limit threshold as the
@@ -97,7 +98,7 @@ const DEFAULTS: RecallConfig = {
   foreignWeight: 0.5,
   halfLifeHours: 4,
   recencyFloor: 0.25,
-  compactTargetTokens: 131_072,
+  compactTargetTokens: 200_000,
   ownSummaries: true,
   summaryChars: 5_000,
   summaryThinking: "off",
