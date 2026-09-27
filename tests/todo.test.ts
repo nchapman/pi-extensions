@@ -6,6 +6,7 @@ import {
   renderReminder,
   renderTodoCall,
   renderTodoResult,
+  summarizeChanges,
   shouldRemind,
   summarizeTodos,
   TODO_TOOL_NAME,
@@ -181,6 +182,15 @@ describe("renderTodoCall", () => {
     expect(text).toContain("write tests");
   });
 
+  it("shows the first pending item as next when nothing is active", () => {
+    const text = renderTodoCall({ todos: [item("a", "completed"), item("fix review", "pending")] }, THEME);
+    expect(text).toContain("next: fix review");
+  });
+
+  it("marks a fully resolved list", () => {
+    expect(renderTodoCall({ todos: [item("a", "completed")] }, THEME)).toContain("1/1 ✓");
+  });
+
   it("tolerates partially streamed arguments", () => {
     expect(renderTodoCall({}, THEME)).toBe("todo");
     // Any key order: status may arrive before content.
@@ -196,6 +206,47 @@ describe("renderTodoResult", () => {
     expect(text).toContain("1/3");
     expect(text).toContain("write tests");
     expect(text).not.toContain("[x]");
+  });
+
+  it("carries the delta as the news: done, started, added", () => {
+    const todos = [item("a", "completed"), item("b", "completed"), item("c", "in_progress"), item("d")];
+    const changes = {
+      completed: ["a", "b"],
+      started: ["c"],
+      added: ["d"],
+      cancelled: [],
+    };
+    const text = renderTodoResult({ todos, changes }, { expanded: false }, THEME);
+    expect(text).toContain("2/4");
+    expect(text).toContain('✓ "a" +1');
+    expect(text).toContain('▸ "c"');
+    expect(text).toContain('+ "d"');
+  });
+
+  it("caps name lists at two plus a count, one per category on multi-category calls", () => {
+    const changes = { completed: ["a", "b", "c", "d"], started: [], added: [], cancelled: [] };
+    const text = renderTodoResult({ todos: [item("a", "completed")], changes }, { expanded: false }, THEME);
+    expect(text).toContain('✓ "a", "b" +2');
+
+    const multi = { completed: ["a", "b"], started: ["c"], added: ["d"], cancelled: [] };
+    const multiText = renderTodoResult({ todos: [item("a", "completed")], changes: multi }, { expanded: false }, THEME);
+    expect(multiText).toContain('✓ "a" +1');
+    expect(multiText).toContain('▸ "c"');
+  });
+
+  it("announces a finished plan", () => {
+    const todos = [item("a", "completed"), item("b", "completed")];
+    const changes = { completed: ["b"], started: [], added: [], cancelled: [] };
+    const text = renderTodoResult({ todos, changes }, { expanded: false }, THEME);
+    expect(text).toContain("2/2");
+    expect(text).toContain('✓ "b"');
+    expect(text).toContain("all resolved");
+  });
+
+  it("falls back to the active item when nothing changed", () => {
+    const todos = [item("a", "completed"), item("b", "in_progress")];
+    const text = renderTodoResult({ todos }, { expanded: false }, THEME);
+    expect(text).toContain("1/2 ▸ b");
   });
 
   it("shows the full checklist when expanded", () => {
@@ -297,6 +348,27 @@ describe("lastTodoSnapshot", () => {
   });
 });
 
+describe("summarizeChanges", () => {
+  it("classifies each transition, matched by exact text", () => {
+    const prev = [item("a", "in_progress"), item("b", "pending"), item("c", "pending"), item("d", "pending")];
+    const next = [item("a", "completed"), item("b", "in_progress"), item("c", "cancelled"), item("e", "pending")];
+    expect(summarizeChanges(prev, next)).toEqual({
+      completed: ["a"],
+      started: ["b"],
+      added: ["e"],
+      cancelled: ["c"],
+    });
+  });
+
+  it("ignores unchanged items and pins the deliberate non-events", () => {
+    const prev = [item("a", "completed"), item("b", "pending"), item("c", "in_progress")];
+    const next = [item("a", "completed"), item("b", "pending"), item("c", "pending")];
+    expect(summarizeChanges(prev, next)).toEqual({ completed: [], started: [], added: [], cancelled: [] });
+    // Un-resolving reads as cancellation news; counts don't lie either way.
+    expect(summarizeChanges([item("a", "completed")], [item("a", "cancelled")]).cancelled).toEqual(["a"]);
+  });
+});
+
 describe("registerTodoTool", () => {
   it("updates state on valid lists and snapshots it into details", async () => {
     const { pi, tools } = makePi();
@@ -308,6 +380,18 @@ describe("registerTodoTool", () => {
     expect(result.content[0].text).toContain("[x] a");
     expect(result.details.todos).toHaveLength(2);
     expect(result.details.error).toBeUndefined();
+  });
+
+  it("reports what the call changed in details", async () => {
+    const { pi, tools } = makePi();
+    registerTodoTool(pi);
+    const tool = tools.get(TODO_TOOL_NAME)!;
+
+    await tool.execute("1", { todos: [item("a", "in_progress"), item("b", "pending")] });
+    const result = (await tool.execute("2", {
+      todos: [item("a", "completed"), item("b", "pending")],
+    })) as { details: TodoDetails };
+    expect(result.details.changes).toEqual({ completed: ["a"], started: [], added: [], cancelled: [] });
   });
 
   it("rejects invalid lists but returns the current state", async () => {

@@ -37,6 +37,8 @@ export interface TodoItem {
 export interface TodoDetails {
   todos: TodoItem[];
   error?: string;
+  /** What this call changed — the news for the collapsed result row. */
+  changes?: TodoChanges;
 }
 
 const TODO_STATUSES = ["pending", "in_progress", "completed", "cancelled"] as const;
@@ -172,7 +174,7 @@ export function shouldRemind(state: ReminderState): boolean {
   return state.unfinished && (state.compactedSinceUpdate || state.turnsSinceUpdate >= REMINDER_MIN_TURNS);
 }
 
-/** Collapsed call row: `todo 2/5 — active item`. */
+/** Collapsed call row: `todo 2/5 — active item`, `— next: …`, or ` ✓` when all resolved. */
 export function renderTodoCall(args: { todos?: unknown }, theme: Pick<Theme, "fg" | "bold">): string {
   if (!Array.isArray(args?.todos)) return theme.fg("toolTitle", theme.bold("todo"));
   // Items stream in partially (any key order); keep only well-formed ones.
@@ -180,6 +182,11 @@ export function renderTodoCall(args: { todos?: unknown }, theme: Pick<Theme, "fg
   const p = summarizeTodos(todos);
   let text = theme.fg("toolTitle", theme.bold("todo ")) + theme.fg("accent", `${p.resolved}/${p.total}`);
   if (p.active) text += theme.fg("dim", ` — ${clip(p.active.content, 60)}`);
+  else {
+    const nextItem = todos.find((t) => t.status === "pending");
+    if (nextItem) text += theme.fg("dim", ` — next: ${clip(nextItem.content, 55)}`);
+    else if (p.total > 0 && p.resolved === p.total) text += theme.fg("success", " ✓");
+  }
   return text;
 }
 
@@ -190,7 +197,39 @@ const GLYPHS: Record<TodoStatus, { mark: string; color: "success" | "accent" | "
   cancelled: { mark: "✗", color: "dim" },
 };
 
-/** Result row: one-line progress collapsed; full checklist when expanded. */
+/** What one todo call changed, matched by exact item text. */
+export interface TodoChanges {
+  completed: string[];
+  started: string[];
+  added: string[];
+  cancelled: string[];
+}
+
+export function summarizeChanges(prev: TodoItem[], next: TodoItem[]): TodoChanges {
+  const before = new Map(prev.map((t) => [t.content, t.status]));
+  const changes: TodoChanges = { completed: [], started: [], added: [], cancelled: [] };
+  for (const t of next) {
+    const was = before.get(t.content);
+    if (was === undefined) changes.added.push(t.content);
+    else if (was !== "completed" && t.status === "completed") changes.completed.push(t.content);
+    else if (was === "pending" && t.status === "in_progress") changes.started.push(t.content);
+    else if (was !== "cancelled" && t.status === "cancelled") changes.cancelled.push(t.content);
+  }
+  return changes;
+}
+
+/** Names for one change category: `max` quoted names, then +N. When several
+ * categories fire in one call, callers pass max=1 so the collapsed row stays
+ * close to one line — expand is the dump view. */
+function clipNames(names: string[], max: number): string {
+  const shown = names
+    .slice(0, max)
+    .map((n) => `"${clip(n, 40)}"`)
+    .join(", ");
+  return names.length > max ? `${shown} +${names.length - max}` : shown;
+}
+
+/** Result row: progress counts, then what changed; full checklist when expanded. */
 export function renderTodoResult(
   details: TodoDetails | undefined,
   options: { expanded: boolean },
@@ -201,9 +240,20 @@ export function renderTodoResult(
   const p = summarizeTodos(todos);
   if (todos.length === 0) return theme.fg("dim", "no todos");
 
-  let text =
-    theme.fg(p.resolved === p.total ? "success" : "muted", `${p.resolved}/${p.total}`) +
-    (p.active ? theme.fg("accent", ` ▸ ${clip(p.active.content, 60)}`) : "");
+  const allDone = p.resolved === p.total;
+  const ch = details?.changes;
+  const fired = [ch?.completed, ch?.started, ch?.added, ch?.cancelled].filter((c) => c !== undefined && c.length > 0);
+  const max = fired.length > 1 ? 1 : 2;
+  const parts: string[] = [];
+  if (ch?.completed.length) parts.push(theme.fg("success", `✓ ${clipNames(ch.completed, max)}`));
+  if (ch?.started.length) parts.push(theme.fg("accent", `▸ ${clipNames(ch.started, max)}`));
+  if (ch?.added.length) parts.push(theme.fg("muted", `+ ${clipNames(ch.added, max)}`));
+  if (ch?.cancelled.length) parts.push(theme.fg("dim", `✗ ${clipNames(ch.cancelled, max)}`));
+  if (parts.length === 0 && p.active) parts.push(theme.fg("accent", `▸ ${clip(p.active.content, 60)}`));
+  if (allDone) parts.push(theme.fg("dim", "all resolved"));
+
+  let text = theme.fg(allDone ? "success" : "muted", `${p.resolved}/${p.total}`);
+  if (parts.length > 0) text += ` ${parts.join(theme.fg("dim", " · "))}`;
   if (options.expanded) {
     const list = todos
       .map((t) => {
@@ -410,6 +460,7 @@ export function registerTodoTool(pi: ExtensionAPI): void {
         };
       }
       const dropped = droppedUnfinishedItems(todos, next);
+      const changes = summarizeChanges(todos, next);
       todos = next;
       turnsSinceUpdate = 0;
       compactedSinceUpdate = false;
@@ -419,7 +470,7 @@ export function registerTodoTool(pi: ExtensionAPI): void {
           : "";
       return {
         content: [{ type: "text", text: note + renderPlainList(todos) }],
-        details: { todos: [...todos] } as TodoDetails,
+        details: { todos: [...todos], changes } as TodoDetails,
       };
     },
     renderCall(args, theme, context) {
