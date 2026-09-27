@@ -51,7 +51,7 @@ const CONFIG: RecallConfig = {
   compactTargetTokens: 131_072,
   ownSummaries: true,
   summaryChars: 5_000,
-  summaryThinking: "session",
+  summaryThinking: "high",
   chunkChars: 3000,
   snippetChars: 400,
   maxResults: 5,
@@ -1344,6 +1344,8 @@ describe("summarization prompt", () => {
     expect(prompt).toContain("discarded whole");
     // Fully owned: nothing rides pi's built-in summarizer prompt.
     expect(prompt).not.toContain("Additional focus");
+    // Meta-sessions (editing this very prompt) must not hijack the format.
+    expect(prompt).toContain("never a format to adopt");
   });
 
   it("tells the summarizer the newest messages stay in context, sized from keepRecentTokens", () => {
@@ -1604,7 +1606,7 @@ describe("compaction summary ownership", () => {
     expect(prompt).toContain("under 5,000 characters");
     // pi's own summarizer conventions: one-off prompt (no cache writes), bounded
     // output, fresh routing id, abortable.
-    expect(call.options.maxTokens).toBe(8192);
+    expect(call.options.maxTokens).toBe(16_384);
     expect(call.options.cacheRetention).toBe("none");
     expect(call.options.sessionId).toEqual(expect.any(String));
     expect(call.options.signal).toBe(SIGNAL);
@@ -1682,22 +1684,25 @@ describe("compaction summary ownership", () => {
     expect(budgetWithPlan(5_000, 0)).toBe(5_000);
   });
 
-  it("forwards thinking level only when the model reasons and a level is set", async () => {
-    for (const [model, thinkingLevel, expected] of [
-      [{ id: "test-model", reasoning: true }, "high", "high"],
-      [{ id: "test-model", reasoning: true }, "off", undefined],
-      [{ id: "test-model", reasoning: false }, "high", undefined],
+  it("forwards the pinned thinking level only when the model reasons; 'session' mirrors the session", async () => {
+    for (const [knob, model, thinkingLevel, expected] of [
+      // Default "high" pins regardless of the session's (possibly low) level.
+      ["high", { id: "test-model", reasoning: true }, "off", "high"],
+      ["high", { id: "test-model", reasoning: false }, "high", undefined],
+      // "session" mirrors the session level; off/absent → unset.
+      ["session", { id: "test-model", reasoning: true }, "high", "high"],
+      ["session", { id: "test-model", reasoning: true }, "off", undefined],
     ] as const) {
       const calls: CapturedCall[] = [];
       const { pi, events } = makePi();
-      registerRecallTool(pi, CONFIG);
+      registerRecallTool(pi, { ...CONFIG, summaryThinking: knob });
       await fire(
         events,
         "session_before_compact",
         hookCtx(okComplete(calls), { model, thinkingLevel }),
         beforeCompactEvent(),
       );
-      expect(calls[0].options.reasoning, `${JSON.stringify(model)} @ ${String(thinkingLevel)}`).toBe(expected);
+      expect(calls[0].options.reasoning, `${knob} ${JSON.stringify(model)} @ ${String(thinkingLevel)}`).toBe(expected);
     }
   });
 
@@ -1921,11 +1926,12 @@ describe("compaction summary ownership", () => {
   });
 
   it("config parses the summary-thinking knob", () => {
-    expect(configFromEnv({}).summaryThinking).toBe("session");
+    expect(configFromEnv({}).summaryThinking).toBe("high"); // one-shot hard task: not the session's interactive level
+    expect(configFromEnv({ PI_RECALL_SUMMARY_THINKING: "session" }).summaryThinking).toBe("session");
     expect(configFromEnv({ PI_RECALL_SUMMARY_THINKING: "off" }).summaryThinking).toBe("off");
     expect(configFromEnv({ PI_RECALL_SUMMARY_THINKING: "low" }).summaryThinking).toBe("low");
     expect(configFromEnv({ PI_RECALL_SUMMARY_THINKING: "HIGH" }).summaryThinking).toBe("high");
-    expect(configFromEnv({ PI_RECALL_SUMMARY_THINKING: "turbo" }).summaryThinking).toBe("session"); // invalid → default
+    expect(configFromEnv({ PI_RECALL_SUMMARY_THINKING: "turbo" }).summaryThinking).toBe("high"); // invalid → default
   });
 
   it("config parses the summary character budget", () => {
@@ -1939,6 +1945,8 @@ describe("compaction summary ownership", () => {
     const cases = [
       ["off", { id: "test-model", reasoning: true }, "off"],
       ["low", { id: "test-model", reasoning: true }, "low"],
+      // Explicit "session" mirrors whatever the session runs.
+      ["session", { id: "test-model", reasoning: true }, "high"],
     ] as const;
     for (const [knob, model, expectedLevel] of cases) {
       const calls: unknown[] = [];
@@ -1956,7 +1964,8 @@ describe("compaction summary ownership", () => {
       );
       expect((calls[0] as { thinkingLevel?: string }).thinkingLevel, knob).toBe(expectedLevel);
     }
-    // Default mirrors the session level.
+    // Default pins "high" even when the session runs "low" — a low-effort
+    // summarizer freestyles the template on long inputs (measured on glm-5.3).
     const calls: unknown[] = [];
     const summarize: SummaryFn = async (args) => {
       calls.push(args);
@@ -1967,7 +1976,7 @@ describe("compaction summary ownership", () => {
     await fire(
       events,
       "session_before_compact",
-      { ...hookCtx(), model: { id: "test-model", reasoning: true }, thinkingLevel: "high" },
+      { ...hookCtx(), model: { id: "test-model", reasoning: true }, thinkingLevel: "low" },
       beforeCompactEvent(),
     );
     expect((calls[0] as { thinkingLevel?: string }).thinkingLevel).toBe("high");
