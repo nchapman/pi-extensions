@@ -387,70 +387,29 @@ describe("registerTodoTool", () => {
     expect(reminder.message.content).toContain("[>] a");
   });
 
-  it("a plan-carrying compaction disarms the flag an earlier plan-less one armed", async () => {
-    const { pi, tools, events } = makePi();
-    registerTodoTool(pi);
-
-    await tools.get(TODO_TOOL_NAME)!.execute("1", { todos: [item("a", "in_progress")] });
-    // Fallback compaction (pi default summary) arms the reminder…
-    fire(events, "session_compact", undefined, {
-      type: "session_compact",
-      compactionEntry: { type: "compaction", summary: "## Goal\nwork" },
-      fromExtension: false,
-    });
-    // …a later recall-owned compaction embeds the plan and disarms it.
-    fire(events, "session_compact", undefined, {
-      type: "session_compact",
-      compactionEntry: { type: "compaction", summary: "## Goal\nwork\n\n## Current Plan\n1/2 resolved\n [>] a" },
-      fromExtension: true,
-    });
-
-    expect(fire(events, "before_agent_start")).toBeUndefined();
-  });
-
-  it("a plan-less compaction after a plan-carrying one re-arms the reminder", async () => {
+  it("reminds after every compaction — extension-written summaries are plan-less too", async () => {
     const { pi, tools, events } = makePi();
     registerTodoTool(pi);
 
     await tools.get(TODO_TOOL_NAME)!.execute("1", { todos: [item("a", "in_progress")] });
     fire(events, "session_compact", undefined, {
       type: "session_compact",
-      compactionEntry: { type: "compaction", summary: "## Goal\nwork\n\n## Current Plan\n1/2 resolved\n [>] a" },
-      fromExtension: true,
-    });
-    fire(events, "session_compact", undefined, {
-      type: "session_compact",
       compactionEntry: { type: "compaction", summary: "## Goal\nwork" },
-      fromExtension: false,
+      fromExtension: true,
     });
 
     const reminder = fire(events, "before_agent_start") as { message: { content: string } };
     expect(reminder.message.content).toContain("[>] a");
   });
 
-  it("stays quiet on resume when the compaction summary already carries the plan", () => {
-    const branch = [
-      {
-        type: "message",
-        message: { role: "toolResult", toolName: TODO_TOOL_NAME, details: { todos: [item("a", "in_progress")] } },
-      },
-      { type: "compaction", summary: "## Goal\nwork\n\n## Current Plan\n1/2 resolved\n [>] a" },
-    ];
-    const { pi, events } = makePi();
-    registerTodoTool(pi);
-
-    fire(events, "session_start", { sessionManager: { getBranch: () => branch } } as unknown as ExtensionContext);
-    expect(fire(events, "before_agent_start")).toBeUndefined();
-  });
-
-  it("on resume, only the newest compaction decides — plan-less then plan-carrying stays quiet", () => {
+  it("stays quiet on resume when a plan message follows the compaction", () => {
     const branch = [
       {
         type: "message",
         message: { role: "toolResult", toolName: TODO_TOOL_NAME, details: { todos: [item("a", "in_progress")] } },
       },
       { type: "compaction", summary: "## Goal\nwork" },
-      { type: "compaction", summary: "## Goal\nwork\n\n## Current Plan\n1/2 resolved\n [>] a" },
+      { type: "custom_message", customType: "todo.plan", content: "## Current Plan\n1/2 resolved\n [>] a" },
     ];
     const { pi, events } = makePi();
     registerTodoTool(pi);
@@ -459,13 +418,45 @@ describe("registerTodoTool", () => {
     expect(fire(events, "before_agent_start")).toBeUndefined();
   });
 
-  it("on resume, a later plan-less compaction after a plan-carrying one reminds", () => {
+  it("stays quiet on resume when the extension's own reminder follows the compaction", () => {
     const branch = [
       {
         type: "message",
         message: { role: "toolResult", toolName: TODO_TOOL_NAME, details: { todos: [item("a", "in_progress")] } },
       },
-      { type: "compaction", summary: "## Goal\nwork\n\n## Current Plan\n1/2 resolved\n [>] a" },
+      { type: "compaction", summary: "## Goal\nwork" },
+      { type: "custom_message", customType: "todo.reminder", content: "TODO REMINDER — current plan (0/1)" },
+    ];
+    const { pi, events } = makePi();
+    registerTodoTool(pi);
+
+    fire(events, "session_start", { sessionManager: { getBranch: () => branch } } as unknown as ExtensionContext);
+    expect(fire(events, "before_agent_start")).toBeUndefined();
+  });
+
+  it("stays quiet on resume when no compaction follows the snapshot", () => {
+    const branch = [
+      {
+        type: "message",
+        message: { role: "toolResult", toolName: TODO_TOOL_NAME, details: { todos: [item("a", "in_progress")] } },
+      },
+      { type: "message", message: { role: "user", content: "still here" } },
+    ];
+    const { pi, events } = makePi();
+    registerTodoTool(pi);
+
+    fire(events, "session_start", { sessionManager: { getBranch: () => branch } } as unknown as ExtensionContext);
+    expect(fire(events, "before_agent_start")).toBeUndefined();
+  });
+
+  it("on resume, a plan message before a newer compaction still reminds", () => {
+    const branch = [
+      {
+        type: "message",
+        message: { role: "toolResult", toolName: TODO_TOOL_NAME, details: { todos: [item("a", "in_progress")] } },
+      },
+      { type: "compaction", summary: "## Goal\nwork" },
+      { type: "custom_message", customType: "todo.plan", content: "## Current Plan\n1/2 resolved\n [>] a" },
       { type: "compaction", summary: "## Goal\nwork" },
     ];
     const { pi, events } = makePi();
@@ -509,20 +500,6 @@ describe("registerTodoTool", () => {
 
     const reminder = fire(events, "before_agent_start") as { message: { content: string } };
     expect(reminder.message.content).toContain("[>] a");
-  });
-
-  it("stays quiet after a compaction whose summary already carries the plan", async () => {
-    const { pi, tools, events } = makePi();
-    registerTodoTool(pi);
-
-    await tools.get(TODO_TOOL_NAME)!.execute("1", { todos: [item("a", "in_progress")] });
-    fire(events, "session_compact", undefined, {
-      type: "session_compact",
-      compactionEntry: { type: "compaction", summary: "## Goal\nwork\n\n## Current Plan\n1/2 resolved\n [>] a" },
-      fromExtension: true,
-    });
-
-    expect(fire(events, "before_agent_start")).toBeUndefined();
   });
 
   it("still reminds after a plan-less compaction even when an extension wrote the summary", async () => {

@@ -13,8 +13,9 @@
  *   branch on session_start/session_tree restores the right list for every
  *   branch, rewind, and resume (no filesystem, nothing desyncs)
  * - One-shot reminders on before_agent_start when the plan is unfinished and
- *   stale (or compaction wiped it — a summary that embeds the plan already
- *   covers that, so only plan-less summaries arm the reminder)
+ *   stale (or compaction wiped it — summaries never carry the plan: recall
+ *   re-injects it as a tail message after mid-run drafts, and this reminder
+ *   covers every other compaction)
  * - /todos renders the list full-screen in the TUI
  */
 
@@ -276,6 +277,7 @@ class TodoListComponent {
 type TodoBranchEntry = {
   type?: string;
   summary?: unknown;
+  customType?: unknown;
   message?: { role?: string; content?: unknown; toolName?: string; details?: unknown } | null;
 };
 
@@ -306,33 +308,48 @@ export function lastTodoSnapshot(branch: TodoBranchEntry[]): TodoItem[] {
   return scanTodoSnapshots(branch).todos;
 }
 
-/** Marker a compaction summary carries when it already embeds the plan (rendered by recall's planSection). */
+/** Title of the plan block in recall's post-compaction plan message. */
 export const PLAN_SECTION_HEADER = "## Current Plan";
 
-/** Whether a compaction entry's summary already carries the plan — then the post-compaction reminder is redundant. */
-function summaryCarriesPlan(entry: { summary?: unknown } | undefined | null): boolean {
-  return typeof entry?.summary === "string" && entry.summary.includes(PLAN_SECTION_HEADER);
-}
+/** customType of the message recall chains after a mid-run draft compaction to carry the plan at the context tail. */
+export const PLAN_MESSAGE_TYPE = "todo.plan";
+
+/** customType of this extension's one-shot staleness/compaction reminder message. */
+export const TODO_REMINDER_TYPE = "todo.reminder";
+
+/** Message types that carry the plan across a compaction — a resume scan treats any of them as "not hidden". */
+const PLAN_CARRIERS = new Set([PLAN_MESSAGE_TYPE, TODO_REMINDER_TYPE]);
 
 /**
  * Adopt the last todo snapshot recorded on the session branch. Tool results
  * always carry the full list, so the last one on the branch is the state.
  * Also reports whether a compaction that hides the plan follows that snapshot
- * — a compaction whose summary embeds the plan does not count as hiding it.
+ * — a plan message after the compaction (recall's mid-run draft carrier)
+ * means it was not hidden.
  */
 function reconstructFromSession(ctx: ExtensionContext): { todos: TodoItem[]; planHiddenByCompaction: boolean } {
   const branch = ctx.sessionManager.getBranch() as TodoBranchEntry[];
   const { todos, index: lastIndex } = scanTodoSnapshots(branch);
   // Only the newest compaction after the snapshot decides: a later one folds
   // the earlier and is what the context actually shows.
-  let lastCompaction: TodoBranchEntry | undefined;
+  let lastCompactionIndex = -1;
   for (let i = branch.length - 1; i > lastIndex; i--) {
     if (branch[i].type === "compaction") {
-      lastCompaction = branch[i];
+      lastCompactionIndex = i;
       break;
     }
   }
-  const planHiddenByCompaction = todos.length > 0 && !!lastCompaction && !summaryCarriesPlan(lastCompaction);
+  const planHiddenByCompaction =
+    todos.length > 0 &&
+    lastCompactionIndex !== -1 &&
+    !branch
+      .slice(lastCompactionIndex + 1)
+      .some(
+        (entry) =>
+          entry.type === "custom_message" &&
+          typeof entry.customType === "string" &&
+          PLAN_CARRIERS.has(entry.customType),
+      );
   return { todos, planHiddenByCompaction };
 }
 
@@ -353,11 +370,12 @@ export function registerTodoTool(pi: ExtensionAPI): void {
   pi.on("session_tree", (_event, ctx) => {
     adoptBranchState(ctx);
   });
-  pi.on("session_compact", (event) => {
-    // Recall-owned summaries embed the plan — reminding would re-inject the
-    // identical list one message later. Assign (not early-return): a later
-    // plan-carrying compaction must also disarm an earlier plan-less one.
-    compactedSinceUpdate = !summaryCarriesPlan(event.compactionEntry);
+  pi.on("session_compact", () => {
+    // Summaries never carry the plan, so every compaction re-arms the reminder
+    // and the list is re-injected at the next run start. Mid-run draft
+    // compactions fire no session_compact — recall chains a plan message
+    // after them instead, and the resume scan above recognizes that carrier.
+    compactedSinceUpdate = true;
   });
 
   pi.on("before_agent_start", () => {
@@ -369,7 +387,7 @@ export function registerTodoTool(pi: ExtensionAPI): void {
     compactedSinceUpdate = false;
     return {
       message: {
-        customType: "todo.reminder",
+        customType: TODO_REMINDER_TYPE,
         content: renderReminder(todos),
         display: false,
       },

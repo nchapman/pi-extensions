@@ -38,13 +38,14 @@
  *   included), falling back to pi's default summarizer on any failure, and by
  *   the same summarizer inline for drafts, which never fire the hook and
  *   simply retry on the next turn (PI_RECALL_COMPACT_OWN=0 opts out).
- * - Every owned summary carries the current todo plan verbatim (## Current
- *   Plan, from the todo tool's branch snapshot): compaction is the one moment
- *   the plan otherwise leaves the context, and boundary drafts fire no
- *   session_compact for the todo extension's reminder to catch — the summary
- *   itself is the reliable carrier. The section's length is deducted from the
- *   summarizer's character budget (floored at the summaryChars minimum —
- *   dropping state is worse than exceeding the cap).
+ * - Mid-run drafts chain a plan message after the compaction entry (## Current
+ *   Plan, from the todo tool's branch snapshot): current state belongs at the
+ *   recent position — after the kept tail — not frozen inside the summary,
+ *   where it would age behind newer todo calls. Drafts fire no session_compact
+ *   for the todo extension's reminder to catch, so the chained message is the
+ *   carrier; pi-triggered compactions stay plan-less and lean on that reminder
+ *   instead (the todo extension's resume scan recognizes the chained carrier,
+ *   so resumed drafts do not double-inject).
  */
 
 import fsp from "node:fs/promises";
@@ -60,10 +61,11 @@ import {
   ModelRegistry,
   type ProjectedSessionEntry,
   serializeConversation,
+  type SessionBoundaryDraft,
   type SessionEntry,
   type Theme,
 } from "@earendil-works/pi-coding-agent";
-import { PLAN_SECTION_HEADER, lastTodoSnapshot, renderPlainList } from "./todo";
+import { PLAN_MESSAGE_TYPE, PLAN_SECTION_HEADER, lastTodoSnapshot, renderPlainList } from "./todo";
 
 export const RECALL_TOOL_NAME = "recall";
 
@@ -109,7 +111,7 @@ const DEFAULTS: RecallConfig = {
   projectMaxBytes: 64 * 1024 * 1024,
 };
 
-/** Minimum for PI_RECALL_SUMMARY_CHARS, and the floor the plan section may squeeze the generation budget to. */
+/** Minimum for PI_RECALL_SUMMARY_CHARS. */
 const MIN_SUMMARY_CHARS = 500;
 
 function boolFromEnv(env: NodeJS.ProcessEnv, name: string, fallback: boolean): boolean {
@@ -1057,8 +1059,10 @@ export function registerRecallTool(
       return;
     }
     const signal = ctx.signal ?? new AbortController().signal;
-    // The plan rides in the draft summary: drafts fire no session_compact, so
-    // the todo extension's post-compaction reminder never runs for them.
+    // The plan rides as a message chained after the compaction entry — the
+    // recent position, after the kept tail, not frozen inside the summary:
+    // drafts fire no session_compact, so the todo extension's post-compaction
+    // reminder never runs for them.
     const plan = planSection(ctx.sessionManager.getBranch());
     try {
       const { text, usage: summaryUsage } = await retryTransient(
@@ -1072,7 +1076,7 @@ export function registerRecallTool(
             messages: preparation.messages,
             previousSummary: preparation.previousSummary,
             userFocus: undefined,
-            budgetChars: budgetWithPlan(config.summaryChars, plan.length),
+            budgetChars: config.summaryChars,
             keptRecentTokens: keepRecentTokens,
             signal,
           }),
@@ -1096,7 +1100,7 @@ export function registerRecallTool(
           ...event.entries,
           {
             type: "compaction",
-            summary: withPlanSection(text, plan),
+            summary: text,
             firstKeptEntryId: preparation.firstKeptEntryId,
             details: carryForwardFileLists(
               lastCompactionDetails(ctx.sessionManager.getBranch()),
@@ -1104,6 +1108,13 @@ export function registerRecallTool(
             ),
             usage: summaryUsage as CompactionUsage,
           },
+          // The plan at the recent position — after the kept tail, where only
+          // later todo calls (never older ones) supersede it.
+          ...(plan === ""
+            ? []
+            : ([
+                { type: "custom_message", customType: PLAN_MESSAGE_TYPE, content: plan, display: false },
+              ] as SessionBoundaryDraft[])),
         ],
       };
     } catch (err) {
@@ -1136,10 +1147,9 @@ export function registerRecallTool(
       return;
     }
     const p = event.preparation;
-    // The plan rides in the summary: pi-triggered compactions also fire
-    // session_compact (the todo extension's reminder covers the next run
-    // start), but the summary carries the exact plan immediately.
-    const plan = planSection(event.branchEntries);
+    // Plan-less by design: current state belongs at the recent position, and
+    // pi-triggered compactions fire session_compact — the todo extension's
+    // reminder re-injects the plan at the next run start.
     try {
       const { text, usage } = await retryTransient(
         () =>
@@ -1159,7 +1169,7 @@ export function registerRecallTool(
             previousSummary: p.previousSummary,
             userFocus: event.customInstructions?.trim() || undefined,
             // Tight target: recall makes the summary a map, not the archive.
-            budgetChars: budgetWithPlan(config.summaryChars, plan.length),
+            budgetChars: config.summaryChars,
             keptRecentTokens: p.settings.keepRecentTokens,
             signal: event.signal,
           }),
@@ -1173,7 +1183,7 @@ export function registerRecallTool(
       }
       return {
         compaction: {
-          summary: withPlanSection(text, plan),
+          summary: text,
           firstKeptEntryId: p.firstKeptEntryId,
           tokensBefore: p.tokensBefore,
           usage: usage as CompactionUsage,
@@ -1360,8 +1370,8 @@ export function buildSummarizationPrompt(
       "error strings verbatim; compress everything else.",
     "- Never drop a dead end silently: record each abandoned approach with the reason it failed — a summary " +
       "that forgets one invites retrying it after compaction.",
-    "- The current todo plan is re-attached verbatim below the summary after generation; do not include a " +
-      "## Current Plan section yourself — plan statuses live only in that appended copy.",
+    "- The current todo plan is re-injected separately after compaction — do not restate plan items or " +
+      "include a ## Current Plan section; exact statuses live in that separate, newer copy when one exists.",
     "- The previous summary, when provided, is a stale draft: re-derive volatile facts (current git HEAD and log, " +
       "test counts, what was just committed, what the user most recently asked) from the newest messages in " +
       "<conversation> rather than copying them; when they disagree, the messages win. Never carry Next Steps " +
@@ -1583,30 +1593,18 @@ export function lastCompactionDetails(branchEntries: SessionEntry[]): unknown {
 // ---------------------------------------------------------------------------
 
 /**
- * The current plan section for an owned compaction summary: the todo tool's
+ * The plan message chained after a mid-run draft compaction: the todo tool's
  * authoritative state, read from the branch snapshot (tool results carry the
  * full list, so the newest one is the live plan). Empty when no todos exist.
  * Fully-resolved lists are carried intentionally — “this milestone completed”
- * orients the model and marks the work done.
+ * orients the model and marks the work done. (pi-triggered compactions chain
+ * nothing: the todo reminder re-injects unfinished plans at the next run
+ * start, and completed milestones are the summary's Progress/Done territory.)
  */
 export function planSection(branchEntries: SessionEntry[]): string {
   const todos = lastTodoSnapshot(branchEntries);
   if (todos.length === 0) return "";
   return `${PLAN_SECTION_HEADER}\n(todo tool state — authoritative, exact statuses)\n${renderPlainList(todos)}`;
-}
-
-/**
- * Budget for the generated text: the plan section's length is reserved so the
- * total stays under the configured cap — floored at the env minimum
- * (MIN_SUMMARY_CHARS), because dropping state is worse than exceeding the cap.
- */
-export function budgetWithPlan(base: number, sectionChars: number): number {
-  return Math.max(MIN_SUMMARY_CHARS, base - sectionChars);
-}
-
-/** The plan rides after the generated map — exact state, immune to summarizer compression. */
-export function withPlanSection(summary: string, section: string): string {
-  return section === "" ? summary : `${summary}\n\n${section}`;
 }
 
 /** Boundaries of one model completion, as the extension seam sees it. */

@@ -35,7 +35,6 @@ import {
   tokenize,
   type RecallConfig,
   type SearchHit,
-  budgetWithPlan,
 } from "../extensions/recall";
 import { TODO_TOOL_NAME } from "../extensions/todo";
 
@@ -1659,7 +1658,7 @@ describe("compaction summary ownership", () => {
     expect(prompt).toContain("~32,000 tokens of messages stay in context verbatim");
   });
 
-  it("carries the current todo plan in the summary, within the budget", async () => {
+  it("leaves pi-triggered summaries plan-less — the todo reminder is the carrier", async () => {
     const calls: CapturedCall[] = [];
     const { pi, events } = makePi();
     registerRecallTool(pi, CONFIG);
@@ -1677,18 +1676,14 @@ describe("compaction summary ownership", () => {
       beforeCompactEvent({ branchEntries }),
     )) as { compaction: { summary: string } };
 
-    // The newest snapshot rides verbatim after the generated map.
+    // The map carries no plan: current state rides separately, after the kept tail.
     const { summary } = result.compaction;
-    expect(summary.startsWith("## Goal\n- Recall-aware summary\n\n## Current Plan")).toBe(true);
-    expect(summary).toContain("[x] write the fix");
-    expect(summary).toContain("[>] run the tests");
-    expect(summary).toContain("1/2 resolved");
-    // The section's length is deducted from the summarizer's budget, and the
-    // prompt forbids the model from emitting its own plan section.
-    const section = summary.slice(summary.indexOf("## Current Plan"));
+    expect(summary.startsWith("## Goal\n- Recall-aware summary")).toBe(true);
+    expect(summary).not.toContain("## Current Plan");
+    // Full budget for the map, and the prompt points plan state at its own message.
     const prompt = calls[0].context.messages[0].content[0].text;
-    expect(prompt).toContain(`under ${(CONFIG.summaryChars - section.length).toLocaleString("en-US")} characters`);
-    expect(prompt).toContain("do not include a ## Current Plan section yourself");
+    expect(prompt).toContain(`under ${CONFIG.summaryChars.toLocaleString("en-US")} characters`);
+    expect(prompt).toContain("re-injected separately after compaction");
   });
 
   it("leaves the summary unchanged when there is no todo state", async () => {
@@ -1705,12 +1700,6 @@ describe("compaction summary ownership", () => {
     expect(result.compaction.summary).toBe("## Goal\n- Recall-aware summary");
     const prompt = calls[0].context.messages[0].content[0].text;
     expect(prompt).toContain("under 5,000 characters");
-  });
-
-  it("budgetWithPlan floors the generation budget so a huge plan cannot starve the summary", () => {
-    expect(budgetWithPlan(5_000, 200)).toBe(4_800);
-    expect(budgetWithPlan(5_000, 6_000)).toBe(500);
-    expect(budgetWithPlan(5_000, 0)).toBe(5_000);
   });
 
   it("forwards the pinned thinking level only when the model reasons; 'session' mirrors the session", async () => {
@@ -2207,9 +2196,11 @@ describe("mid-run compaction wiring (turn_end)", () => {
     expect(draft.summary).toBe("## Goal\n- mid-run summary");
     expect(typeof draft.firstKeptEntryId).toBe("string");
     expect(draft.usage).toEqual({ totalTokens: 7 });
+    // No todo state on the branch — the draft stands alone, no plan message.
+    expect(result!.entries).toHaveLength(1);
   });
 
-  it("carries the current todo plan in mid-run drafts — drafts fire no session_compact, so the summary is the only carrier", async () => {
+  it("chains the current plan as a message after the draft — drafts fire no session_compact, so nothing else carries it", async () => {
     const { pi, events } = makePi();
     registerRecallTool(pi, CONFIG);
     const branch = [
@@ -2225,9 +2216,20 @@ describe("mid-run compaction wiring (turn_end)", () => {
       turnEndEvent(),
     )) as { entries: Array<Record<string, unknown>> };
 
-    const summary = result.entries[0].summary as string;
-    expect(summary).toContain("## Current Plan");
-    expect(summary).toContain("[>] survive compaction");
+    // Plan-less compaction first, then the plan carrier at the recent position.
+    expect(result.entries[0].type).toBe("compaction");
+    expect(result.entries[0].summary).not.toContain("## Current Plan");
+    const planMessage = result.entries[1] as {
+      type: string;
+      customType: string;
+      content: string;
+      display: boolean;
+    };
+    expect(planMessage.type).toBe("custom_message");
+    expect(planMessage.customType).toBe("todo.plan");
+    expect(planMessage.content).toContain("## Current Plan");
+    expect(planMessage.content).toContain("[>] survive compaction");
+    expect(planMessage.display).toBe(false);
   });
 
   it("summarizes the projection chronologically with the previous compaction summary, and unions file lists", async () => {
