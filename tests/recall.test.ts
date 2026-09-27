@@ -1338,7 +1338,9 @@ describe("summarization prompt", () => {
     // Dead ends are load-bearing: forgetting one invites retrying it.
     expect(prompt).toContain("invites retrying");
     expect(prompt).toContain("<conversation>\n[User]: do the thing\n</conversation>");
-    expect(prompt).not.toContain("<previous-summary>");
+    // No previous-summary *block* when none was provided — the directive's
+    // inline mention ("and any <previous-summary>") is expected, the block is not.
+    expect(prompt).not.toContain("\n<previous-summary>\n");
     // The hard budget keeps the generation under our output cap.
     expect(prompt).toContain("under 5,000 characters");
     expect(prompt).toContain("discarded whole");
