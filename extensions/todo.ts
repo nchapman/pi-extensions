@@ -4,8 +4,11 @@
  * Design (mirrors Claude Code's TodoWrite / Codex's update_plan):
  * - One `todo` tool; every call sends the FULL list and replaces the old one
  * - Statuses: pending | in_progress | completed | cancelled, at most one
- *   in_progress — invalid lists are rejected with the current state so the
- *   model self-corrects in one retry
+ *   in_progress — structurally invalid lists are rejected with the current
+ *   state so the model self-corrects in one retry
+ * - Updates that drop unfinished items are accepted with a note naming them:
+ *   deliberate restructuring (reword, split, abandon) stays friction-free
+ *   while accidental drops remain visible
  * - State snapshots ride in tool-result `details`; replaying the session
  *   branch on session_start/session_tree restores the right list for every
  *   branch, rewind, and resume (no filesystem, nothing desyncs)
@@ -125,8 +128,9 @@ export function summarizeTodos(todos: TodoItem[]): TodoProgress {
 
 /**
  * Unfinished items from `previous` that vanish from `next`. Whole-list rewrite
- * makes silent drift possible; rejecting these drops forces the model to carry
- * its work forward or cancel it explicitly. Resolved items may drop freely.
+ * makes silent drift possible; naming these drops in the result keeps them
+ * visible without blocking deliberate restructuring. Resolved items may drop
+ * freely.
  */
 export function droppedUnfinishedItems(previous: TodoItem[], next: TodoItem[]): TodoItem[] {
   const kept = new Set(next.map((t) => t.content));
@@ -334,7 +338,7 @@ export function registerTodoTool(pi: ExtensionAPI): void {
     name: TODO_TOOL_NAME,
     label: "Todo",
     description:
-      "Record a plan that must outlive the context window. Use for work that will span many tool calls or a likely compaction (multi-file changes, long test/fix loops, migrations), or when the user asks for a plan or visible progress. Skip it when a few tool calls and thinking suffice — do not use it to organize your own thoughts. Send the FULL list on every call (it replaces the previous list); update when items resolve, batching several changes per call; at most one item may be in_progress. Items match by exact text — to reword or abandon one, mark it cancelled and add the replacement; unfinished items cannot be silently dropped.",
+      "Record a plan that must outlive the context window. Use for work that will span many tool calls or a likely compaction (multi-file changes, long test/fix loops, migrations), or when the user asks for a plan or visible progress. Skip it when a few tool calls and thinking suffice — do not use it to organize your own thoughts. Send the FULL list on every call (it replaces the previous list); update when items resolve, batching several changes per call; at most one item may be in_progress. Items match by exact text; if an update drops unfinished items, the result names them — re-add if unintended, otherwise ignore the note (that was a reword, split, or abandonment).",
     parameters: TodoParams,
     async execute(_id, params) {
       const { todos: next, error } = validateTodoList(params.todos);
@@ -346,23 +350,15 @@ export function registerTodoTool(pi: ExtensionAPI): void {
         };
       }
       const dropped = droppedUnfinishedItems(todos, next);
-      if (dropped.length > 0) {
-        const names = dropped.map((t) => `"${t.content}"`).join(", ");
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Error: dropped unfinished item(s): ${names}. Re-include them with identical text, or mark them cancelled (to reword: cancel the old item and add the new one). To clear the list, send all items cancelled.\nCurrent list:\n${renderPlainList(todos)}`,
-            },
-          ],
-          details: { todos: [...todos], error: `dropped ${dropped.length} unfinished item(s)` } as TodoDetails,
-        };
-      }
       todos = next;
       turnsSinceUpdate = 0;
       compactedSinceUpdate = false;
+      const note =
+        dropped.length > 0
+          ? `Note: dropped unfinished item(s): ${dropped.map((t) => `"${t.content}"`).join(", ")}. Re-add them if unintended; otherwise ignore this note.\n`
+          : "";
       return {
-        content: [{ type: "text", text: renderPlainList(todos) }],
+        content: [{ type: "text", text: note + renderPlainList(todos) }],
         details: { todos: [...todos] } as TodoDetails,
       };
     },

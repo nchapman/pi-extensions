@@ -369,7 +369,7 @@ describe("registerTodoTool", () => {
     expect(notify).toHaveBeenCalledWith(expect.stringContaining("interactive"), "error");
   });
 
-  it("rejects updates that silently drop unfinished items", async () => {
+  it("accepts updates that drop unfinished items, naming them in a note", async () => {
     const { pi, tools } = makePi();
     registerTodoTool(pi);
     const tool = tools.get(TODO_TOOL_NAME)!;
@@ -381,9 +381,24 @@ describe("registerTodoTool", () => {
     };
 
     expect(result.content[0].text).toContain('"drop"');
-    expect(result.content[0].text).toContain("cancelled");
-    // State is unchanged by the rejected update.
-    expect(result.details.todos).toHaveLength(3);
+    // The update applies; the drop is surfaced, not blocked.
+    expect(result.details.error).toBeUndefined();
+    expect(result.details.todos).toEqual([item("keep", "completed"), item("done", "completed")]);
+  });
+
+  it("accepts decomposing an in_progress item into sub-tasks", async () => {
+    const { pi, tools } = makePi();
+    registerTodoTool(pi);
+    const tool = tools.get(TODO_TOOL_NAME)!;
+    await tool.execute("1", { todos: [item("refactor auth", "in_progress")] });
+
+    const result = (await tool.execute("2", {
+      todos: [item("extract validator", "in_progress"), item("update call sites")],
+    })) as { content: Array<{ type: string; text: string }>; details: TodoDetails };
+
+    expect(result.details.error).toBeUndefined();
+    expect(result.details.todos).toEqual([item("extract validator", "in_progress"), item("update call sites")]);
+    expect(result.content[0].text).toContain('"refactor auth"');
   });
 
   it("accepts explicit cancellation and allows clearing a fully resolved list", async () => {
@@ -401,7 +416,7 @@ describe("registerTodoTool", () => {
     expect(cleared.details.todos).toEqual([]);
   });
 
-  it("rejects clearing while unfinished items remain, leaving state unchanged", async () => {
+  it("clears unfinished lists with a note naming what was dropped", async () => {
     const { pi, tools } = makePi();
     registerTodoTool(pi);
     const tool = tools.get(TODO_TOOL_NAME)!;
@@ -412,21 +427,23 @@ describe("registerTodoTool", () => {
       details: TodoDetails;
     };
     expect(result.content[0].text).toContain('"a"');
-    expect(result.details.todos).toEqual([item("a", "in_progress")]);
-    expect(result.details.error).toBeDefined();
+    expect(result.details.todos).toEqual([]);
+    expect(result.details.error).toBeUndefined();
   });
 
-  it("supports rewording via cancel-and-replace in one call", async () => {
+  it("supports rewording in one call (the old item is dropped, not cancelled)", async () => {
     const { pi, tools } = makePi();
     registerTodoTool(pi);
     const tool = tools.get(TODO_TOOL_NAME)!;
     await tool.execute("1", { todos: [item("run the tests")] });
 
-    const result = (await tool.execute("2", {
-      todos: [item("run the tests", "cancelled"), item("run vitest")],
-    })) as { details: TodoDetails };
+    const result = (await tool.execute("2", { todos: [item("run vitest", "in_progress")] })) as {
+      content: Array<{ type: string; text: string }>;
+      details: TodoDetails;
+    };
     expect(result.details.error).toBeUndefined();
-    expect(result.details.todos).toEqual([item("run the tests", "cancelled"), item("run vitest")]);
+    expect(result.details.todos).toEqual([item("run vitest", "in_progress")]);
+    expect(result.content[0].text).toContain('"run the tests"');
   });
 
   it("recovers from the 50-item cap via cancel-then-replace", async () => {
@@ -471,6 +488,32 @@ describe("registerTodoTool", () => {
     expect(description).toContain("outlive the context");
     expect(description).toContain("compaction");
     expect(description).toContain("Skip it");
+  });
+
+  it("omits the drop note when unfinished items are kept", async () => {
+    const { pi, tools } = makePi();
+    registerTodoTool(pi);
+    const tool = tools.get(TODO_TOOL_NAME)!;
+    await tool.execute("1", { todos: [item("a", "in_progress"), item("b")] });
+
+    const result = (await tool.execute("2", { todos: [item("a", "completed"), item("b", "in_progress")] })) as {
+      content: Array<{ type: string; text: string }>;
+    };
+    expect(result.content[0].text).not.toContain("dropped unfinished");
+  });
+
+  it("an accepted drop update resets the staleness counter", async () => {
+    const { pi, tools, events } = makePi();
+    registerTodoTool(pi);
+    await tools.get(TODO_TOOL_NAME)!.execute("1", { todos: [item("a", "in_progress")] });
+
+    for (let i = 0; i < REMINDER_MIN_TURNS - 1; i++) fire(events, "before_agent_start");
+    // Rewording drops the old item; the accepted update still counts as keeping the plan current.
+    await tools.get(TODO_TOOL_NAME)!.execute("2", { todos: [item("a2", "in_progress")] });
+    for (let i = 0; i < REMINDER_MIN_TURNS - 1; i++) {
+      expect(fire(events, "before_agent_start")).toBeUndefined();
+    }
+    expect(fire(events, "before_agent_start")).toBeDefined();
   });
 
   it("renders the /todos checklist full-screen in TUI mode", async () => {
