@@ -1368,7 +1368,6 @@ describe("summarization prompt", () => {
 
   it("keeps the previous summary between the conversation and the directive", () => {
     const prompt = buildSummarizationPrompt("[User]: do the thing", "## Goal\n- stale", undefined, 5_000, 20_000);
-    const conv = prompt.indexOf("\n<conversation>\n");
     const prev = prompt.indexOf("\n<previous-summary>\n");
     const directive = prompt.indexOf("Now write the summary");
     expect(prev).toBeGreaterThan(prompt.lastIndexOf("\n</conversation>\n"));
