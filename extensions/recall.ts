@@ -62,7 +62,7 @@ import {
   type SessionEntry,
   type Theme,
 } from "@earendil-works/pi-coding-agent";
-import { lastTodoSnapshot, renderPlainList } from "./todo";
+import { PLAN_SECTION_HEADER, lastTodoSnapshot, renderPlainList } from "./todo";
 
 export const RECALL_TOOL_NAME = "recall";
 
@@ -1549,7 +1549,7 @@ export function lastCompactionDetails(branchEntries: SessionEntry[]): unknown {
 export function planSection(branchEntries: SessionEntry[]): string {
   const todos = lastTodoSnapshot(branchEntries);
   if (todos.length === 0) return "";
-  return `## Current Plan\n(todo tool state — authoritative, exact statuses)\n${renderPlainList(todos)}`;
+  return `${PLAN_SECTION_HEADER}\n(todo tool state — authoritative, exact statuses)\n${renderPlainList(todos)}`;
 }
 
 /**

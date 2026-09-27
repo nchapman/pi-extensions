@@ -13,7 +13,8 @@
  *   branch on session_start/session_tree restores the right list for every
  *   branch, rewind, and resume (no filesystem, nothing desyncs)
  * - One-shot reminders on before_agent_start when the plan is unfinished and
- *   stale (or compaction wiped it) — the anti-drift mechanism Codex lacks
+ *   stale (or compaction wiped it — a summary that embeds the plan already
+ *   covers that, so only plan-less summaries arm the reminder)
  * - /todos renders the list full-screen in the TUI
  */
 
@@ -274,6 +275,7 @@ class TodoListComponent {
 /** Loose entry shape so the scan accepts both SessionEntry[] and test doubles. */
 type TodoBranchEntry = {
   type?: string;
+  summary?: unknown;
   message?: { role?: string; content?: unknown; toolName?: string; details?: unknown } | null;
 };
 
@@ -304,16 +306,33 @@ export function lastTodoSnapshot(branch: TodoBranchEntry[]): TodoItem[] {
   return scanTodoSnapshots(branch).todos;
 }
 
+/** Marker a compaction summary carries when it already embeds the plan (rendered by recall's planSection). */
+export const PLAN_SECTION_HEADER = "## Current Plan";
+
+/** Whether a compaction entry's summary already carries the plan — then the post-compaction reminder is redundant. */
+function summaryCarriesPlan(entry: { summary?: unknown } | undefined | null): boolean {
+  return typeof entry?.summary === "string" && entry.summary.includes(PLAN_SECTION_HEADER);
+}
+
 /**
  * Adopt the last todo snapshot recorded on the session branch. Tool results
  * always carry the full list, so the last one on the branch is the state.
- * Also reports whether a compaction entry follows that snapshot — the model's
- * context no longer contains the plan then, so a reminder is due.
+ * Also reports whether a compaction that hides the plan follows that snapshot
+ * — a compaction whose summary embeds the plan does not count as hiding it.
  */
 function reconstructFromSession(ctx: ExtensionContext): { todos: TodoItem[]; planHiddenByCompaction: boolean } {
   const branch = ctx.sessionManager.getBranch() as TodoBranchEntry[];
   const { todos, index: lastIndex } = scanTodoSnapshots(branch);
-  const planHiddenByCompaction = todos.length > 0 && branch.some((e, i) => i > lastIndex && e.type === "compaction");
+  // Only the newest compaction after the snapshot decides: a later one folds
+  // the earlier and is what the context actually shows.
+  let lastCompaction: TodoBranchEntry | undefined;
+  for (let i = branch.length - 1; i > lastIndex; i--) {
+    if (branch[i].type === "compaction") {
+      lastCompaction = branch[i];
+      break;
+    }
+  }
+  const planHiddenByCompaction = todos.length > 0 && !!lastCompaction && !summaryCarriesPlan(lastCompaction);
   return { todos, planHiddenByCompaction };
 }
 
@@ -334,8 +353,11 @@ export function registerTodoTool(pi: ExtensionAPI): void {
   pi.on("session_tree", (_event, ctx) => {
     adoptBranchState(ctx);
   });
-  pi.on("session_compact", () => {
-    compactedSinceUpdate = true;
+  pi.on("session_compact", (event) => {
+    // Recall-owned summaries embed the plan — reminding would re-inject the
+    // identical list one message later. Assign (not early-return): a later
+    // plan-carrying compaction must also disarm an earlier plan-less one.
+    compactedSinceUpdate = !summaryCarriesPlan(event.compactionEntry);
   });
 
   pi.on("before_agent_start", () => {
