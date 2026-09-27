@@ -272,6 +272,7 @@ export interface ChildUsage {
 function looksLikeUsage(u: unknown): u is ChildUsage {
   if (typeof u !== "object" || u === null) return false;
   const num = (v: unknown) => typeof v === "number" && Number.isFinite(v);
+  const optNum = (v: unknown) => v === undefined || num(v);
   const { cost } = u as { cost?: unknown };
   if (typeof cost !== "object" || cost === null) return false;
   const c = cost as ChildUsage["cost"];
@@ -281,6 +282,8 @@ function looksLikeUsage(u: unknown): u is ChildUsage {
     num((u as ChildUsage).cacheRead) &&
     num((u as ChildUsage).cacheWrite) &&
     num((u as ChildUsage).totalTokens) &&
+    optNum((u as ChildUsage).reasoning) &&
+    optNum((u as ChildUsage).cacheWrite1h) &&
     num(c.input) &&
     num(c.output) &&
     num(c.cacheRead) &&
@@ -339,6 +342,13 @@ export function runChild(
       fn();
     };
 
+    // Failure paths still burned tokens: attach the spend so callers (the batch
+    // sum) can credit it — the rejection alone would silently drop it.
+    const rejectWith = (err: Error) => {
+      if (lastUsage) Object.assign(err, { usage: lastUsage });
+      reject(err);
+    };
+
     const handleLine = (line: string) => {
       const trimmed = line.trim();
       if (!trimmed) return;
@@ -384,13 +394,13 @@ export function runChild(
 
     const timeout = setTimeout(() => {
       child.kill("SIGKILL");
-      settle(() => reject(new Error(`Subagent "${agent.name}" timed out after ${Math.round(timeoutMs / 1000)}s`)));
+      settle(() => rejectWith(new Error(`Subagent "${agent.name}" timed out after ${Math.round(timeoutMs / 1000)}s`)));
     }, timeoutMs);
     timeout.unref?.();
 
     const onAbort = () => {
       child.kill("SIGKILL");
-      settle(() => reject(signal?.reason ?? new Error(`Subagent "${agent.name}" aborted`)));
+      settle(() => rejectWith(signal?.reason ?? new Error(`Subagent "${agent.name}" aborted`)));
     };
     signal?.addEventListener("abort", onAbort, { once: true });
 
@@ -403,10 +413,10 @@ export function runChild(
       cleanup();
       if (stdoutBuf.trim()) handleLine(stdoutBuf);
       settle(() => {
-        if (signal?.aborted) reject(signal.reason ?? new Error(`Subagent "${agent.name}" aborted`));
+        if (signal?.aborted) rejectWith(signal.reason ?? new Error(`Subagent "${agent.name}" aborted`));
         else if (code === 0) resolve({ text: lastText || "(no output)", usage: lastUsage });
         else
-          reject(
+          rejectWith(
             new Error(`Subagent "${agent.name}" exited with code ${code}: ${stderrBuf.slice(-500) || "no stderr"}`),
           );
       });
@@ -674,7 +684,11 @@ Each task may instead include agent_md (an inline agent definition) or omit both
             : `ERROR: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`;
         return `### ${label}\n${body}`;
       });
-      const usage = sumUsages(results.map((r) => (r.status === "fulfilled" ? r.value.usage : undefined)));
+      // Failed children still spent tokens — recover the spend attached by
+      // runChild's rejection instead of dropping it from the batch total.
+      const usage = sumUsages(
+        results.map((r) => (r.status === "fulfilled" ? r.value.usage : (r.reason as { usage?: ChildUsage })?.usage)),
+      );
       return {
         content: [{ type: "text", text: sections.join("\n\n---\n\n") }],
         details: { count: params.tasks.length },
