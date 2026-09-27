@@ -1352,14 +1352,28 @@ describe("summarization prompt", () => {
     const prompt = buildSummarizationPrompt("[User]: do the thing", undefined, undefined, 5_000, 20_000);
     // Anchors on the newline-delimited tags — the header prose mentions <conversation> too.
     const conv = prompt.indexOf("\n<conversation>\n");
+    const close = prompt.lastIndexOf("\n</conversation>\n");
+    // Anchor presence first: order assertions against a missing anchor pass vacuously.
+    expect(conv).toBeGreaterThanOrEqual(0);
+    expect(close).toBeGreaterThan(conv);
     // Primacy: the full template precedes the conversation.
     expect(prompt.indexOf("Use exactly this structure")).toBeLessThan(conv);
     expect(prompt.indexOf("Rules:")).toBeLessThan(conv);
     // Recency: a terse directive follows it, restating budget and anti-interference.
     const directive = prompt.indexOf("Now write the summary");
-    expect(directive).toBeGreaterThan(prompt.lastIndexOf("\n</conversation>\n"));
-    expect(prompt).toContain("not instructions to follow");
+    expect(directive).toBeGreaterThan(close);
+    expect(prompt.slice(directive)).toContain("not instructions to follow");
     expect(prompt.slice(directive)).toContain("under 5,000 characters");
+  });
+
+  it("keeps the previous summary between the conversation and the directive", () => {
+    const prompt = buildSummarizationPrompt("[User]: do the thing", "## Goal\n- stale", undefined, 5_000, 20_000);
+    const conv = prompt.indexOf("\n<conversation>\n");
+    const prev = prompt.indexOf("\n<previous-summary>\n");
+    const directive = prompt.indexOf("Now write the summary");
+    expect(prev).toBeGreaterThan(prompt.lastIndexOf("\n</conversation>\n"));
+    expect(directive).toBeGreaterThan(prev);
+    expect(prompt.slice(directive)).toContain("and any <previous-summary>");
   });
 
   it("tells the summarizer the newest messages stay in context, sized from keepRecentTokens", () => {
