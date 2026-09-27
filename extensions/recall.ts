@@ -1047,7 +1047,8 @@ export function registerRecallTool(
     }
     // ExtensionContext does not expose resolved per-model compaction settings,
     // so drafts always keep pi's default recent tail (20k tokens).
-    const preparation = draftPreparation(event.context.contextEntries, DEFAULT_COMPACTION_SETTINGS.keepRecentTokens);
+    const keepRecentTokens = DEFAULT_COMPACTION_SETTINGS.keepRecentTokens;
+    const preparation = draftPreparation(event.context.contextEntries, keepRecentTokens);
     if (!preparation) return;
     const model = ctx.model;
     if (!model) {
@@ -1071,6 +1072,7 @@ export function registerRecallTool(
             previousSummary: preparation.previousSummary,
             userFocus: undefined,
             budgetChars: budgetWithPlan(config.summaryChars, plan.length),
+            keptRecentTokens: keepRecentTokens,
             signal,
           }),
         SUMMARY_RETRY_ATTEMPTS,
@@ -1154,6 +1156,7 @@ export function registerRecallTool(
             userFocus: event.customInstructions?.trim() || undefined,
             // Tight target: recall makes the summary a map, not the archive.
             budgetChars: budgetWithPlan(config.summaryChars, plan.length),
+            keptRecentTokens: p.settings.keepRecentTokens,
             signal: event.signal,
           }),
         SUMMARY_RETRY_ATTEMPTS,
@@ -1187,7 +1190,7 @@ export function registerRecallTool(
     name: RECALL_TOOL_NAME,
     label: "Recall",
     description:
-      "Search conversation history that is no longer in your context (compacted away). Compaction keeps only a summary in context — the verbatim messages remain on disk and this tool retrieves them. Use it when you need earlier details you cannot see: decisions, prior failed attempts, file paths, command outputs, error strings. mode 'search' (default) takes a query and returns ranked verbatim excerpts with provenance; mode 'read' takes an id from a prior result and returns the full entry. scope 'session' (default) searches this session's compacted history; scope 'project' also searches past sessions in this directory (labeled and down-ranked). Prefer recall over re-deriving or guessing at earlier state.",
+      "Search conversation history that is no longer in your context (compacted away). Compaction folds dropped turns into a summary — the newest messages stay in context, and the verbatim transcript remains on disk where this tool retrieves it. Use it when you need earlier details you cannot see: decisions, prior failed attempts, file paths, command outputs, error strings. mode 'search' (default) takes a query and returns ranked verbatim excerpts with provenance; mode 'read' takes an id from a prior result and returns the full entry. scope 'session' (default) searches this session's compacted history; scope 'project' also searches past sessions in this directory (labeled and down-ranked). Prefer recall over re-deriving or guessing at earlier state.",
     promptSnippet: "recall — search compacted-away session history verbatim (scope 'project' adds past sessions)",
     parameters: RecallParams,
     async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -1276,8 +1279,11 @@ async function retryTransient<T>(
 /**
  * The extension's complete summarization prompt — the only prompt involved.
  * pi's built-in summarizer prompt is never merged or appended to, so pi-side
- * prompt changes cannot reshape our summaries. The transcript stays
- * verbatim-searchable via recall, so the summary's job is to be a working
+ * prompt changes cannot reshape our summaries. The prompt states pi's two
+ * safety nets — the raw kept tail (the newest ~keepRecentTokens stay in
+ * context, newer than everything summarized, so current in-flight work needs
+ * no restating) and recall (the dropped transcript stays verbatim-searchable,
+ * so detail is retrievable on demand) — which makes the summary a lean resume
  * map with searchable anchors, not an archive.
  */
 export function buildSummarizationPrompt(
@@ -1285,11 +1291,25 @@ export function buildSummarizationPrompt(
   previousSummary?: string,
   userFocus?: string,
   budgetChars: number = DEFAULTS.summaryChars,
+  keptRecentTokens: number = DEFAULT_COMPACTION_SETTINGS.keepRecentTokens,
 ): string {
   const sections = [
-    "Summarize the conversation inside <conversation> so the work can continue after these messages are dropped " +
-      "from context. The full transcript remains verbatim-searchable via the recall tool, so this summary is a " +
-      "working map, not an archive: compress the past hard, never restate long passages, prefer lists.",
+    "Summarize the conversation inside <conversation> for continuation after it is dropped from context. " +
+      "Compress hard — two safety nets make brevity safe:",
+    ...(keptRecentTokens > 0
+      ? [
+          "- The newest ~" +
+            keptRecentTokens.toLocaleString("en-US") +
+            " tokens of messages stay in context verbatim, " +
+            "immediately after this summary. They are newer than everything in <conversation>: do not restate or " +
+            "infer current in-flight work — it remains visible there and wins on conflict.",
+        ]
+      : [
+          "- Nothing newer than <conversation> is kept in context: this summary is the only carrier of current " +
+            "state — record open work fully, as no raw tail survives.",
+        ]),
+    "- The dropped transcript stays verbatim-searchable via the recall tool: the agent re-fetches detail on " +
+      "demand. Keep what is durable, plus the exact strings recall searches will match.",
     "",
     "<conversation>",
     conversationText,
@@ -1312,7 +1332,7 @@ export function buildSummarizationPrompt(
     "### Done",
     "- [x] [Milestones, with commit hashes where they landed]",
     "### In Progress",
-    "- [ ] [Current work]",
+    "- [ ] [What <conversation> leaves unfinished at its end]",
     "### Blocked",
     "- [Blockers, or omit this subsection]",
     "",
@@ -1323,31 +1343,31 @@ export function buildSummarizationPrompt(
     "- **[Decision]**: [Rationale] — keep every decision still in force",
     "",
     "## Next Steps",
-    "1. [The literally in-flight action when compaction fired — what was being done this minute]",
-    "2. [Then the ordered queue: names, paths, and commands specific enough to resume cold without re-reading anything]",
+    "1. [Ordered queue from where <conversation> ends — names, paths, and commands specific enough to resume " +
+      "cold without re-reading anything. The bridge for when the kept context is itself compacted: never " +
+      "compress it for brevity; note open questions and blockers explicitly.]",
     "",
     "## Critical Context",
     "- [Repo paths, model/tool quirks, and the exact file paths, identifiers, commands, URLs, and error strings " +
       "still in use — these are the anchors future recall searches will match]",
     "",
     "Rules:",
-    "- Preserve exact file paths, identifiers, commands, URLs, and error strings verbatim; compress everything else.",
-    "- The future is not recoverable: treat Next Steps as the most important section. Never compress it for " +
-      "brevity; note open questions and blockers explicitly.",
+    "- Prefer lists; never restate long passages. Preserve exact file paths, identifiers, commands, URLs, and " +
+      "error strings verbatim; compress everything else.",
     "- Never drop a dead end silently: record each abandoned approach with the reason it failed — a summary " +
       "that forgets one invites retrying it after compaction.",
     "- The current todo plan is re-attached verbatim below the summary after generation; do not include a " +
       "## Current Plan section yourself — plan statuses live only in that appended copy.",
     "- The previous summary, when provided, is a stale draft: re-derive volatile facts (current git HEAD and log, " +
-      "test counts, what was just committed, what the user most recently asked) from the newest messages rather " +
-      "than copying them; when they disagree, the messages win. Never carry Next Steps forward unchanged — rewrite " +
-      "them from the newest messages, which are where the current task state actually lives.",
+      "test counts, what was just committed, what the user most recently asked) from the newest messages in " +
+      "<conversation> rather than copying them; when they disagree, the messages win. Never carry Next Steps " +
+      "forward unchanged — rewrite them from the newest messages.",
     "- Hard budget: the entire summary must stay under " +
       budgetChars.toLocaleString("en-US") +
       " characters — a cut-off generation is discarded whole. " +
       "When space is tight, compress Done and Critical Context first; never Next Steps, active decisions' rationale, " +
       "or exact strings still in use.",
-    "- Only summarize what appears in the conversation above; do not infer later events.",
+    "- Only summarize what appears in <conversation>; never invent events outside it.",
   );
   if (userFocus) {
     sections.push(`- User focus for this compaction: ${userFocus}`);
@@ -1589,6 +1609,8 @@ export interface SummaryFnArgs {
   userFocus: string | undefined;
   /** Hard character budget for the summary (PI_RECALL_SUMMARY_CHARS, default 5,000). */
   budgetChars: number;
+  /** Size of the raw kept tail that stays in context after compaction (pi's keepRecentTokens). */
+  keptRecentTokens: number;
   signal: AbortSignal;
 }
 export type SummaryFn = (args: SummaryFnArgs) => Promise<{ text: string; usage: unknown }>;
@@ -1601,10 +1623,11 @@ const defaultSummaryFn: SummaryFn = async ({
   previousSummary,
   userFocus,
   budgetChars,
+  keptRecentTokens,
   signal,
 }) => {
   const conversationText = serializeConversation(convertToLlm(messages));
-  const prompt = buildSummarizationPrompt(conversationText, previousSummary, userFocus, budgetChars);
+  const prompt = buildSummarizationPrompt(conversationText, previousSummary, userFocus, budgetChars, keptRecentTokens);
   const options: NonNullable<Parameters<SummaryComplete>[2]> & { reasoning?: SummaryThinkingLevel } = {
     maxTokens: Math.min(SUMMARY_MAX_OUTPUT_TOKENS, model.maxTokens > 0 ? model.maxTokens : SUMMARY_MAX_OUTPUT_TOKENS),
     signal,

@@ -1346,6 +1346,26 @@ describe("summarization prompt", () => {
     expect(prompt).not.toContain("Additional focus");
   });
 
+  it("tells the summarizer the newest messages stay in context, sized from keepRecentTokens", () => {
+    // Default: pi's 20k-token raw tail kept after the summary.
+    const prompt = buildSummarizationPrompt("[User]: do the thing");
+    expect(prompt).toContain("~20,000 tokens of messages stay in context verbatim");
+    // Current in-flight work lives in that tail: never restated or inferred here.
+    expect(prompt).toContain("do not restate or infer current in-flight work");
+    expect(prompt).not.toContain("in-flight action");
+    // A resolved per-model setting sizes the tail the prompt reports. Both knobs
+    // render, pinning the parameter order (budget in characters, tail in tokens).
+    const tuned = buildSummarizationPrompt("[User]: do the thing", undefined, undefined, 5_000, 32_000);
+    expect(tuned).toContain("~32,000 tokens of messages stay in context verbatim");
+    expect(tuned).toContain("under 5,000 characters");
+  });
+
+  it("drops the kept-tail note when the tail is disabled (keepRecentTokens 0)", () => {
+    const prompt = buildSummarizationPrompt("[User]: do the thing", undefined, undefined, 5_000, 0);
+    expect(prompt).not.toContain("stay in context verbatim");
+    expect(prompt).toContain("only carrier of current state");
+  });
+
   it("wraps the previous summary as a stale draft, and appends user focus, only when present", () => {
     const prompt = buildSummarizationPrompt("[User]: hi", "## Goal\n- stale", "focus on auth");
     expect(prompt).toContain("<previous-summary>\n## Goal\n- stale\n</previous-summary>");
@@ -1595,6 +1615,17 @@ describe("compaction summary ownership", () => {
     expect(result.compaction.usage).toEqual({ totalTokens: 42 });
     // Previous compaction entry has no details → lists come from fileOps alone.
     expect(result.compaction.details).toEqual({ readFiles: ["read1.ts"], modifiedFiles: ["wrote1.ts"] });
+  });
+
+  it("sizes the prompt's kept-tail note from the resolved compaction settings", async () => {
+    const calls: CapturedCall[] = [];
+    const { pi, events } = makePi();
+    registerRecallTool(pi, CONFIG);
+    const event = beforeCompactEvent();
+    event.preparation.settings.keepRecentTokens = 32_000;
+    await fire(events, "session_before_compact", hookCtx(okComplete(calls)), event);
+    const prompt = calls[0].context.messages[0].content[0].text;
+    expect(prompt).toContain("~32,000 tokens of messages stay in context verbatim");
   });
 
   it("carries the current todo plan in the summary, within the budget", async () => {
@@ -2177,11 +2208,18 @@ describe("mid-run compaction wiring (turn_end)", () => {
     )) as {
       entries: Array<Record<string, unknown>>;
     };
-    const args = calls[0] as { messages: Array<{ role: string }>; previousSummary?: string; userFocus?: string };
+    const args = calls[0] as {
+      messages: Array<{ role: string }>;
+      previousSummary?: string;
+      userFocus?: string;
+      keptRecentTokens?: number;
+    };
     expect(args.messages.every((m) => m.role !== "system")).toBe(true);
     expect(args.messages[0].role).toBe("user");
     expect(args.previousSummary).toBe("## Goal\n- earlier era");
     expect(args.userFocus).toBeUndefined();
+    // Drafts cannot see resolved per-model settings — always pi's default tail.
+    expect(args.keptRecentTokens).toBe(20_000);
     expect(result.entries[0].details).toEqual({ readFiles: ["old.txt", "read1.ts"], modifiedFiles: [] });
   });
 
