@@ -27,12 +27,16 @@
  *   the tail; no context rewrites, no system-prompt churn, one promptSnippet.
  * - The extension owns the context budget and the summary: auto-compaction
  *   fires when projected context exceeds a target (default 128k, well below
- *   the reasoning-reliability cliff; PI_RECALL_COMPACT_TARGET, 0 disables)
- *   with pi's near-limit threshold as the mid-run safety net, and every
- *   compaction — manual /compact included — is summarized through
- *   session_before_compact with recall-aware instructions (terse working map,
- *   searchable anchors) via pi's generateSummary plumbing, falling back to
- *   pi's default summarizer on any failure (PI_RECALL_COMPACT_OWN=0 opts out).
+ *   the reasoning-reliability cliff; PI_RECALL_COMPACT_TARGET, 0 disables) —
+ *   via a turn_end boundary draft mid-run (a continuously busy agent never
+ *   settles, so a settled-only trigger drifts to pi's near-limit backstop)
+ *   and from agent_settled when idle, with pi's near-limit threshold as the
+ *   remaining mid-run safety net — and every compaction is summarized with
+ *   recall-aware instructions (terse working map, searchable anchors): via
+ *   session_before_compact for pi-triggered compactions (manual /compact
+ *   included), falling back to pi's default summarizer on any failure, and by
+ *   the same summarizer inline for drafts, which never fire the hook and
+ *   simply retry on the next turn (PI_RECALL_COMPACT_OWN=0 opts out).
  */
 
 import fsp from "node:fs/promises";
@@ -41,9 +45,12 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
   convertToLlm,
+  DEFAULT_COMPACTION_SETTINGS,
+  estimateTokens,
   type ExtensionAPI,
   type ExtensionContext,
   ModelRegistry,
+  type ProjectedSessionEntry,
   serializeConversation,
   type SessionEntry,
   type Theme,
@@ -969,7 +976,8 @@ export function registerRecallTool(
 
   // Context budget: auto-compact between turns, once the run has fully settled
   // (idle — nothing to abort, nothing to race). pi's own near-limit threshold
-  // stays as the mid-run backstop. PI_RECALL_COMPACT_TARGET=0 disables.
+  // stays as the backstop for anything this trigger cannot see.
+  // PI_RECALL_COMPACT_TARGET=0 disables.
   pi.on("agent_settled", (_event, ctx) => {
     const usage = ctx.getContextUsage();
     if (
@@ -990,6 +998,101 @@ export function registerRecallTool(
         logCompactionError(`budget trigger failed: ${err instanceof Error ? err.message : String(err)}`);
       },
     });
+  });
+
+  // Mid-run budget compaction. A continuously busy agent never settles — one
+  // long run can climb from the target to pi's near-limit backstop (~94% of
+  // the window) with the trigger above dormant — but turn_end fires after
+  // every assistant response. Its boundary-result seam is pi's sanctioned
+  // mid-run compaction: proposed entries commit before the next request, no
+  // continuation is forced (entries only — pi's own decision stands), and
+  // nothing is aborted. The summary is generated here because drafts carry
+  // extension content (session_before_compact does not fire for them); a
+  // failure costs one turn's wait, then the next turn_end tries again.
+  pi.on("turn_end", async (event, ctx) => {
+    // Draft content is ours alone — no pi-default fallback exists for drafts.
+    if (!config.ownSummaries) return;
+    // Aborted/error turns defer to pi's recovery — and a user cancel must not
+    // pay for a summary.
+    if (event.outcome !== "completed") return;
+    // A naturally-ending turn settles immediately; the idle trigger above owns
+    // compaction there.
+    if (!event.context.canContinue) return;
+    // Boundary entries are last-writer-wins across handlers — if another
+    // extension already proposed a compaction this boundary, defer to it.
+    if (event.entries.some((entry) => entry.type === "compaction")) return;
+    const usage = ctx.getContextUsage();
+    if (
+      !shouldAutoCompact(
+        usage?.tokens ?? null,
+        usage?.contextWindow ?? 0,
+        config.compactTargetTokens,
+        autoCompactInFlight,
+      )
+    ) {
+      return;
+    }
+    // ExtensionContext does not expose resolved per-model compaction settings,
+    // so drafts always keep pi's default recent tail (20k tokens).
+    const preparation = draftPreparation(event.context.contextEntries, DEFAULT_COMPACTION_SETTINGS.keepRecentTokens);
+    if (!preparation) return;
+    const model = ctx.model;
+    if (!model) {
+      logCompactionError("mid-run compaction skipped: no model on session context");
+      return;
+    }
+    const signal = ctx.signal ?? new AbortController().signal;
+    try {
+      const { text, usage: summaryUsage } = await retryTransient(
+        () =>
+          summarize({
+            model,
+            complete: (m, context, options) => ctx.modelRegistry.complete(m, context, options),
+            thinkingLevel: config.summaryThinking === "session" ? ctx.thinkingLevel : config.summaryThinking,
+            // Chronological, mirroring the session_before_compact path; the auto
+            // trigger never sets a user focus.
+            messages: preparation.messages,
+            previousSummary: preparation.previousSummary,
+            userFocus: undefined,
+            budgetChars: config.summaryChars,
+            signal,
+          }),
+        SUMMARY_RETRY_ATTEMPTS,
+        deps.retryDelayMs ?? 1000,
+        signal,
+      );
+      if (!text.trim()) {
+        logCompactionError("mid-run compaction skipped: summarizer returned empty text");
+        return;
+      }
+      // Boundary commits never fire session_compact — arm the one-shot
+      // reminder ourselves so the invariant "reminder after each compaction"
+      // holds for mid-run drafts too (it fires at the next run start).
+      reminderPending = true;
+      // Entries-only (no forced continuation — pi's own decision stands), and
+      // merge with earlier handlers' proposals: boundary entries are
+      // last-writer-wins, so returning a fresh array would clobber them.
+      return {
+        entries: [
+          ...event.entries,
+          {
+            type: "compaction",
+            summary: text,
+            firstKeptEntryId: preparation.firstKeptEntryId,
+            details: carryForwardFileLists(
+              lastCompactionDetails(ctx.sessionManager.getBranch()),
+              collectFileOps(preparation.messages),
+            ),
+            usage: summaryUsage as CompactionUsage,
+          },
+        ],
+      };
+    } catch (err) {
+      // An aborted signal is a user cancel, not a failure — stay silent.
+      if (signal.aborted) return;
+      logCompactionError(`mid-run compaction skipped: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
   });
 
   // pi-side compaction failures (any trigger, including the default summarizer
@@ -1246,6 +1349,127 @@ export function shouldAutoCompact(
   if (inFlight || tokens === null) return false;
   const target = effectiveCompactTarget(configTarget, contextWindow);
   return target !== undefined && tokens > target;
+}
+
+/** One model-visible message of a boundary projection. */
+type ProjectedMessage = ProjectedSessionEntry["messages"][number];
+
+/** pi's cut-point rule: these roles may start the kept tail; tool results must stay with their call. */
+function isCutPointMessage(message: ProjectedMessage): boolean {
+  switch (message.role) {
+    case "user":
+    case "assistant":
+    case "bashExecution":
+    case "custom":
+    case "branchSummary":
+    case "compactionSummary":
+      return true;
+    default:
+      return false;
+  }
+}
+
+/** What the extension's summarizer needs from a boundary projection. */
+export interface DraftPreparation {
+  /** Raw id of the first projected entry the compacted context keeps. */
+  firstKeptEntryId: string;
+  /** Chronological messages to summarize — older spans first; the split-turn prefix folds in at the end, the same set the session_before_compact path sees. */
+  messages: ProjectedMessage[];
+  /** Newest projected compaction summary, if any. */
+  previousSummary: string | undefined;
+}
+
+/**
+ * Compaction preparation from a boundary projection — the walk pi's
+ * prepareCompaction() performs, reduced to what this extension's summarizer
+ * consumes. The single-prompt scheme folds pi's split-turn two-summary merge
+ * into one chronological span, so turn boundaries play no role here. Returns
+ * undefined when there is nothing to compact (session smaller than the kept
+ * tail, or no valid cut point).
+ */
+export function draftPreparation(
+  contextEntries: ProjectedSessionEntry[],
+  keepRecentTokens: number,
+): DraftPreparation | undefined {
+  // The newest compaction is projected first; older ones contribute nothing.
+  const prevCompactionIndex = contextEntries.findIndex(
+    (entry) => entry.sourceEntry.type === "compaction" && entry.messages.length > 0,
+  );
+  const previousSummary =
+    prevCompactionIndex >= 0
+      ? (contextEntries[prevCompactionIndex].sourceEntry as { summary?: string }).summary
+      : undefined;
+  const start = prevCompactionIndex >= 0 ? prevCompactionIndex + 1 : 0;
+
+  // Cut candidates: non-compaction entries holding a message that may legally
+  // start the kept tail.
+  const candidates: number[] = [];
+  for (let i = start; i < contextEntries.length; i++) {
+    const entry = contextEntries[i];
+    if (entry.sourceEntry.type !== "compaction" && entry.messages.some(isCutPointMessage)) candidates.push(i);
+  }
+  if (candidates.length === 0) return undefined;
+
+  // Walk backwards accumulating estimated tokens; the first candidate at or
+  // after the entry that fills keepRecentTokens starts the kept tail. A
+  // session smaller than the kept tail cuts at the first candidate and
+  // summarizes nothing — the empty check below treats that as "nothing to
+  // compact". (pi additionally advances the cut past context-invisible
+  // recovery suffixes; staying behind them only keeps harmless entries.)
+  let cut = candidates[0];
+  let accumulated = 0;
+  for (let i = contextEntries.length - 1; i >= start; i--) {
+    const tokens = contextEntries[i].messages.reduce((sum, message) => sum + estimateTokens(message), 0);
+    if (tokens === 0) continue;
+    accumulated += tokens;
+    if (accumulated >= keepRecentTokens) {
+      cut = candidates.find((candidate) => candidate >= i) ?? candidates[candidates.length - 1];
+      break;
+    }
+  }
+
+  const firstKept = contextEntries[cut]?.sourceEntry;
+  if (!firstKept?.id) return undefined;
+  const messages = contextEntries
+    .slice(start, cut)
+    .flatMap((entry) =>
+      entry.sourceEntry.type === "compaction" ? [] : entry.messages.filter((message) => message.role !== "system"),
+    );
+  if (messages.length === 0) return undefined;
+  return { firstKeptEntryId: firstKept.id, messages, previousSummary };
+}
+
+/**
+ * File operations from tool calls in the summarized messages — pi's
+ * extractFileOpsFromMessage (not exported): read/write/edit calls contribute
+ * their `path` argument. Feeds the compaction entry's file lists.
+ */
+export function collectFileOps(messages: ProjectedMessage[]): FileOpsLike {
+  const fileOps = { read: new Set<string>(), written: new Set<string>(), edited: new Set<string>() };
+  for (const message of messages) {
+    if (message.role !== "assistant") continue;
+    const content = (message as { content?: unknown }).content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (typeof block !== "object" || block === null) continue;
+      if ((block as { type?: unknown }).type !== "toolCall") continue;
+      const args = (block as { arguments?: unknown }).arguments;
+      const path = (args as { path?: unknown } | undefined)?.path;
+      if (typeof path !== "string") continue;
+      switch ((block as { name?: unknown }).name) {
+        case "read":
+          fileOps.read.add(path);
+          break;
+        case "write":
+          fileOps.written.add(path);
+          break;
+        case "edit":
+          fileOps.edited.add(path);
+          break;
+      }
+    }
+  }
+  return fileOps;
 }
 
 /** File-operation sets as pi's CompactionPreparation provides them. */

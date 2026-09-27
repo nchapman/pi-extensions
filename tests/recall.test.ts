@@ -8,7 +8,9 @@ import {
   buildFileCorpus,
   chunkText,
   chunksFromEntry,
+  collectFileOps,
   configFromEnv,
+  draftPreparation,
   fsProjectReader,
   extractEntrySections,
   extractSnippet,
@@ -1874,6 +1876,373 @@ describe("compaction summary ownership", () => {
       beforeCompactEvent(),
     );
     expect((calls[0] as { thinkingLevel?: string }).thinkingLevel).toBe("high");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Mid-run compaction (turn_end boundary drafts)
+// ---------------------------------------------------------------------------
+
+describe("mid-run compaction preparation", () => {
+  const user = (text: string) => ({ role: "user", content: text });
+  const toolResult = () => ({ role: "toolResult", toolCallId: "t1", content: "output" });
+  const assistant = (text: string, calls: unknown[] = []) => ({
+    role: "assistant",
+    content: [...(text ? [{ type: "text", text }] : []), ...calls],
+  });
+  const readCall = (p: string) => ({ type: "toolCall", id: "t1", name: "read", arguments: { path: p } });
+
+  /** Projected entry over a raw entry, projecting exactly `messages`. */
+  const proj = (sourceEntry: SessionEntry, messages: unknown[]) =>
+    ({ sourceEntry, messages }) as unknown as Parameters<typeof draftPreparation>[0][number];
+
+  const entryOf = (messages: unknown[], label = "e") => {
+    const e = msgEntry("message", { label }, "2026-09-26T10:00:00.000Z");
+    return proj(e, messages);
+  };
+
+  it("cuts to keep the recent tail and summarizes the older span", () => {
+    const u1 = entryOf([user("x".repeat(8000))]); // ~2000 tokens
+    const a1 = entryOf([assistant("y".repeat(1600))]); // ~400 tokens
+    const u2 = entryOf([user("z".repeat(800))]); // ~200 tokens
+    const a2 = entryOf([assistant("w".repeat(800))]); // ~200 tokens
+    const prep = draftPreparation([u1, a1, u2, a2], 400);
+    expect(prep).toBeDefined();
+    expect(prep!.firstKeptEntryId).toBe(u2.sourceEntry.id);
+    expect(prep!.messages).toEqual([u1.messages[0], a1.messages[0]]);
+    expect(prep!.previousSummary).toBeUndefined();
+  });
+
+  it("folds the split-turn prefix into the same chronological span, never cutting at a tool result", () => {
+    // One user-message span larger than keepRecentTokens: the cut lands at an
+    // assistant message mid-span (pi's "split turn"), its trailing tool result
+    // stays kept, and the whole prefix — user message included — is summarized.
+    const u1 = entryOf([user("we need to fix the wasm error boundary")]);
+    const a1 = entryOf([assistant("looking…")]);
+    const a2 = entryOf([assistant("big edit turn", [readCall("src/lib.rs")]), toolResult()]);
+    const tr = entryOf([toolResult()]);
+    const prep = draftPreparation([u1, a1, a2, tr], 1);
+    expect(prep!.firstKeptEntryId).toBe(a2.sourceEntry.id);
+    expect(prep!.messages).toEqual([u1.messages[0], a1.messages[0]]);
+  });
+
+  it("starts after the newest projected compaction and carries its summary", () => {
+    const comp = proj(compactionEntry("## Goal\n- earlier era", "k0"), [{ role: "compactionSummary", content: "x" }]);
+    const u1 = entryOf([user("x".repeat(800))]);
+    const a1 = entryOf([assistant("y".repeat(400))]);
+    const prep = draftPreparation([comp, u1, a1], 1);
+    expect(prep!.firstKeptEntryId).toBe(a1.sourceEntry.id);
+    expect(prep!.messages).toEqual([u1.messages[0]]);
+    expect(prep!.previousSummary).toBe("## Goal\n- earlier era");
+  });
+
+  it("returns undefined when there is nothing to compact", () => {
+    // Session smaller than the kept tail.
+    const u1 = entryOf([user("tiny")]);
+    expect(draftPreparation([u1], 20_000)).toBeUndefined();
+    // No valid cut point at all (tool results only).
+    expect(draftPreparation([entryOf([toolResult()])], 1)).toBeUndefined();
+  });
+
+  it("returns undefined when the cut entry has no id or the newest entry is a compaction", () => {
+    const u1 = entryOf([user("x".repeat(400))]);
+    const idless = entryOf([assistant("y".repeat(4000))]);
+    delete (idless.sourceEntry as { id?: string }).id;
+    expect(draftPreparation([u1, idless], 1)).toBeUndefined();
+
+    // Post-draft shape: nothing new to compact after the newest compaction.
+    const compLast = proj(compactionEntry("just compacted", "k1"), [{ role: "compactionSummary", content: "x" }]);
+    expect(draftPreparation([entryOf([user("hi")]), compLast], 1)).toBeUndefined();
+  });
+
+  it("counts system messages in the token walk but never summarizes them", () => {
+    const e1 = entryOf([{ role: "system", content: "x".repeat(400) }, user("go")]);
+    const e2 = entryOf([assistant("y".repeat(400))]);
+    const prep = draftPreparation([e1, e2], 1);
+    expect(prep!.firstKeptEntryId).toBe(e2.sourceEntry.id);
+    expect(prep!.messages).toEqual([user("go")]);
+  });
+});
+
+describe("collectFileOps", () => {
+  it("collects read/write/edit paths from assistant tool calls only", () => {
+    const messages = [
+      { role: "user", content: "go" },
+      {
+        role: "assistant",
+        content: [
+          { type: "toolCall", name: "read", arguments: { path: "a.ts" } },
+          { type: "toolCall", name: "write", arguments: { path: "b.ts" } },
+          { type: "toolCall", name: "edit", arguments: { path: "c.ts" } },
+          { type: "toolCall", name: "bash", arguments: { command: "ls" } },
+          { type: "toolCall", name: "read", arguments: {} },
+          { type: "text", text: "note" },
+        ],
+      },
+    ] as never[];
+    expect(collectFileOps(messages)).toEqual({
+      read: new Set(["a.ts"]),
+      written: new Set(["b.ts"]),
+      edited: new Set(["c.ts"]),
+    });
+  });
+});
+
+describe("mid-run compaction wiring (turn_end)", () => {
+  const OVER = { tokens: 150_000, contextWindow: 200_000 };
+
+  /** Projection shaped like a long over-budget run: compaction, user turn, then a churn of big assistant turns. */
+  function longRunProjection() {
+    const comp = {
+      sourceEntry: compactionEntry("## Goal\n- earlier era", "k0"),
+      messages: [{ role: "compactionSummary", content: "x" }],
+    };
+    const big = (label: string, path?: string) => ({
+      sourceEntry: msgEntry("assistant", { label }),
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            ...(path ? [{ type: "toolCall", id: `t-${label}`, name: "read", arguments: { path } }] : []),
+            { type: "text", text: `${label}\n${"x".repeat(40_000)}` }, // ~10k tokens each
+          ],
+        },
+      ],
+    });
+    const entries = [
+      comp,
+      {
+        sourceEntry: msgEntry("user", { content: "fix all the seams" }),
+        messages: [{ role: "user", content: "fix all the seams" }],
+      },
+      big("t1"),
+      big("t2", "read1.ts"),
+      big("t3"),
+      big("t4", "read2.ts"),
+    ];
+    return entries as unknown as Parameters<typeof draftPreparation>[0];
+  }
+
+  function turnEndEvent(overrides: Record<string, unknown> = {}, contextEntries = longRunProjection()) {
+    return {
+      type: "turn_end",
+      turnIndex: 3,
+      message: { role: "assistant" },
+      toolResults: [],
+      messageEntryId: "m1",
+      toolResultEntryIds: [],
+      outcome: "completed",
+      entries: [],
+      continue: false,
+      context: { contextEntries, contextMessages: [], llmMessages: [], pendingMessages: [], canContinue: true },
+      ...overrides,
+    };
+  }
+
+  function turnEndCtx(
+    usage: { tokens: number | null; contextWindow: number } | undefined = OVER,
+    overrides: Record<string, unknown> = {},
+  ) {
+    return {
+      getContextUsage: () => usage,
+      compact: () => {},
+      model: { id: "test-model", reasoning: false },
+      modelRegistry: {
+        complete: async () => ({
+          content: [{ type: "text", text: "## Goal\n- mid-run summary" }],
+          usage: { totalTokens: 7 },
+          stopReason: "stop",
+        }),
+      },
+      thinkingLevel: undefined,
+      sessionManager: { getBranch: () => [] },
+      ...overrides,
+    };
+  }
+
+  it("proposes a compaction draft mid-run — entries only, no forced continuation", async () => {
+    const { pi, events } = makePi();
+    registerRecallTool(pi, CONFIG);
+    const result = (await fire(events, "turn_end", turnEndCtx(), turnEndEvent())) as
+      { entries: unknown[]; continue?: boolean } | undefined;
+    expect(result).toBeDefined();
+    expect(result!.continue).toBeUndefined(); // pi's own continuation decision stands
+    const [draft] = result!.entries as Array<Record<string, unknown>>;
+    expect(draft.type).toBe("compaction");
+    expect(draft.summary).toBe("## Goal\n- mid-run summary");
+    expect(typeof draft.firstKeptEntryId).toBe("string");
+    expect(draft.usage).toEqual({ totalTokens: 7 });
+  });
+
+  it("summarizes the projection chronologically with the previous compaction summary, and unions file lists", async () => {
+    const calls: unknown[] = [];
+    const summarize: SummaryFn = async (args) => {
+      calls.push(args);
+      return { text: "summary", usage: { totalTokens: 1 } };
+    };
+    const { pi, events } = makePi();
+    const branch = [compactionEntry("old", "k0")];
+    (branch[0] as { details?: unknown }).details = { readFiles: ["old.txt"], modifiedFiles: [] };
+    registerRecallTool(pi, CONFIG, undefined, { summarize });
+    const result = (await fire(
+      events,
+      "turn_end",
+      turnEndCtx(OVER, { sessionManager: { getBranch: () => branch } }),
+      turnEndEvent(),
+    )) as {
+      entries: Array<Record<string, unknown>>;
+    };
+    const args = calls[0] as { messages: Array<{ role: string }>; previousSummary?: string; userFocus?: string };
+    expect(args.messages.every((m) => m.role !== "system")).toBe(true);
+    expect(args.messages[0].role).toBe("user");
+    expect(args.previousSummary).toBe("## Goal\n- earlier era");
+    expect(args.userFocus).toBeUndefined();
+    expect(result.entries[0].details).toEqual({ readFiles: ["old.txt", "read1.ts"], modifiedFiles: [] });
+  });
+
+  it("skips when the turn ended naturally — the settled trigger owns idle compaction", async () => {
+    const { pi, events } = makePi();
+    registerRecallTool(pi, CONFIG);
+    const event = turnEndEvent({
+      context: { contextEntries: [], contextMessages: [], llmMessages: [], pendingMessages: [], canContinue: false },
+    });
+    expect(await fire(events, "turn_end", turnEndCtx(), event)).toBeUndefined();
+  });
+
+  it("skips aborted or error turns — recovery owns those, and a cancel must not pay for a summary", async () => {
+    const { pi, events } = makePi();
+    registerRecallTool(pi, CONFIG);
+    expect(await fire(events, "turn_end", turnEndCtx(), turnEndEvent({ outcome: "aborted" }))).toBeUndefined();
+    expect(await fire(events, "turn_end", turnEndCtx(), turnEndEvent({ outcome: "error" }))).toBeUndefined();
+  });
+
+  it("skips below the target, on unknown tokens, and when disabled", async () => {
+    const { pi, events } = makePi();
+    registerRecallTool(pi, CONFIG);
+    expect(
+      await fire(events, "turn_end", turnEndCtx({ tokens: 100_000, contextWindow: 200_000 }), turnEndEvent()),
+    ).toBeUndefined();
+    expect(
+      await fire(events, "turn_end", turnEndCtx({ tokens: null, contextWindow: 200_000 }), turnEndEvent()),
+    ).toBeUndefined();
+    const off = makePi();
+    registerRecallTool(off.pi, { ...CONFIG, compactTargetTokens: 0 });
+    expect(await fire(off.events, "turn_end", turnEndCtx(), turnEndEvent())).toBeUndefined();
+  });
+
+  it("stays out of the way when summary ownership is disabled — no draft fallback exists", async () => {
+    const never: SummaryFn = async () => {
+      throw new Error("must not be called");
+    };
+    const { pi, events } = makePi();
+    registerRecallTool(pi, { ...CONFIG, ownSummaries: false }, undefined, { summarize: never });
+    expect(await fire(events, "turn_end", turnEndCtx(), turnEndEvent())).toBeUndefined();
+  });
+
+  it("a summarizer failure leaves a breadcrumb and the next turn tries again", async () => {
+    const crumbs: string[] = [];
+    let fail = true;
+    const summarize: SummaryFn = async () => {
+      if (fail) throw new Error("auth expired");
+      return { text: "second try", usage: {} };
+    };
+    const { pi, events } = makePi();
+    registerRecallTool(pi, CONFIG, undefined, { summarize, logCompactionError: (l) => crumbs.push(l) });
+    expect(await fire(events, "turn_end", turnEndCtx(), turnEndEvent())).toBeUndefined();
+    expect(crumbs).toEqual([expect.stringContaining("mid-run compaction skipped: auth expired")]);
+    fail = false;
+    const result = (await fire(events, "turn_end", turnEndCtx(), turnEndEvent())) as {
+      entries: Array<Record<string, unknown>>;
+    };
+    expect(result.entries[0].summary).toBe("second try");
+    expect(crumbs).toHaveLength(1);
+  });
+
+  it("skips on empty summary text with a breadcrumb, and stays silent on abort", async () => {
+    const crumbs: string[] = [];
+    const empty: SummaryFn = async () => ({ text: "   ", usage: {} });
+    const a = makePi();
+    registerRecallTool(a.pi, CONFIG, undefined, { summarize: empty, logCompactionError: (l) => crumbs.push(l) });
+    expect(await fire(a.events, "turn_end", turnEndCtx(), turnEndEvent())).toBeUndefined();
+    expect(crumbs).toEqual([expect.stringContaining("summarizer returned empty text")]);
+
+    const controller = new AbortController();
+    controller.abort();
+    const failing: SummaryFn = async () => {
+      throw new Error("aborted mid-flight");
+    };
+    const b = makePi();
+    registerRecallTool(b.pi, CONFIG, undefined, { summarize: failing, logCompactionError: (l) => crumbs.push(l) });
+    expect(
+      await fire(b.events, "turn_end", turnEndCtx(OVER, { signal: controller.signal }), turnEndEvent()),
+    ).toBeUndefined();
+    expect(crumbs).toHaveLength(1); // no crumb for the user cancel
+  });
+
+  it("skips without a model, leaving a breadcrumb", async () => {
+    const crumbs: string[] = [];
+    const { pi, events } = makePi();
+    registerRecallTool(pi, CONFIG, undefined, { logCompactionError: (l) => crumbs.push(l) });
+    expect(await fire(events, "turn_end", turnEndCtx(OVER, { model: undefined }), turnEndEvent())).toBeUndefined();
+    expect(crumbs).toEqual([expect.stringContaining("no model on session context")]);
+  });
+
+  it("does not re-trigger while the post-draft context is below the target", async () => {
+    const { pi, events } = makePi();
+    registerRecallTool(pi, CONFIG);
+    // First turn over budget proposes the draft; the next turn sees the
+    // compacted context and stays quiet.
+    const ctx = turnEndCtx();
+    let usage = { tokens: 150_000, contextWindow: 200_000 };
+    (ctx as { getContextUsage: () => unknown }).getContextUsage = () => usage;
+    await fire(events, "turn_end", ctx, turnEndEvent());
+    usage = { tokens: 30_000, contextWindow: 200_000 };
+    expect(await fire(events, "turn_end", ctx, turnEndEvent())).toBeUndefined();
+  });
+
+  it("stays quiet while a settled-trigger compaction is in flight", async () => {
+    const compactCalls: Array<Record<string, unknown>> = [];
+    const ctx = {
+      getContextUsage: () => OVER,
+      compact: (opts: Record<string, unknown>) => compactCalls.push(opts),
+    };
+    const { pi, events } = makePi();
+    registerRecallTool(pi, CONFIG);
+    await fire(events, "agent_settled", ctx); // sets the in-flight flag
+    expect(compactCalls).toHaveLength(1);
+    expect(
+      await fire(events, "turn_end", { ...turnEndCtx(), ...ctx, compact: ctx.compact }, turnEndEvent()),
+    ).toBeUndefined();
+    (compactCalls[0].onComplete as () => void)();
+    expect((await fire(events, "turn_end", { ...turnEndCtx(), ...ctx }, turnEndEvent())) as unknown).toBeDefined();
+  });
+
+  it("merges with earlier handlers' proposals and arms the post-compaction reminder", async () => {
+    const { pi, events } = makePi();
+    registerRecallTool(pi, CONFIG);
+    const earlier = { type: "custom", customType: "other.note", data: { keep: true } };
+    const result = (await fire(events, "turn_end", turnEndCtx(), turnEndEvent({ entries: [earlier] }))) as {
+      entries: Array<Record<string, unknown>>;
+    };
+    expect(result.entries).toHaveLength(2);
+    expect(result.entries[0]).toEqual(earlier); // not clobbered
+    expect(result.entries[1].type).toBe("compaction");
+    // Boundary commits never fire session_compact — the reminder must fire at
+    // the next run start anyway.
+    const reminder = (await fire(events, "before_agent_start", turnEndCtx())) as {
+      message: { customType: string };
+    };
+    expect(reminder.message.customType).toBe("recall.reminder");
+  });
+
+  it("defers when another handler already proposed a compaction this boundary", async () => {
+    const never: SummaryFn = async () => {
+      throw new Error("must not be called");
+    };
+    const { pi, events } = makePi();
+    registerRecallTool(pi, CONFIG, undefined, { summarize: never });
+    const theirs = { type: "compaction", summary: "theirs", firstKeptEntryId: "k", details: undefined };
+    expect(await fire(events, "turn_end", turnEndCtx(), turnEndEvent({ entries: [theirs] }))).toBeUndefined();
   });
 });
 
