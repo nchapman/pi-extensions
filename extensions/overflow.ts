@@ -142,3 +142,5 @@ export function registerOverflow(pi: ExtensionAPI): void {
     }
   });
 }
+
+export default registerOverflow;
