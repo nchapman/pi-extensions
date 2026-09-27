@@ -1955,12 +1955,14 @@ describe("compaction summary ownership", () => {
   });
 
   it("config parses the summary-thinking knob", () => {
-    expect(configFromEnv({}).summaryThinking).toBe("high"); // one-shot hard task: not the session's interactive level
+    // Default off: no thinking requested — the sandwich layout carries template
+    // adherence at 0 reasoning tokens, so the whole output cap is summary text.
+    expect(configFromEnv({}).summaryThinking).toBe("off");
     expect(configFromEnv({ PI_RECALL_SUMMARY_THINKING: "session" }).summaryThinking).toBe("session");
     expect(configFromEnv({ PI_RECALL_SUMMARY_THINKING: "off" }).summaryThinking).toBe("off");
     expect(configFromEnv({ PI_RECALL_SUMMARY_THINKING: "low" }).summaryThinking).toBe("low");
     expect(configFromEnv({ PI_RECALL_SUMMARY_THINKING: "HIGH" }).summaryThinking).toBe("high");
-    expect(configFromEnv({ PI_RECALL_SUMMARY_THINKING: "turbo" }).summaryThinking).toBe("high"); // invalid → default
+    expect(configFromEnv({ PI_RECALL_SUMMARY_THINKING: "turbo" }).summaryThinking).toBe("off"); // invalid → default
   });
 
   it("config parses the summary character budget", () => {

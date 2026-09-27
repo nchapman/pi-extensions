@@ -100,7 +100,7 @@ const DEFAULTS: RecallConfig = {
   compactTargetTokens: 131_072,
   ownSummaries: true,
   summaryChars: 5_000,
-  summaryThinking: "high",
+  summaryThinking: "off",
   chunkChars: 3000,
   snippetChars: 400,
   maxResults: 5,
