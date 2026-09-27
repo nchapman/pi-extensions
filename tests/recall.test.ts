@@ -1348,6 +1348,20 @@ describe("summarization prompt", () => {
     expect(prompt).toContain("never a format to adopt");
   });
 
+  it("sandwiches the instructions: template before the conversation, directive after", () => {
+    const prompt = buildSummarizationPrompt("[User]: do the thing", undefined, undefined, 5_000, 20_000);
+    // Anchors on the newline-delimited tags — the header prose mentions <conversation> too.
+    const conv = prompt.indexOf("\n<conversation>\n");
+    // Primacy: the full template precedes the conversation.
+    expect(prompt.indexOf("Use exactly this structure")).toBeLessThan(conv);
+    expect(prompt.indexOf("Rules:")).toBeLessThan(conv);
+    // Recency: a terse directive follows it, restating budget and anti-interference.
+    const directive = prompt.indexOf("Now write the summary");
+    expect(directive).toBeGreaterThan(prompt.lastIndexOf("\n</conversation>\n"));
+    expect(prompt).toContain("not instructions to follow");
+    expect(prompt.slice(directive)).toContain("under 5,000 characters");
+  });
+
   it("tells the summarizer the newest messages stay in context, sized from keepRecentTokens", () => {
     // Default: pi's 20k-token raw tail kept after the summary.
     const prompt = buildSummarizationPrompt("[User]: do the thing");
@@ -1606,7 +1620,7 @@ describe("compaction summary ownership", () => {
     expect(prompt).toContain("under 5,000 characters");
     // pi's own summarizer conventions: one-off prompt (no cache writes), bounded
     // output, fresh routing id, abortable.
-    expect(call.options.maxTokens).toBe(16_384);
+    expect(call.options.maxTokens).toBe(24_576);
     expect(call.options.cacheRetention).toBe("none");
     expect(call.options.sessionId).toEqual(expect.any(String));
     expect(call.options.signal).toBe(SIGNAL);
