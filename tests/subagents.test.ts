@@ -24,15 +24,31 @@ import {
   runChild,
   runWithLimit,
   splitFrontmatter,
+  sumUsages,
   summarizeTask,
   renderSubagentResult,
   type AgentDef,
   type ChildLike,
+  type ChildUsage,
   type SpawnFn,
 } from "../extensions/subagents";
 
 /** Identity theme: strips styling so assertions see plain text. */
 const THEME = { fg: (_k: string, s: string) => s, bold: (s: string) => s } as never;
+
+const USAGE = (over: Partial<ChildUsage> = {}): ChildUsage => ({
+  input: 100,
+  output: 5,
+  cacheRead: 0,
+  cacheWrite: 0,
+  totalTokens: 105,
+  cost: { input: 0.1, output: 0.02, cacheRead: 0, cacheWrite: 0, total: 0.12 },
+  ...over,
+});
+
+const usageLine = (usage: ChildUsage): string => JSON.stringify({ type: "message_update", usage });
+const assistantLine = (text: string): string =>
+  JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }] } });
 
 /** Render a tool-call component to plain text for assertions. */
 function renderPlain(component: { render: (width: number) => string[] }): string {
@@ -323,7 +339,9 @@ describe("runChild", () => {
       }) + "\n",
     );
     child.close(0);
-    await expect(promise).resolves.toBe("final");
+    const r = await promise;
+    expect(r.text).toBe("final");
+    expect(r.usage).toBeUndefined();
   });
 
   it("keeps earlier text when the final message has only tool calls", async () => {
@@ -342,7 +360,8 @@ describe("runChild", () => {
       }) + "\n",
     );
     child.close(0);
-    await expect(promise).resolves.toBe("useful");
+    const r = await promise;
+    expect(r.text).toBe("useful");
   });
 
   it("parses a final line without trailing newline", async () => {
@@ -355,14 +374,76 @@ describe("runChild", () => {
       }),
     );
     child.close(0);
-    await expect(promise).resolves.toBe("last-line");
+    const r = await promise;
+    expect(r.text).toBe("last-line");
   });
 
   it("falls back to (no output) for empty text", async () => {
     const child = fakeChild();
     const promise = runChild(AGENT, "task", undefined, { timeoutMs: 5000 }, () => child);
     child.close(0);
-    await expect(promise).resolves.toBe("(no output)");
+    const r = await promise;
+    expect(r.text).toBe("(no output)");
+  });
+
+  it("sums per-message usage across the child run", async () => {
+    const child = fakeChild();
+    const promise = runChild(AGENT, "task", undefined, { timeoutMs: 5000 }, () => child);
+    // First request: tool-call round trip. message_update's usage is per-request
+    // cumulative — it must not be counted; only the message_end total is.
+    child.stdoutEmit(`${usageLine(USAGE({ input: 999 }))}\n`);
+    child.stdoutEmit(
+      JSON.stringify({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", name: "bash" }],
+          usage: USAGE({ input: 1000, output: 40, totalTokens: 1040 }),
+        },
+      }) + "\n",
+    );
+    // Second request: final text answer with its own usage.
+    child.stdoutEmit(`${usageLine(USAGE({ input: 5 }))}\n`);
+    child.stdoutEmit(
+      `${JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }], usage: USAGE({ input: 2000, output: 10, totalTokens: 2010 }) } })}\n`,
+    );
+    child.close(0);
+    const r = await promise;
+    expect(r.usage).toEqual(
+      USAGE({
+        input: 3000,
+        output: 50,
+        totalTokens: 3050,
+        cost: { input: 0.2, output: 0.04, cacheRead: 0, cacheWrite: 0, total: 0.24 },
+      }),
+    );
+  });
+
+  it("ignores malformed usage payloads", async () => {
+    const child = fakeChild();
+    const promise = runChild(AGENT, "task", undefined, { timeoutMs: 5000 }, () => child);
+    child.stdoutEmit(
+      `${JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }], usage: { input: "lots" } } })}\n`,
+    );
+    child.stdoutEmit(
+      `${JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "more" }], usage: "banana" } })}\n`,
+    );
+    child.close(0);
+    const r = await promise;
+    expect(r.text).toBe("more");
+    expect(r.usage).toBeUndefined();
+  });
+
+  it("ignores malformed usage payloads", async () => {
+    const child = fakeChild();
+    const promise = runChild(AGENT, "task", undefined, { timeoutMs: 5000 }, () => child);
+    child.stdoutEmit(`${JSON.stringify({ type: "message_update", usage: { input: "lots" } })}\n`);
+    child.stdoutEmit(`${JSON.stringify({ type: "message_update", usage: "banana" })}\n`);
+    child.stdoutEmit(`${assistantLine("done")}\n`);
+    child.close(0);
+    const r = await promise;
+    expect(r.text).toBe("done");
+    expect(r.usage).toBeUndefined();
   });
 
   it("rejects with stderr tail on non-zero exit", async () => {
@@ -425,6 +506,42 @@ describe("runChild", () => {
     const promise = runChild(AGENT, "task", undefined, { timeoutMs: 5000 }, () => child);
     child.fail(new Error("ENOENT pi"));
     await expect(promise).rejects.toThrow(/Failed to spawn pi.*ENOENT/);
+  });
+});
+
+describe("sumUsages", () => {
+  it("sums per-child run totals across a batch", () => {
+    expect(sumUsages([USAGE({ input: 100, output: 40 }), USAGE({ input: 50, output: 10 })])).toEqual(
+      USAGE({
+        input: 150,
+        output: 50,
+        totalTokens: 210,
+        cost: { input: 0.2, output: 0.04, cacheRead: 0, cacheWrite: 0, total: 0.24 },
+      }),
+    );
+  });
+
+  it("skips children that reported none and returns undefined when no child did", () => {
+    expect(sumUsages([USAGE(), undefined, USAGE({ input: 1 })])).toEqual(
+      USAGE({
+        input: 101,
+        output: 10,
+        totalTokens: 210,
+        cost: { input: 0.2, output: 0.04, cacheRead: 0, cacheWrite: 0, total: 0.24 },
+      }),
+    );
+    expect(sumUsages([undefined, undefined])).toBeUndefined();
+    expect(sumUsages([])).toBeUndefined();
+  });
+
+  it("carries optional reasoning and cacheWrite1h fields through the sum", () => {
+    expect(
+      sumUsages([USAGE({ reasoning: 3, cacheWrite1h: 5 }), USAGE({ reasoning: 4, cacheWrite1h: 7 })]),
+    ).toMatchObject({
+      reasoning: 7,
+      cacheWrite1h: 12,
+    });
+    expect(sumUsages([USAGE({ reasoning: 3 }), USAGE()])).toMatchObject({ reasoning: 3 });
   });
 });
 
@@ -541,6 +658,74 @@ describe("registerSubagentTools", () => {
   function jsonLine(text: string): string {
     return JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }] } });
   }
+
+  it("forwards child usage on the single subagent tool result", async () => {
+    const { pi, tools } = makePi();
+    registerSubagentTools(
+      pi as never,
+      mkdtempSync(join(tmpdir(), "agents-")),
+      spawnReturning(
+        [
+          JSON.stringify({
+            type: "message_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "done" }],
+              usage: USAGE({ output: 40, totalTokens: 140 }),
+            },
+          }),
+        ],
+        [],
+      ),
+    );
+    const result = (await tools.get("subagent")!.execute("1", { task: "t" })) as { usage?: ChildUsage };
+    expect(result.usage).toEqual(USAGE({ output: 40, totalTokens: 140 }));
+  });
+
+  it("omits usage when no child reported any", async () => {
+    const { pi, tools } = makePi();
+    registerSubagentTools(pi as never, mkdtempSync(join(tmpdir(), "agents-")), spawnReturning([jsonLine("done")], []));
+    const result = (await tools.get("subagent")!.execute("1", { task: "t" })) as { usage?: ChildUsage };
+    expect(result.usage).toBeUndefined();
+  });
+
+  it("aggregates usage across the batch", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agents-"));
+    writeFileSync(join(dir, "reviewer.md"), "---\nname: reviewer\ndescription: d\n---\nReview things.");
+    const perCall: string[][] = [];
+    const spawnFn = (_c: string, _a: string[], _o: unknown): ChildLike => {
+      perCall.push([]);
+      const child = fakeChild();
+      setImmediate(() => {
+        child.stdoutEmit(
+          JSON.stringify({
+            type: "message_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "ok" }],
+              usage: USAGE({ input: 100, output: 40, totalTokens: 140 }),
+            },
+          }) + "\n",
+        );
+        child.close(0);
+      });
+      return child;
+    };
+    const { pi, tools } = makePi();
+    registerSubagentTools(pi as never, dir, spawnFn as unknown as SpawnFn);
+    const result = (await tools.get("subagents")!.execute("1", {
+      tasks: [{ agent: "reviewer", task: "t1" }, { task: "t2" }],
+    })) as { usage?: ChildUsage };
+    expect(perCall.length).toBe(2);
+    expect(result.usage).toEqual(
+      USAGE({
+        input: 200,
+        output: 80,
+        totalTokens: 280,
+        cost: { input: 0.2, output: 0.04, cacheRead: 0, cacheWrite: 0, total: 0.24 },
+      }),
+    );
+  });
 
   it("runs a mixed batch: named, inline, and default agents", async () => {
     const dir = mkdtempSync(join(tmpdir(), "agents-"));

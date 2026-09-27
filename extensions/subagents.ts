@@ -249,13 +249,80 @@ export function buildChildArgs(agent: AgentDef, task: string, model?: string): s
   return args;
 }
 
+/** What runChild resolves with: the child's final text plus its cumulative usage, when reported. */
+export interface ChildRun {
+  text: string;
+  usage?: ChildUsage;
+}
+
+/** Required fields of pi-ai's Usage, as it appears on JSON-mode assistant messages. */
+export interface ChildUsage {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  totalTokens: number;
+  /** Subset of output, reported by providers that expose a reasoning breakdown. */
+  reasoning?: number;
+  /** Subset of cacheWrite with 1h retention (Anthropic). */
+  cacheWrite1h?: number;
+  cost: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+}
+
+function looksLikeUsage(u: unknown): u is ChildUsage {
+  if (typeof u !== "object" || u === null) return false;
+  const num = (v: unknown) => typeof v === "number" && Number.isFinite(v);
+  const { cost } = u as { cost?: unknown };
+  if (typeof cost !== "object" || cost === null) return false;
+  const c = cost as ChildUsage["cost"];
+  return (
+    num((u as ChildUsage).input) &&
+    num((u as ChildUsage).output) &&
+    num((u as ChildUsage).cacheRead) &&
+    num((u as ChildUsage).cacheWrite) &&
+    num((u as ChildUsage).totalTokens) &&
+    num(c.input) &&
+    num(c.output) &&
+    num(c.cacheRead) &&
+    num(c.cacheWrite) &&
+    num(c.total)
+  );
+}
+
+/** Sum two usage records; optional fields carry through when either side reports them. */
+function addUsage(a: ChildUsage, b: ChildUsage): ChildUsage {
+  const opt = (x: number | undefined, y: number | undefined) => (x === undefined ? y : y === undefined ? x : x + y);
+  return {
+    input: a.input + b.input,
+    output: a.output + b.output,
+    cacheRead: a.cacheRead + b.cacheRead,
+    cacheWrite: a.cacheWrite + b.cacheWrite,
+    totalTokens: a.totalTokens + b.totalTokens,
+    reasoning: opt(a.reasoning, b.reasoning),
+    cacheWrite1h: opt(a.cacheWrite1h, b.cacheWrite1h),
+    cost: {
+      input: a.cost.input + b.cost.input,
+      output: a.cost.output + b.cost.output,
+      cacheRead: a.cost.cacheRead + b.cost.cacheRead,
+      cacheWrite: a.cost.cacheWrite + b.cost.cacheWrite,
+      total: a.cost.total + b.cost.total,
+    },
+  };
+}
+
+/** Sum per-child run totals so batch results keep session cost accounting accurate; undefined when no child reported any. */
+export function sumUsages(list: Array<ChildUsage | undefined>): ChildUsage | undefined {
+  const valid = list.filter((u): u is ChildUsage => u !== undefined);
+  return valid.length ? valid.reduce(addUsage) : undefined;
+}
+
 export function runChild(
   agent: AgentDef,
   task: string,
   model: string | undefined,
   options: RunChildOptions = {},
   spawnFn: SpawnFn = defaultSpawn,
-): Promise<string> {
+): Promise<ChildRun> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const { onUpdate, signal } = options;
   return new Promise((resolve, reject) => {
@@ -263,6 +330,7 @@ export function runChild(
     let stdoutBuf = "";
     let stderrBuf = "";
     let lastText = "";
+    let lastUsage: ChildUsage | undefined;
     let settled = false;
 
     const settle = (fn: () => void) => {
@@ -277,6 +345,11 @@ export function runChild(
       try {
         const event = JSON.parse(trimmed);
         if (event.type === "message_end" && event.message?.role === "assistant") {
+          // Each assistant message carries its request's final usage; summing them
+          // mirrors pi's own session accounting (message_update resets per request).
+          if (looksLikeUsage(event.message.usage)) {
+            lastUsage = lastUsage ? addUsage(lastUsage, event.message.usage) : event.message.usage;
+          }
           const text = extractAssistantText(event.message.content);
           if (text) {
             lastText = text;
@@ -331,7 +404,7 @@ export function runChild(
       if (stdoutBuf.trim()) handleLine(stdoutBuf);
       settle(() => {
         if (signal?.aborted) reject(signal.reason ?? new Error(`Subagent "${agent.name}" aborted`));
-        else if (code === 0) resolve(lastText || "(no output)");
+        else if (code === 0) resolve({ text: lastText || "(no output)", usage: lastUsage });
         else
           reject(
             new Error(`Subagent "${agent.name}" exited with code ${code}: ${stderrBuf.slice(-500) || "no stderr"}`),
@@ -526,7 +599,7 @@ The subagent runs to completion and returns its final response. Use for reviews,
     async execute(_id, params, signal, onUpdate) {
       const list = loadAgents(agentsDir);
       const agent = resolveAgentDef(list, params);
-      const text = await runChild(
+      const { text, usage } = await runChild(
         agent,
         params.task,
         params.model,
@@ -537,7 +610,11 @@ The subagent runs to completion and returns its final response. Use for reviews,
         },
         spawnFn,
       );
-      return { content: [{ type: "text", text }], details: { agent: agent.name } };
+      return {
+        content: [{ type: "text", text }],
+        details: { agent: agent.name },
+        ...(usage ? { usage } : {}),
+      };
     },
   });
 
@@ -593,13 +670,15 @@ Each task may instead include agent_md (an inline agent definition) or omit both
         const label = refLabel(params.tasks[i]);
         const body =
           r.status === "fulfilled"
-            ? r.value
+            ? r.value.text
             : `ERROR: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`;
         return `### ${label}\n${body}`;
       });
+      const usage = sumUsages(results.map((r) => (r.status === "fulfilled" ? r.value.usage : undefined)));
       return {
         content: [{ type: "text", text: sections.join("\n\n---\n\n") }],
         details: { count: params.tasks.length },
+        ...(usage ? { usage } : {}),
       };
     },
   });
