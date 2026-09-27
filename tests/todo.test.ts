@@ -14,6 +14,7 @@ import {
   type TodoItem,
   registerTodoTool,
   droppedUnfinishedItems,
+  lastTodoSnapshot,
 } from "../extensions/todo";
 
 const THEME = { fg: (_k: string, s: string) => s, bold: (s: string) => s } as never;
@@ -231,6 +232,63 @@ describe("renderReminder", () => {
     expect(text).toContain("[x] a");
     expect(text).toContain("[>] b");
     expect(text).toContain("Keep statuses current");
+  });
+});
+
+describe("lastTodoSnapshot", () => {
+  const snapshot = (todos: unknown) => ({
+    type: "message",
+    message: { role: "toolResult", toolName: TODO_TOOL_NAME, details: { todos } },
+  });
+
+  it("returns the newest todo snapshot on the branch", () => {
+    const branch = [
+      { type: "message", message: { role: "user", content: "plan the work" } },
+      snapshot([item("old", "completed")]),
+      { type: "compaction" },
+      snapshot([item("new", "in_progress")]),
+    ];
+    expect(lastTodoSnapshot(branch)).toEqual([item("new", "in_progress")]);
+  });
+
+  it("returns [] when the branch has no todo snapshots", () => {
+    expect(lastTodoSnapshot([{ type: "message", message: { role: "user", content: "hi" } }])).toEqual([]);
+    expect(lastTodoSnapshot([])).toEqual([]);
+  });
+
+  it("skips snapshots with malformed details, keeping the newest valid one", () => {
+    const branch = [snapshot([item("valid", "pending")]), snapshot("not an array"), snapshot({})];
+    expect(lastTodoSnapshot(branch)).toEqual([item("valid", "pending")]);
+  });
+
+  it("ignores other tools' results even when they carry todos-shaped details", () => {
+    const branch = [
+      { type: "message", message: { role: "toolResult", toolName: "read", details: { todos: [item("x")] } } },
+    ];
+    expect(lastTodoSnapshot(branch)).toEqual([]);
+  });
+
+  it("accepts rejected-update snapshots (error + current list) as the newest state", () => {
+    const branch = [
+      snapshot([item("stale")]),
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: TODO_TOOL_NAME,
+          details: { todos: [item("current")], error: "bad list" },
+        },
+      },
+    ];
+    expect(lastTodoSnapshot(branch)).toEqual([item("current")]);
+  });
+
+  it("falls back past error-only details to the previous valid snapshot", () => {
+    const branch = [
+      snapshot([item("valid", "in_progress")]),
+      { type: "message", message: { role: "toolResult", toolName: TODO_TOOL_NAME, details: { error: "bad list" } } },
+    ];
+    expect(lastTodoSnapshot(branch)).toEqual([item("valid", "in_progress")]);
   });
 });
 

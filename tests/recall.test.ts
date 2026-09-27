@@ -35,7 +35,9 @@ import {
   tokenize,
   type RecallConfig,
   type SearchHit,
+  budgetWithPlan,
 } from "../extensions/recall";
+import { TODO_TOOL_NAME } from "../extensions/todo";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -1552,6 +1554,11 @@ describe("compaction summary ownership", () => {
     };
   }
 
+  /** A todo tool-result snapshot on the branch, as the todo extension records it. */
+  function todoSnapshotEntry(todos: Array<{ content: string; status: string }>) {
+    return msgEntry("toolResult", { toolName: TODO_TOOL_NAME, details: { todos } });
+  }
+
   it("generates the summary with the extension's own prompt via modelRegistry.complete", async () => {
     const calls: CapturedCall[] = [];
     const { pi, events } = makePi();
@@ -1585,6 +1592,60 @@ describe("compaction summary ownership", () => {
     expect(result.compaction.usage).toEqual({ totalTokens: 42 });
     // Previous compaction entry has no details → lists come from fileOps alone.
     expect(result.compaction.details).toEqual({ readFiles: ["read1.ts"], modifiedFiles: ["wrote1.ts"] });
+  });
+
+  it("carries the current todo plan in the summary, within the budget", async () => {
+    const calls: CapturedCall[] = [];
+    const { pi, events } = makePi();
+    registerRecallTool(pi, CONFIG);
+    const branchEntries = [
+      todoSnapshotEntry([{ content: "write the fix", status: "completed" }]),
+      todoSnapshotEntry([
+        { content: "write the fix", status: "completed" },
+        { content: "run the tests", status: "in_progress" },
+      ]),
+    ];
+    const result = (await fire(
+      events,
+      "session_before_compact",
+      hookCtx(okComplete(calls)),
+      beforeCompactEvent({ branchEntries }),
+    )) as { compaction: { summary: string } };
+
+    // The newest snapshot rides verbatim after the generated map.
+    const { summary } = result.compaction;
+    expect(summary.startsWith("## Goal\n- Recall-aware summary\n\n## Current Plan")).toBe(true);
+    expect(summary).toContain("[x] write the fix");
+    expect(summary).toContain("[>] run the tests");
+    expect(summary).toContain("1/2 resolved");
+    // The section's length is deducted from the summarizer's budget, and the
+    // prompt forbids the model from emitting its own plan section.
+    const section = summary.slice(summary.indexOf("## Current Plan"));
+    const prompt = calls[0].context.messages[0].content[0].text;
+    expect(prompt).toContain(`under ${(CONFIG.summaryChars - section.length).toLocaleString("en-US")} characters`);
+    expect(prompt).toContain("do not include a ## Current Plan section yourself");
+  });
+
+  it("leaves the summary unchanged when there is no todo state", async () => {
+    const calls: CapturedCall[] = [];
+    const { pi, events } = makePi();
+    registerRecallTool(pi, CONFIG);
+    const result = (await fire(
+      events,
+      "session_before_compact",
+      hookCtx(okComplete(calls)),
+      beforeCompactEvent({ branchEntries: [compactionEntry("old", "k0"), todoSnapshotEntry([])] }),
+    )) as { compaction: { summary: string } };
+
+    expect(result.compaction.summary).toBe("## Goal\n- Recall-aware summary");
+    const prompt = calls[0].context.messages[0].content[0].text;
+    expect(prompt).toContain("under 5,000 characters");
+  });
+
+  it("budgetWithPlan floors the generation budget so a huge plan cannot starve the summary", () => {
+    expect(budgetWithPlan(5_000, 200)).toBe(4_800);
+    expect(budgetWithPlan(5_000, 6_000)).toBe(500);
+    expect(budgetWithPlan(5_000, 0)).toBe(5_000);
   });
 
   it("forwards thinking level only when the model reasons and a level is set", async () => {
@@ -2072,6 +2133,27 @@ describe("mid-run compaction wiring (turn_end)", () => {
     expect(draft.summary).toBe("## Goal\n- mid-run summary");
     expect(typeof draft.firstKeptEntryId).toBe("string");
     expect(draft.usage).toEqual({ totalTokens: 7 });
+  });
+
+  it("carries the current todo plan in mid-run drafts — drafts fire no session_compact, so the summary is the only carrier", async () => {
+    const { pi, events } = makePi();
+    registerRecallTool(pi, CONFIG);
+    const branch = [
+      msgEntry("toolResult", {
+        toolName: TODO_TOOL_NAME,
+        details: { todos: [{ content: "survive compaction", status: "in_progress" }] },
+      }),
+    ];
+    const result = (await fire(
+      events,
+      "turn_end",
+      turnEndCtx(OVER, { sessionManager: { getBranch: () => branch } }),
+      turnEndEvent(),
+    )) as { entries: Array<Record<string, unknown>> };
+
+    const summary = result.entries[0].summary as string;
+    expect(summary).toContain("## Current Plan");
+    expect(summary).toContain("[>] survive compaction");
   });
 
   it("summarizes the projection chronologically with the previous compaction summary, and unions file lists", async () => {

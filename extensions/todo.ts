@@ -271,6 +271,39 @@ class TodoListComponent {
   }
 }
 
+/** Loose entry shape so the scan accepts both SessionEntry[] and test doubles. */
+type TodoBranchEntry = {
+  type?: string;
+  message?: { role?: string; content?: unknown; toolName?: string; details?: unknown } | null;
+};
+
+/**
+ * One scan of the branch: the newest valid todo snapshot (tool results carry
+ * the state) and its index, -1 when none. Snapshots with malformed details
+ * never win — the scan keeps the last one whose `details.todos` is an array.
+ */
+function scanTodoSnapshots(branch: TodoBranchEntry[]): { todos: TodoItem[]; index: number } {
+  let todos: TodoItem[] = [];
+  let index = -1;
+  for (let i = 0; i < branch.length; i++) {
+    const entry = branch[i];
+    if (entry.type !== "message") continue;
+    const msg = entry.message;
+    if (msg?.role !== "toolResult" || msg.toolName !== TODO_TOOL_NAME) continue;
+    const d = msg.details as TodoDetails | undefined;
+    if (!Array.isArray(d?.todos)) continue;
+    // Filter in place — intermediate snapshots are throwaway work.
+    todos = d.todos.filter(isTodoItem);
+    index = i;
+  }
+  return { todos, index };
+}
+
+/** Newest todo snapshot recorded on the session branch (tool results carry the state). */
+export function lastTodoSnapshot(branch: TodoBranchEntry[]): TodoItem[] {
+  return scanTodoSnapshots(branch).todos;
+}
+
 /**
  * Adopt the last todo snapshot recorded on the session branch. Tool results
  * always carry the full list, so the last one on the branch is the state.
@@ -278,21 +311,8 @@ class TodoListComponent {
  * context no longer contains the plan then, so a reminder is due.
  */
 function reconstructFromSession(ctx: ExtensionContext): { todos: TodoItem[]; planHiddenByCompaction: boolean } {
-  const branch = ctx.sessionManager.getBranch();
-  let lastDetails: TodoDetails | undefined;
-  let lastIndex = -1;
-  for (let i = 0; i < branch.length; i++) {
-    const entry = branch[i];
-    if (entry.type !== "message") continue;
-    const msg = entry.message as { role?: string; toolName?: string; details?: unknown };
-    if (msg.role !== "toolResult" || msg.toolName !== TODO_TOOL_NAME) continue;
-    const d = msg.details as TodoDetails | undefined;
-    if (!Array.isArray(d?.todos)) continue;
-    lastDetails = d;
-    lastIndex = i;
-  }
-  // Filter once — intermediate snapshots are throwaway work.
-  const todos = lastDetails ? lastDetails.todos.filter(isTodoItem) : [];
+  const branch = ctx.sessionManager.getBranch() as TodoBranchEntry[];
+  const { todos, index: lastIndex } = scanTodoSnapshots(branch);
   const planHiddenByCompaction = todos.length > 0 && branch.some((e, i) => i > lastIndex && e.type === "compaction");
   return { todos, planHiddenByCompaction };
 }
