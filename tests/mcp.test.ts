@@ -83,9 +83,9 @@ function makePi() {
   return { pi, tools, handlers };
 }
 
-function writeConfig(dir: string, servers: Record<string, unknown>): string {
+function writeConfig(dir: string, servers: Record<string, unknown>, extra: Record<string, unknown> = {}): string {
   const path = join(dir, "mcp.json");
-  writeFileSync(path, JSON.stringify({ mcpServers: servers }));
+  writeFileSync(path, JSON.stringify({ mcpServers: servers, ...extra }));
   return path;
 }
 
@@ -378,5 +378,156 @@ describe("registerMcpTool integration", () => {
     expect(result.content[0].text).toContain("s1__web_search");
     expect(result.content[0].text).toContain("s1__web_fetch");
     expect(calls).toEqual([undefined, { cursor: "c1" }]);
+  });
+});
+
+describe("pins", () => {
+  beforeEach(() => {
+    sdk.instances.length = 0;
+    sdk.behavior.connect = async () => undefined;
+    sdk.behavior.listTools = async () => ({ tools: TWO_TOOLS });
+    sdk.behavior.callTool = async () => ({ content: [{ type: "text", text: "ok" }] });
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  async function setupPins(pin: string[], servers: Record<string, unknown> = { s1: { url: "https://x/mcp" } }) {
+    const dir = mkdtempSync(join(tmpdir(), "mcp-pin-"));
+    const path = writeConfig(dir, servers, { pin });
+    const { pi, tools, handlers } = makePi();
+    await registerMcpTool(pi, path);
+    return { tools, handlers };
+  }
+
+  it("registers pinned tools natively with the server's schema and description", async () => {
+    const { tools } = await setupPins(["s1__web_search"]);
+    const pinned = tools.get("s1__web_search") as unknown as {
+      description: string;
+      promptSnippet: string;
+      parameters: unknown;
+    };
+    expect(pinned).toBeDefined();
+    expect(pinned.description).toContain("Search the web");
+    expect(pinned.description).toContain('MCP server "s1"');
+    expect(pinned.promptSnippet).toContain("Search the web");
+    expect(pinned.parameters).toEqual(TWO_TOOLS[0].inputSchema);
+    expect(tools.get("mcp")).toBeDefined(); // gateway still present for the tail
+  });
+
+  it("routes pinned calls through the shared connection and closes on idle", async () => {
+    const callTool = vi.fn(async () => ({ content: [{ type: "text", text: "ok" }] }));
+    sdk.behavior.callTool = callTool;
+    const { tools } = await setupPins(["s1__web_search"]);
+    const result = await tools.get("s1__web_search")!.execute("1", { query: "q" });
+    expect(result.content[0].text).toBe("ok");
+    expect(callTool).toHaveBeenCalledWith(
+      { name: "web_search", arguments: { query: "q" } },
+      undefined,
+      expect.objectContaining({ timeout: 120_000 }),
+    );
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sdk.instances[0].closed).toBe(1);
+  });
+
+  it("degrades an unreachable pinned server to a status line, never a load failure", async () => {
+    sdk.behavior.connect = async () => {
+      throw new Error("boom");
+    };
+    const { tools } = await setupPins(["s1__web_search"]);
+    expect(tools.get("s1__web_search")).toBeUndefined();
+    const status = await tools.get("mcp")!.execute("1", {});
+    expect(status.content[0].text).toMatch(/- pin s1__web_search: .*boom/);
+  });
+
+  it("names unknown tools, bare names, and non-object schemas as pin issues", async () => {
+    sdk.behavior.listTools = async () => ({
+      tools: [...TWO_TOOLS, { name: "weird", inputSchema: { type: "string" } }],
+    });
+    const { tools } = await setupPins(["s1__nope", "s1__weird", "bare_name", "sX__thing"]);
+    for (const name of ["s1__nope", "s1__weird", "bare_name", "sX__thing"]) {
+      expect(tools.get(name)).toBeUndefined();
+    }
+    const status = await tools.get("mcp")!.execute("1", {});
+    const text = status.content[0].text;
+    expect(text).toMatch(/s1__nope: not offered/);
+    expect(text).toMatch(/s1__weird: input schema is not an object/);
+    expect(text).toMatch(/bare_name: unknown server/);
+    expect(text).toMatch(/sX__thing: unknown server/);
+  });
+
+  it("lists successful pins in status", async () => {
+    const { tools } = await setupPins(["s1__web_search"]);
+    const status = await tools.get("mcp")!.execute("1", {});
+    expect(status.content[0].text).toContain("- pinned s1__web_search: native tool");
+  });
+
+  it("annotates the gateway description with server notes", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mcp-note-"));
+    const path = writeConfig(dir, { s1: { url: "https://x/mcp", note: "web search and fetch" } });
+    const { pi, tools } = makePi();
+    await registerMcpTool(pi, path);
+    expect((tools.get("mcp") as unknown as { description: string }).description).toContain("s1 (web search and fetch)");
+  });
+
+  it("survives malformed pin config with a status line, never a load failure", async () => {
+    for (const bad of [{}, "s1__web_search"]) {
+      const dir = mkdtempSync(join(tmpdir(), "mcp-bad-"));
+      const path = writeConfig(dir, { s1: { url: "https://x/mcp" } }, { pin: bad });
+      const { pi, tools } = makePi();
+      await expect(registerMcpTool(pi, path)).resolves.toBeUndefined();
+      expect(tools.get("mcp")).toBeDefined();
+    }
+    const dir = mkdtempSync(join(tmpdir(), "mcp-bad-"));
+    const path = writeConfig(dir, { s1: { url: "https://x/mcp" } }, { pin: [42, "s1__web_search"] });
+    const { pi, tools } = makePi();
+    await registerMcpTool(pi, path);
+    expect(tools.get("s1__web_search")).toBeDefined(); // the valid entry still lands
+    const status = await tools.get("mcp")!.execute("1", {});
+    expect(status.content[0].text).toContain("42: pin entries must be strings");
+  });
+
+  it("rejects pin names providers refuse and $ref schemas Anthropic would drop", async () => {
+    sdk.behavior.listTools = async () => ({
+      tools: [
+        ...TWO_TOOLS,
+        {
+          name: "refl",
+          inputSchema: { type: "object", $defs: { q: {} }, properties: { x: { $ref: "#/$defs/q" } } },
+        },
+      ],
+    });
+    const { tools } = await setupPins(["my.server__x", "s1__refl"]);
+    expect(tools.get("my.server__x")).toBeUndefined();
+    const status = await tools.get("mcp")!.execute("1", {});
+    const text = status.content[0].text;
+    expect(text).toContain("my.server__x: tool name must be 1-64 chars");
+    expect(text).toContain("s1__refl: schema uses $ref");
+  });
+
+  it("reports a disabled server by name instead of 'unknown server'", async () => {
+    const { tools } = await setupPins(["s1__web_search"], { s1: { url: "https://x/mcp", disabled: true } });
+    expect(tools.get("s1__web_search")).toBeUndefined();
+    const status = await tools.get("mcp")!.execute("1", {});
+    expect(status.content[0].text).toContain("s1__web_search: server is disabled");
+  });
+
+  it("shares one connection across pins on a server and dedupes repeated pins", async () => {
+    const { tools } = await setupPins(["s1__web_search", "s1__web_fetch", "s1__web_search"]);
+    expect(sdk.instances).toHaveLength(1);
+    const status = await tools.get("mcp")!.execute("1", {});
+    const pinnedLines = (status.content[0].text ?? "").split("\n").filter((l: string) => l.includes("- pinned"));
+    expect(pinnedLines).toHaveLength(2);
+  });
+
+  it("reconnects a pinned tool after the idle close", async () => {
+    const { tools } = await setupPins(["s1__web_search"]);
+    await tools.get("s1__web_search")!.execute("1", { query: "a" });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sdk.instances[0].closed).toBe(1);
+    const result = await tools.get("s1__web_search")!.execute("2", { query: "b" });
+    expect(result.content[0].text).toBe("ok");
+    expect(sdk.instances).toHaveLength(2);
   });
 });

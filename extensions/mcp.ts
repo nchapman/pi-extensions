@@ -5,6 +5,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Type } from "typebox";
+import type { TSchema } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 
@@ -15,10 +16,15 @@ export interface ServerDef {
   env?: Record<string, string>;
   cwd?: string;
   disabled?: boolean;
+  /** One-line capability hint shown in the gateway tool's description. */
+  note?: string;
 }
 
 export interface McpConfig {
   mcpServers?: Record<string, ServerDef>;
+  /** Qualified tool names (server__tool) registered as native tools at load.
+   * The pin string is the tool name the model sees. */
+  pin?: string[];
 }
 
 export interface ToolMeta {
@@ -192,9 +198,11 @@ function reuseText(context: { lastComponent?: unknown } | undefined): Text {
   return context?.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
 }
 
-export function registerMcpTool(pi: ExtensionAPI, configPath: string = CONFIG_PATH): void {
+export async function registerMcpTool(pi: ExtensionAPI, configPath: string = CONFIG_PATH): Promise<void> {
   const { config, error: configError } = loadConfig(configPath);
   const servers = new Map<string, ServerState>();
+  const pinnedTools: string[] = [];
+  const pinIssues: string[] = [];
   for (const [name, def] of Object.entries(config.mcpServers ?? {})) {
     if (def.disabled) continue;
     const state: ServerState = { def, activeCalls: 0, shuttingDown: false };
@@ -344,18 +352,19 @@ export function registerMcpTool(pi: ExtensionAPI, configPath: string = CONFIG_PA
     }
   });
 
-  const serverNames = [...servers.keys()];
+  const serverList =
+    [...servers.entries()].map(([n, s]) => (s.def.note ? `${n} (${s.def.note})` : n)).join(", ") || "(none configured)";
   pi.registerTool({
     name: "mcp",
     label: "MCP",
-    description: `MCP gateway — status, tool search/describe, and tool calls over MCP servers. Servers: ${serverNames.join(", ") || "(none configured)"}.
+    description: `MCP gateway — status, tool search/describe, and tool calls over MCP servers. Servers: ${serverList}.
 Usage:
   mcp({})                            → server status
   mcp({ search: "query" })           → search tools by name/description
   mcp({ describe: "server__tool" })  → show a tool's parameters
   mcp({ tool: "server__tool", args: { ... } }) → call a tool
   mcp({ server: "name" })            → list a server's tools
-Tool names are "server__tool"; a bare name works when unambiguous. Servers connect lazily on first use.`,
+Tool names are "server__tool"; a bare name works when unambiguous. Unpinned servers connect lazily on first use.`,
     promptSnippet: "MCP gateway — search and call tools on external MCP servers",
     promptGuidelines: [
       'Discover MCP tools with mcp({ search: ... }) before calling them; call with mcp({ tool: "server__tool", args: { ... } }).',
@@ -394,6 +403,8 @@ Tool names are "server__tool"; a bare name works when unambiguous. Servers conne
                 : "not connected yet";
           lines.push(`- ${name} (${kind}): ${status}`);
         }
+        for (const pin of pinnedTools) lines.push(`- pinned ${pin}: native tool`);
+        for (const issue of pinIssues) lines.push(`- pin ${issue}`);
         return reply(lines.join("\n") || "No MCP servers configured.");
       }
 
@@ -443,8 +454,99 @@ Tool names are "server__tool"; a bare name works when unambiguous. Servers conne
       }
     },
   });
+
+  /** A pinned MCP tool exposed as a native pi tool: the server's own schema and
+   * description, execute routed through the shared connection machinery —
+   * pinned servers connect eagerly at load so the schema is in hand. */
+  function registerPinnedTool(tool: ToolMeta): void {
+    const description = tool.description?.trim() || "(no description)";
+    pi.registerTool({
+      name: tool.qualified,
+      label: tool.qualified,
+      description: `${description} — direct proxy for MCP server "${tool.server}"; everything else stays behind the mcp gateway.`,
+      promptSnippet: description.split("\n")[0].slice(0, 120).trim() || "(no description)",
+      parameters: tool.inputSchema as TSchema,
+      async execute(_id, params, signal) {
+        if (signal?.aborted) throw new Error("Aborted");
+        const state = await ensureConnected(tool.server);
+        state.activeCalls++;
+        try {
+          const result = await withTimeout(
+            state.client!.callTool(
+              { name: tool.name, arguments: (params ?? {}) as Record<string, unknown> },
+              undefined,
+              {
+                timeout: CALL_TIMEOUT_MS,
+                signal,
+              },
+            ),
+            CALL_TIMEOUT_MS + 5_000,
+            `Call ${tool.qualified}`,
+          );
+          return reply(serializeCallResult(result));
+        } finally {
+          state.activeCalls--;
+          scheduleIdleClose(state);
+        }
+      },
+    });
+  }
+
+  // Pins resolve against their named server only, so an unreachable or unknown
+  // pin never blocks the rest — it degrades to a status line. The name and
+  // schema guards exist because a bad pin fails at the provider on every
+  // request, not just when called — registration-time acceptance isn't enough.
+  if (config.pin !== undefined && !Array.isArray(config.pin)) {
+    pinIssues.push("pin: config must be an array of server__tool strings");
+  }
+  for (const pin of new Set(Array.isArray(config.pin) ? config.pin : [])) {
+    if (typeof pin !== "string") {
+      pinIssues.push(`${JSON.stringify(pin)}: pin entries must be strings (server__tool)`);
+      continue;
+    }
+    if (!/^[\w-]{1,64}$/.test(pin)) {
+      pinIssues.push(`${pin}: tool name must be 1-64 chars of [a-zA-Z0-9_-] for providers`);
+      continue;
+    }
+    const sep = pin.indexOf("__");
+    const serverName = sep > 0 ? pin.slice(0, sep) : undefined;
+    const state = serverName !== undefined ? servers.get(serverName) : undefined;
+    if (serverName === undefined || state === undefined) {
+      if (serverName !== undefined && config.mcpServers?.[serverName]?.disabled) {
+        pinIssues.push(`${pin}: server is disabled`);
+      } else {
+        pinIssues.push(`${pin}: unknown server (pins use server__tool names)`);
+      }
+      continue;
+    }
+    if (state.invalid) {
+      pinIssues.push(`${pin}: server config invalid (${state.invalid})`);
+      continue;
+    }
+    try {
+      await ensureMeta(serverName);
+      const tool = state.tools?.find((t) => t.name === pin.slice(sep + 2));
+      if (!tool) {
+        pinIssues.push(`${pin}: not offered by ${serverName}`);
+        continue;
+      }
+      const schema = tool.inputSchema as { type?: unknown } | undefined;
+      if (!schema || schema.type !== "object") {
+        pinIssues.push(`${pin}: input schema is not an object`);
+        continue;
+      }
+      if (JSON.stringify(schema).includes("$ref")) {
+        pinIssues.push(`${pin}: schema uses $ref — not portable to all providers`);
+        continue;
+      }
+      registerPinnedTool(tool);
+      pinnedTools.push(pin);
+    } catch (error) {
+      pinIssues.push(`${pin}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
 }
 
-export default function (pi: ExtensionAPI) {
-  registerMcpTool(pi);
+export default async function (pi: ExtensionAPI) {
+  await registerMcpTool(pi);
 }
