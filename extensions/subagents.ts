@@ -11,6 +11,7 @@ import {
   type BackgroundRegistry,
   capResultText,
   createBackgroundRegistry,
+  createBgTool,
   DEFAULT_BG_AFTER_MS,
   formatSubagentWake,
   parseBgAfterMs,
@@ -1026,12 +1027,14 @@ export function registerSubagentsExtension(
     const killed = registry.killAll();
     if (killed > 0 && (event.reason === "new" || event.reason === "resume" || event.reason === "fork")) {
       ui?.notify(
-        `Background subagents killed (${event.reason}): killed ${killed}, their results will not arrive.`,
+        `Background tasks killed (${event.reason}): killed ${killed}, their results will not arrive.`,
         "warning",
       );
     }
   });
   registerSubagentTools(pi, agentsDir, opts.spawnFn ?? defaultSpawn, agents, registry);
+  // bg shares the registry: one footer count, one shutdown kill, the same wake channel.
+  pi.registerTool(createBgTool(registry, { defaultTimeoutMs: DEFAULT_TIMEOUT_MS }));
   registerCommandsForAgents(pi, agents);
 }
 
