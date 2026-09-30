@@ -19,6 +19,8 @@ describe("env parsing", () => {
     expect(parseBgAfterMs({})).toBe(DEFAULT_BG_AFTER_MS);
     expect(parseBgAfterMs({ PI_SUBAGENT_BG_AFTER_MS: "abc" })).toBe(DEFAULT_BG_AFTER_MS);
     expect(parseBgAfterMs({ PI_SUBAGENT_BG_AFTER_MS: "-5" })).toBe(DEFAULT_BG_AFTER_MS);
+    expect(parseBgAfterMs({ PI_SUBAGENT_BG_AFTER_MS: "" })).toBe(DEFAULT_BG_AFTER_MS); // Number("") is 0
+    expect(parseBgAfterMs({ PI_SUBAGENT_BG_AFTER_MS: "  " })).toBe(DEFAULT_BG_AFTER_MS);
   });
 
   it("accepts valid thresholds including zero", () => {
@@ -112,6 +114,20 @@ describe("createBackgroundRegistry", () => {
     });
     return { registry, sendUserMessage, notify, setStatus };
   }
+
+  it("swallows a throwing wake channel instead of surfacing an unhandled rejection", () => {
+    const registry = createBackgroundRegistry({
+      sendUserMessage: () => {
+        throw new Error("channel down");
+      },
+      notify: vi.fn(),
+      setStatus: vi.fn(),
+      now: () => 1000,
+    });
+    const id = registry.adopt({ name: "a", kind: "subagent", kill: () => undefined });
+    expect(() => registry.complete(id, { ok: true, text: "wake" })).not.toThrow();
+    expect(registry.running()).toHaveLength(0); // still consumed fire-once
+  });
 
   it("adopts with sequential ids and lists running tasks oldest first", () => {
     const { registry } = makeDeps();

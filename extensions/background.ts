@@ -70,8 +70,9 @@ export interface BackgroundRegistry {
 export const DEFAULT_BG_AFTER_MS = 120_000;
 
 export function parseBgAfterMs(env: Record<string, string | undefined>): number {
-  const raw = Number(env.PI_SUBAGENT_BG_AFTER_MS);
-  return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_BG_AFTER_MS;
+  // Trim first: Number("") coerces to 0, which would background every child instantly.
+  const raw = env.PI_SUBAGENT_BG_AFTER_MS?.trim();
+  return raw && Number.isFinite(Number(raw)) && Number(raw) >= 0 ? Number(raw) : DEFAULT_BG_AFTER_MS;
 }
 
 const WAKE_OFF = new Set(["0", "false", "no", "off"]);
@@ -160,8 +161,16 @@ export function createBackgroundRegistry(deps: BackgroundDeps = {}): BackgroundR
       task.state = wake.ok ? "done" : "failed";
       task.endedAt = now();
       refreshStatus();
-      if (deps.wakeEnabled !== false) deps.sendUserMessage?.(wake.text);
-      deps.notify?.(wake.text.split("\n")[0], wake.ok ? "info" : "error");
+      // Channels are external and can throw (a wake landing during session
+      // teardown, say); the completion promise observing this call must not
+      // reject unhandled and crash the host.
+      try {
+        if (deps.wakeEnabled !== false) deps.sendUserMessage?.(wake.text);
+        deps.notify?.(wake.text.split("\n")[0], wake.ok ? "info" : "error");
+      } catch {
+        // Delivery failed after the fire-once flip — the wake is lost, but the
+        // session survives it.
+      }
     },
     running() {
       return [...tasks.values()]

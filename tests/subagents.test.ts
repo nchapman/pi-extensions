@@ -719,6 +719,15 @@ describe("adoption (runChild)", () => {
     await expect(promise).rejects.toThrow(/timed out/); // hard timeout, no adoption
   });
 
+  it("kills the child when the signal was already aborted at registration", async () => {
+    const child = fakeChild();
+    const controller = new AbortController();
+    controller.abort(new Error("cancelled before start"));
+    const promise = runChild(AGENT, "task", undefined, { timeoutMs: 5000, signal: controller.signal }, () => child);
+    await expect(promise).rejects.toThrow("cancelled before start");
+    expect(child.killed).toBe(true);
+  });
+
   it("rejects via the abort path when abort wins the race with the adopt timer", async () => {
     const child = fakeChild();
     const controller = new AbortController();

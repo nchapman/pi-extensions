@@ -511,6 +511,9 @@ export function runChild(
       settle(() => rejectWith(signal?.reason ?? new Error(`Subagent "${agent.name}" aborted`)));
     };
     signal?.addEventListener("abort", onAbort, { once: true });
+    // A signal aborted before registration never fires the listener — check
+    // manually so an already-cancelled turn doesn't leave the child running.
+    if (signal?.aborted) onAbort();
 
     // Soft threshold: hand the still-running child to onAdopted and resolve
     // immediately. The abort listener detaches — a backgrounded child survives
