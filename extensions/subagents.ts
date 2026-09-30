@@ -348,9 +348,13 @@ export function formatUsageLine(u: ChildUsage): string {
   return `${k(u.totalTokens)} tokens (${k(u.input)} in / ${k(u.output)} out), $${u.cost.total.toFixed(3)}`;
 }
 
-/** The tool result when a child moves to the background: what happened, and where the result will come from. */
+/** The tool result when a child moves to the background: what happened, and
+ * how the result is received. Wakes steer in — delivered as the parent's next
+ * message at a turn boundary, even mid-run — so the notice says the result
+ * arrives on its own and that sleep-polling is pure waste (the wake would
+ * land when the sleep returns; the sleep just burns its whole duration). */
 export function backgroundedNotice(agentName: string, id: string): string {
-  return `Subagent "${agentName}" is still running — moved to the background (${id}). Its result will arrive in a follow-up message when it completes (the hard timeout still applies); continue with other work meanwhile.`;
+  return `Subagent "${agentName}" is still running — moved to the background (${id}). When it completes, its result is delivered to you automatically as your next message — even mid-run, while you keep working — so continue other work; never sleep or poll to wait for it. The hard timeout still applies.`;
 }
 
 /** Adopt a still-running child into the registry and wire its wake. Returns the task id. */
@@ -720,7 +724,7 @@ const modelField = Type.Optional(Type.String({ description: "Model override (pro
 const backgroundField = Type.Optional(
   Type.Boolean({
     description:
-      "Run in the background: return immediately with a task id; the result arrives later in a follow-up message (long runs also background automatically).",
+      "Run in the background: return immediately with a task id; the result is delivered to you automatically as your next message, even mid-run (long runs also background automatically).",
   }),
 );
 const taskItem = Type.Object({
@@ -761,12 +765,12 @@ Available agents:
 ${agentList}
 Alternatively pass agent_md: a full agent definition in markdown (frontmatter + system prompt) for an ad-hoc specialist. With neither, a generic read-only investigator runs.
 The subagent runs to completion and returns its final response. Use for reviews, research, and any work that benefits from an isolated context.
-Subagents still running after ~2 minutes move to the background: the tool returns immediately and a follow-up message delivers the result. Pass background: true for known-long work; don't wait or poll — the result comes to you.`,
+Subagents still running after ~2 minutes move to the background: the tool returns immediately, and the result is delivered to you automatically as your next message — even mid-run, while you keep working. Pass background: true for known-long work; never sleep or poll waiting for it.`,
     promptSnippet: "Delegate a task to a focused subagent (isolated pi session)",
     promptGuidelines: [
       "Use subagent for self-contained work (reviews, research, audits); the subagent only sees the task text you pass, so include all needed context.",
       "For a bespoke specialist, pass agent_md with the exact instructions and tool restrictions instead of forcing a named agent to fit.",
-      "Long subagent runs background automatically and their results arrive in follow-up messages — continue other work instead of waiting or polling.",
+      "Long subagent runs background automatically; results are delivered to you automatically as your next message, even mid-run — continue other work and never sleep or poll.",
     ],
     parameters: taskItem,
     renderCall(args, theme, context) {
@@ -829,10 +833,11 @@ Subagents still running after ~2 minutes move to the background: the tool return
 Available agents:
 ${agentList}
 Each task may instead include agent_md (an inline agent definition) or omit both to use the generic read-only investigator.
-Slow tasks background individually after ~2 minutes; each such result then arrives in its own follow-up message. Pass background: true per task for known-long work.`,
+Slow tasks background individually after ~2 minutes; each result is then delivered to you automatically as your next message, even mid-run. Pass background: true per task for known-long work; never sleep or poll waiting for one.`,
     promptSnippet: "Run several subagent tasks in parallel",
     promptGuidelines: [
       "Use subagents for independent, self-contained tasks that benefit from parallel isolated sessions; each subagent only sees its own task text, so include all needed context.",
+      "Slow tasks background individually; each result is delivered to you automatically as your next message, even mid-run — continue other work and never sleep or poll.",
     ],
     parameters: Type.Object({
       tasks: Type.Array(taskItem, { minItems: 1, description: "Tasks to run in parallel" }),
@@ -888,7 +893,7 @@ Slow tasks background individually after ~2 minutes; each such result then arriv
           r.status === "rejected"
             ? `ERROR: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`
             : "adopted" in r.value
-              ? `Still running — backgrounded as ${r.value.id}; the result will arrive in a follow-up message.`
+              ? `Still running — backgrounded as ${r.value.id}; when it completes, the result is delivered to you automatically as your next message, even mid-run — never sleep or poll.`
               : r.value.text;
         return `### ${label}\n${body}`;
       });
@@ -1016,8 +1021,15 @@ export function registerSubagentsExtension(
   const agents = loadAgents(agentsDir);
   // UI channels arrive with the first event context; the wake channel is pi itself.
   let ui: ExtensionContext["ui"] | undefined;
+  // Wakes steer in rather than follow up: a followUp message queues until the
+  // run ends, so a model that "waits" by calling tools — sleep-polling — can
+  // never receive it (delivery is turn-boundary-based, not time-based).
+  // Steering lands at the parent's next turn boundary, even mid-run: a busy
+  // model gets the result as its next message, and a sleep-polling model gets
+  // it the moment its sleep returns — the livelock is impossible by mechanism,
+  // not by instruction.
   const registry = createBackgroundRegistry({
-    sendUserMessage: (text) => pi.sendUserMessage(text, { deliverAs: "followUp" }),
+    sendUserMessage: (text) => pi.sendUserMessage(text, { deliverAs: "steer" }),
     notify: (message, level) => ui?.notify(message, level),
     setStatus: (key, text) => ui?.setStatus(key, text),
     wakeEnabled: parseWakeEnabled(process.env),

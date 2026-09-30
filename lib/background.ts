@@ -4,9 +4,11 @@
  *
  * Design (the deliberate cut of a larger plan):
  * - a subagent child that outlives its adoption threshold keeps running while
- *   the parent turn moves on; when it settles, one wake message delivers the
- *   result as a followUp user message — a real transcript entry, so recall can
- *   find it again after compaction (no status tool, no polling)
+ *   the parent turn moves on; when it settles, one wake message steers in
+ *   with the result — delivered as the parent's next message at a turn
+ *   boundary, even mid-run, so a sleep-polling model can never starve it
+ *   (a real transcript entry, so recall can find it again after compaction;
+ *   no status tool, no polling)
  * - the registry is in-memory and session-scoped: pi reloads and exits run
  *   session_shutdown, which kills running children — an orphaned child burns
  *   API tokens with nobody consuming the result, so nothing outlives the
@@ -46,7 +48,7 @@ export interface AdoptedHandle<T = { text: string; usage?: unknown }> {
 }
 
 export interface BackgroundDeps {
-  /** Wake channel — receives the followUp user message text. */
+  /** Wake channel — receives the steered user message text. */
   sendUserMessage?: (text: string) => void;
   /** Terminal notification channel (ctx.ui.notify); optional for headless modes. */
   notify?: (message: string, level: "info" | "warning" | "error") => void;
@@ -301,12 +303,13 @@ export function createBgTool(
     name: "bg",
     label: "Background shell",
     description: `Run a shell command in the background and return immediately with a task id.
-When the command exits, one follow-up message delivers its exit status, duration, and the tail of its combined output; long output is saved to a file whose path the message includes.
+When the command exits, its wake is delivered to you automatically as your next message — even mid-run, while you keep working — carrying the exit status, duration, and the tail of its combined output; long output is saved to a file whose path the message includes. Never sleep or poll waiting for it.
 Use for long-running commands whose result you need later — builds, test suites, migrations — not for output you need inline. A timeout (default 10m) SIGKILLs; kill_task can stop a task early.`,
     promptSnippet: "Background a long-running shell command",
     promptGuidelines: [
       "Use bg for shell commands whose result you need later but don't need to wait for (builds, test suites, migrations).",
       "Prefer the regular bash tool when you need the output to proceed — bg never blocks and never returns output inline.",
+      "Background results are delivered to you automatically as your next message, even mid-run — keep working and they will reach you; never sleep or poll waiting for one.",
     ],
     parameters: Type.Object({
       command: Type.String({ description: "Shell command, passed to bash -c" }),
@@ -416,7 +419,7 @@ Use for long-running commands whose result you need later — builds, test suite
         content: [
           {
             type: "text" as const,
-            text: `Backgrounded (${id}): ${bashCommandHead(command)}\nExit status and output tail arrive in a follow-up message.`,
+            text: `Backgrounded (${id}): ${bashCommandHead(command)}\nWhen the command exits, the exit status and output tail are delivered to you automatically as your next message — even mid-run, while you keep working. Continue other work if you have any; never sleep or poll waiting for it.`,
           },
         ],
         details: { kind: "bash", id },
@@ -443,7 +446,7 @@ export function createKillTaskTool(
     name: "kill_task",
     label: "Kill background task",
     description: `Kill one running background task by id (bg-1, bg-2, …) — a backgrounded shell command or subagent alike.
-The task stops immediately and its result never arrives. Ids come from the bg tool's return, a backgrounded subagent's notice, or a follow-up message.`,
+The task stops immediately and its result never arrives. Ids come from the bg tool's return, a backgrounded subagent's notice, or a background wake message.`,
     promptSnippet: "Kill a background task by id",
     promptGuidelines: [
       "Reach for kill_task when a backgrounded command or subagent is no longer wanted — stopped tasks are gone for good, so re-launch if the work is still needed.",

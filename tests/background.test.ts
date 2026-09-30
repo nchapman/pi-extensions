@@ -262,6 +262,14 @@ describe("createBgTool", () => {
 
   const CTX = { sessionManager: { getSessionDir: () => undefined } } as never;
 
+  it("teaches the wake contract in its description and guidelines", () => {
+    const d = toolDeps();
+    const tool = createBgTool(d.registry, { spawnFn: () => fakeBash() });
+    expect(tool.description).toContain("even mid-run");
+    expect(tool.description).toContain("Never sleep or poll");
+    expect(tool.promptGuidelines.join("\n")).toContain("never sleep or poll");
+  });
+
   it("returns a task id immediately and adopts the still-running child", async () => {
     const d = toolDeps();
     const child = fakeBash();
@@ -270,6 +278,11 @@ describe("createBgTool", () => {
     expect(result.details).toEqual({ kind: "bash", id: "bg-1" });
     expect(child.killed).toBe(false);
     expect(d.registry.running()[0]).toMatchObject({ id: "bg-1", kind: "bash", name: "sleep 30" });
+    // The result text carries the delivery contract: the wake steers in as
+    // the next message, even mid-run — never sleep or poll for it.
+    expect(result.content[0].text).toContain("delivered to you automatically");
+    expect(result.content[0].text).toContain("even mid-run");
+    expect(result.content[0].text).toContain("never sleep or poll");
   });
 
   it("wakes with exit status and the output tail on a clean exit", async () => {

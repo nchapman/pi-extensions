@@ -881,11 +881,16 @@ describe("formatUsageLine / backgroundedNotice", () => {
     );
   });
 
-  it("tells the model what happened and where the result will come from", () => {
+  it("tells the model what happened and how the result is received", () => {
     const notice = backgroundedNotice("reviewer", "bg-3");
     expect(notice).toContain('"reviewer"');
     expect(notice).toContain("bg-3");
-    expect(notice).toContain("follow-up message");
+    // The delivery contract: wakes steer in as the parent's next message,
+    // even mid-run — so the notice says the result arrives on its own and
+    // forbids sleep-polling (which can only waste time, never help).
+    expect(notice).toContain("delivered to you automatically");
+    expect(notice).toContain("even mid-run");
+    expect(notice).toContain("never sleep or poll");
   });
 });
 
@@ -894,6 +899,8 @@ describe("registerSubagentTools with a registry", () => {
     const tools = new Map<
       string,
       {
+        description?: string;
+        promptGuidelines?: string[];
         execute: (
           id: string,
           params: unknown,
@@ -908,6 +915,8 @@ describe("registerSubagentTools with a registry", () => {
     const pi = {
       registerTool: (t: {
         name: string;
+        description?: string;
+        promptGuidelines?: string[];
         execute: (
           id: string,
           params: unknown,
@@ -935,6 +944,20 @@ describe("registerSubagentTools with a registry", () => {
     return { sessionManager: { getSessionDir: () => dir } };
   }
 
+  it("teaches the wake contract on every delivery surface", () => {
+    const { pi, tools } = makePi();
+    registerSubagentTools(pi, mkdtempSync(join(tmpdir(), "agents-")), silentSpawn([]), undefined, undefined);
+    // Descriptions are always in context — each surface that mentions
+    // backgrounding must teach that wakes arrive automatically (even
+    // mid-run) and forbid sleep-polling, with a guideline reinforcing it.
+    for (const name of ["subagent", "subagents"]) {
+      const tool = tools.get(name)!;
+      expect(tool.description).toContain("even mid-run");
+      expect(tool.description).toContain("sleep or poll");
+      expect((tool.promptGuidelines ?? []).join("\n")).toContain("sleep or poll");
+    }
+  });
+
   it("backgrounds a background:true task immediately and wakes on completion", async () => {
     const children: FakeChild[] = [];
     const sendUserMessage = vi.fn();
@@ -951,7 +974,8 @@ describe("registerSubagentTools with a registry", () => {
     expect(result.details.backgrounded).toBe(true);
     expect(result.details.id).toBe("bg-1");
     expect(result.content[0].text).toContain("bg-1");
-    expect(result.content[0].text).toContain("follow-up message");
+    expect(result.content[0].text).toContain("even mid-run");
+    expect(result.content[0].text).toContain("never sleep or poll");
     expect(registry.running()).toHaveLength(1);
 
     children[0].stdoutEmit(jsonLine("late but worth it"));
@@ -1009,6 +1033,9 @@ describe("registerSubagentTools with a registry", () => {
 
     expect(result.content[0].text).toContain("### reviewer\nfast ok");
     expect(result.content[0].text).toContain("backgrounded as bg-1");
+    // The inline backgrounded section teaches the wake contract too.
+    expect(result.content[0].text).toContain("even mid-run");
+    expect(result.content[0].text).toContain("never sleep or poll");
     expect(result.details).toMatchObject({ count: 2, backgrounded: 1 });
     // Only the fast child's usage rides inline; the slow one's comes in its wake.
     expect(result.usage).toEqual(USAGE());
@@ -1100,6 +1127,24 @@ describe("registerSubagentsExtension (full wiring)", () => {
     expect(children[0].killed).toBe(false);
     return result;
   }
+
+  it("delivers wakes as steering so a busy or sleep-polling model receives them", async () => {
+    const wired = wireUp();
+    await runBackgroundedTask(wired.tools, wired.children);
+
+    // Child settles: the wake must go out with deliverAs "steer". A followUp
+    // wake queues until the run ends — a model that keeps calling tools
+    // (e.g. sleeping to "wait") would never receive it. Steering lands at the
+    // parent's next turn boundary, even mid-run, making the livelock
+    // impossible by mechanism.
+    wired.children[0].stdoutEmit(jsonLine("done"));
+    wired.children[0].close(0);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(wired.sendUserMessage).toHaveBeenCalledTimes(1);
+    const [text, options] = wired.sendUserMessage.mock.calls[0] as [string, { deliverAs?: string }];
+    expect(text).toContain("[background]");
+    expect(options?.deliverAs).toBe("steer");
+  });
 
   it("kills backgrounded children on session replacement and explains the lost wake", async () => {
     const wired = wireUp();
