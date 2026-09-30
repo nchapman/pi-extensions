@@ -4,12 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
+  adoptSubagentTask,
   agentFromText,
+  backgroundedNotice,
   buildCommandPrompt,
   BUILTIN_TOOLS,
   buildChildArgs,
   DEFAULT_AGENT_MD,
   extractAssistantText,
+  formatUsageLine,
   isValidCommandName,
   loadAgents,
   parseConcurrency,
@@ -17,6 +20,7 @@ import {
   refLabel,
   registerCommandsForAgents,
   registerSubagentCommands,
+  registerSubagentsExtension,
   registerSubagentTools,
   renderSubagentCall,
   renderSubagentsCall,
@@ -29,9 +33,11 @@ import {
   renderSubagentResult,
   type AgentDef,
   type ChildLike,
+  type ChildRun,
   type ChildUsage,
   type SpawnFn,
 } from "../extensions/subagents";
+import { createBackgroundRegistry, type AdoptedHandle } from "../extensions/background";
 
 /** Identity theme: strips styling so assertions see plain text. */
 const THEME = { fg: (_k: string, s: string) => s, bold: (s: string) => s } as never;
@@ -49,6 +55,8 @@ const USAGE = (over: Partial<ChildUsage> = {}): ChildUsage => ({
 const usageLine = (usage: ChildUsage): string => JSON.stringify({ type: "message_update", usage });
 const assistantLine = (text: string): string =>
   JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }] } });
+/** A complete assistant message_end line, the shape runChild parses for final text. */
+const jsonLine = assistantLine;
 
 /** Render a tool-call component to plain text for assertions. */
 function renderPlain(component: { render: (width: number) => string[] }): string {
@@ -544,6 +552,540 @@ describe("runChild", () => {
     const promise = runChild(AGENT, "task", undefined, { timeoutMs: 5000 }, () => child);
     child.fail(new Error("ENOENT pi"));
     await expect(promise).rejects.toThrow(/Failed to spawn pi.*ENOENT/);
+  });
+});
+
+describe("adoption (runChild)", () => {
+  const adoptOpts = { timeoutMs: 5000, adoptAfterMs: 5 };
+
+  it("hands the still-running child to onAdopted and resolves immediately", async () => {
+    const child = fakeChild();
+    let handle: AdoptedHandle<ChildRun> | undefined;
+    const promise = runChild(
+      AGENT,
+      "task",
+      undefined,
+      {
+        ...adoptOpts,
+        onAdopted: (h) => {
+          handle = h;
+          return "bg-1";
+        },
+      },
+      () => child,
+    );
+    const run = await promise;
+    expect(run).toEqual({ adopted: true, id: "bg-1" });
+    expect(handle).toBeDefined();
+    expect(child.killed).toBe(false); // the child keeps running
+  });
+
+  it("delivers text streamed after adoption through the completion promise", async () => {
+    const child = fakeChild();
+    let handle: AdoptedHandle<ChildRun> | undefined;
+    const promise = runChild(
+      AGENT,
+      "task",
+      undefined,
+      {
+        ...adoptOpts,
+        onAdopted: (h) => {
+          handle = h;
+          return "bg-1";
+        },
+      },
+      () => child,
+    );
+    await promise;
+    // The final reply arrives only after the tool result already returned.
+    child.stdoutEmit(
+      `${JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "late answer" }], usage: USAGE() },
+      })}\n`,
+    );
+    child.close(0);
+    const completion = await handle!.completion;
+    expect(completion.text).toBe("late answer");
+    expect(completion.usage).toEqual(USAGE());
+  });
+
+  it("stops streaming partials once adopted", async () => {
+    const child = fakeChild();
+    const updates: unknown[] = [];
+    const promise = runChild(
+      AGENT,
+      "task",
+      undefined,
+      {
+        ...adoptOpts,
+        onUpdate: (p: unknown) => updates.push(p),
+        onAdopted: () => "bg-1",
+      },
+      () => child,
+    );
+    await promise;
+    child.stdoutEmit(
+      `${JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "after" }] } })}\n`,
+    );
+    child.close(0);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(updates).toHaveLength(0);
+  });
+
+  it("detaches the abort signal at adoption: a turn abort no longer kills the child", async () => {
+    const child = fakeChild();
+    const controller = new AbortController();
+    let handle: AdoptedHandle<ChildRun> | undefined;
+    const promise = runChild(
+      AGENT,
+      "task",
+      undefined,
+      {
+        ...adoptOpts,
+        signal: controller.signal,
+        onAdopted: (h) => {
+          handle = h;
+          return "bg-1";
+        },
+      },
+      () => child,
+    );
+    await promise;
+    controller.abort(new Error("user cancelled"));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(child.killed).toBe(false);
+    child.stdoutEmit(jsonLine("kept going"));
+    child.close(0);
+    await expect(handle!.completion).resolves.toMatchObject({ text: "kept going" });
+  });
+
+  it("still enforces the hard timeout after adoption", async () => {
+    const child = fakeChild();
+    let handle: AdoptedHandle<ChildRun> | undefined;
+    const promise = runChild(
+      AGENT,
+      "task",
+      undefined,
+      {
+        timeoutMs: 20,
+        adoptAfterMs: 5,
+        onAdopted: (h) => {
+          handle = h;
+          return "bg-1";
+        },
+      },
+      () => child,
+    );
+    await promise;
+    await expect(handle!.completion).rejects.toThrow(/timed out after 0s/);
+    expect(child.killed).toBe(true);
+  });
+
+  it("carries usage on an adopted child's failure", async () => {
+    const child = fakeChild();
+    let handle: AdoptedHandle<ChildRun> | undefined;
+    const promise = runChild(
+      AGENT,
+      "task",
+      undefined,
+      {
+        ...adoptOpts,
+        onAdopted: (h) => {
+          handle = h;
+          return "bg-1";
+        },
+      },
+      () => child,
+    );
+    await promise;
+    child.stdoutEmit(
+      `${JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "partial" }], usage: USAGE({ input: 700 }) },
+      })}\n`,
+    );
+    child.stderrEmit("boom");
+    child.close(2);
+    const err = (await handle!.completion.catch((e: unknown) => e)) as Error & { usage?: ChildUsage };
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toMatch(/exited with code 2/);
+    expect(err.usage).toEqual(USAGE({ input: 700 }));
+  });
+
+  it("never adopts without onAdopted, even past the threshold", async () => {
+    const child = fakeChild();
+    const promise = runChild(AGENT, "task", undefined, { timeoutMs: 30, adoptAfterMs: 5 }, () => child);
+    await expect(promise).rejects.toThrow(/timed out/); // hard timeout, no adoption
+  });
+
+  it("rejects via the abort path when abort wins the race with the adopt timer", async () => {
+    const child = fakeChild();
+    const controller = new AbortController();
+    const onAdopted = vi.fn(() => "bg-1");
+    const promise = runChild(
+      AGENT,
+      "task",
+      undefined,
+      { timeoutMs: 5000, adoptAfterMs: 5000, signal: controller.signal, onAdopted },
+      () => child,
+    );
+    controller.abort(new Error("user cancelled"));
+    await expect(promise).rejects.toThrow("user cancelled");
+    expect(onAdopted).not.toHaveBeenCalled();
+    expect(child.killed).toBe(true);
+  });
+
+  it("fails the call instead of hanging when onAdopted throws", async () => {
+    const child = fakeChild();
+    const promise = runChild(
+      AGENT,
+      "task",
+      undefined,
+      {
+        ...adoptOpts,
+        onAdopted: () => {
+          throw new Error("registry exploded");
+        },
+      },
+      () => child,
+    );
+    await expect(promise).rejects.toThrow("registry exploded");
+    expect(child.killed).toBe(true);
+  });
+
+  it("rejects the completion promise when the child errors after adoption", async () => {
+    const child = fakeChild();
+    let handle: AdoptedHandle<ChildRun> | undefined;
+    const promise = runChild(
+      AGENT,
+      "task",
+      undefined,
+      {
+        ...adoptOpts,
+        onAdopted: (h) => {
+          handle = h;
+          return "bg-1";
+        },
+      },
+      () => child,
+    );
+    await promise;
+    child.fail(new Error("spawn pipe broke"));
+    await expect(handle!.completion).rejects.toThrow(/Failed to spawn/);
+  });
+});
+
+describe("adoptSubagentTask", () => {
+  it("wires completion and failure wakes through the registry", async () => {
+    const sendUserMessage = vi.fn();
+    const registry = createBackgroundRegistry({ sendUserMessage });
+    const okChild = fakeChild();
+    const failChild = fakeChild();
+
+    const okPromise = runChild(
+      AGENT,
+      "task",
+      undefined,
+      { timeoutMs: 5000, adoptAfterMs: 5, onAdopted: (h) => adoptSubagentTask(registry, "reviewer", h, undefined) },
+      () => okChild,
+    );
+    await okPromise;
+    okChild.stdoutEmit(jsonLine("all clear"));
+    okChild.close(0);
+
+    const failPromise = runChild(
+      AGENT,
+      "task",
+      undefined,
+      { timeoutMs: 5000, adoptAfterMs: 5, onAdopted: (h) => adoptSubagentTask(registry, "reviewer", h, undefined) },
+      () => failChild,
+    );
+    await failPromise;
+    failChild.stderrEmit("boom");
+    failChild.close(2);
+
+    await new Promise((r) => setTimeout(r, 10));
+    expect(sendUserMessage).toHaveBeenCalledTimes(2);
+    const okWake = sendUserMessage.mock.calls[0][0] as string;
+    expect(okWake).toContain('[background] subagent "reviewer" (bg-1,');
+    expect(okWake).toContain("completed");
+    expect(okWake).toContain("all clear");
+    const failWake = sendUserMessage.mock.calls[1][0] as string;
+    expect(failWake).toContain("failed");
+    expect(failWake).toContain("exited with code 2");
+  });
+
+  it("sends no wake when the child completes after killAll", async () => {
+    const sendUserMessage = vi.fn();
+    const registry = createBackgroundRegistry({ sendUserMessage });
+    const child = fakeChild();
+    const promise = runChild(
+      AGENT,
+      "task",
+      undefined,
+      { timeoutMs: 5000, adoptAfterMs: 5, onAdopted: (h) => adoptSubagentTask(registry, "reviewer", h, undefined) },
+      () => child,
+    );
+    await promise;
+    registry.killAll();
+    child.stdoutEmit(jsonLine("never delivered"));
+    child.close(0);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("includes the usage line and stashes over-cap replies", async () => {
+    const sessionDir = mkdtempSync(join(tmpdir(), "bg-adopt-"));
+    const sendUserMessage = vi.fn();
+    const registry = createBackgroundRegistry({ sendUserMessage });
+    const child = fakeChild();
+    const long = `${"r".repeat(4500)}`;
+    const promise = runChild(
+      AGENT,
+      "task",
+      undefined,
+      { timeoutMs: 5000, adoptAfterMs: 5, onAdopted: (h) => adoptSubagentTask(registry, "reviewer", h, sessionDir) },
+      () => child,
+    );
+    await promise;
+    child.stdoutEmit(
+      `${JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: long }], usage: USAGE() },
+      })}\n`,
+    );
+    child.close(0);
+    await new Promise((r) => setTimeout(r, 10));
+    const wake = sendUserMessage.mock.calls[0][0] as string;
+    expect(wake).toContain("105 tokens (100 in / 5 out), $0.120");
+    expect(wake).toContain("full reply:");
+    expect(wake).not.toContain("r".repeat(4500));
+  });
+});
+
+describe("formatUsageLine / backgroundedNotice", () => {
+  it("formats compact token and cost figures", () => {
+    expect(formatUsageLine(USAGE())).toBe("105 tokens (100 in / 5 out), $0.120");
+    expect(formatUsageLine(USAGE({ input: 12_000, output: 3_400, totalTokens: 15_400 }))).toBe(
+      "15.4k tokens (12.0k in / 3.4k out), $0.120",
+    );
+  });
+
+  it("tells the model what happened and where the result will come from", () => {
+    const notice = backgroundedNotice("reviewer", "bg-3");
+    expect(notice).toContain('"reviewer"');
+    expect(notice).toContain("bg-3");
+    expect(notice).toContain("follow-up message");
+  });
+});
+
+describe("registerSubagentTools with a registry", () => {
+  function makePi() {
+    const tools = new Map<
+      string,
+      {
+        execute: (
+          id: string,
+          params: unknown,
+          signal?: AbortSignal,
+          onUpdate?: unknown,
+          ctx?: unknown,
+        ) => Promise<unknown>;
+        renderCall?: (args: never, theme: never, context?: never) => unknown;
+        renderResult?: (result: never, options: never, theme: never, context?: never) => unknown;
+      }
+    >();
+    const pi = {
+      registerTool: (t: {
+        name: string;
+        execute: (
+          id: string,
+          params: unknown,
+          signal?: AbortSignal,
+          onUpdate?: unknown,
+          ctx?: unknown,
+        ) => Promise<unknown>;
+        renderCall?: (args: never, theme: never, context?: never) => unknown;
+        renderResult?: (result: never, options: never, theme: never, context?: never) => unknown;
+      }) => tools.set(t.name, t),
+    };
+    return { pi: pi as never, tools };
+  }
+
+  /** A child that stays silent until the test drives it. */
+  function silentSpawn(children: FakeChild[]): SpawnFn {
+    return (): ChildLike => {
+      const child = fakeChild();
+      children.push(child);
+      return child;
+    };
+  }
+
+  function ctxWithSessionDir(dir?: string) {
+    return { sessionManager: { getSessionDir: () => dir } };
+  }
+
+  it("backgrounds a background:true task immediately and wakes on completion", async () => {
+    const children: FakeChild[] = [];
+    const sendUserMessage = vi.fn();
+    const registry = createBackgroundRegistry({ sendUserMessage });
+    const { pi, tools } = makePi();
+    registerSubagentTools(pi, mkdtempSync(join(tmpdir(), "agents-")), silentSpawn(children), undefined, registry);
+
+    const result = (await tools
+      .get("subagent")!
+      .execute("1", { task: "t", background: true }, undefined, undefined, ctxWithSessionDir())) as {
+      content: Array<{ type: string; text: string }>;
+      details: { agent: string; backgrounded: boolean; id: string };
+    };
+    expect(result.details.backgrounded).toBe(true);
+    expect(result.details.id).toBe("bg-1");
+    expect(result.content[0].text).toContain("bg-1");
+    expect(result.content[0].text).toContain("follow-up message");
+    expect(registry.running()).toHaveLength(1);
+
+    children[0].stdoutEmit(jsonLine("late but worth it"));
+    children[0].close(0);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(sendUserMessage.mock.calls[0][0]).toContain("late but worth it");
+    expect(registry.running()).toHaveLength(0);
+  });
+
+  it("returns partial results when only some batch tasks background", async () => {
+    const children: FakeChild[] = [];
+    const sendUserMessage = vi.fn();
+    const registry = createBackgroundRegistry({ sendUserMessage });
+    const dir = mkdtempSync(join(tmpdir(), "agents-"));
+    writeFileSync(join(dir, "reviewer.md"), "---\nname: reviewer\ndescription: d\n---\nBody.");
+    let call = 0;
+    const spawnFn = (): ChildLike => {
+      const child = fakeChild();
+      children.push(child);
+      const i = call++;
+      if (i === 0) {
+        // Fast child finishes before any adoption.
+        setImmediate(() => {
+          child.stdoutEmit(
+            `${JSON.stringify({
+              type: "message_end",
+              message: { role: "assistant", content: [{ type: "text", text: "fast ok" }], usage: USAGE() },
+            })}\n`,
+          );
+          child.close(0);
+        });
+      }
+      return child;
+    };
+    const { pi, tools } = makePi();
+    registerSubagentTools(pi, dir, spawnFn as unknown as SpawnFn, undefined, registry);
+
+    const result = (await tools.get("subagents")!.execute(
+      "1",
+      {
+        tasks: [
+          { agent: "reviewer", task: "t1" },
+          { agent: "reviewer", task: "t2", background: true },
+        ],
+      },
+      undefined,
+      undefined,
+      ctxWithSessionDir(),
+    )) as {
+      content: Array<{ type: string; text: string }>;
+      details: { count: number; backgrounded?: number };
+      usage?: ChildUsage;
+    };
+
+    expect(result.content[0].text).toContain("### reviewer\nfast ok");
+    expect(result.content[0].text).toContain("backgrounded as bg-1");
+    expect(result.details).toMatchObject({ count: 2, backgrounded: 1 });
+    // Only the fast child's usage rides inline; the slow one's comes in its wake.
+    expect(result.usage).toEqual(USAGE());
+    expect(registry.running()).toHaveLength(1);
+  });
+
+  it("renders backgrounded result rows", () => {
+    const single = renderSubagentResult(
+      backgroundedNotice("reviewer", "bg-1"),
+      { agent: "reviewer", backgrounded: true },
+      { isPartial: false, expanded: false, isError: false },
+      THEME,
+    );
+    expect(single).toContain("backgrounded (reviewer)");
+
+    const batch = renderSubagentResult(
+      "### reviewer\nok",
+      { count: 2, backgrounded: 1 },
+      { isPartial: false, expanded: false, isError: false },
+      THEME,
+    );
+    expect(batch).toContain("done (2 subagents, 1 backgrounded)");
+  });
+});
+
+describe("registerSubagentsExtension (full wiring)", () => {
+  interface WiredTool {
+    execute: (id: string, params: unknown, signal?: AbortSignal, onUpdate?: unknown, ctx?: unknown) => Promise<unknown>;
+  }
+
+  function wireUp() {
+    const handlers = new Map<string, (event?: unknown, ctx?: unknown) => void>();
+    const sendUserMessage = vi.fn();
+    const notify = vi.fn();
+    const setStatus = vi.fn();
+    const tools = new Map<string, WiredTool>();
+    const children: FakeChild[] = [];
+    const pi = {
+      registerTool: (t: { name: string }) => tools.set(t.name, t as unknown as WiredTool),
+      registerCommand: () => undefined,
+      sendUserMessage,
+      on: (event: string, handler: (event?: unknown, ctx?: unknown) => void) => handlers.set(event, handler),
+    };
+    registerSubagentsExtension(pi as never, {
+      agentsDir: mkdtempSync(join(tmpdir(), "agents-")),
+      spawnFn: (() => {
+        const child = fakeChild();
+        children.push(child);
+        return child;
+      }) as unknown as SpawnFn,
+    });
+    handlers.get("session_start")!(undefined, { ui: { notify, setStatus } });
+    return { handlers, sendUserMessage, notify, setStatus, tools, children };
+  }
+
+  async function runBackgroundedTask(tools: Map<string, WiredTool>, children: FakeChild[]) {
+    const result = (await tools.get("subagent")!.execute("1", { task: "t", background: true }, undefined, undefined, {
+      sessionManager: { getSessionDir: () => undefined },
+    })) as { details: { id: string } };
+    expect(children[0].killed).toBe(false);
+    return result;
+  }
+
+  it("kills backgrounded children on session replacement and explains the lost wake", async () => {
+    const wired = wireUp();
+    await runBackgroundedTask(wired.tools, wired.children);
+
+    wired.handlers.get("session_shutdown")!({ reason: "fork" });
+    expect(wired.children[0].killed).toBe(true);
+    expect(wired.notify).toHaveBeenCalledWith(expect.stringContaining("killed 1"), "warning");
+    expect(wired.notify).toHaveBeenCalledWith(expect.stringContaining("results will not arrive"), "warning");
+
+    // The killed child's close event lands after the kill: no wake for it.
+    wired.children[0].stdoutEmit(jsonLine("too late"));
+    wired.children[0].close(0);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(wired.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("stays silent on quit and reload shutdowns", async () => {
+    const wired = wireUp();
+    await runBackgroundedTask(wired.tools, wired.children);
+
+    wired.handlers.get("session_shutdown")!({ reason: "quit" });
+    expect(wired.children[0].killed).toBe(true);
+    expect(wired.notify).not.toHaveBeenCalled();
   });
 });
 
