@@ -65,6 +65,8 @@ export interface BackgroundRegistry {
   complete(id: string, wake: { ok: boolean; text: string }): void;
   /** Tasks still running, oldest first. */
   running(): BgTask[];
+  /** Whether the task exists and has not settled or been killed. */
+  isRunning(id: string): boolean;
   /** Kill every running task and mark it killed — no wakes fire for killed tasks. Returns how many were killed. */
   killAll(): number;
 }
@@ -97,19 +99,20 @@ export function capResultText(
   sessionDir: string | undefined,
   id: string,
   cap: number = WAKE_TEXT_CAP,
+  noun: "reply" | "output" = "reply",
 ): { text: string; resultPath?: string } {
   if (text.length <= cap) return { text };
   if (!sessionDir) {
-    return { text: `${text.slice(0, cap)}\n[… truncated — no session dir to stash the full reply …]` };
+    return { text: `${text.slice(0, cap)}\n[… truncated — no session dir to stash the full ${noun} …]` };
   }
   const resultPath = stashPath(sessionDir, id);
   try {
     mkdirSync(join(sessionDir, "bg"), { recursive: true });
     writeFileSync(resultPath, text);
   } catch {
-    return { text: `${text.slice(0, cap)}\n[… truncated — stashing the full reply failed …]` };
+    return { text: `${text.slice(0, cap)}\n[… truncated — stashing the full ${noun} failed …]` };
   }
-  return { text: `${text.slice(0, cap)}\n[… truncated — full reply: ${resultPath} …]`, resultPath };
+  return { text: `${text.slice(0, cap)}\n[… truncated — full ${noun}: ${resultPath} …]`, resultPath };
 }
 
 /** Compact duration for wake headers: 4m12s, 38s. */
@@ -181,6 +184,9 @@ export function createBackgroundRegistry(deps: BackgroundDeps = {}): BackgroundR
         .map(({ kill: _kill, ...rest }) => rest)
         .sort((a, b) => a.startedAt - b.startedAt);
     },
+    isRunning(id) {
+      return tasks.get(id)?.state === "running";
+    },
     killAll() {
       let killed = 0;
       for (const task of tasks.values()) {
@@ -216,12 +222,30 @@ export interface BashChild {
   stdout: { on(event: "data", cb: (chunk: string | Buffer) => void): unknown } | null;
   stderr: { on(event: "data", cb: (chunk: string | Buffer) => void): unknown } | null;
   kill(signal?: NodeJS.Signals): unknown;
+  /** Process id — the process-group leader when spawned detached. */
+  readonly pid?: number | undefined;
 }
 
-export type BashSpawnFn = (command: string) => BashChild;
+export type BashSpawnFn = (command: string, cwd?: string) => BashChild;
 
-const defaultBashSpawn: BashSpawnFn = (command) =>
-  nodeSpawn("bash", ["-c", command], { stdio: ["ignore", "pipe", "pipe"] });
+/** Node clamps out-of-range setTimeout delays to 1ms — an instant kill. Keep timeouts schedulable. */
+export const MAX_TIMEOUT_MS = 2_147_483_647;
+
+/** Clamp a caller-supplied timeout into schedulable range; invalid values fall back. */
+export function clampTimeoutMs(value: number | undefined, fallback: number): number {
+  if (value === undefined || !Number.isFinite(value) || value < 1) return fallback;
+  return Math.min(Math.floor(value), MAX_TIMEOUT_MS);
+}
+
+const defaultBashSpawn: BashSpawnFn = (command, cwd) =>
+  nodeSpawn("bash", ["-c", command], {
+    stdio: ["ignore", "pipe", "pipe"],
+    cwd,
+    // Detached on POSIX makes bash a process-group leader so kills take out
+    // grandchildren too — a surviving grandchild holds the pipe write-ends and
+    // blocks close (and the wake) indefinitely. Same approach as pi's bash tool.
+    detached: process.platform !== "win32",
+  });
 
 /** One line identifying the command for wake headers and the registry's running list. */
 export function bashCommandHead(command: string): string {
@@ -238,7 +262,7 @@ export function formatBashWake(opts: {
   sessionDir: string | undefined;
 }): string {
   const body = opts.output.trim()
-    ? `\n\n${capResultText(opts.output.trim(), opts.sessionDir, opts.id).text}`
+    ? `\n\n${capResultText(opts.output.trim(), opts.sessionDir, opts.id, WAKE_TEXT_CAP, "output").text}`
     : ""; // quiet commands stay quiet
   return `[background] bash (${opts.id}, ${formatDuration(opts.durationMs)}) ${opts.status} — ${bashCommandHead(
     opts.command,
@@ -279,7 +303,7 @@ Use for long-running commands whose result you need later — builds, test suite
       params: { command: string; timeout_ms?: number },
       _signal: AbortSignal | undefined,
       _onUpdate: undefined, // unused: bg never streams partials; loose type to satisfy bivariant method checks
-      ctx: { sessionManager?: { getSessionDir(): string | undefined } } | undefined,
+      ctx: { sessionManager?: { getSessionDir(): string | undefined }; cwd?: string } | undefined,
     ): Promise<BgToolResult> {
       const command = params.command?.trim();
       if (!command) {
@@ -291,7 +315,7 @@ Use for long-running commands whose result you need later — builds, test suite
       }
       let child: BashChild;
       try {
-        child = spawnFn(command);
+        child = spawnFn(command, ctx?.cwd);
       } catch (error) {
         return {
           content: [
@@ -303,41 +327,72 @@ Use for long-running commands whose result you need later — builds, test suite
       }
       const sessionDir = ctx?.sessionManager?.getSessionDir();
       const startedAt = now();
-      let tail = "";
+      // Rolling tail kept as bytes: a chunk can end mid-codepoint, and string
+      // concatenation would bake U+FFFD into the tail at every boundary.
+      // Decoding once at finish also makes the cap a byte cap.
+      let tailBuf = Buffer.alloc(0);
       let timedOut = false;
+      // Kill the process group when possible so grandchildren (the pipe-
+      // holders a spawned test suite leaves behind) die with bash; fall back
+      // to the child itself when the group is already gone or on Windows.
+      const killTree = () => {
+        if (child.pid !== undefined && process.platform !== "win32") {
+          try {
+            process.kill(-child.pid, "SIGKILL");
+            return;
+          } catch {
+            // group gone — the child may not be
+          }
+        }
+        child.kill("SIGKILL");
+      };
       const id = registry.adopt({
         name: bashCommandHead(command),
         kind: "bash",
-        kill: () => child.kill("SIGKILL"),
+        kill: killTree,
       });
       // Combined rolling tail, interleaved as received.
       const append = (chunk: string | Buffer) => {
-        tail = (tail + chunk.toString()).slice(-BASH_TAIL_CAP);
+        const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        const next = Buffer.concat([tailBuf, bytes]);
+        tailBuf = next.subarray(next.length - BASH_TAIL_CAP);
       };
       child.stdout?.on("data", append);
       child.stderr?.on("data", append);
-      const timeoutMs = params.timeout_ms ?? opts.defaultTimeoutMs ?? 10 * 60_000;
+      const timeoutMs = clampTimeoutMs(params.timeout_ms, opts.defaultTimeoutMs ?? 10 * 60_000);
       const timer = setTimeout(() => {
         timedOut = true;
-        child.kill("SIGKILL");
+        killTree();
       }, timeoutMs);
       timer.unref?.();
       const finish = (status: string, ok: boolean) => {
         clearTimeout(timer);
+        // A task killed by shutdown completes (and stashes) as a no-op — but
+        // guard before composing so a killed task leaves no orphaned stash.
+        if (!registry.isRunning(id)) return;
         registry.complete(id, {
           ok,
-          text: formatBashWake({ command, id, status, durationMs: now() - startedAt, output: tail, sessionDir }),
+          text: formatBashWake({
+            command,
+            id,
+            status,
+            durationMs: now() - startedAt,
+            output: tailBuf.toString("utf8"),
+            sessionDir,
+          }),
         });
       };
       child.on("close", (code, signal) => {
-        // A task killed by shutdown completes as a no-op — fire-once.
+        // Only a signal-less exit with no code is a timeout kill; a natural
+        // exit racing the deadline still reports its real code.
+        const timedOutKill = timedOut && code === null;
         finish(
-          timedOut
+          timedOutKill
             ? `timed out after ${formatDuration(timeoutMs)}`
             : code === null
               ? `killed (${signal ?? "unknown signal"})`
               : `exited ${code}`,
-          !timedOut && code === 0,
+          code === 0 && !timedOutKill,
         );
       });
       child.on("error", (error) => finish(`failed: ${error.message}`, false));

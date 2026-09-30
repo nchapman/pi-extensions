@@ -12,6 +12,7 @@ import {
   capResultText,
   createBackgroundRegistry,
   createBgTool,
+  type BashSpawnFn,
   DEFAULT_BG_AFTER_MS,
   formatSubagentWake,
   parseBgAfterMs,
@@ -1003,7 +1004,7 @@ export function registerSubagentCommands(pi: ExtensionAPI, agentsDir: string = A
  * with a fake pi and injected spawn. */
 export function registerSubagentsExtension(
   pi: ExtensionAPI,
-  opts: { agentsDir?: string; spawnFn?: SpawnFn } = {},
+  opts: { agentsDir?: string; spawnFn?: SpawnFn; bgSpawnFn?: BashSpawnFn } = {},
 ): void {
   const agentsDir = opts.agentsDir ?? AGENTS_DIR;
   const agents = loadAgents(agentsDir);
@@ -1034,7 +1035,7 @@ export function registerSubagentsExtension(
   });
   registerSubagentTools(pi, agentsDir, opts.spawnFn ?? defaultSpawn, agents, registry);
   // bg shares the registry: one footer count, one shutdown kill, the same wake channel.
-  pi.registerTool(createBgTool(registry, { defaultTimeoutMs: DEFAULT_TIMEOUT_MS }));
+  pi.registerTool(createBgTool(registry, { defaultTimeoutMs: DEFAULT_TIMEOUT_MS, spawnFn: opts.bgSpawnFn }));
   registerCommandsForAgents(pi, agents);
 }
 

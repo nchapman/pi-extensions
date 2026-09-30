@@ -1039,6 +1039,29 @@ describe("registerSubagentsExtension (full wiring)", () => {
     execute: (id: string, params: unknown, signal?: AbortSignal, onUpdate?: unknown, ctx?: unknown) => Promise<unknown>;
   }
 
+  /** Minimal bash child fake: enough surface for the bg tool's wiring path. */
+  function wireBgChild() {
+    const closers: Array<(code: number | null, signal: NodeJS.Signals | null) => void> = [];
+    const data: Array<(chunk: string) => void> = [];
+    const child = {
+      stdout: { on: (_event: "data", cb: (chunk: string) => void) => void data.push(cb) },
+      stderr: { on: () => undefined },
+      on: (event: string, cb: (...args: never[]) => void) => {
+        if (event === "close") closers.push(cb as never);
+      },
+      pid: 4242,
+      killed: false,
+      kill: () => {
+        child.killed = true;
+        setImmediate(() => closers.forEach((h) => h(null, "SIGKILL")));
+      },
+      emit: (chunk: string) => data.forEach((h) => h(chunk)),
+      close: (code: number | null) => closers.forEach((h) => h(code, null)),
+    };
+    return child;
+  }
+  type WireBgChild = ReturnType<typeof wireBgChild>;
+
   function wireUp() {
     const handlers = new Map<string, (event?: unknown, ctx?: unknown) => void>();
     const sendUserMessage = vi.fn();
@@ -1046,6 +1069,7 @@ describe("registerSubagentsExtension (full wiring)", () => {
     const setStatus = vi.fn();
     const tools = new Map<string, WiredTool>();
     const children: FakeChild[] = [];
+    const bgChildren: WireBgChild[] = [];
     const pi = {
       registerTool: (t: { name: string }) => tools.set(t.name, t as unknown as WiredTool),
       registerCommand: () => undefined,
@@ -1059,9 +1083,14 @@ describe("registerSubagentsExtension (full wiring)", () => {
         children.push(child);
         return child;
       }) as unknown as SpawnFn,
+      bgSpawnFn: (() => {
+        const child = wireBgChild();
+        bgChildren.push(child);
+        return child;
+      }) as never,
     });
     handlers.get("session_start")!(undefined, { ui: { notify, setStatus } });
-    return { handlers, sendUserMessage, notify, setStatus, tools, children };
+    return { handlers, sendUserMessage, notify, setStatus, tools, children, bgChildren };
   }
 
   async function runBackgroundedTask(tools: Map<string, WiredTool>, children: FakeChild[]) {
@@ -1086,6 +1115,21 @@ describe("registerSubagentsExtension (full wiring)", () => {
     wired.children[0].close(0);
     await new Promise((r) => setTimeout(r, 10));
     expect(wired.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("registers the bg tool and kills its task on shutdown alongside subagents", async () => {
+    const wired = wireUp();
+    const result = (await wired.tools.get("bg")!.execute("1", { command: "sleep 60" }, undefined, undefined, {
+      sessionManager: { getSessionDir: () => undefined },
+    })) as { details: { id: string } };
+    expect(result.details.id).toBe("bg-1");
+    expect(wired.bgChildren[0].killed).toBe(false);
+
+    wired.handlers.get("session_shutdown")!({ reason: "fork" });
+    await new Promise((r) => setTimeout(r, 10)); // killAll marks killed, then close lands
+    expect(wired.bgChildren[0].killed).toBe(true);
+    expect(wired.sendUserMessage).not.toHaveBeenCalled(); // killed tasks never wake
+    expect(wired.notify).toHaveBeenCalledWith(expect.stringContaining("killed 1"), "warning");
   });
 
   it("stays silent on quit and reload shutdowns", async () => {

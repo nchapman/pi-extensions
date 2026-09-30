@@ -1,13 +1,15 @@
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
   BASH_TAIL_CAP,
   capResultText,
+  clampTimeoutMs,
   createBackgroundRegistry,
   createBgTool,
   DEFAULT_BG_AFTER_MS,
+  MAX_TIMEOUT_MS,
   formatDuration,
   formatSubagentWake,
   parseBgAfterMs,
@@ -212,30 +214,36 @@ describe("stashPath", () => {
 describe("createBgTool", () => {
   interface FakeBash {
     killed: boolean;
-    emitData(chunk: string): void;
+    emitData(chunk: string | Buffer): void;
+    emitErr(chunk: string): void;
     close(code: number | null): void;
+    closeSignaled(): void;
     fail(error: Error): void;
   }
 
   function fakeBash(): FakeBash & import("../lib/background").BashChild {
     const closers: Array<(code: number | null, signal: NodeJS.Signals | null) => void> = [];
     const failers: Array<(error: Error) => void> = [];
-    const data: Array<(chunk: string) => void> = [];
+    const data: Array<(chunk: string | Buffer) => void> = [];
+    const errs: Array<(chunk: string) => void> = [];
     const fake = {
-      stdout: { on: (_event: "data", cb: (chunk: string) => void) => void data.push(cb) },
-      stderr: { on: () => undefined },
+      stdout: { on: (_event: "data", cb: (chunk: string | Buffer) => void) => void data.push(cb) },
+      stderr: { on: (_event: "data", cb: (chunk: string) => void) => void errs.push(cb) },
       on: (event: string, cb: (...args: never[]) => void) => {
         if (event === "close") closers.push(cb as never);
         else if (event === "error") failers.push(cb as never);
       },
+      pid: 4242,
       killed: false,
       // A real killed process emits close; the fake mirrors that so kill paths settle.
       kill: () => {
         fake.killed = true;
         setImmediate(() => closers.forEach((h) => h(null, "SIGKILL")));
       },
-      emitData: (chunk: string) => data.forEach((h) => h(chunk)),
+      emitData: (chunk: string | Buffer) => data.forEach((h) => h(chunk)),
+      emitErr: (chunk: string) => errs.forEach((h) => h(chunk)),
       close: (code: number | null) => closers.forEach((h) => h(code, null)),
+      closeSignaled: () => closers.forEach((h) => h(null, "SIGTERM")),
       fail: (error: Error) => failers.forEach((h) => h(error)),
     };
     return fake as unknown as FakeBash & import("../lib/background").BashChild;
@@ -332,7 +340,7 @@ describe("createBgTool", () => {
     child.close(0);
     const wake = d.sendUserMessage.mock.calls[0][0] as string;
     expect(wake.length).toBeLessThan(BASH_TAIL_CAP); // capped well below the in-memory tail
-    expect(wake).toContain("full reply"); // stash pointer wording
+    expect(wake).toContain("full output"); // stash pointer wording
     const stashed = readFileSync(stashPath(dir, "bg-1"), "utf8");
     expect(stashed.length).toBe(BASH_TAIL_CAP);
     expect(stashed.startsWith("x")).toBe(true);
@@ -347,5 +355,116 @@ describe("createBgTool", () => {
     d.registry.killAll();
     await new Promise((r) => setTimeout(r, 10));
     expect(d.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("leaves no orphaned stash when a killed task had over-cap output", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bg-kill-"));
+    const d = toolDeps();
+    const child = fakeBash();
+    const tool = createBgTool(d.registry, { spawnFn: () => child });
+    await tool.execute("1", { command: "spew" }, undefined, undefined, {
+      sessionManager: { getSessionDir: () => dir },
+    } as never);
+    child.emitData("x".repeat(BASH_TAIL_CAP));
+    d.registry.killAll(); // marks killed before the close event lands
+    await new Promise((r) => setTimeout(r, 10));
+    expect(existsSync(stashPath(dir, "bg-1"))).toBe(false);
+  });
+
+  it("keeps multi-byte UTF-8 intact across chunk boundaries", async () => {
+    const d = toolDeps();
+    const child = fakeBash();
+    const tool = createBgTool(d.registry, { spawnFn: () => child });
+    await tool.execute("1", { command: "cjk" }, undefined, undefined, CTX);
+    // Split "日日日" mid-codepoint: byte 4 falls inside the second character.
+    const whole = Buffer.from("日日日");
+    child.emitData(whole.subarray(0, 4));
+    child.emitData(whole.subarray(4));
+    child.close(0);
+    const wake = d.sendUserMessage.mock.calls[0][0] as string;
+    expect(wake).toContain("日日日");
+    expect(wake).not.toContain("\uFFFD");
+  });
+
+  it("interleaves stdout and stderr into one tail", async () => {
+    const d = toolDeps();
+    const child = fakeBash();
+    const tool = createBgTool(d.registry, { spawnFn: () => child });
+    await tool.execute("1", { command: "both" }, undefined, undefined, CTX);
+    child.emitData("out-");
+    child.emitErr("err-");
+    child.emitData("done\n");
+    child.close(0);
+    const wake = d.sendUserMessage.mock.calls[0][0] as string;
+    expect(wake).toContain("out-err-done");
+  });
+
+  it("reports an async spawn error and settles once despite a trailing close", async () => {
+    const d = toolDeps();
+    const child = fakeBash();
+    const tool = createBgTool(d.registry, { spawnFn: () => child });
+    await tool.execute("1", { command: "enoent" }, undefined, undefined, CTX);
+    child.fail(new Error("spawn enoent ENOENT"));
+    child.close(null); // real error paths are followed by close — fire-once absorbs it
+    const wake = d.sendUserMessage.mock.calls[0][0] as string;
+    expect(wake).toContain("failed: spawn enoent ENOENT");
+    expect(d.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("labels an external signal kill without the timeout wording", async () => {
+    const d = toolDeps();
+    const child = fakeBash();
+    const tool = createBgTool(d.registry, { spawnFn: () => child, defaultTimeoutMs: 5_000_000 });
+    await tool.execute("1", { command: "victim" }, undefined, undefined, CTX);
+    child.closeSignaled(); // SIGTERM from outside, not our timeout
+    const wake = d.sendUserMessage.mock.calls[0][0] as string;
+    expect(wake).toContain("killed (SIGTERM) — victim");
+    expect(d.notify).toHaveBeenCalledWith(expect.stringContaining("killed (SIGTERM)"), "error");
+  });
+
+  it("honors timeout_ms, clamps overflow to schedulable range, and falls back on invalid values", async () => {
+    // Overflow would clamp inside Node to 1ms — an instant kill.
+    const sane = toolDeps();
+    const saneChild = fakeBash();
+    const toolA = createBgTool(sane.registry, { spawnFn: () => saneChild });
+    await toolA.execute("1", { command: "a", timeout_ms: 1e10 }, undefined, undefined, CTX);
+    await new Promise((r) => setTimeout(r, 25));
+    expect(saneChild.killed).toBe(false); // ~24 days, not 1ms
+    sane.registry.killAll();
+
+    // Invalid values fall back to the tool default (15ms here → timeout).
+    const fallback = toolDeps();
+    const fbChild = fakeBash();
+    const toolB = createBgTool(fallback.registry, { spawnFn: () => fbChild, defaultTimeoutMs: 15 });
+    await toolB.execute("1", { command: "b", timeout_ms: -5 }, undefined, undefined, CTX);
+    await new Promise((r) => setTimeout(r, 40));
+    expect(fbChild.killed).toBe(true);
+    const wake = fallback.sendUserMessage.mock.calls[0][0] as string;
+    expect(wake).toContain("timed out after 0s");
+  });
+
+  it("runs a real command end to end through Node's ChildProcess", async () => {
+    const d = toolDeps();
+    const tool = createBgTool(d.registry, { defaultTimeoutMs: 10_000 });
+    const dir = mkdtempSync(join(tmpdir(), "bg-real-"));
+    const result = await tool.execute("1", { command: "echo real-hi" }, undefined, undefined, {
+      sessionManager: { getSessionDir: () => dir },
+    } as never);
+    expect(result.details).toEqual({ kind: "bash", id: "bg-1" });
+    await vi.waitFor(() => expect(d.sendUserMessage).toHaveBeenCalledTimes(1), { timeout: 5_000 });
+    const wake = d.sendUserMessage.mock.calls[0][0] as string;
+    expect(wake).toContain("exited 0 — echo real-hi");
+    expect(wake).toContain("real-hi");
+  }, 10_000);
+});
+
+describe("clampTimeoutMs", () => {
+  it("keeps schedulable values, clamps overflow, and falls back on invalid input", () => {
+    expect(clampTimeoutMs(5_000, 1_000)).toBe(5_000);
+    expect(clampTimeoutMs(1.9, 1_000)).toBe(1); // fractional ms floor to 1
+    expect(clampTimeoutMs(1e12, 1_000)).toBe(MAX_TIMEOUT_MS);
+    expect(clampTimeoutMs(-5, 1_000)).toBe(1_000);
+    expect(clampTimeoutMs(Number.NaN, 1_000)).toBe(1_000);
+    expect(clampTimeoutMs(undefined, 1_000)).toBe(1_000);
   });
 });
