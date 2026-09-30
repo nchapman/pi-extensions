@@ -297,11 +297,11 @@ export function createBgTool(
     name: "bg",
     label: "Background shell",
     description: `Run a shell command in the background and return immediately with a task id.
-When the command exits, one follow-up message delivers its exit status, duration, and the tail of its combined output (stashed beside the session when over the inline cap).
-Use for long-running commands whose result you need later — builds, test suites, migrations — not for output you need inline. Killed on session shutdown; a timeout (default 10m) SIGKILLs.`,
+When the command exits, one follow-up message delivers its exit status, duration, and the tail of its combined output; long output is saved to a file whose path the message includes.
+Use for long-running commands whose result you need later — builds, test suites, migrations — not for output you need inline. A timeout (default 10m) SIGKILLs; kill_task can stop a task early.`,
     promptSnippet: "Background a long-running shell command",
     promptGuidelines: [
-      "Use bg for shell commands whose result you need later but don't need to wait for (builds, test suites); it returns a task id immediately and the result arrives in a follow-up message.",
+      "Use bg for shell commands whose result you need later but don't need to wait for (builds, test suites, migrations).",
       "Prefer the regular bash tool when you need the output to proceed — bg never blocks and never returns output inline.",
     ],
     parameters: Type.Object({
@@ -439,10 +439,10 @@ export function createKillTaskTool(
     name: "kill_task",
     label: "Kill background task",
     description: `Kill one running background task by id (bg-1, bg-2, …) — a backgrounded shell command or subagent alike.
-The task is killed immediately and never delivers its wake. Use when a backgrounded command or subagent is no longer wanted; pair with the ids returned by the bg and subagent tools.`,
+The task stops immediately and its result never arrives. Ids come from the bg tool's return, a backgrounded subagent's notice, or a follow-up message.`,
     promptSnippet: "Kill a background task by id",
     promptGuidelines: [
-      "Use kill_task to stop an unwanted background task by its bg-N id — from the bg tool's return, a backgrounded subagent's notice, or a wake header.",
+      "Reach for kill_task when a backgrounded command or subagent is no longer wanted — stopped tasks are gone for good, so re-launch if the work is still needed.",
     ],
     parameters: Type.Object({
       id: Type.String({ description: "Task id to kill, e.g. bg-2" }),

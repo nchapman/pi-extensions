@@ -761,7 +761,7 @@ Available agents:
 ${agentList}
 Alternatively pass agent_md: a full agent definition in markdown (frontmatter + system prompt) for an ad-hoc specialist. With neither, a generic read-only investigator runs.
 The subagent runs to completion and returns its final response. Use for reviews, research, and any work that benefits from an isolated context.
-Subagents still running after ~2 minutes (PI_SUBAGENT_BG_AFTER_MS) move to the background: the tool returns immediately and a follow-up message delivers the result. Pass background: true for known-long work; don't wait or poll — the result comes to you.`,
+Subagents still running after ~2 minutes move to the background: the tool returns immediately and a follow-up message delivers the result. Pass background: true for known-long work; don't wait or poll — the result comes to you.`,
     promptSnippet: "Delegate a task to a focused subagent (isolated pi session)",
     promptGuidelines: [
       "Use subagent for self-contained work (reviews, research, audits); the subagent only sees the task text you pass, so include all needed context.",
@@ -829,7 +829,11 @@ Subagents still running after ~2 minutes (PI_SUBAGENT_BG_AFTER_MS) move to the b
 Available agents:
 ${agentList}
 Each task may instead include agent_md (an inline agent definition) or omit both to use the generic read-only investigator.
-Slow tasks background individually after ~2 minutes (PI_SUBAGENT_BG_AFTER_MS); each such result then arrives in its own follow-up message. Pass background: true per task for known-long work.`,
+Slow tasks background individually after ~2 minutes; each such result then arrives in its own follow-up message. Pass background: true per task for known-long work.`,
+    promptSnippet: "Run several subagent tasks in parallel",
+    promptGuidelines: [
+      "Use subagents for independent, self-contained tasks that benefit from parallel isolated sessions; each subagent only sees its own task text, so include all needed context.",
+    ],
     parameters: Type.Object({
       tasks: Type.Array(taskItem, { minItems: 1, description: "Tasks to run in parallel" }),
     }),
