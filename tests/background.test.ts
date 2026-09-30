@@ -1,0 +1,192 @@
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, expect, it, vi } from "vitest";
+import {
+  capResultText,
+  createBackgroundRegistry,
+  DEFAULT_BG_AFTER_MS,
+  formatDuration,
+  formatSubagentWake,
+  parseBgAfterMs,
+  parseWakeEnabled,
+  stashPath,
+  WAKE_TEXT_CAP,
+} from "../extensions/background";
+
+describe("env parsing", () => {
+  it("defaults the adoption threshold and rejects invalid values", () => {
+    expect(parseBgAfterMs({})).toBe(DEFAULT_BG_AFTER_MS);
+    expect(parseBgAfterMs({ PI_SUBAGENT_BG_AFTER_MS: "abc" })).toBe(DEFAULT_BG_AFTER_MS);
+    expect(parseBgAfterMs({ PI_SUBAGENT_BG_AFTER_MS: "-5" })).toBe(DEFAULT_BG_AFTER_MS);
+  });
+
+  it("accepts valid thresholds including zero", () => {
+    expect(parseBgAfterMs({ PI_SUBAGENT_BG_AFTER_MS: "1500" })).toBe(1500);
+    expect(parseBgAfterMs({ PI_SUBAGENT_BG_AFTER_MS: "0" })).toBe(0);
+  });
+
+  it("treats 0/false/no/off as wake disabled and everything else enabled", () => {
+    for (const off of ["0", "false", "no", "off", "OFF", " no "]) {
+      expect(parseWakeEnabled({ PI_BG_WAKE: off })).toBe(false);
+    }
+    expect(parseWakeEnabled({})).toBe(true);
+    expect(parseWakeEnabled({ PI_BG_WAKE: "1" })).toBe(true);
+    expect(parseWakeEnabled({ PI_BG_WAKE: "yes" })).toBe(true);
+  });
+});
+
+describe("capResultText", () => {
+  it("passes short text through untouched", () => {
+    expect(capResultText("short", "/tmp/s", "bg-1")).toEqual({ text: "short" });
+  });
+
+  it("stashes over-cap text beside the session and points at the file", () => {
+    const sessionDir = mkdtempSync(join(tmpdir(), "bg-cap-"));
+    const long = "x".repeat(WAKE_TEXT_CAP + 100);
+    const { text, resultPath } = capResultText(long, sessionDir, "bg-7");
+    expect(resultPath).toBe(stashPath(sessionDir, "bg-7"));
+    expect(text.startsWith("x".repeat(WAKE_TEXT_CAP))).toBe(true);
+    expect(text).toContain(`full reply: ${resultPath}`);
+    expect(readFileSync(resultPath!, "utf8")).toBe(long);
+  });
+
+  it("hard-truncates when there is no session dir, saying so", () => {
+    const long = "y".repeat(WAKE_TEXT_CAP + 10);
+    const { text, resultPath } = capResultText(long, undefined, "bg-1");
+    expect(resultPath).toBeUndefined();
+    expect(text).toContain("no session dir");
+    expect(text.length).toBeLessThanOrEqual(WAKE_TEXT_CAP + 100);
+  });
+
+  it("fails open when the stash write fails", () => {
+    // A file where a directory is needed: mkdir fails, the text survives.
+    const notADir = join(tmpdir(), `bg-notdir-${Date.now()}`);
+    writeFileSync(notADir, "occupied");
+    const long = "z".repeat(WAKE_TEXT_CAP + 10);
+    const { text } = capResultText(long, notADir, "bg-1");
+    expect(text).toContain("stashing the full reply failed");
+  });
+});
+
+describe("formatDuration", () => {
+  it("formats seconds, minutes, and hours", () => {
+    expect(formatDuration(0)).toBe("0s");
+    expect(formatDuration(38_000)).toBe("38s");
+    expect(formatDuration(252_000)).toBe("4m12s");
+    expect(formatDuration(3_900_000)).toBe("1h5m");
+  });
+});
+
+describe("formatSubagentWake", () => {
+  it("formats completion with usage and body", () => {
+    const text = formatSubagentWake("reviewer", "bg-1", {
+      ok: true,
+      durationMs: 252_000,
+      text: "All clear.",
+      usageLine: "105 tokens (100 in / 5 out), $0.120",
+    });
+    expect(text).toContain('[background] subagent "reviewer" (bg-1, 4m12s) completed');
+    expect(text).toContain("105 tokens");
+    expect(text).toContain("All clear.");
+  });
+
+  it("formats failure with the error message", () => {
+    const text = formatSubagentWake("reviewer", "bg-2", { ok: false, durationMs: 5_000, text: "boom happened" });
+    expect(text).toContain('[background] subagent "reviewer" (bg-2, 5s) failed');
+    expect(text).toContain("boom happened");
+  });
+});
+
+describe("createBackgroundRegistry", () => {
+  function makeDeps() {
+    const sendUserMessage = vi.fn();
+    const notify = vi.fn();
+    const setStatus = vi.fn();
+    let tick = 1000;
+    const registry = createBackgroundRegistry({
+      sendUserMessage,
+      notify,
+      setStatus,
+      now: () => (tick += 1000),
+    });
+    return { registry, sendUserMessage, notify, setStatus };
+  }
+
+  it("adopts with sequential ids and lists running tasks oldest first", () => {
+    const { registry } = makeDeps();
+    const a = registry.adopt({ name: "a", kind: "subagent", kill: () => undefined });
+    const b = registry.adopt({ name: "b", kind: "subagent", kill: () => undefined });
+    expect(a).toBe("bg-1");
+    expect(b).toBe("bg-2");
+    expect(registry.running().map((t) => t.id)).toEqual(["bg-1", "bg-2"]);
+    expect(registry.running()[0]).toMatchObject({ id: "bg-1", name: "a", kind: "subagent", state: "running" });
+  });
+
+  it("completes with exactly one wake and notification, at the right levels", () => {
+    const { registry, sendUserMessage, notify } = makeDeps();
+    const id = registry.adopt({ name: "a", kind: "subagent", kill: () => undefined });
+    registry.complete(id, { ok: true, text: "done wake" });
+    registry.complete(id, { ok: true, text: "done wake" }); // fire-once: ignored
+    expect(sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(sendUserMessage).toHaveBeenCalledWith("done wake");
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("done wake"), "info");
+    expect(registry.running()).toHaveLength(0);
+  });
+
+  it("notifies failures at error level", () => {
+    const { registry, notify } = makeDeps();
+    const id = registry.adopt({ name: "a", kind: "subagent", kill: () => undefined });
+    registry.complete(id, { ok: false, text: "failed wake" });
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("failed wake"), "error");
+  });
+
+  it("ignores completion for unknown tasks", () => {
+    const { registry, sendUserMessage } = makeDeps();
+    registry.complete("bg-nope", { ok: true, text: "wake" });
+    expect(sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("suppresses the wake but keeps the notification when wakes are disabled", () => {
+    const sendUserMessage = vi.fn();
+    const notify = vi.fn();
+    const registry = createBackgroundRegistry({ sendUserMessage, notify, wakeEnabled: false });
+    const id = registry.adopt({ name: "a", kind: "subagent", kill: () => undefined });
+    registry.complete(id, { ok: true, text: "wake" });
+    expect(sendUserMessage).not.toHaveBeenCalled();
+    expect(notify).toHaveBeenCalledTimes(1);
+  });
+
+  it("killAll kills running children, skips finished ones, silences their wakes, and returns the count", () => {
+    const { registry, sendUserMessage } = makeDeps();
+    const kills: string[] = [];
+    const id1 = registry.adopt({ name: "a", kind: "subagent", kill: () => kills.push("a") });
+    const id2 = registry.adopt({ name: "b", kind: "subagent", kill: () => kills.push("b") });
+    registry.complete(id2, { ok: true, text: "b done" });
+    expect(registry.killAll()).toBe(1); // b already finished
+    expect(kills).toEqual(["a"]);
+    expect(sendUserMessage).toHaveBeenCalledTimes(1); // only b's completion
+    // The killed child's close event lands after killAll: no wake for it.
+    registry.complete(id1, { ok: false, text: "a was killed" });
+    expect(sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(registry.killAll()).toBe(0); // nothing left running
+  });
+
+  it("maintains the footer status across transitions", () => {
+    const { registry, setStatus } = makeDeps();
+    const id1 = registry.adopt({ name: "a", kind: "subagent", kill: () => undefined });
+    registry.adopt({ name: "b", kind: "subagent", kill: () => undefined });
+    expect(setStatus).toHaveBeenLastCalledWith("bg", "2 running");
+    registry.complete(id1, { ok: true, text: "wake" });
+    expect(setStatus).toHaveBeenLastCalledWith("bg", "1 running");
+    registry.killAll();
+    expect(setStatus).toHaveBeenLastCalledWith("bg", undefined);
+  });
+});
+
+describe("stashPath", () => {
+  it("nests under bg/ beside the session", () => {
+    expect(stashPath("/sessions/s1", "bg-3")).toBe(join("/sessions/s1", "bg", "bg-3.txt"));
+  });
+});
