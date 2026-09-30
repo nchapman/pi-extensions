@@ -1,9 +1,11 @@
+import { execSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
   BASH_TAIL_CAP,
+  bashCommandHead,
   capResultText,
   clampTimeoutMs,
   createBackgroundRegistry,
@@ -594,3 +596,141 @@ function fakeBashForControl() {
   };
   return child as unknown as import("../lib/background").BashChild & { killed: boolean };
 }
+
+describe("bashCommandHead", () => {
+  it("collapses whitespace so commands cannot forge extra header lines", () => {
+    expect(bashCommandHead("a\nb  c\td")).toBe("a b c d");
+    expect(bashCommandHead("   padded   ")).toBe("padded");
+  });
+
+  it("caps at 80 code points without splitting surrogate pairs", () => {
+    expect(bashCommandHead("x".repeat(100))).toHaveLength(80);
+    const emoji = "🎉".repeat(81); // 162 UTF-16 units, 81 code points
+    const head = bashCommandHead(emoji);
+    expect(Array.from(head)).toHaveLength(80);
+    // A lone surrogate makes encodeURIComponent throw — the old slice did exactly that.
+    expect(() => encodeURIComponent(head)).not.toThrow();
+  });
+});
+
+describe("bg with real bash commands", () => {
+  function realTool(sessionDir?: string) {
+    const sendUserMessage = vi.fn();
+    const notify = vi.fn();
+    const setStatus = vi.fn();
+    const registry = createBackgroundRegistry({ sendUserMessage, notify, setStatus });
+    const tool = createBgTool(registry, { defaultTimeoutMs: 30_000 });
+    const ctx = { sessionManager: { getSessionDir: () => sessionDir } };
+    return { sendUserMessage, notify, setStatus, registry, tool, ctx };
+  }
+
+  type RealTool = ReturnType<typeof realTool>;
+
+  async function runReal(d: RealTool, command: string) {
+    const result = await d.tool.execute("1", { command }, undefined, undefined, d.ctx);
+    await vi.waitFor(() => expect(d.sendUserMessage).toHaveBeenCalledTimes(1), { timeout: 10_000 });
+    return {
+      details: result.details as { id: string },
+      wake: d.sendUserMessage.mock.calls[0][0] as string,
+    };
+  }
+
+  it("preserves multi-line output in the tail", async () => {
+    const { wake } = await runReal(realTool(), "printf 'one\\ntwo\\nthree\\n'");
+    expect(wake).toContain("one\ntwo\nthree");
+  }, 15_000);
+
+  it("keeps unicode intact through real pipes", async () => {
+    const { wake } = await runReal(realTool(), "printf 'héllo 世界 🎉\\n'");
+    expect(wake).toContain("héllo 世界 🎉");
+  }, 15_000);
+
+  it("captures stderr-only commands", async () => {
+    const { wake } = await runReal(realTool(), "printf 'only-stderr\\n' >&2");
+    expect(wake).toContain("only-stderr");
+  }, 15_000);
+
+  it("stays header-only for quiet commands", async () => {
+    const { wake } = await runReal(realTool(), "true");
+    expect(wake).toMatch(/exited 0 — true$/);
+    expect(wake).not.toContain("\n"); // no body, no stash pointer
+  }, 15_000);
+
+  it("preserves exact exit codes", async () => {
+    const d = realTool();
+    const { wake } = await runReal(d, "exit 42");
+    expect(wake).toContain("exited 42 — exit 42");
+    expect(d.notify).toHaveBeenCalledWith(expect.stringContaining("exited 42"), "error");
+  }, 15_000);
+
+  it("labels a self-terminated command as a signal kill", async () => {
+    const { wake } = await runReal(realTool(), "kill -TERM $$");
+    expect(wake).toContain("killed (SIGTERM)");
+  }, 15_000);
+
+  it("runs pipelines and compound commands through bash -c", async () => {
+    const { wake } = await runReal(realTool(), "echo pipeline | tr a-z A-Z && echo compound");
+    expect(wake).toContain("PIPELINE");
+    expect(wake).toContain("compound");
+  }, 15_000);
+
+  it("runs in the session cwd when ctx provides one", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bg-cwd-"));
+    const d = realTool();
+    // The real ExtensionToolContext carries cwd; the loose lib type accepts it.
+    const result = await d.tool.execute("1", { command: "pwd" }, undefined, undefined, {
+      sessionManager: { getSessionDir: () => undefined },
+      cwd: dir,
+    } as never);
+    expect(result.details).toMatchObject({ kind: "bash" });
+    await vi.waitFor(() => expect(d.sendUserMessage).toHaveBeenCalledTimes(1), { timeout: 10_000 });
+    const wake = d.sendUserMessage.mock.calls[0][0] as string;
+    expect(wake).toContain(dir);
+  }, 15_000);
+
+  it("replaces invalid UTF-8 bytes instead of corrupting the tail", async () => {
+    const { wake } = await runReal(realTool() as never, "printf '\\xff\\xfe\\x80'");
+    expect(wake).toContain("\uFFFD");
+    expect(wake).toContain("exited 0");
+  }, 15_000);
+
+  it("rolls a real large output into the tail and stashes the overflow", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bg-big-"));
+    const d = realTool(dir);
+    const { wake, details } = await runReal(d, "seq 1 5000");
+    expect(wake).toContain("full output"); // stash pointer
+    expect(wake.length).toBeLessThan(6_000); // capped inline body
+    const stashed = readFileSync(stashPath(dir, details.id), "utf8");
+    expect(stashed).toContain("4999\n5000"); // the end survives the roll
+    expect(stashed.startsWith("1\n")).toBe(false); // the start rolled out
+  }, 15_000);
+
+  it("trims whitespace-padded commands before naming and running them", async () => {
+    const { wake } = await runReal(realTool(), "   echo trimmed   ");
+    expect(wake).toContain("exited 0 — echo trimmed");
+    expect(wake).toContain("trimmed");
+  }, 15_000);
+
+  it("killing a command with running grandchildren takes the whole process group", async () => {
+    const pgrep = (pattern: string) => {
+      try {
+        return execSync(`pgrep -f ${JSON.stringify(pattern)}`, { stdio: ["ignore", "pipe", "ignore"] })
+          .toString()
+          .trim();
+      } catch {
+        return ""; // pgrep exits 1 when nothing matches
+      }
+    };
+    const d = realTool();
+    const result = await d.tool.execute("1", { command: "sleep 19 & sleep 19 & wait" }, undefined, undefined, {
+      sessionManager: { getSessionDir: () => undefined },
+    } as never);
+    // Grandchildren must be alive before the kill proves anything.
+    await vi.waitFor(() => expect(pgrep("sleep 19")).not.toBe(""), { timeout: 10_000 });
+    d.registry.kill((result.details as { id: string }).id);
+    // Without the group kill, the pipe-holding sleeps would outlive bash by 19s.
+    await vi.waitFor(() => expect(pgrep("sleep 19")).toBe(""), { timeout: 3_000 });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(d.sendUserMessage).not.toHaveBeenCalled(); // killed tasks never wake
+  }, 20_000);
+});

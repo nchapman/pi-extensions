@@ -261,7 +261,11 @@ const defaultBashSpawn: BashSpawnFn = (command, cwd) =>
 
 /** One line identifying the command for wake headers and the registry's running list. */
 export function bashCommandHead(command: string): string {
-  return command.replace(/\s+/g, " ").trim().slice(0, 80);
+  // Code-point aware truncation: a UTF-16 slice could split a surrogate pair
+  // at the cap and put undecodable garbage in the wake header and notify.
+  return Array.from(command.replace(/\s+/g, " ").trim())
+    .slice(0, 80)
+    .join("");
 }
 
 /** The wake message for a finished shell command: status, duration, capped tail. */
