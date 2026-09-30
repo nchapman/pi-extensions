@@ -12,6 +12,8 @@ import {
   capResultText,
   createBackgroundRegistry,
   createBgTool,
+  createKillTaskTool,
+  createTasksCommand,
   type BashSpawnFn,
   DEFAULT_BG_AFTER_MS,
   formatSubagentWake,
@@ -1036,6 +1038,12 @@ export function registerSubagentsExtension(
   registerSubagentTools(pi, agentsDir, opts.spawnFn ?? defaultSpawn, agents, registry);
   // bg shares the registry: one footer count, one shutdown kill, the same wake channel.
   pi.registerTool(createBgTool(registry, { defaultTimeoutMs: DEFAULT_TIMEOUT_MS, spawnFn: opts.bgSpawnFn }));
+  // Per-task control, agent side: kill by id; the terminal sees it happen.
+  pi.registerTool(
+    createKillTaskTool(registry, { onKilled: (id) => ui?.notify(`Background task killed: ${id}`, "warning") }),
+  );
+  // Per-task control, user side: /tasks lists, /tasks <id> kills.
+  pi.registerCommand("tasks", createTasksCommand(registry));
   registerCommandsForAgents(pi, agents);
 }
 

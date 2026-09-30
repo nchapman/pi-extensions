@@ -69,6 +69,8 @@ export interface BackgroundRegistry {
   isRunning(id: string): boolean;
   /** Kill every running task and mark it killed — no wakes fire for killed tasks. Returns how many were killed. */
   killAll(): number;
+  /** Kill one task by id; true when it existed and was running. Killed tasks never wake. */
+  kill(id: string): boolean;
 }
 
 /** Millis before a subagent child is adopted into the background. */
@@ -147,6 +149,21 @@ export function createBackgroundRegistry(deps: BackgroundDeps = {}): BackgroundR
     deps.setStatus?.("bg", n > 0 ? `${n} running` : undefined);
   };
 
+  // Mark killed before killing: the child's close event must find a
+  // non-running task, and a failed kill surfaces through the process exit.
+  const killTask = (task: (BgTask & { kill: () => void }) | undefined): boolean => {
+    if (!task || task.state !== "running") return false;
+    task.state = "killed";
+    task.endedAt = now();
+    try {
+      task.kill();
+    } catch {
+      // a failed kill is reported by the process exit, not here
+    }
+    refreshStatus();
+    return true;
+  };
+
   return {
     adopt(record) {
       const id = `bg-${++counter}`;
@@ -187,18 +204,13 @@ export function createBackgroundRegistry(deps: BackgroundDeps = {}): BackgroundR
     isRunning(id) {
       return tasks.get(id)?.state === "running";
     },
+    kill(id) {
+      return killTask(tasks.get(id));
+    },
     killAll() {
       let killed = 0;
       for (const task of tasks.values()) {
-        if (task.state !== "running") continue;
-        task.state = "killed"; // set first: the child's close event must find a non-running task
-        task.endedAt = now();
-        killed++;
-        try {
-          task.kill();
-        } catch {
-          // a failed kill on shutdown is reported by the process exit, not here
-        }
+        if (killTask(task)) killed++;
       }
       refreshStatus();
       return killed;
@@ -405,6 +417,88 @@ Use for long-running commands whose result you need later — builds, test suite
         ],
         details: { kind: "bash", id },
       };
+    },
+  };
+}
+
+/** One line of the /tasks listing and the kill_task error hint. */
+export function describeRunningTasks(tasks: BgTask[], nowMs: number = Date.now()): string {
+  if (tasks.length === 0) return "No background tasks running.";
+  return tasks
+    .map((t) => `${t.id} (${t.kind}, ${formatDuration(nowMs - t.startedAt)}) ${t.name}`)
+    .join("\n");
+}
+
+/** The agent-side lever: kill one background task by id, whatever spawned it. */
+export function createKillTaskTool(
+  registry: BackgroundRegistry,
+  opts: { now?: () => number; onKilled?: (id: string) => void } = {},
+) {
+  const now = opts.now ?? Date.now;
+  return {
+    name: "kill_task",
+    label: "Kill background task",
+    description: `Kill one running background task by id (bg-1, bg-2, …) — a backgrounded shell command or subagent alike.
+The task is killed immediately and never delivers its wake. Use when a backgrounded command or subagent is no longer wanted; pair with the ids returned by the bg and subagent tools.`,
+    promptSnippet: "Kill a background task by id",
+    promptGuidelines: [
+      "Use kill_task to stop an unwanted background task by its bg-N id — from the bg tool's return, a backgrounded subagent's notice, or a wake header.",
+    ],
+    parameters: Type.Object({
+      id: Type.String({ description: "Task id to kill, e.g. bg-2" }),
+    }),
+    async execute(
+      _id: string,
+      params: { id: string },
+      _signal: AbortSignal | undefined,
+      _onUpdate: undefined,
+      _ctx: unknown,
+    ): Promise<{ content: { type: "text"; text: string }[]; details: { killed: boolean; id: string }; isError?: boolean }> {
+      const id = params.id?.trim();
+      const killed = registry.kill(id);
+      if (!killed) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `No running task ${id ?? "(none)"}. Running:\n${describeRunningTasks(registry.running(), now())}`,
+            },
+          ],
+          details: { killed: false, id: id ?? "" },
+          isError: true,
+        };
+      }
+      opts.onKilled?.(id ?? "");
+      return {
+        content: [{ type: "text" as const, text: `Killed ${id}. No wake will arrive for it.` }],
+        details: { killed: true, id },
+      };
+    },
+  };
+}
+
+/** The user-side lever: /tasks lists running tasks; /tasks <id> kills one. */
+export function createTasksCommand(registry: BackgroundRegistry, opts: { now?: () => number } = {}) {
+  const now = opts.now ?? Date.now;
+  return {
+    description: "List background tasks (bg-…) — or kill one: /tasks bg-2",
+    handler: async (
+      args: string,
+      ctx: { ui: { notify(message: string, level: "info" | "warning" | "error"): unknown } },
+    ) => {
+      const id = args.trim();
+      if (!id) {
+        ctx.ui.notify(describeRunningTasks(registry.running(), now()), "info");
+        return;
+      }
+      if (registry.kill(id)) {
+        ctx.ui.notify(`Killed ${id}. Its wake will not arrive.`, "warning");
+      } else {
+        ctx.ui.notify(
+          `No running task ${id}. Running:\n${describeRunningTasks(registry.running(), now())}`,
+          "error",
+        );
+      }
     },
   };
 }

@@ -8,6 +8,8 @@ import {
   clampTimeoutMs,
   createBackgroundRegistry,
   createBgTool,
+  createKillTaskTool,
+  createTasksCommand,
   DEFAULT_BG_AFTER_MS,
   MAX_TIMEOUT_MS,
   formatDuration,
@@ -468,3 +470,107 @@ describe("clampTimeoutMs", () => {
     expect(clampTimeoutMs(undefined, 1_000)).toBe(1_000);
   });
 });
+
+describe("kill and control surfaces", () => {
+  function controlDeps() {
+    const sendUserMessage = vi.fn();
+    const notify = vi.fn();
+    const registry = createBackgroundRegistry({ sendUserMessage, notify, setStatus: vi.fn(), now: () => 1_000 });
+    return { sendUserMessage, notify, registry };
+  }
+
+  it("registry.kill kills a running task by id and silences its wake", () => {
+    const d = controlDeps();
+    const kills: string[] = [];
+    const id = d.registry.adopt({ name: "a", kind: "bash", kill: () => kills.push("a") });
+    expect(d.registry.kill(id)).toBe(true);
+    expect(kills).toEqual(["a"]);
+    d.registry.complete(id, { ok: true, text: "late" }); // close event after the kill
+    expect(d.sendUserMessage).not.toHaveBeenCalled();
+    expect(d.registry.kill(id)).toBe(false); // already killed
+    expect(d.registry.kill("bg-99")).toBe(false); // unknown
+  });
+
+  it("kill_task kills a bg task and never wakes it", async () => {
+    const d = controlDeps();
+    const child = fakeBashForControl();
+    const onKilled = vi.fn();
+    const bg = createBgTool(d.registry, { spawnFn: () => child });
+    const killTool = createKillTaskTool(d.registry, { onKilled });
+    await bg.execute("1", { command: "spin" }, undefined, undefined, {
+      sessionManager: { getSessionDir: () => undefined },
+    } as never);
+    const result = await killTool.execute("2", { id: "bg-1" }, undefined, undefined, undefined);
+    expect(result.details).toEqual({ killed: true, id: "bg-1" });
+    expect(onKilled).toHaveBeenCalledWith("bg-1");
+    await new Promise((r) => setTimeout(r, 10));
+    expect(child.killed).toBe(true);
+    expect(d.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("kill_task errors with the running list when the id is unknown", async () => {
+    const d = controlDeps();
+    const child = fakeBashForControl();
+    const bg = createBgTool(d.registry, { spawnFn: () => child });
+    await bg.execute("1", { command: "live" }, undefined, undefined, {
+      sessionManager: { getSessionDir: () => undefined },
+    } as never);
+    const killTool = createKillTaskTool(d.registry);
+    const result = await killTool.execute("2", { id: "bg-9" }, undefined, undefined, undefined);
+    expect(result.isError).toBe(true);
+    const text = result.content[0].text;
+    expect(text).toContain("No running task bg-9");
+    expect(text).toContain("bg-1 (bash,");
+    expect(child.killed).toBe(false);
+  });
+
+  it("/tasks lists running tasks and kills by id argument", () => {
+    const d = controlDeps();
+    const child = fakeBashForControl();
+    void createBgTool(d.registry, { spawnFn: () => child }).execute("1", { command: "idle" }, undefined, undefined, {
+      sessionManager: { getSessionDir: () => undefined },
+    } as never);
+    const cmd = createTasksCommand(d.registry, { now: () => 4_000 });
+    const notify = vi.fn();
+    const ctx = { ui: { notify } };
+
+    cmd.handler("", ctx);
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("bg-1 (bash, 3s) idle"), "info");
+
+    cmd.handler("bg-1", ctx);
+    expect(notify).toHaveBeenCalledWith("Killed bg-1. Its wake will not arrive.", "warning");
+    expect(child.killed).toBe(true);
+
+    cmd.handler("bg-8", ctx);
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("No running task bg-8"), "error");
+  });
+
+  it("kill_task and /tasks work on adopted subagent tasks too", () => {
+    const d = controlDeps();
+    const id = d.registry.adopt({ name: "reviewer", kind: "subagent", kill: () => undefined });
+    const cmd = createTasksCommand(d.registry);
+    const notify = vi.fn();
+    cmd.handler("", { ui: { notify } });
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining(`${id} (subagent,`), "info");
+  });
+});
+
+/** Shared minimal bash fake for the control-surface tests. */
+function fakeBashForControl() {
+  const closers: Array<(code: number | null, signal: NodeJS.Signals | null) => void> = [];
+  const data: Array<(chunk: string) => void> = [];
+  const child = {
+    stdout: { on: (_event: "data", cb: (chunk: string) => void) => void data.push(cb) },
+    stderr: { on: () => undefined },
+    on: (event: string, cb: (...args: never[]) => void) => {
+      if (event === "close") closers.push(cb as never);
+    },
+    pid: 4242,
+    killed: false,
+    kill: () => {
+      child.killed = true;
+      setImmediate(() => closers.forEach((h) => h(null, "SIGKILL")));
+    },
+  };
+  return child as unknown as import("../lib/background").BashChild & { killed: boolean };
+}
