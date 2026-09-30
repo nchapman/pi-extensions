@@ -12,7 +12,7 @@ import {
   parseWakeEnabled,
   stashPath,
   WAKE_TEXT_CAP,
-} from "../extensions/background";
+} from "../lib/background";
 
 describe("env parsing", () => {
   it("defaults the adoption threshold and rejects invalid values", () => {

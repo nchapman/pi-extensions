@@ -37,7 +37,7 @@ import {
   type ChildUsage,
   type SpawnFn,
 } from "../extensions/subagents";
-import { createBackgroundRegistry, type AdoptedHandle } from "../extensions/background";
+import { createBackgroundRegistry, type AdoptedHandle } from "../lib/background";
 
 /** Identity theme: strips styling so assertions see plain text. */
 const THEME = { fg: (_k: string, s: string) => s, bold: (s: string) => s } as never;

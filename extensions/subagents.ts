@@ -15,7 +15,7 @@ import {
   formatSubagentWake,
   parseBgAfterMs,
   parseWakeEnabled,
-} from "./background";
+} from "../lib/background";
 
 export const BUILTIN_TOOLS = ["read", "write", "edit", "bash", "grep", "find", "ls"];
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
