@@ -38,6 +38,7 @@ describe("storedToModels", () => {
   it("applies defaults for missing optional fields", () => {
     expect(storedToModels([{ id: "llama" }])).toEqual([
       {
+        type: "chat",
         id: "llama",
         name: "llama",
         reasoning: false,

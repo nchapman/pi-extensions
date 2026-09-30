@@ -19,10 +19,14 @@ export interface StoredModel {
   maxTokens?: number;
 }
 
-export function toModels(data: { id?: unknown; name?: unknown }[]): ProviderModelConfig[] {
+/** Chat-model member of pi's ProviderModelConfig union (the chat variant isn't exported at the package root). */
+export type ChatModel = Extract<ProviderModelConfig, { type?: "chat" }>;
+
+export function toModels(data: { id?: unknown; name?: unknown }[]): ChatModel[] {
   return data
     .filter((m) => typeof m.id === "string" && (m.id as string).length > 0)
     .map((m) => ({
+      type: "chat",
       id: m.id as string,
       name: typeof m.name === "string" && m.name.length > 0 ? m.name : (m.id as string),
       reasoning: false,
@@ -34,8 +38,9 @@ export function toModels(data: { id?: unknown; name?: unknown }[]): ProviderMode
 }
 
 /** Rehydrate a persisted catalog, applying gateway defaults for missing fields. */
-export function storedToModels(stored: readonly StoredModel[] | undefined): ProviderModelConfig[] {
+export function storedToModels(stored: readonly StoredModel[] | undefined): ChatModel[] {
   return (stored ?? []).map((m) => ({
+    type: "chat",
     id: m.id,
     name: m.name ?? m.id,
     reasoning: m.reasoning ?? false,
@@ -47,7 +52,7 @@ export function storedToModels(stored: readonly StoredModel[] | undefined): Prov
 }
 
 /** Fetch and validate a gateway's model catalog from `GET <baseUrl>/models`. */
-export async function fetchProviderModels(baseUrl: string, signal: AbortSignal): Promise<ProviderModelConfig[]> {
+export async function fetchProviderModels(baseUrl: string, signal: AbortSignal): Promise<ChatModel[]> {
   const res = await fetch(`${baseUrl}/models`, { signal });
   if (!res.ok) throw new Error(`GET /models returned ${res.status}`);
   const body = (await res.json()) as { data?: { id?: unknown; name?: unknown }[] };
