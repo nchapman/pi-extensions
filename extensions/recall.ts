@@ -26,9 +26,12 @@
  * - Cache invariants hold by construction: a plain tool whose results ride at
  *   the tail; no context rewrites, no system-prompt churn, one promptSnippet.
  * - The extension owns the context budget and the summary: auto-compaction
- *   fires when projected context exceeds a target (default 200k, raised from
- *   128k — note 200k sits inside the measured 128–256k reasoning-reliability
- *   cliff band; PI_RECALL_COMPACT_TARGET, 0 disables) —
+ *   fires when projected context exceeds a target — min(256k tokens, 70% of
+ *   the model's context window), whichever is reached first: an absolute
+ *   ceiling at the top of the measured 128–256k reasoning-reliability cliff
+ *   band, scaled down for smaller windows (PI_RECALL_COMPACT_TARGET caps
+ *   tokens, PI_RECALL_COMPACT_RATIO scales to the window; token cap 0
+ *   disables, and so does a target below what compaction can achieve) —
  *   via a turn_end boundary draft mid-run (a continuously busy agent never
  *   settles, so a settled-only trigger drifts to pi's near-limit backstop)
  *   and from agent_settled when idle, with pi's near-limit threshold as the
@@ -82,6 +85,8 @@ export interface RecallConfig {
   recencyFloor: number;
   /** Auto-compact when projected context exceeds this many tokens (0 disables). */
   compactTargetTokens: number;
+  /** Also bound the target to this fraction of the model's context window — the smaller of token cap and ratio wins (0 disables the ratio). */
+  compactTargetRatio: number;
   /** Generate compaction summaries ourselves with recall-aware instructions (PI_RECALL_COMPACT_OWN=0 to opt out). */
   ownSummaries: boolean;
   /** Hard character budget for generated summaries (PI_RECALL_SUMMARY_CHARS). */
@@ -100,7 +105,8 @@ const DEFAULTS: RecallConfig = {
   foreignWeight: 0.5,
   halfLifeHours: 4,
   recencyFloor: 0.25,
-  compactTargetTokens: 200_000,
+  compactTargetTokens: 256_000,
+  compactTargetRatio: 0.7,
   ownSummaries: true,
   summaryChars: 5_000,
   summaryThinking: "off",
@@ -161,6 +167,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): RecallConfi
     compactTargetTokens: Math.floor(
       numFromEnv(env, "PI_RECALL_COMPACT_TARGET", DEFAULTS.compactTargetTokens, 0, 10_000_000),
     ),
+    compactTargetRatio: numFromEnv(env, "PI_RECALL_COMPACT_RATIO", DEFAULTS.compactTargetRatio, 0, 1),
     ownSummaries: boolFromEnv(env, "PI_RECALL_COMPACT_OWN", DEFAULTS.ownSummaries),
     summaryChars: Math.floor(
       numFromEnv(env, "PI_RECALL_SUMMARY_CHARS", DEFAULTS.summaryChars, MIN_SUMMARY_CHARS, 20_000),
@@ -1001,6 +1008,7 @@ export function registerRecallTool(
         usage?.tokens ?? null,
         usage?.contextWindow ?? 0,
         config.compactTargetTokens,
+        config.compactTargetRatio,
         autoCompactInFlight,
       )
     ) {
@@ -1043,6 +1051,7 @@ export function registerRecallTool(
         usage?.tokens ?? null,
         usage?.contextWindow ?? 0,
         config.compactTargetTokens,
+        config.compactTargetRatio,
         autoCompactInFlight,
       )
     ) {
@@ -1246,6 +1255,8 @@ function reminderMessage(): { message: { customType: string; content: string; di
 
 /** Never plan to fill the window: headroom kept when clamping the target. */
 const COMPACT_WINDOW_HEADROOM_TOKENS = 4096;
+/** A target below this can never be reached by one compaction: the kept tail alone is larger, so it would re-draft every turn forever. */
+const MIN_ACHIEVABLE_COMPACT_TARGET = DEFAULT_COMPACTION_SETTINGS.keepRecentTokens + COMPACT_WINDOW_HEADROOM_TOKENS;
 
 /**
  * Output cap for the summarization request — a backstop, not a target. The
@@ -1404,14 +1415,24 @@ export function buildSummarizationPrompt(
 }
 
 /**
- * Effective auto-compaction target: the smaller of the configured target and
- * what the window can hold. `undefined` means "do not auto-compact" (disabled
- * by config, or a window too small to reason about).
+ * Effective auto-compaction target: the token cap or a fraction of the
+ * context window, whichever is reached first, never above what the window can
+ * hold. `undefined` means "do not auto-compact" — disabled by config, a
+ * window too small to reason about, or a target below what one compaction can
+ * achieve (the kept tail alone exceeds it, so it would retrigger forever;
+ * pi's near-limit backstop still covers such sessions).
  */
-export function effectiveCompactTarget(configTarget: number, contextWindow: number): number | undefined {
+export function effectiveCompactTarget(
+  configTarget: number,
+  contextWindow: number,
+  ratio: number = DEFAULTS.compactTargetRatio,
+): number | undefined {
   if (configTarget <= 0) return undefined;
   if (!Number.isFinite(contextWindow) || contextWindow <= COMPACT_WINDOW_HEADROOM_TOKENS) return undefined;
-  return Math.min(configTarget, Math.floor(contextWindow - COMPACT_WINDOW_HEADROOM_TOKENS));
+  const bounds = [configTarget, contextWindow - COMPACT_WINDOW_HEADROOM_TOKENS];
+  if (ratio > 0 && Number.isFinite(ratio)) bounds.push(ratio * contextWindow);
+  const target = Math.floor(Math.min(...bounds));
+  return target < MIN_ACHIEVABLE_COMPACT_TARGET ? undefined : target;
 }
 
 /** Whether the extension should trigger compaction before the next turn starts. */
@@ -1419,10 +1440,11 @@ export function shouldAutoCompact(
   tokens: number | null,
   contextWindow: number,
   configTarget: number,
+  compactRatio: number,
   inFlight: boolean,
 ): boolean {
   if (inFlight || tokens === null) return false;
-  const target = effectiveCompactTarget(configTarget, contextWindow);
+  const target = effectiveCompactTarget(configTarget, contextWindow, compactRatio);
   return target !== undefined && tokens > target;
 }
 

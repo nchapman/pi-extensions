@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_COMPACTION_SETTINGS } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import {
   buildArchiveChunks,
@@ -48,6 +49,7 @@ const CONFIG: RecallConfig = {
   halfLifeHours: 4,
   recencyFloor: 0.25,
   compactTargetTokens: 131_072,
+  compactTargetRatio: 0.7,
   ownSummaries: true,
   summaryChars: 5_000,
   summaryThinking: "high",
@@ -1297,23 +1299,40 @@ function isoAdd(iso: string, days: number): string {
 // ---------------------------------------------------------------------------
 
 describe("context budget", () => {
-  it("effectiveCompactTarget picks the smaller of config target and window headroom", () => {
-    expect(effectiveCompactTarget(131_072, 200_000)).toBe(131_072);
-    expect(effectiveCompactTarget(131_072, 100_000)).toBe(95_904); // window-bound
-    expect(effectiveCompactTarget(500_000, 200_000)).toBe(195_904); // big target clamps to window
+  it("effectiveCompactTarget picks the smallest of token cap, window ratio, and window headroom", () => {
+    expect(effectiveCompactTarget(256_000, 400_000)).toBe(256_000); // token cap wins: 70% is 280k
+    expect(effectiveCompactTarget(256_000, 200_000)).toBe(140_000); // ratio wins: 70% is 140k
+    expect(effectiveCompactTarget(131_072, 100_000)).toBe(70_000); // ratio beats window headroom
+    expect(effectiveCompactTarget(131_072, 200_000)).toBe(131_072); // explicit cap below ratio bound
+    expect(effectiveCompactTarget(131_072, 100_000, 0)).toBe(95_904); // ratio off: window-bound
+    expect(effectiveCompactTarget(500_000, 200_000, 0)).toBe(195_904); // big target clamps to window
+    expect(effectiveCompactTarget(256_000, 200_000, 1)).toBe(195_904); // ratio 1: headroom wins
+    expect(effectiveCompactTarget(256_000, 200_000, Number.NaN)).toBe(195_904); // nonsense ratio: ignored
+    expect(effectiveCompactTarget(100_000, 1_000_000)).toBe(100_000); // huge window: cap wins over 700k
     expect(effectiveCompactTarget(0, 200_000)).toBeUndefined(); // disabled
     expect(effectiveCompactTarget(131_072, 4096)).toBeUndefined(); // window nonsense
-    expect(effectiveCompactTarget(131_072, 4097)).toBe(1); // boundary: just above headroom
     expect(effectiveCompactTarget(131_072, 0)).toBeUndefined();
   });
 
-  it("shouldAutoCompact gates on tokens, target, and in-flight state", () => {
-    expect(shouldAutoCompact(150_000, 200_000, 131_072, false)).toBe(true);
-    expect(shouldAutoCompact(100_000, 200_000, 131_072, false)).toBe(false);
-    expect(shouldAutoCompact(null, 200_000, 131_072, false)).toBe(false); // tokens unknown
-    expect(shouldAutoCompact(150_000, 200_000, 131_072, true)).toBe(false); // already compacting
-    expect(shouldAutoCompact(150_000, 200_000, 0, false)).toBe(false); // disabled
-    expect(shouldAutoCompact(131_072, 200_000, 131_072, false)).toBe(false); // exactly at target: not over
+  it("effectiveCompactTarget disables targets one compaction could never reach", () => {
+    // The kept tail alone (pi default 20k) plus headroom sets the floor.
+    const floor = DEFAULT_COMPACTION_SETTINGS.keepRecentTokens + 4_096;
+    expect(effectiveCompactTarget(floor, 1_000_000)).toBe(floor); // exactly at the floor: achievable
+    expect(effectiveCompactTarget(floor - 1, 1_000_000)).toBeUndefined(); // below: would re-draft forever
+    expect(effectiveCompactTarget(131_072, 20_000)).toBeUndefined(); // tiny window: every bound unachievable
+    expect(effectiveCompactTarget(131_072, 4097)).toBeUndefined(); // boundary: just above headroom, still unachievable
+  });
+
+  it("shouldAutoCompact gates on tokens, target, ratio, and in-flight state", () => {
+    expect(shouldAutoCompact(150_000, 200_000, 131_072, 0.7, false)).toBe(true);
+    expect(shouldAutoCompact(100_000, 200_000, 131_072, 0.7, false)).toBe(false);
+    expect(shouldAutoCompact(null, 200_000, 131_072, 0.7, false)).toBe(false); // tokens unknown
+    expect(shouldAutoCompact(150_000, 200_000, 131_072, 0.7, true)).toBe(false); // already compacting
+    expect(shouldAutoCompact(150_000, 200_000, 0, 0.7, false)).toBe(false); // disabled
+    expect(shouldAutoCompact(131_072, 200_000, 131_072, 0.7, false)).toBe(false); // exactly at target: not over
+    expect(shouldAutoCompact(150_000, 200_000, 500_000, 0.7, false)).toBe(true); // ratio alone triggers: 140k bound
+    expect(shouldAutoCompact(140_000, 200_000, 500_000, 0.7, false)).toBe(false); // exactly at ratio bound: not over
+    expect(shouldAutoCompact(139_999, 200_000, 500_000, 0.7, false)).toBe(false); // just under the ratio bound
   });
 });
 
@@ -1938,7 +1957,11 @@ describe("compaction summary ownership", () => {
   it("config parses the budget knobs", () => {
     expect(configFromEnv({ PI_RECALL_COMPACT_TARGET: "60000" }).compactTargetTokens).toBe(60000);
     expect(configFromEnv({ PI_RECALL_COMPACT_TARGET: "0" }).compactTargetTokens).toBe(0);
-    expect(configFromEnv({ PI_RECALL_COMPACT_TARGET: "nope" }).compactTargetTokens).toBe(200_000);
+    expect(configFromEnv({ PI_RECALL_COMPACT_TARGET: "nope" }).compactTargetTokens).toBe(256_000);
+    expect(configFromEnv({ PI_RECALL_COMPACT_RATIO: "0.8" }).compactTargetRatio).toBe(0.8);
+    expect(configFromEnv({ PI_RECALL_COMPACT_RATIO: "0" }).compactTargetRatio).toBe(0); // ratio off
+    expect(configFromEnv({ PI_RECALL_COMPACT_RATIO: "3" }).compactTargetRatio).toBe(1); // clamped
+    expect(configFromEnv({ PI_RECALL_COMPACT_RATIO: "nope" }).compactTargetRatio).toBe(0.7); // invalid → default
     expect(configFromEnv({ PI_RECALL_COMPACT_OWN: "0" }).ownSummaries).toBe(false);
     expect(configFromEnv({ PI_RECALL_COMPACT_OWN: "nope" }).ownSummaries).toBe(true); // invalid → default with warning
   });
