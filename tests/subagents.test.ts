@@ -1146,6 +1146,24 @@ describe("registerSubagentsExtension (full wiring)", () => {
     expect(options?.deliverAs).toBe("steer");
   });
 
+  it("delivers bg-tool wakes through the same steered channel as subagent wakes", async () => {
+    const wired = wireUp();
+    await wired.tools.get("bg")!.execute("1", { command: "just check 2>&1" }, undefined, undefined, {
+      sessionManager: { getSessionDir: () => undefined },
+    });
+
+    // The bash kind must ride the same steered wake channel — a split
+    // (bg queueing as followUp) would reintroduce the sleep-poll livelock
+    // for shell tasks only.
+    wired.bgChildren[0].emit("ok\n");
+    wired.bgChildren[0].close(0);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(wired.sendUserMessage).toHaveBeenCalledTimes(1);
+    const [text, options] = wired.sendUserMessage.mock.calls[0] as [string, { deliverAs?: string }];
+    expect(text).toContain("[background] bash");
+    expect(options?.deliverAs).toBe("steer");
+  });
+
   it("kills backgrounded children on session replacement and explains the lost wake", async () => {
     const wired = wireUp();
     await runBackgroundedTask(wired.tools, wired.children);
