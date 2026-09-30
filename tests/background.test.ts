@@ -524,10 +524,15 @@ describe("kill and control surfaces", () => {
     expect(child.killed).toBe(false);
   });
 
-  it("/tasks lists running tasks and kills by id argument", () => {
+  it("/tasks lists, kills by `kill <id>`, kills all, and teaches its grammar on misuse", () => {
     const d = controlDeps();
-    const child = fakeBashForControl();
-    void createBgTool(d.registry, { spawnFn: () => child }).execute("1", { command: "idle" }, undefined, undefined, {
+    const childA = fakeBashForControl();
+    const childB = fakeBashForControl();
+    const bg = createBgTool(d.registry, { spawnFn: (c) => (c === "a" ? childA : childB) });
+    void bg.execute("1", { command: "a" }, undefined, undefined, {
+      sessionManager: { getSessionDir: () => undefined },
+    } as never);
+    void bg.execute("2", { command: "b" }, undefined, undefined, {
       sessionManager: { getSessionDir: () => undefined },
     } as never);
     const cmd = createTasksCommand(d.registry, { now: () => 4_000 });
@@ -535,14 +540,29 @@ describe("kill and control surfaces", () => {
     const ctx = { ui: { notify } };
 
     cmd.handler("", ctx);
-    expect(notify).toHaveBeenCalledWith(expect.stringContaining("bg-1 (bash, 3s) idle"), "info");
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("bg-1 (bash, 3s) a"), "info");
 
+    // Bare id — the old form — now teaches the grammar instead of killing.
     cmd.handler("bg-1", ctx);
-    expect(notify).toHaveBeenCalledWith("Killed bg-1. Its wake will not arrive.", "warning");
-    expect(child.killed).toBe(true);
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("Usage: /tasks"), "info");
+    expect(childA.killed).toBe(false);
 
-    cmd.handler("bg-8", ctx);
+    cmd.handler("kill bg-8", ctx);
     expect(notify).toHaveBeenCalledWith(expect.stringContaining("No running task bg-8"), "error");
+
+    cmd.handler("kill bg-1", ctx);
+    expect(notify).toHaveBeenCalledWith("Killed bg-1. Its wake will not arrive.", "warning");
+    expect(childA.killed).toBe(true);
+
+    cmd.handler("kill all", ctx);
+    expect(notify).toHaveBeenCalledWith("Killed 1 task. Their wakes will not arrive.", "warning");
+    expect(childB.killed).toBe(true);
+
+    cmd.handler("kill all", ctx); // nothing left
+    expect(notify).toHaveBeenCalledWith("No running tasks.", "info");
+
+    cmd.handler("kill", ctx); // missing target
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("Usage: /tasks"), "info");
   });
 
   it("kill_task and /tasks work on adopted subagent tasks too", () => {

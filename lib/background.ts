@@ -480,22 +480,42 @@ The task stops immediately and its result never arrives. Ids come from the bg to
 /** The user-side lever: /tasks lists running tasks; /tasks <id> kills one. */
 export function createTasksCommand(registry: BackgroundRegistry, opts: { now?: () => number } = {}) {
   const now = opts.now ?? Date.now;
+  const usage = () =>
+    `Usage: /tasks — list running tasks; /tasks kill <bg-N | all>\n\n${describeRunningTasks(
+      registry.running(),
+      now(),
+    )}`;
   return {
-    description: "List background tasks (bg-…) — or kill one: /tasks bg-2",
+    description: "List background tasks, or kill: /tasks kill <id | all>",
     handler: async (
       args: string,
       ctx: { ui: { notify(message: string, level: "info" | "warning" | "error"): unknown } },
     ) => {
-      const id = args.trim();
-      if (!id) {
+      // Verb-first subcommands, matching pi's own /mcp add|remove|list grammar:
+      // self-documenting on a mistype, extensible beyond kill without breaking.
+      const parts = args.trim().split(/\s+/).filter(Boolean);
+      if (parts.length === 0) {
         ctx.ui.notify(describeRunningTasks(registry.running(), now()), "info");
         return;
       }
-      if (registry.kill(id)) {
-        ctx.ui.notify(`Killed ${id}. Its wake will not arrive.`, "warning");
+      const [verb, target] = parts;
+      if (verb !== "kill" || !target || parts.length > 2) {
+        ctx.ui.notify(usage(), "info");
+        return;
+      }
+      if (target === "all") {
+        const n = registry.killAll();
+        ctx.ui.notify(
+          n > 0 ? `Killed ${n} task${n === 1 ? "" : "s"}. Their wakes will not arrive.` : "No running tasks.",
+          n > 0 ? "warning" : "info",
+        );
+        return;
+      }
+      if (registry.kill(target)) {
+        ctx.ui.notify(`Killed ${target}. Its wake will not arrive.`, "warning");
       } else {
         ctx.ui.notify(
-          `No running task ${id}. Running:\n${describeRunningTasks(registry.running(), now())}`,
+          `No running task ${target}. Running:\n${describeRunningTasks(registry.running(), now())}`,
           "error",
         );
       }
