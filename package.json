@@ -32,7 +32,7 @@
 		"test": "vitest run",
 		"check": "tsc --noEmit && vitest run",
 		"test:coverage": "vitest run --coverage",
-		"format": "prettier --write extensions tests",
-		"check:format": "prettier --check extensions tests"
+		"format": "prettier --write extensions lib tests",
+		"check:format": "prettier --check extensions lib tests"
 	}
 }

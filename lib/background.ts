@@ -265,9 +265,7 @@ const defaultBashSpawn: BashSpawnFn = (command, cwd) =>
 export function bashCommandHead(command: string): string {
   // Code-point aware truncation: a UTF-16 slice could split a surrogate pair
   // at the cap and put undecodable garbage in the wake header and notify.
-  return Array.from(command.replace(/\s+/g, " ").trim())
-    .slice(0, 80)
-    .join("");
+  return Array.from(command.replace(/\s+/g, " ").trim()).slice(0, 80).join("");
 }
 
 /** The wake message for a finished shell command: status, duration, capped tail. */
@@ -338,7 +336,10 @@ Use for long-running commands whose result you need later — builds, test suite
       } catch (error) {
         return {
           content: [
-            { type: "text" as const, text: `Failed to spawn: ${error instanceof Error ? error.message : String(error)}` },
+            {
+              type: "text" as const,
+              text: `Failed to spawn: ${error instanceof Error ? error.message : String(error)}`,
+            },
           ],
           details: { kind: "bash" },
           isError: true,
@@ -431,9 +432,7 @@ Use for long-running commands whose result you need later — builds, test suite
 /** One line of the /tasks listing and the kill_task error hint. */
 export function describeRunningTasks(tasks: BgTask[], nowMs: number = Date.now()): string {
   if (tasks.length === 0) return "No background tasks running.";
-  return tasks
-    .map((t) => `${t.id} (${t.kind}, ${formatDuration(nowMs - t.startedAt)}) ${t.name}`)
-    .join("\n");
+  return tasks.map((t) => `${t.id} (${t.kind}, ${formatDuration(nowMs - t.startedAt)}) ${t.name}`).join("\n");
 }
 
 /** The agent-side lever: kill one background task by id, whatever spawned it. */
@@ -460,7 +459,11 @@ The task stops immediately and its result never arrives. Ids come from the bg to
       _signal: AbortSignal | undefined,
       _onUpdate: undefined,
       _ctx: unknown,
-    ): Promise<{ content: { type: "text"; text: string }[]; details: { killed: boolean; id: string }; isError?: boolean }> {
+    ): Promise<{
+      content: { type: "text"; text: string }[];
+      details: { killed: boolean; id: string };
+      isError?: boolean;
+    }> {
       const id = params.id?.trim();
       const killed = registry.kill(id);
       if (!killed) {

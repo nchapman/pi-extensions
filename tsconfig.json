@@ -18,6 +18,7 @@
   },
   "include": [
     "extensions",
+    "lib",
     "tests"
   ]
 }
