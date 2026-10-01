@@ -655,6 +655,8 @@ export interface EmbedSeam {
     items: readonly { key: string; text: string }[],
   ): Promise<Array<{ key: string; vector: Float32Array }> | undefined>;
   kill(): void;
+  /** Terminal: kill AND refuse every later request (no lazy respawn). */
+  dispose(): void;
 }
 
 /**
@@ -1265,7 +1267,10 @@ export function registerRecallTool(
   // must not outlive the session that spawned it (its result would have no
   // consumer), and the store handle belongs to one session directory.
   pi.on("session_shutdown", () => {
-    embed.kill();
+    // dispose, not kill: an in-flight catch-up can land its request after this
+    // handler runs — kill alone would let the request lazily respawn the
+    // worker, whose pipes would then hold the host's event loop open forever.
+    embed.dispose();
     const support = vectorSupport;
     vectorSupport = null;
     catchUpInFlight = false;

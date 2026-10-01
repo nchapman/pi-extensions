@@ -85,6 +85,7 @@ export class EmbedClient {
   private stderrTail = "";
   private fatalNoticed = false;
   private idleTimer: NodeJS.Timeout | null = null;
+  private disposed = false;
   private readonly opts: EmbedClientOptions;
 
   constructor(opts: EmbedClientOptions) {
@@ -98,7 +99,7 @@ export class EmbedClient {
 
   /** Spawn the worker if needed. False when permanently disabled. */
   start(): boolean {
-    if (this.givenUp) return false;
+    if (this.disposed || this.givenUp) return false;
     if (this.child !== null) return true;
     const max = this.opts.maxStartAttempts ?? 3;
     if (this.startAttempts >= max) {
@@ -171,6 +172,12 @@ export class EmbedClient {
     return out.length === 0 ? undefined : out;
   }
 
+  /** Kill AND refuse every later request. Unlike kill(), no lazy respawn is possible afterwards — without this, an in-flight catch-up whose request lands after session_shutdown would respawn the worker, and its pipes would hold the host's event loop open forever. */
+  dispose(): void {
+    this.disposed = true;
+    this.kill();
+  }
+
   /** Stop the worker and settle everything in flight. Idempotent. */
   kill(): void {
     if (this.idleTimer !== null) {
@@ -202,6 +209,8 @@ export class EmbedClient {
 
   /** Send one request and resolve its reply object, or undefined on timeout/death/error. */
   private async request(op: Record<string, unknown>, timeoutMs: number): Promise<Record<string, unknown> | undefined> {
+    // A disposed client never respawns — the host is tearing down.
+    if (this.disposed) return undefined;
     if (this.child === null && !this.start()) return undefined;
     const child = this.child;
     if (child === null) return undefined;

@@ -76,6 +76,34 @@ describe("EmbedClient", () => {
     expect(v?.length).toBe(EMBED_DIMS);
   });
 
+  it("dispose settles an in-flight request and refuses any later request without respawning", async () => {
+    let spawned = 0;
+    const children: FakeChild[] = [];
+    const spawnFn: SpawnFn = () => {
+      spawned++;
+      const child = new FakeChild();
+      children.push(child);
+      return child;
+    };
+    const client = new EmbedClient({
+      workerPath: "/virtual/embed-worker.ts",
+      dtype: "q8",
+      modelDir: "/virtual/models",
+      spawnFn,
+      embedBaseTimeoutMs: 60_000,
+    });
+    client.start();
+    // A request that never replies — the worker is busy when shutdown lands.
+    const inFlight = client.embed([{ key: "a", text: "t" }]);
+    client.dispose();
+    expect(await inFlight).toBeUndefined(); // settled, not leaked
+    // The post-shutdown catch-up's request must fail open with NO respawn.
+    expect(await client.query("late")).toBeUndefined();
+    expect(await client.embed([{ key: "b", text: "t" }])).toBeUndefined();
+    expect(client.start()).toBe(false);
+    expect(spawned).toBe(1); // exactly one child for the whole session
+  });
+
   it("round-trips embed items", async () => {
     const child = new FakeChild();
     const client = makeClient(child);

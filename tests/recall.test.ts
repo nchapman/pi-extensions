@@ -1090,7 +1090,13 @@ function vec(...axes: number[]): Float32Array {
 function fakeEmbedSeam(overrides: { queryVector?: Float32Array } = {}) {
   // Mutable state so tests can flip failure modes between settles; kill is
   // running-aware so it stays idempotent like the real client.
-  const state = { failQuery: false, failEmbed: false, queryVector: overrides.queryVector ?? vec(1), running: false };
+  const state = {
+    failQuery: false,
+    failEmbed: false,
+    disposed: false,
+    queryVector: overrides.queryVector ?? vec(1),
+    running: false,
+  };
   const calls = {
     started: 0,
     killed: 0,
@@ -1117,6 +1123,12 @@ function fakeEmbedSeam(overrides: { queryVector?: Float32Array } = {}) {
       return state.failEmbed ? undefined : items.map((item) => ({ key: item.key, vector: vec(1) }));
     },
     kill: () => {
+      if (!state.running) return;
+      state.running = false;
+      calls.killed++;
+    },
+    dispose: () => {
+      state.disposed = true;
       if (!state.running) return;
       state.running = false;
       calls.killed++;
