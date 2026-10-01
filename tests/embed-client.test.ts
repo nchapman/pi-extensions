@@ -388,6 +388,11 @@ describe("presetFor", () => {
     expect(presetFor("onnx-community/Qwen3-Embedding-0.6B-ONNX").queryPrefix).toContain("Instruct:");
     expect(presetFor("jina-code-embeddings-0.5b").docPrefix).toBe("Candidate answer:\n");
     expect(presetFor("jina-code-embeddings-0.5b").dims).toBe(896);
+    expect(presetFor("jinaai/jina-embeddings-v5-text-nano-retrieval")).toEqual({
+      queryPrefix: "Query: ",
+      docPrefix: "Document: ",
+      dims: 768,
+    });
     expect(presetFor("some-unknown-model")).toEqual({ queryPrefix: "", docPrefix: "", dims: 768 });
   });
 });

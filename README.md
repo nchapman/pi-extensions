@@ -64,6 +64,17 @@ npm run bench:recall   # retrieval benchmark over a real session dir (spawns the
 
 The benchmark (`scripts/bench-recall.ts`, separate vitest config so `npm test` stays model-free) points at a real session directory, samples archived chunks as targets, derives keyword queries by rarity-ranked token extraction and descriptions by masking every grep-able token out of the target text, then scores entry-level Hit@1/Hit@5/MRR for the old single-query behavior vs the description/queries split, plus a fusion-weight sweep. The corpus is **snapshotted into the OS tmpdir once** (`BENCH_SNAPSHOT=1` refreshes) — the live session dir grows while you work, which made early runs wobble by points; the frozen copy makes runs reproducible and models directly comparable (same targets for every model). `BENCH_DIR` / `BENCH_TARGETS` / `BENCH_CORPUS` / `BENCH_FRESH` tune it; vector caches live in the OS tmpdir, **one file per model** (store files fingerprint the model that built them — a switch resets the cache rather than mixing incomparable vectors), so switching models re-embeds cleanly. `BENCH_MODEL` selects the embedding model (any transformers.js-compatible HF id or local dir; default EmbeddingGemma) — per-model knowledge (query/document prefixes from the model card, output dims) lives in `presetFor()` in `lib/embed-client.ts`; unknown models default to no prefixes and 768 dims, overridable via client opts. Masked descriptions are a pessimistic paraphrase (word order preserved, exact terms removed) — the split's win over the old behavior is real; the semantic side's absolute numbers will be better with real model-written descriptions.
 
+**Model comparison** (frozen snapshot: 5,000 chunks / 32 sessions / 50 targets, description/queries split at the default weight 0.3):
+
+| model | params · dtype | dims | Hit@1 | Hit@5 | MRR@10 | embed rate |
+|---|---|---|---|---|---|---|
+| onnx-community/embeddinggemma-300m-ONNX (default) | 300M · q8 | 768 | 92% | 100% | 0.954 | ~13 chunks/s |
+| nchapman/jina-code-embeddings-0.5b-onnx | 494M · fp16 | 896 | 82% | 100% | 0.900 | ~6/s |
+| onnx-community/Qwen3-Embedding-0.6B-ONNX | 600M · q8 | 1024 | 80% | 100% | 0.892 | ~1.6/s |
+| jinaai/jina-embeddings-v5-text-nano-retrieval | 211M · q8 | 768 | 86% | 98% | 0.913 | ~17/s |
+
+The default holds: EmbeddingGemma 300M beats embedders 2–3× its size on this workload — session-history retrieval where the semantic query is a masked-prose paraphrase. The nano is the noted alternative — fastest and smallest, and it out-scores the Qwen3-0.6B its 4B teacher distilled — if embed throughput or residency ever matters more than the last 4 points of Hit@1. Every run above used the same frozen targets, so the gaps are the models, not sampling noise. Switching is one env (`PI_RECALL_EMBED_MODEL`); re-run `npm run bench:recall` with `BENCH_MODEL` if the workload ever shifts.
+
 To benchmark `jinaai/jina-code-embeddings-0.5b` (no official transformers.js build), assemble a local model dir once: `config.json` from the official repo, tokenizer files from `Parth2684/jina-code-embeddings-0.5b-onnx`'s `tokenizer/` moved to the root, and its `quantized/embedding_int8_dynamic.onnx` saved as `onnx/model_quantized.onnx` — then `BENCH_MODEL=~/.pi/agent/models/jina-code-embeddings-0.5b`.
 
 Pure logic (config parsing, frontmatter splitting, tool-name resolution, result serialization) is exported separately and covered by vitest suites in `tests/`; the spawn boundary is injected so child runs are testable without launching pi.

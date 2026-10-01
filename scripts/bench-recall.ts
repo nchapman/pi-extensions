@@ -102,7 +102,10 @@ function fmt(m: Metrics): string {
 }
 
 describe("recall retrieval benchmark", () => {
-  it("evaluates the description/queries split on real session data", { timeout: 20 * 60_000 }, async () => {
+  it(
+    "evaluates the description/queries split on real session data",
+    { timeout: Number(process.env.BENCH_TIMEOUT_MS) || 20 * 60_000 },
+    async () => {
     const dir = dirArg();
     const wantTargets = arg("targets", 50);
     const corpusCap = arg("corpus", 900);

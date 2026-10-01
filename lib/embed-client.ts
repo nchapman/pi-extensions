@@ -67,6 +67,13 @@ const EMBED_PRESETS: Array<{ match: string; preset: EmbedPreset }> = [
       dims: 896,
     },
   },
+  {
+    // jina-embeddings-v5 task repos (retrieval adapter merged): Query:/Document: prefixes,
+    // last-token pooling, EuroBERT backbone. Only the nano (768d) is preset —
+    // other sizes need their dims via PI_RECALL_EMBED_DIMS or a preset entry.
+    match: "v5-text-nano",
+    preset: { queryPrefix: "Query: ", docPrefix: "Document: ", dims: 768 },
+  },
 ];
 
 export function presetFor(model?: string): EmbedPreset {
