@@ -892,7 +892,7 @@ describe("registerRecallTool", () => {
   it("registers the tool with search defaults", async () => {
     const { tools, run } = setup();
     expect(tools.get(RECALL_TOOL_NAME)).toBeDefined();
-    const result = (await run({ query: "rotation" })) as {
+    const result = (await run({ description: "rotation" })) as {
       content: Array<{ text: string }>;
       details: { hits: unknown[] };
     };
@@ -901,16 +901,16 @@ describe("registerRecallTool", () => {
     expect(result.details.hits.length).toBeGreaterThan(0);
   });
 
-  it("errors when search mode lacks a query", async () => {
+  it("errors when search mode has neither description nor queries", async () => {
     const { run } = setup();
     const result = (await run({})) as { content: Array<{ text: string }> };
-    expect(result.content[0].text).toContain("Error: query is required");
+    expect(result.content[0].text).toContain("Error: description (or queries) is required");
   });
 
   it("tells the model when nothing has been compacted yet", async () => {
     const { run } = setup();
     const ctx = sessionCtx({ branch: [], contextEntries: [] });
-    const result = (await run({ query: "anything" }, ctx)) as { content: Array<{ text: string }> };
+    const result = (await run({ description: "anything" }, ctx)) as { content: Array<{ text: string }> };
     expect(result.content[0].text).toContain("Nothing has been compacted yet");
   });
 
@@ -943,11 +943,11 @@ describe("registerRecallTool", () => {
     const archived2 = msgEntry("user", { content: "rotation confirmed later" }, "2026-09-26T09:30:00.000Z");
     const kept = msgEntry("user", { content: "current turn" }, "2026-09-26T11:00:00.000Z");
     const ctx = sessionCtx({ branch: [archived1, archived2, kept], contextEntries: [kept] });
-    const all = (await run({ query: "rotation" }, ctx)) as { details: { hits: unknown[] } }; // default limit (5)
+    const all = (await run({ description: "rotation" }, ctx)) as { details: { hits: unknown[] } }; // default limit (5)
     expect(all.details.hits).toHaveLength(2);
-    const zero = (await run({ query: "rotation", limit: 0 }, ctx)) as { details: { hits: unknown[] } };
+    const zero = (await run({ description: "rotation", limit: 0 }, ctx)) as { details: { hits: unknown[] } };
     expect(zero.details.hits).toHaveLength(1); // floored to 1
-    const negative = (await run({ query: "rotation", limit: -3 }, ctx)) as { details: { hits: unknown[] } };
+    const negative = (await run({ description: "rotation", limit: -3 }, ctx)) as { details: { hits: unknown[] } };
     expect(negative.details.hits).toHaveLength(1);
   });
 
@@ -959,7 +959,7 @@ describe("registerRecallTool", () => {
     const ctx = sessionCtx({ sessionDir: dir });
     const result = (await tools
       .get(RECALL_TOOL_NAME)!
-      .execute("t", { query: "uniquely findable" }, undefined, undefined, ctx)) as {
+      .execute("t", { description: "uniquely findable" }, undefined, undefined, ctx)) as {
       content: Array<{ text: string }>;
       details: { scope: string; hits: Array<{ ref: string }> };
     };
@@ -993,14 +993,14 @@ describe("registerRecallTool", () => {
     // Session-scope query misses the foreign-only content.
     const sessionOnly = (await tools
       .get(RECALL_TOOL_NAME)!
-      .execute("t", { query: "migration rollback" }, undefined, undefined, ctx)) as {
+      .execute("t", { description: "migration rollback" }, undefined, undefined, ctx)) as {
       content: Array<{ text: string }>;
     };
     expect(sessionOnly.content[0].text).toContain("No matches");
     // Project scope finds it, labeled as a past session.
     const project = (await tools
       .get(RECALL_TOOL_NAME)!
-      .execute("t", { query: "migration rollback", scope: "project" }, undefined, undefined, ctx)) as {
+      .execute("t", { description: "migration rollback", scope: "project" }, undefined, undefined, ctx)) as {
       content: Array<{ text: string }>;
       details: { hits: Array<{ session: string }> };
     };
@@ -1021,7 +1021,7 @@ describe("registerRecallTool", () => {
     registerRecallTool(pi, CONFIG, missing);
     const result = (await tools
       .get(RECALL_TOOL_NAME)!
-      .execute("t", { query: "x", scope: "project" }, undefined, undefined, sessionCtx())) as {
+      .execute("t", { description: "x", scope: "project" }, undefined, undefined, sessionCtx())) as {
       content: Array<{ text: string }>;
     };
     expect(result.content[0].text).toContain("project scope unavailable");
@@ -1035,7 +1035,7 @@ describe("registerRecallTool", () => {
     const ctx = sessionCtx({ sessionDir: dir });
     const search = (await tools
       .get(RECALL_TOOL_NAME)!
-      .execute("t", { query: "exact foreign detail", scope: "project" }, undefined, undefined, ctx)) as {
+      .execute("t", { description: "exact foreign detail", scope: "project" }, undefined, undefined, ctx)) as {
       details: { hits: Array<{ ref: string }> };
     };
     const ref = search.details.hits[0].ref;
@@ -1233,7 +1233,9 @@ describe("semantic hybrid search", () => {
     const store = fakeVectorStore([{ key: firstKey(semantic), vector: vec(1) }]);
     const embed = fakeEmbedSeam({ queryVector: vec(1) });
     const { run } = await hybridSetup(embed, store);
-    const result = (await run({ query: "kitten napping sunny spot" }, ctx)) as { content: Array<{ text: string }> };
+    const result = (await run({ description: "kitten napping sunny spot" }, ctx)) as {
+      content: Array<{ text: string }>;
+    };
     expect(result.content[0].text).toContain("Fluffy");
     expect(result.content[0].text).toContain("· sem");
   });
@@ -1245,7 +1247,7 @@ describe("semantic hybrid search", () => {
     ]);
     const embed = fakeEmbedSeam({ queryVector: vec(1) });
     const { run } = await hybridSetup(embed, store);
-    const result = (await run({ query: "rotate tokens" }, ctx)) as { content: Array<{ text: string }> };
+    const result = (await run({ description: "rotate tokens" }, ctx)) as { content: Array<{ text: string }> };
     expect(result.content[0].text).toContain("· lex+sem");
     expect(result.content[0].text.indexOf("rotate")).toBeLessThan(result.content[0].text.indexOf("Fluffy"));
   });
@@ -1255,12 +1257,12 @@ describe("semantic hybrid search", () => {
     const lexicalRun = (await (function () {
       const { pi, tools } = makePi();
       registerRecallTool(pi, CONFIG);
-      return tools.get(RECALL_TOOL_NAME)!.execute("t", { query: "rotate tokens" }, undefined, undefined, ctx);
+      return tools.get(RECALL_TOOL_NAME)!.execute("t", { description: "rotate tokens" }, undefined, undefined, ctx);
     })()) as { content: Array<{ text: string }> };
     const embed = fakeEmbedSeam();
     embed.state.failQuery = true;
     const { run } = await hybridSetup(embed, fakeVectorStore());
-    const hybridRun = (await run({ query: "rotate tokens" }, ctx)) as { content: Array<{ text: string }> };
+    const hybridRun = (await run({ description: "rotate tokens" }, ctx)) as { content: Array<{ text: string }> };
     expect(hybridRun.content[0].text).toBe(lexicalRun.content[0].text);
     expect(embed.calls.queries).toHaveLength(1);
   });
@@ -1269,7 +1271,7 @@ describe("semantic hybrid search", () => {
     const { ctx } = hybridCtx();
     const embed = fakeEmbedSeam({ queryVector: vec(1) });
     const { run } = await hybridSetup(embed, fakeVectorStore(), { embedWeight: 0 });
-    await run({ query: "rotate tokens" }, ctx);
+    await run({ description: "rotate tokens" }, ctx);
     expect(embed.calls.queries).toHaveLength(0);
   });
 
@@ -1277,9 +1279,66 @@ describe("semantic hybrid search", () => {
     const { ctx } = hybridCtx();
     const embed = fakeEmbedSeam({ queryVector: vec(1) });
     const { run } = await hybridSetup(embed, fakeVectorStore());
-    const result = (await run({ query: "rotate tokens" }, ctx)) as { content: Array<{ text: string }> };
+    const result = (await run({ description: "rotate tokens" }, ctx)) as { content: Array<{ text: string }> };
     expect(result.content[0].text).toContain("rotate");
     expect(result.content[0].text).not.toContain("· sem");
+  });
+
+  it("routes description to the semantic side and queries to BM25", async () => {
+    const { ctx, semantic } = hybridCtx();
+    const embed = fakeEmbedSeam({ queryVector: vec(1) });
+    const store = fakeVectorStore([{ key: firstKey(semantic), vector: vec(1) }]);
+    const { run } = await hybridSetup(embed, store);
+    // Zero token overlap with the lexical entry ("rotate the tokens on every
+    // refresh") — the rotate hit below is reachable ONLY if BM25 saw the
+    // queries; a regression to description-fed BM25 drops it entirely.
+    const result = (await run({ description: "kitten napping sunny spot", queries: ["rotate", "tokens"] }, ctx)) as {
+      content: Array<{ text: string }>;
+    };
+    // The embedding model received the natural-language description…
+    expect(embed.calls.queries[0]).toBe("kitten napping sunny spot");
+    // …BM25 received only the keywords, and the cat entry surfaces via
+    // vectors only (its terms match neither query).
+    expect(result.content[0].text).toContain("rotate");
+    expect(result.content[0].text).toContain("Fluffy");
+    expect(result.content[0].text).toContain("· sem");
+  });
+
+  it("with no queries, the description feeds both sides", async () => {
+    const { ctx } = hybridCtx();
+    const embed = fakeEmbedSeam({ queryVector: vec(1) });
+    const { run } = await hybridSetup(embed, fakeVectorStore());
+    const result = (await run({ description: "rotate tokens" }, ctx)) as { content: Array<{ text: string }> };
+    expect(embed.calls.queries[0]).toBe("rotate tokens");
+    expect(result.content[0].text).toContain("rotate");
+  });
+
+  it("with no description, the joined queries feed both sides", async () => {
+    const { ctx } = hybridCtx();
+    const embed = fakeEmbedSeam({ queryVector: vec(1) });
+    const { run } = await hybridSetup(embed, fakeVectorStore());
+    const result = (await run({ queries: ["rotate", "tokens"] }, ctx)) as { content: Array<{ text: string }> };
+    expect(embed.calls.queries[0]).toBe("rotate tokens");
+    expect(result.content[0].text).toContain("rotate");
+  });
+
+  it("blank queries and blank description degrade gracefully", async () => {
+    const { ctx } = hybridCtx();
+    const embed = fakeEmbedSeam({ queryVector: vec(1) });
+    const { run } = await hybridSetup(embed, fakeVectorStore());
+    // All-blank queries after trim/filter → same as omitted → description feeds both.
+    const blanks = (await run({ description: "rotate tokens", queries: ["  ", ""] }, ctx)) as {
+      content: Array<{ text: string }>;
+    };
+    expect(blanks.content[0].text).toContain("rotate");
+    expect(embed.calls.queries[0]).toBe("rotate tokens");
+    // A blank entry among real ones is dropped, not fatal.
+    const mixed = (await run({ queries: ["", "rotate tokens"] }, ctx)) as { content: Array<{ text: string }> };
+    expect(mixed.content[0].text).toContain("rotate");
+    expect(embed.calls.queries[0]).toBe("rotate tokens");
+    // Whitespace-only description with no queries → the required-arg error.
+    const empty = (await run({ description: "   " }, ctx)) as { content: Array<{ text: string }> };
+    expect(empty.content[0].text).toContain("Error: description (or queries) is required");
   });
 });
 
@@ -1358,7 +1417,9 @@ describe("embedding catch-up wiring", () => {
       expect(embed.calls.started).toBe(0); // spawn only after the store opens
       const result = (await tools
         .get(RECALL_TOOL_NAME)!
-        .execute("t", { query: "rotate tokens" }, undefined, undefined, ctx)) as { content: Array<{ text: string }> };
+        .execute("t", { description: "rotate tokens" }, undefined, undefined, ctx)) as {
+        content: Array<{ text: string }>;
+      };
       expect(result.content[0].text).toContain("rotate");
       expect(err).toHaveBeenCalled();
     } finally {
@@ -1613,14 +1674,16 @@ describe("embed config", () => {
 describe("renderers", () => {
   const theme = { fg: (_k: string, s: string) => s, bold: (s: string) => s } as never;
 
-  it("call row shows the query, or read mode", () => {
-    expect(renderRecallCall({ query: "token rotation" }, theme)).toContain("token rotation");
+  it("call row shows the description (or joined queries), or read mode", () => {
+    expect(renderRecallCall({ description: "token rotation" }, theme)).toContain("token rotation");
     expect(renderRecallCall({ mode: "read", id: "x" }, theme)).toContain("recall read");
-    expect(renderRecallCall({ query: 42 }, theme)).not.toContain("42"); // non-string query renders bare
+    expect(renderRecallCall({ description: 42 }, theme)).not.toContain("42"); // non-string renders bare
+    expect(renderRecallCall({ queries: ["rotate", "tokens"] }, theme)).toContain("rotate · tokens");
+    expect(renderRecallCall({ description: "   ", queries: ["rotate"] }, theme)).toContain("rotate"); // trimmed
   });
 
   it("clips long queries in the collapsed call row", () => {
-    const row = renderRecallCall({ query: "x".repeat(100) }, theme);
+    const row = renderRecallCall({ description: "x".repeat(100) }, theme);
     expect(row).toContain("…");
     expect(row.length).toBeLessThan(100);
   });
@@ -1630,10 +1693,10 @@ describe("renderers", () => {
     registerRecallTool(pi, CONFIG);
     const tool = tools.get(RECALL_TOOL_NAME)!;
     const callCtx: { lastComponent?: unknown } = {};
-    const first = tool.renderCall!({ query: "auth" } as never, theme as never, callCtx as never);
+    const first = tool.renderCall!({ description: "auth" } as never, theme as never, callCtx as never);
     expect(first).toBeInstanceOf(Text);
     callCtx.lastComponent = first;
-    const second = tool.renderCall!({ query: "tokens" } as never, theme as never, callCtx as never);
+    const second = tool.renderCall!({ description: "tokens" } as never, theme as never, callCtx as never);
     expect(second).toBe(first); // same component object, updated in place
     const resultCtx: { lastComponent?: unknown } = {};
     const resultA = tool.renderResult!(
@@ -3038,7 +3101,7 @@ describe("review regressions", () => {
     const ctx = sessionCtx({ sessionDir: dir });
     const search = (await tools
       .get(RECALL_TOOL_NAME)!
-      .execute("t", { query: "findable foreign", scope: "project" }, undefined, undefined, ctx)) as {
+      .execute("t", { description: "findable foreign", scope: "project" }, undefined, undefined, ctx)) as {
       details: { hits: Array<{ ref: string }> };
     };
     const ref = search.details.hits[0].ref;
@@ -3062,7 +3125,7 @@ describe("review regressions", () => {
     const ctx = sessionCtx({ sessionDir: dir });
     const search = (await tools
       .get(RECALL_TOOL_NAME)!
-      .execute("t", { query: "original entry", scope: "project" }, undefined, undefined, ctx)) as {
+      .execute("t", { description: "original entry", scope: "project" }, undefined, undefined, ctx)) as {
       details: { hits: Array<{ ref: string }> };
     };
     const ref = search.details.hits[0].ref;
@@ -3090,7 +3153,7 @@ describe("review regressions", () => {
     const ctx = sessionCtx({ sessionDir: dir });
     const search = (await tools
       .get(RECALL_TOOL_NAME)!
-      .execute("t", { query: "findable foreign", scope: "project" }, undefined, undefined, ctx)) as {
+      .execute("t", { description: "findable foreign", scope: "project" }, undefined, undefined, ctx)) as {
       details: { hits: Array<{ ref: string }> };
     };
     const ref = search.details.hits[0].ref;
@@ -3112,7 +3175,7 @@ describe("review regressions", () => {
     const ctx = sessionCtx({ sessionDir: dir });
     const search = (await tools
       .get(RECALL_TOOL_NAME)!
-      .execute("t", { query: "findable foreign", scope: "project" }, undefined, undefined, ctx)) as {
+      .execute("t", { description: "findable foreign", scope: "project" }, undefined, undefined, ctx)) as {
       details: { hits: Array<{ ref: string }> };
     };
     const ref = search.details.hits[0].ref;
@@ -3136,7 +3199,7 @@ describe("review regressions", () => {
     const ctx = sessionCtx({ sessionDir: dir });
     const search = (await tools
       .get(RECALL_TOOL_NAME)!
-      .execute("t", { query: "target entry", scope: "project" }, undefined, undefined, ctx)) as {
+      .execute("t", { description: "target entry", scope: "project" }, undefined, undefined, ctx)) as {
       details: { hits: Array<{ ref: string }> };
     };
     const ref = search.details.hits[0].ref;

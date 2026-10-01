@@ -1038,10 +1038,17 @@ export class ProjectCorpusCache {
 // ---------------------------------------------------------------------------
 
 const RecallParams = Type.Object({
-  query: Type.Optional(
+  description: Type.Optional(
     Type.String({
       description:
-        "Search terms (search mode). Plain words, identifiers, or exact strings like file paths and error messages",
+        "Natural-language description of what you're looking for — a sentence or two describing the ideal memory. Drives semantic (paraphrase) matching; also used for exact-term matching when no queries are given",
+    }),
+  ),
+  queries: Type.Optional(
+    Type.Array(Type.String(), {
+      maxItems: 5,
+      description:
+        "Keyword search queries — the exact terms you'd grep for and expect verbatim in the history: identifiers, file paths, names, error strings. 1-5 short queries; drives exact-term (BM25) matching and replaces the description there (omit or pass [] for none)",
     }),
   ),
   mode: Type.Optional(
@@ -1061,7 +1068,7 @@ const RecallParams = Type.Object({
 });
 
 const REMINDER_TEXT =
-  "Compaction summarized earlier history. Re-orient before continuing: confirm the current task and the immediate next action from the most recent messages you can see (the summary may lag the newest work); if either is unclear, search the transcript with `recall` rather than guessing. " +
+  "Compaction summarized earlier history. Re-orient before continuing: confirm the current task and the immediate next action from the most recent messages you can see (the summary may lag the newest work); if either is unclear, search the transcript with `recall` rather than guessing — describe what you're looking for (semantic), and add short keyword queries when you remember exact terms (identifiers, paths, error strings). " +
   "Compacted turns remain verbatim-searchable via `recall` (decisions, prior attempts, file paths, command outputs).";
 
 function reuseText(context: { lastComponent?: unknown } | undefined): Text {
@@ -1072,14 +1079,19 @@ function clip(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
-/** Collapsed call row: `recall — query…`. */
+/** Collapsed call row: `recall — description…`. */
 export function renderRecallCall(
-  args: { query?: unknown; mode?: unknown; id?: unknown },
+  args: { description?: unknown; queries?: unknown; mode?: unknown; id?: unknown },
   theme: Pick<Theme, "fg" | "bold">,
 ): string {
-  if (args?.mode === "read" || (!args?.query && args?.id)) return theme.fg("toolTitle", theme.bold("recall read"));
-  const q = typeof args?.query === "string" ? args.query : "";
-  return theme.fg("toolTitle", theme.bold("recall ")) + theme.fg("dim", clip(q, 60));
+  if (args?.mode === "read" || (!args?.description && !args?.queries && args?.id))
+    return theme.fg("toolTitle", theme.bold("recall read"));
+  const d = typeof args?.description === "string" ? args.description.trim() : "";
+  const qs = Array.isArray(args?.queries)
+    ? (args.queries as unknown[]).filter((q): q is string => typeof q === "string")
+    : [];
+  const shown = d !== "" ? d : qs.join(" · ");
+  return theme.fg("toolTitle", theme.bold("recall ")) + theme.fg("dim", clip(shown, 60));
 }
 
 /** Result row: `n hits` collapsed; hit lines when expanded. */
@@ -1542,8 +1554,9 @@ export function registerRecallTool(
     name: RECALL_TOOL_NAME,
     label: "Recall",
     description:
-      "Search conversation history that is no longer in your context (compacted away). Compaction folds dropped turns into a summary — the newest messages stay in context, and the verbatim transcript remains on disk where this tool retrieves it. Use it when you need earlier details you cannot see: decisions, prior failed attempts, file paths, command outputs, error strings. mode 'search' (default) takes a query and returns ranked verbatim excerpts with provenance (hybrid lexical + semantic ranking — plain words, identifiers, or paraphrases all work); mode 'read' takes an id from a prior result and returns the full entry. scope 'session' (default) searches this session's compacted history; scope 'project' also searches past sessions in this directory (labeled and down-ranked). Prefer recall over re-deriving or guessing at earlier state.",
-    promptSnippet: "recall — search compacted-away session history verbatim (scope 'project' adds past sessions)",
+      "Search conversation history that is no longer in your context (compacted away). Compaction folds dropped turns into a summary — the newest messages stay in context, and the verbatim transcript remains on disk where this tool retrieves it. Use it when you need earlier details you cannot see: decisions, prior failed attempts, file paths, command outputs, error strings. mode 'search' (default) ranks archived chunks and returns verbatim excerpts with provenance: give a `description` of what you're looking for in natural language (drives semantic matching — paraphrases and summaries of the idea find their targets) plus optional `queries` — short keyword searches of the exact terms you expect verbatim in the history, like identifiers, file paths, and error strings (drives exact-term matching). What makes a good description makes a poor keyword query and vice versa — describe the idea, grep for the tokens. mode 'read' takes an id from a prior result and returns the full entry. scope 'session' (default) searches this session's compacted history; scope 'project' also searches past sessions in this directory (labeled and down-ranked). Prefer recall over re-deriving or guessing at earlier state.",
+    promptSnippet:
+      "recall — search compacted-away session history verbatim (description = what you're looking for, natural language; queries = exact terms like identifiers/paths/errors; scope 'project' adds past sessions)",
     parameters: RecallParams,
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const mode = params.mode ?? "search";
@@ -1555,7 +1568,12 @@ export function registerRecallTool(
     },
     renderCall(args, theme, context) {
       const text = reuseText(context);
-      text.setText(renderRecallCall((args ?? {}) as { query?: unknown; mode?: unknown; id?: unknown }, theme));
+      text.setText(
+        renderRecallCall(
+          (args ?? {}) as { description?: unknown; queries?: unknown; mode?: unknown; id?: unknown },
+          theme,
+        ),
+      );
       return text;
     },
     renderResult(result, options, theme, context) {
@@ -2047,13 +2065,22 @@ function errorResult(
 }
 
 async function search(
-  params: { query?: string; scope?: "session" | "project"; limit?: number },
+  params: { description?: string; queries?: string[]; scope?: "session" | "project"; limit?: number },
   ctx: ExtensionContext,
   corpusCache: ProjectCorpusCache,
   config: RecallConfig,
   vectors: { store: VectorStoreLike; embed: EmbedSeam } | null,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: RecallDetails }> {
-  const query = params.query?.trim() ?? "";
+  const description = params.description?.trim() ?? "";
+  // Keyword queries replace the description for exact-term matching — prose
+  // dilutes BM25 (low-IDF filler everywhere), and terse identifiers starve the
+  // embedding model (trained on natural queries). Each side gets its diet.
+  const lexical = (params.queries ?? [])
+    .map((q) => q.trim())
+    .filter((q) => q !== "")
+    .join(" ");
+  const lexicalQuery = lexical !== "" ? lexical : description;
+  const semanticQuery = description !== "" ? description : lexicalQuery;
   const scope = params.scope ?? config.defaultScope;
   const limit = Math.floor(
     typeof params.limit === "number" && Number.isFinite(params.limit)
@@ -2061,8 +2088,11 @@ async function search(
       : config.maxResults,
   );
   const details: RecallDetails = { mode: "search", scope };
-  if (query === "") {
-    return errorResult("query is required in search mode (use mode 'read' with an id to fetch a full entry)", details);
+  if (lexicalQuery === "") {
+    return errorResult(
+      "description (or queries) is required in search mode (use mode 'read' with an id to fetch a full entry)",
+      details,
+    );
   }
 
   const sm = ctx.sessionManager;
@@ -2094,13 +2124,13 @@ async function search(
     allChunks = [...archiveChunks, ...corpora.flatMap((c) => c.chunks)];
   }
 
-  let rankedAll = rankChunks(allChunks, query, config.foreignWeight, config.halfLifeHours, config.recencyFloor);
+  let rankedAll = rankChunks(allChunks, lexicalQuery, config.foreignWeight, config.halfLifeHours, config.recencyFloor);
   // Semantic side: embed the query, scan the cached vectors over this
   // corpus's keys, and fuse by rank. Every step fails open — worker down
   // (lazily respawned by the request itself, bounded), query timeout, or
   // nothing cached yet leaves rankedAll exactly as BM25 produced it.
   if (vectors !== null && config.embedWeight > 0) {
-    const queryVector = await vectors.embed.query(query);
+    const queryVector = await vectors.embed.query(semanticQuery);
     if (queryVector !== undefined) {
       const chunksByKey = new Map(allChunks.map((c) => [c.key, c]));
       const frontier = archiveFrontier(allChunks);
@@ -2119,7 +2149,7 @@ async function search(
     score: r.score,
     recencyFactor: r.recencyFactor,
     match: r.sides,
-    snippet: extractSnippet(r.chunk.text, query, config.snippetChars),
+    snippet: extractSnippet(r.chunk.text, lexicalQuery, config.snippetChars),
   }));
   const archiveEntries = new Set(allChunks.map((c) => c.ref)).size;
   const text = formatSearchResult(hits, {
