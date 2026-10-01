@@ -64,21 +64,23 @@ export function toModels(
     }));
 }
 
-/** Rehydrate a persisted catalog, applying gateway defaults for missing fields. */
+/** Rehydrate a persisted catalog, applying gateway defaults for missing fields. Unusable entries are dropped. */
 export function storedToModels(
   stored: readonly StoredModel[] | undefined,
   defaults: { contextWindow: number; maxTokens: number },
 ): ChatModel[] {
-  return (stored ?? []).map((m) => ({
-    type: "chat",
-    id: m.id,
-    name: m.name ?? m.id,
-    reasoning: m.reasoning ?? false,
-    input: m.input ?? ["text"],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: m.contextWindow ?? defaults.contextWindow,
-    maxTokens: m.maxTokens ?? defaults.maxTokens,
-  }));
+  return (stored ?? [])
+    .filter((m) => typeof m?.id === "string" && m.id.length > 0)
+    .map((m) => ({
+      type: "chat",
+      id: m.id,
+      name: m.name ?? m.id,
+      reasoning: m.reasoning ?? false,
+      input: m.input ?? ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: m.contextWindow ?? defaults.contextWindow,
+      maxTokens: m.maxTokens ?? defaults.maxTokens,
+    }));
 }
 
 /** Coerce a config-file token count: positive finite integers only, everything else falls back to the default. */
@@ -113,7 +115,7 @@ function parseSeedModel(value: unknown): StoredModel | null {
 export function parseGateways(config: unknown): { gateways: Gateway[]; skipped: string[] } {
   const gateways: Gateway[] = [];
   const skipped: string[] = [];
-  if (typeof config !== "object" || config === null) {
+  if (typeof config !== "object" || config === null || Array.isArray(config)) {
     return { gateways, skipped: ["config is not an object"] };
   }
   for (const [name, raw] of Object.entries(config as Record<string, unknown>)) {
@@ -157,7 +159,10 @@ export function loadGateways(readFile: (path: string) => string = (p) => readFil
   let text: string;
   try {
     text = readFile(CONFIG_PATH);
-  } catch {
+  } catch (error) {
+    // Only a missing file is the benign "unconfigured machine" case; anything
+    // else (EACCES, EISDIR, ...) is a real problem and must be loud.
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     return { gateways: [], skipped: [] };
   }
   let parsed: unknown;
@@ -177,8 +182,8 @@ export async function fetchProviderModels(
 ): Promise<ChatModel[]> {
   const res = await fetch(`${baseUrl}/models`, { signal });
   if (!res.ok) throw new Error(`GET /models returned ${res.status}`);
-  const body = (await res.json()) as { data?: { id?: unknown; name?: unknown }[] };
-  const models = toModels(body.data ?? [], defaults);
+  const body = (await res.json()) as { data?: unknown };
+  const models = toModels(Array.isArray(body.data) ? (body.data as { id?: unknown; name?: unknown }[]) : [], defaults);
   if (models.length === 0) throw new Error("/models returned no models");
   return models;
 }

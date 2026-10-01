@@ -61,6 +61,16 @@ describe("storedToModels", () => {
     ]);
   });
 
+  it("drops stored entries without a usable id", () => {
+    const junk = [
+      { id: "" },
+      { id: 7 },
+      null,
+      { id: "ok" },
+    ] as unknown as readonly import("../extensions/openai-gateways").StoredModel[];
+    expect(storedToModels(junk, DEFAULTS).map((m) => m.id)).toEqual(["ok"]);
+  });
+
   it("preserves persisted overrides", () => {
     const [model] = storedToModels(
       [{ id: "qwen", name: "Qwen", reasoning: true, input: ["text", "image"], contextWindow: 131072, maxTokens: 8192 }],
@@ -132,15 +142,27 @@ describe("parseGateways", () => {
   it("handles a non-object config", () => {
     expect(parseGateways(null)).toEqual({ gateways: [], skipped: ["config is not an object"] });
     expect(parseGateways("junk").skipped).toEqual(["config is not an object"]);
+    expect(parseGateways([{ baseUrl: "http://x:1/v1" }]).skipped).toEqual(["config is not an object"]);
   });
 });
 
 describe("loadGateways", () => {
   it("returns no gateways when the config file is missing (fail open)", () => {
     const readFile = (path: string) => {
-      throw new Error(`ENOENT: ${path}`);
+      const error = new Error(`ENOENT: ${path}`) as NodeJS.ErrnoException;
+      error.code = "ENOENT";
+      throw error;
     };
     expect(loadGateways(readFile)).toEqual({ gateways: [], skipped: [] });
+  });
+
+  it("rethrows non-ENOENT read errors (fail loud)", () => {
+    const readFile = () => {
+      const error = new Error("EACCES: permission denied") as NodeJS.ErrnoException;
+      error.code = "EACCES";
+      throw error;
+    };
+    expect(() => loadGateways(readFile)).toThrow("EACCES");
   });
 
   it("throws with the path on unparseable JSON (fail loud)", () => {
@@ -156,12 +178,21 @@ describe("loadGateways", () => {
 
 describe("fetchProviderModels", () => {
   it("returns models from a 200 response", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => jsonResponse({ data: [{ id: "a", name: "A" }, { id: "b" }] })),
-    );
+    const fetchMock = vi.fn(async () => jsonResponse({ data: [{ id: "a", name: "A" }, { id: "b" }] }));
+    vi.stubGlobal("fetch", fetchMock);
     const models = await fetchProviderModels("http://yeti:8080/v1", new AbortController().signal, DEFAULTS);
     expect(models.map((m) => m.id)).toEqual(["a", "b"]);
+    expect(fetchMock).toHaveBeenCalledWith("http://yeti:8080/v1/models", expect.anything());
+  });
+
+  it("treats a non-array data payload as an empty catalog", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse({ data: "nope" })),
+    );
+    await expect(fetchProviderModels("http://yeti:8080/v1", new AbortController().signal, DEFAULTS)).rejects.toThrow(
+      "no models",
+    );
   });
 
   it("throws on a non-2xx response", async () => {
