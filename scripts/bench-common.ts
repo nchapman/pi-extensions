@@ -7,6 +7,16 @@
 
 import { tokenize, type RecallChunk } from "../extensions/recall";
 
+/**
+ * pi scopes sessions to the project cwd: the directory name is the cwd with
+ * every non-alphanumeric run collapsed to "-", wrapped in a dash on each
+ * side ("/Users/x/Code/proj" -> "--Users-x-Code-proj--"). Derived from cwd so
+ * benchmarks target this checkout on any machine; BENCH_DIR overrides.
+ */
+export function projectSessionDir(cwd: string, home: string, join: (...parts: string[]) => string): string {
+  return join(home, ".pi", "agent", "sessions", `-${cwd.replace(/[^A-Za-z0-9]+/g, "-")}-`);
+}
+
 /** Grep-able token: identifiers, paths, versions — anything you'd type into a keyword search. */
 export function isGreppy(t: string): boolean {
   return t.includes("_") || t.includes("/") || /\d/.test(t) || /^[a-z]+[A-Z]/.test(t) || t.length >= 7;

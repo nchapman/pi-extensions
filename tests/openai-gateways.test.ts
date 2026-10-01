@@ -90,9 +90,9 @@ describe("storedToModels", () => {
 describe("parseGateways", () => {
   it("parses a full config with defaults", () => {
     const { gateways, skipped } = parseGateways({
-      yeti: { baseUrl: "http://yeti:8080/v1" },
-      spark: {
-        baseUrl: "http://spark:8080/v1/",
+      "gw-a": { baseUrl: "http://gw-a:8080/v1" },
+      "gw-b": {
+        baseUrl: "http://gw-b:8080/v1/",
         apiKey: "secret",
         contextWindow: 131072,
         maxTokens: 8192,
@@ -102,16 +102,16 @@ describe("parseGateways", () => {
     expect(skipped).toEqual([]);
     expect(gateways).toHaveLength(2);
 
-    const [yeti, spark] = gateways;
-    expect(yeti).toMatchObject({ name: "yeti", baseUrl: "http://yeti:8080/v1", apiKey: "local" });
-    expect(yeti.seedModels).toEqual([]);
-    expect(yeti.contextWindow).toBe(262144);
+    const [gwA, gwB] = gateways;
+    expect(gwA).toMatchObject({ name: "gw-a", baseUrl: "http://gw-a:8080/v1", apiKey: "local" });
+    expect(gwA.seedModels).toEqual([]);
+    expect(gwA.contextWindow).toBe(262144);
 
-    expect(spark.baseUrl).toBe("http://spark:8080/v1"); // trailing slash stripped
-    expect(spark.apiKey).toBe("secret");
-    expect(spark.contextWindow).toBe(131072);
-    expect(spark.maxTokens).toBe(8192);
-    expect(spark.seedModels).toEqual([{ id: "a", name: "A" }]);
+    expect(gwB.baseUrl).toBe("http://gw-b:8080/v1"); // trailing slash stripped
+    expect(gwB.apiKey).toBe("secret");
+    expect(gwB.contextWindow).toBe(131072);
+    expect(gwB.maxTokens).toBe(8192);
+    expect(gwB.seedModels).toEqual([{ id: "a", name: "A" }]);
   });
 
   it("skips invalid entries with a reason instead of throwing", () => {
@@ -170,8 +170,8 @@ describe("loadGateways", () => {
   });
 
   it("validates parsed contents", () => {
-    const { gateways, skipped } = loadGateways(() => JSON.stringify({ yeti: { baseUrl: "http://yeti:8080/v1" } }));
-    expect(gateways.map((g) => g.name)).toEqual(["yeti"]);
+    const { gateways, skipped } = loadGateways(() => JSON.stringify({ "gw-a": { baseUrl: "http://gw-a:8080/v1" } }));
+    expect(gateways.map((g) => g.name)).toEqual(["gw-a"]);
     expect(skipped).toEqual([]);
   });
 });
@@ -180,9 +180,9 @@ describe("fetchProviderModels", () => {
   it("returns models from a 200 response", async () => {
     const fetchMock = vi.fn(async () => jsonResponse({ data: [{ id: "a", name: "A" }, { id: "b" }] }));
     vi.stubGlobal("fetch", fetchMock);
-    const models = await fetchProviderModels("http://yeti:8080/v1", new AbortController().signal, DEFAULTS);
+    const models = await fetchProviderModels("http://gw-a:8080/v1", new AbortController().signal, DEFAULTS);
     expect(models.map((m) => m.id)).toEqual(["a", "b"]);
-    expect(fetchMock).toHaveBeenCalledWith("http://yeti:8080/v1/models", expect.anything());
+    expect(fetchMock).toHaveBeenCalledWith("http://gw-a:8080/v1/models", expect.anything());
   });
 
   it("treats a non-array data payload as an empty catalog", async () => {
@@ -190,7 +190,7 @@ describe("fetchProviderModels", () => {
       "fetch",
       vi.fn(async () => jsonResponse({ data: "nope" })),
     );
-    await expect(fetchProviderModels("http://yeti:8080/v1", new AbortController().signal, DEFAULTS)).rejects.toThrow(
+    await expect(fetchProviderModels("http://gw-a:8080/v1", new AbortController().signal, DEFAULTS)).rejects.toThrow(
       "no models",
     );
   });
@@ -200,7 +200,7 @@ describe("fetchProviderModels", () => {
       "fetch",
       vi.fn(async () => jsonResponse({ error: "down" }, 503)),
     );
-    await expect(fetchProviderModels("http://yeti:8080/v1", new AbortController().signal, DEFAULTS)).rejects.toThrow(
+    await expect(fetchProviderModels("http://gw-a:8080/v1", new AbortController().signal, DEFAULTS)).rejects.toThrow(
       "503",
     );
   });
@@ -210,7 +210,7 @@ describe("fetchProviderModels", () => {
       "fetch",
       vi.fn(async () => jsonResponse({ data: [] })),
     );
-    await expect(fetchProviderModels("http://yeti:8080/v1", new AbortController().signal, DEFAULTS)).rejects.toThrow(
+    await expect(fetchProviderModels("http://gw-a:8080/v1", new AbortController().signal, DEFAULTS)).rejects.toThrow(
       "no models",
     );
   });
@@ -241,16 +241,16 @@ describe("registerGateways", () => {
   });
 
   const CONFIG = JSON.stringify({
-    yeti: { baseUrl: "http://yeti:8080/v1" },
-    spark: { baseUrl: "http://spark:8080/v1", models: [{ id: "seed" }] },
+    "gw-a": { baseUrl: "http://gw-a:8080/v1" },
+    "gw-b": { baseUrl: "http://gw-b:8080/v1", models: [{ id: "seed" }] },
     broken: "not an object",
   });
 
   it("registers every valid gateway and reports skipped entries", () => {
     const { pi, providers } = makePi();
     registerGateways(pi, () => CONFIG);
-    expect([...providers.keys()]).toEqual(["yeti", "spark"]);
-    expect(providers.get("yeti")!.baseUrl).toBe("http://yeti:8080/v1");
+    expect([...providers.keys()]).toEqual(["gw-a", "gw-b"]);
+    expect(providers.get("gw-a")!.baseUrl).toBe("http://gw-a:8080/v1");
     expect(console.error).toHaveBeenCalledWith(
       "openai-gateways: skipping config entry — broken: settings are not an object",
     );
@@ -264,7 +264,7 @@ describe("registerGateways", () => {
     const { pi, providers } = makePi();
     registerGateways(pi, () => CONFIG);
 
-    const models = (await providers.get("yeti")!.refreshModels({
+    const models = (await providers.get("gw-a")!.refreshModels({
       signal: new AbortController().signal,
       stored: undefined,
     })) as { id: string }[];
@@ -279,7 +279,7 @@ describe("registerGateways", () => {
     const { pi, providers } = makePi();
     registerGateways(pi, () => CONFIG);
 
-    const models = (await providers.get("spark")!.refreshModels({
+    const models = (await providers.get("gw-b")!.refreshModels({
       signal: new AbortController().signal,
       stored: { models: [{ id: "cached", contextWindow: 8192 }] },
     })) as { id: string }[];
@@ -296,7 +296,7 @@ describe("registerGateways", () => {
     const { pi, providers } = makePi();
     registerGateways(pi, () => CONFIG);
 
-    const models = (await providers.get("spark")!.refreshModels({
+    const models = (await providers.get("gw-b")!.refreshModels({
       signal: new AbortController().signal,
       stored: undefined,
     })) as { id: string }[];
@@ -312,7 +312,7 @@ describe("registerGateways", () => {
     registerGateways(pi, () => CONFIG);
 
     await expect(
-      providers.get("yeti")!.refreshModels({ signal: new AbortController().signal, stored: undefined }),
+      providers.get("gw-a")!.refreshModels({ signal: new AbortController().signal, stored: undefined }),
     ).rejects.toThrow("no cached or seeded catalog available");
   });
 });

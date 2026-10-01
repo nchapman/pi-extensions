@@ -1282,10 +1282,10 @@ describe("resolveAgentDef", () => {
 
   it("resolves an inline definition", () => {
     const agent = resolveAgentDef(list, {
-      agent_md: "---\nname: sql-auditor\nmodel: yeti/foo\ntools: read,bash\n---\nAudit SQL.",
+      agent_md: "---\nname: sql-auditor\nmodel: gw-a/foo\ntools: read,bash\n---\nAudit SQL.",
     });
     expect(agent.name).toBe("sql-auditor");
-    expect(agent.model).toBe("yeti/foo");
+    expect(agent.model).toBe("gw-a/foo");
     expect(agent.tools).toEqual(["read", "bash"]);
     expect(agent.instructions).toBe("Audit SQL.");
   });

@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Personal [pi](https://pi.dev) coding-agent extension package. pi loads this directory in-place (`pi install /Users/nchapman/Code/pi-extensions`, verify with `pi list`), so **there is no build step** — pi runs the TypeScript directly and edits go live on `/reload`. Extension API types come from `@earendil-works/pi-coding-agent`, pinned in devDependencies to the installed pi version.
+Personal [pi](https://pi.dev) coding-agent extension package. pi loads this directory in-place (`pi install ~/Code/pi-extensions`, verify with `pi list`), so **there is no build step** — pi runs the TypeScript directly and edits go live on `/reload`. Extension API types come from `@earendil-works/pi-coding-agent`, pinned in devDependencies to the installed pi version.
 
 ## Commands
 

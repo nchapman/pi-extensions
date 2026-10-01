@@ -89,6 +89,6 @@ pi loads the TypeScript directly; the dev dependency on `@earendil-works/pi-codi
 ## Wiring
 
 ```sh
-pi install /Users/nchapman/Code/pi-extensions   # one-time; loads in-place
+pi install ~/Code/pi-extensions          # one-time; loads in-place
 pi list                                          # verify
 ```

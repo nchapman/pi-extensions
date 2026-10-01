@@ -36,9 +36,9 @@ import {
   rankChunks,
   semanticRankedKeys,
 } from "../extensions/recall";
-import { fmt, metrics, sampleTargets, type Target } from "./bench-common";
+import { fmt, metrics, projectSessionDir, sampleTargets, type Target } from "./bench-common";
 
-const DEFAULT_DIR = path.join(os.homedir(), ".pi/agent/sessions/--Users-nchapman-Code-pi-extensions--");
+const DEFAULT_DIR = projectSessionDir(process.cwd(), os.homedir(), path.join);
 
 // Ranking policy mirrors recall's defaults (PI_RECALL_* unset).
 const POLICY = { foreignWeight: 0.5, halfLifeHours: 4, recencyFloor: 0.25 } as const;

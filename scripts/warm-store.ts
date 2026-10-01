@@ -18,6 +18,7 @@ import { describe, expect, it } from "vitest";
 import { EmbedClient } from "../lib/embed-client";
 import { RECORD_BYTES, VectorStore } from "../lib/vecstore";
 import { fsProjectReader, ProjectCorpusCache } from "../extensions/recall";
+import { projectSessionDir } from "./bench-common";
 
 // Gentle by design: this is an operational utility, never urgent — one core
 // here, and the taskpolicy wrapper in package.json keeps even that off the P-cores.
@@ -25,9 +26,7 @@ process.env.PI_RECALL_EMBED_THREADS ??= "1";
 
 describe("corpus warmer", () => {
   it("embeds every uncached chunk in the project corpus", { timeout: 60 * 60_000 }, async () => {
-    const dir =
-      process.env.BENCH_DIR?.trim() ||
-      path.join(os.homedir(), ".pi/agent/sessions/--Users-nchapman-Code-pi-extensions--");
+    const dir = process.env.BENCH_DIR?.trim() || projectSessionDir(process.cwd(), os.homedir(), path.join);
     const storeFile = path.join(dir, "recall-vectors.bin");
 
     const cache = new ProjectCorpusCache(fsProjectReader, 512 * 1024 * 1024);
