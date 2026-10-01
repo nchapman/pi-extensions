@@ -250,6 +250,24 @@ export type OnAdopted = (handle: AdoptedHandle<ChildRun>) => string;
 /** runChild's result: the child's outcome, or a marker carrying the background task id. */
 export type ChildOutcome = ChildRun | { adopted: true; id: string };
 
+/**
+ * Children inherit the parent chat's model unless something more explicit pins
+ * one: the tool call's model param first, then the agent definition's model.
+ * Without inheritance a child falls back to pi's global default — a different
+ * (and possibly metered) model than the conversation that asked for the work.
+ */
+export function resolveChildModel(
+  param: string | undefined,
+  agentModel: string | undefined,
+  sessionModel: { provider?: string; id?: string } | null | undefined,
+): string | undefined {
+  if (param) return param;
+  if (agentModel) return agentModel;
+  const provider = sessionModel?.provider;
+  const id = sessionModel?.id;
+  return typeof provider === "string" && typeof id === "string" ? `${provider}/${id}` : undefined;
+}
+
 export function buildChildArgs(agent: AgentDef, task: string, model?: string): string[] {
   const args = [
     "-p",
@@ -720,7 +738,12 @@ function reuseText(context: { lastComponent?: unknown } | undefined): Text {
 }
 
 const taskField = Type.String({ description: "The task to delegate, with full context" });
-const modelField = Type.Optional(Type.String({ description: "Model override (provider/id)" }));
+const modelField = Type.Optional(
+  Type.String({
+    description:
+      "Model override (provider/id). Defaults to the agent definition's model, then the parent chat's current model.",
+  }),
+);
 const backgroundField = Type.Optional(
   Type.Boolean({
     description:
@@ -811,7 +834,13 @@ Subagents still running after ~2 minutes move to the background: the tool return
         options.onAdopted = (handle: AdoptedHandle<ChildRun>) =>
           adoptSubagentTask(registry, agent.name, handle, ctx?.sessionManager?.getSessionDir());
       }
-      const run = await runChild(agent, params.task, params.model, options, spawnFn);
+      const run = await runChild(
+        agent,
+        params.task,
+        resolveChildModel(params.model, agent.model, ctx?.model),
+        options,
+        spawnFn,
+      );
       if ("adopted" in run) {
         return {
           content: [{ type: "text", text: backgroundedNotice(agent.name, run.id) }],
@@ -883,7 +912,7 @@ Slow tasks background individually after ~2 minutes; each result is then deliver
             options.onAdopted = (handle: AdoptedHandle<ChildRun>) =>
               adoptSubagentTask(registry, agent.name, handle, sessionDir);
           }
-          return runChild(agent, t.task, t.model, options, spawnFn);
+          return runChild(agent, t.task, resolveChildModel(t.model, agent.model, ctx?.model), options, spawnFn);
         }),
         parseConcurrency(process.env),
       );

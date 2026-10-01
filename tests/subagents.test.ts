@@ -25,6 +25,7 @@ import {
   renderSubagentCall,
   renderSubagentsCall,
   resolveAgentDef,
+  resolveChildModel,
   runChild,
   runWithLimit,
   splitFrontmatter,
@@ -326,6 +327,25 @@ describe("buildChildArgs", () => {
     const args = buildChildArgs({ ...AGENT, model: "agent-model", thinking: "high" }, "t", "caller-model");
     expect(args[args.indexOf("--model") + 1]).toBe("caller-model");
     expect(args[args.indexOf("--thinking") + 1]).toBe("high");
+  });
+});
+
+describe("resolveChildModel", () => {
+  it("inherits the parent chat's model when nothing pins one", () => {
+    expect(resolveChildModel(undefined, undefined, { provider: "zai", id: "glm-5.3" })).toBe("zai/glm-5.3");
+  });
+
+  it("the tool call's model param outranks the agent definition, which outranks the session", () => {
+    const session = { provider: "zai", id: "glm-5.3" };
+    expect(resolveChildModel("param-model", "agent-model", session)).toBe("param-model");
+    expect(resolveChildModel(undefined, "agent-model", session)).toBe("agent-model");
+  });
+
+  it("falls back to pi's default when no model is resolvable", () => {
+    expect(resolveChildModel(undefined, undefined, undefined)).toBeUndefined();
+    // A partial session model cannot form provider/id — never emit a bogus flag.
+    expect(resolveChildModel(undefined, undefined, { id: "glm-5.3" })).toBeUndefined();
+    expect(resolveChildModel(undefined, undefined, { provider: "zai" })).toBeUndefined();
   });
 });
 
@@ -1323,7 +1343,13 @@ describe("registerSubagentTools", () => {
     const tools = new Map<
       string,
       {
-        execute: (id: string, params: unknown, signal?: AbortSignal) => Promise<unknown>;
+        execute: (
+          id: string,
+          params: unknown,
+          signal?: AbortSignal,
+          onUpdate?: unknown,
+          ctx?: unknown,
+        ) => Promise<unknown>;
         renderCall?: (args: never, theme: never, context?: never) => unknown;
         renderResult?: (result: never, options: never, theme: never, context?: never) => unknown;
       }
@@ -1331,7 +1357,13 @@ describe("registerSubagentTools", () => {
     const pi = {
       registerTool: (t: {
         name: string;
-        execute: (id: string, params: unknown, signal?: AbortSignal) => Promise<unknown>;
+        execute: (
+          id: string,
+          params: unknown,
+          signal?: AbortSignal,
+          onUpdate?: unknown,
+          ctx?: unknown,
+        ) => Promise<unknown>;
         renderCall?: (args: never, theme: never, context?: never) => unknown;
         renderResult?: (result: never, options: never, theme: never, context?: never) => unknown;
       }) => tools.set(t.name, t),
@@ -1376,6 +1408,45 @@ describe("registerSubagentTools", () => {
     );
     const result = (await tools.get("subagent")!.execute("1", { task: "t" })) as { usage?: ChildUsage };
     expect(result.usage).toEqual(USAGE({ output: 40, totalTokens: 140 }));
+  });
+
+  it("children inherit the parent chat's model, and the param still overrides", async () => {
+    const calls: string[][] = [];
+    const { pi, tools } = makePi();
+    registerSubagentTools(
+      pi as never,
+      mkdtempSync(join(tmpdir(), "agents-")),
+      spawnReturning([jsonLine("done")], calls),
+    );
+    const ctx = { model: { provider: "zai", id: "glm-5.3" } };
+    await tools.get("subagent")!.execute("1", { task: "t" }, undefined, undefined, ctx);
+    expect(calls[0][calls[0].indexOf("--model") + 1]).toBe("zai/glm-5.3");
+
+    calls.length = 0;
+    await tools.get("subagent")!.execute("1", { task: "t", model: "yeti/other" }, undefined, undefined, ctx);
+    expect(calls[0][calls[0].indexOf("--model") + 1]).toBe("yeti/other");
+
+    // No session model (ctx absent) and no pins: no --model flag, pi's default applies.
+    calls.length = 0;
+    await tools.get("subagent")!.execute("1", { task: "t" });
+    expect(calls[0].includes("--model")).toBe(false);
+  });
+
+  it("batch children inherit the parent chat's model per task", async () => {
+    const calls: string[][] = [];
+    const { pi, tools } = makePi();
+    registerSubagentTools(
+      pi as never,
+      mkdtempSync(join(tmpdir(), "agents-")),
+      spawnReturning([jsonLine("done")], calls),
+    );
+    const ctx = { model: { provider: "yeti", id: "ornith-1.5" } };
+    await tools
+      .get("subagents")!
+      .execute("1", { tasks: [{ task: "a" }, { task: "b", model: "zai/glm-5.3" }] }, undefined, undefined, ctx);
+    expect(calls).toHaveLength(2);
+    expect(calls[0][calls[0].indexOf("--model") + 1]).toBe("yeti/ornith-1.5");
+    expect(calls[1][calls[1].indexOf("--model") + 1]).toBe("zai/glm-5.3");
   });
 
   it("omits usage when no child reported any", async () => {
