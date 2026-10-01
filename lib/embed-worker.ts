@@ -41,6 +41,11 @@ type Dtype = "fp32" | "fp16" | "q8" | "q4" | "q4f16";
 const DTYPES = new Set<Dtype>(["fp32", "fp16", "q8", "q4", "q4f16"]);
 const rawDtype = process.env.PI_RECALL_EMBED_DTYPE?.trim() as Dtype | undefined;
 const DTYPE: Dtype = rawDtype !== undefined && DTYPES.has(rawDtype) ? rawDtype : "q8";
+/** Cap onnxruntime's intra-op thread pool (unset = the runtime's default, all
+ * cores). Background/operational runs set 1 so embedding stays polite —
+ * single-threaded inference is ~2–3× slower but invisible to the foreground. */
+const rawThreads = Number(process.env.PI_RECALL_EMBED_THREADS);
+const THREADS = Number.isInteger(rawThreads) && rawThreads >= 1 && rawThreads <= 32 ? rawThreads : undefined;
 
 /** Model output as produced by transformers.js: pooled (sentence_embedding,
  * Gemma-style), per-token (last_hidden_state, LLM-style embedders like
@@ -72,7 +77,10 @@ async function ensureModel(): Promise<void> {
       env.cacheDir = MODEL_DIR;
       env.logLevel = LogLevel.ERROR; // progress/logging would corrupt the JSONL stdout channel
       const [m, t] = await Promise.all([
-        AutoModel.from_pretrained(MODEL_ID, { dtype: DTYPE }),
+        AutoModel.from_pretrained(MODEL_ID, {
+          dtype: DTYPE,
+          ...(THREADS !== undefined ? { session_options: { intraOpNumThreads: THREADS } } : {}),
+        }),
         AutoTokenizer.from_pretrained(MODEL_ID),
       ]);
       model = m as NonNullable<typeof model>;

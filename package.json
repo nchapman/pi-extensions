@@ -37,6 +37,7 @@
     "format": "prettier --write extensions lib tests",
     "postinstall": "node scripts/fetch-model.mjs",
     "test": "vitest run",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "warm:store": "taskpolicy -c background vitest run --config scripts/warm-store.config.ts"
   }
 }
