@@ -4,16 +4,17 @@
  * A bare child process, spawned by lib/embed-client.ts and run directly by
  * Node's TypeScript stripping (no relative imports on purpose — the file must
  * execute standalone). It owns whichever ONNX embedding model it is pointed
- * at (default EmbeddingGemma; PI_RECALL_EMBED_MODEL selects any
- * transformers.js-compatible id or local dir): loading costs ~1s warm and
- * running parks ~1.7GB of non-returnable ONNX arena in the process, which is
+ * (jina-v5-text-nano, q8): loading costs ~1s warm and
+ * running parks its ONNX arena in the process, which is
  * precisely why it is a child — memory is reclaimed on exit and a native
  * crash cannot take pi down. The parent never imports transformers.js.
  *
  * The worker is a pure model runner: it embeds the text it is given, as-is.
- * Model-specific query/document prefixes live client-side
- * (lib/embed-client.ts presetFor) so they stay unit-testable — this file
- * cannot be imported by tests without spawning the stdin listener.
+ * The model's Query:/Document: prefixes live client-side (lib/embed-client.ts)
+ * so they stay unit-testable — this file cannot be imported by tests without
+ * spawning the stdin listener. Output pooling handles the three shapes real
+ * exports produce (pooled, per-token, custom-named); the nano's EuroBERT
+ * export is per-token (last_hidden_state, last-token pooled).
  *
  * Contract (JSONL on stdin/stdout, one message per line):
  *   parent → child:
@@ -32,8 +33,8 @@
  * node_modules where an npm install would wipe it.
  */
 
-const DEFAULT_MODEL_ID = "onnx-community/embeddinggemma-300m-ONNX";
-const MODEL_ID = process.env.PI_RECALL_EMBED_MODEL?.trim() || DEFAULT_MODEL_ID;
+/** The one embedding model — jina v5-text-nano (retrieval adapter), q8 ONNX (~212MB). */
+const MODEL_ID = "jinaai/jina-embeddings-v5-text-nano-retrieval";
 const MODEL_DIR = process.env.PI_RECALL_MODEL_DIR?.trim() || `${process.env.HOME ?? "~"}/.pi/agent/models`;
 /** dtype whitelist mirrors transformers.js' union, narrowed to the EmbeddingGemma builds worth using. */
 type Dtype = "fp32" | "fp16" | "q8" | "q4" | "q4f16";

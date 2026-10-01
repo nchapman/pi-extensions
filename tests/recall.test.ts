@@ -67,8 +67,6 @@ const CONFIG: RecallConfig = {
   projectMaxBytes: 64 * 1024 * 1024,
   embedEnabled: false, // per-test: hybrid tests opt in with injected fakes — never a real worker
   embedDtype: "q8",
-  embedModel: "onnx-community/embeddinggemma-300m-ONNX",
-  embedDims: 768,
   embedWeight: 0.7,
   embedForeignMaxBytes: 32 * 1024 * 1024,
   embedModelDir: "/virtual/models",
@@ -1649,7 +1647,7 @@ describe("embed config", () => {
     const config = configFromEnv({});
     expect(config.embedEnabled).toBe(true);
     expect(config.embedDtype).toBe("q8");
-    expect(config.embedWeight).toBe(0.3);
+    expect(config.embedWeight).toBe(0.15);
     expect(config.embedForeignMaxBytes).toBe(32 * 1024 * 1024);
     expect(config.embedModelDir).toBe(`${process.env.HOME}/.pi/agent/models`);
   });
@@ -1658,15 +1656,10 @@ describe("embed config", () => {
     expect(configFromEnv({ PI_RECALL_EMBED: "0" }).embedEnabled).toBe(false);
   });
 
-  it("PI_RECALL_EMBED_MODEL selects the model; dims follow the preset unless overridden", () => {
-    const base = configFromEnv({});
-    expect(base.embedModel).toBe("onnx-community/embeddinggemma-300m-ONNX");
-    expect(base.embedDims).toBe(768);
-    const qwen = configFromEnv({ PI_RECALL_EMBED_MODEL: "onnx-community/Qwen3-Embedding-0.6B-ONNX" });
-    expect(qwen.embedModel).toBe("onnx-community/Qwen3-Embedding-0.6B-ONNX");
-    expect(qwen.embedDims).toBe(1024); // preset, no env needed
-    expect(configFromEnv({ PI_RECALL_EMBED_MODEL: "x", PI_RECALL_EMBED_DIMS: "9999" }).embedDims).toBe(4096); // clamped
-    expect(configFromEnv({ PI_RECALL_EMBED_MODEL: "x", PI_RECALL_EMBED_DIMS: "128" }).embedDims).toBe(128);
+  it("PI_RECALL_EMBED_WEIGHT defaults to the binary-tuned 0.15 and clamps", () => {
+    expect(configFromEnv({}).embedWeight).toBe(0.15);
+    expect(configFromEnv({ PI_RECALL_EMBED_WEIGHT: "0.4" }).embedWeight).toBe(0.4);
+    expect(configFromEnv({ PI_RECALL_EMBED_WEIGHT: "9" }).embedWeight).toBe(2);
   });
 
   it("invalid dtype falls back with an explicit error; weights clamp", () => {

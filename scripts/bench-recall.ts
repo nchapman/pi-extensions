@@ -13,13 +13,11 @@
  *
  * Usage: npm run bench:recall — with optional env: BENCH_DIR=<sessionDir>
  *       BENCH_TARGETS=50 BENCH_CORPUS=900 BENCH_FRESH=1 BENCH_SNAPSHOT=1
- *       BENCH_MODEL=<HF id or local dir> (default: EmbeddingGemma)
  * Not part of `npm test` (separate vitest config); spawns the real embed
  * worker. The corpus is snapshotted into /tmp once (BENCH_SNAPSHOT=1
- * refreshes) so every run — and every model comparison — scores the exact
- * same frozen targets; the live session dir keeps growing, which made
- * earlier runs wobble by points. Vector cache lives in /tmp, one file per
- * model (dims differ; files are dims-authoritative).
+ * refreshes) so every run scores the exact same frozen targets; the live
+ * session dir keeps growing, which made earlier runs wobble by points.
+ * Vector cache lives in /tmp so reruns are fast.
  */
 
 import { copyFile, mkdir, readdir, stat } from "node:fs/promises";
@@ -28,7 +26,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { DEFAULT_EMBED_MODEL, EmbedClient, presetFor } from "../lib/embed-client";
+import { EmbedClient } from "../lib/embed-client";
 import { VectorStore } from "../lib/vecstore";
 import {
   archiveFrontier,
@@ -67,11 +65,8 @@ describe("recall retrieval benchmark", () => {
     const wantTargets = arg("targets", 50);
     const corpusCap = arg("corpus", 900);
     const fresh = process.env.BENCH_FRESH === "1";
-    const model = process.env.BENCH_MODEL?.trim() || DEFAULT_EMBED_MODEL;
-    const preset = presetFor(model);
-    const slug = model.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "").slice(-48);
 
-    // -- corpus: frozen snapshot (stable targets across runs and models) -----
+    // -- corpus: frozen snapshot (stable targets across runs) --------------
     // The live session dir grows while we work; a frozen copy makes run-to-run
     // and model-to-model numbers comparable. The snapshot dir is keyed to the
     // SOURCE dir (path hash) so pointing BENCH_DIR at another project can never
@@ -106,23 +101,17 @@ describe("recall retrieval benchmark", () => {
     expect(corpus.length, `no corpus chunks under ${dir}`).toBeGreaterThan(100);
     console.log(`\ncorpus: ${corpus.length} chunks / ${corpora.length} sessions (${snapDir}), ${unreadable} unreadable`);
 
-    // -- embeddings: real worker, /tmp cache per model ------------------------
-    // One cache file per model: files are dims-authoritative (768/1024/896),
-    // so sharing would just reset on every model switch.
-    const benchVec = path.join(os.tmpdir(), `recall-bench-vectors-${slug}.bin`);
+    // -- embeddings: real worker, /tmp cache ----------------------------------
+    const benchVec = path.join(os.tmpdir(), "recall-bench-vectors.bin");
     const prodVec = path.join(dir, "recall-vectors.bin");
-    if (!fresh && model === DEFAULT_EMBED_MODEL && !(await stat(benchVec).then(() => true, () => false)))
+    if (!fresh && !(await stat(benchVec).then(() => true, () => false)))
       await copyFile(prodVec, benchVec).catch(() => {});
-    const store = await VectorStore.open(benchVec, { dims: preset.dims, model });
+    const store = await VectorStore.open(benchVec);
     const pending = corpus.filter((c) => !store.has([c.key]).has(c.key));
     const client = new EmbedClient({
       workerPath: fileURLToPath(new URL("../lib/embed-worker.ts", import.meta.url)),
-      model,
       dtype: process.env.PI_RECALL_EMBED_DTYPE ?? "q8",
       modelDir: process.env.PI_RECALL_MODEL_DIR ?? path.join(os.homedir(), ".pi/agent/models"),
-      dims: preset.dims,
-      queryPrefix: preset.queryPrefix,
-      docPrefix: preset.docPrefix,
       embedBaseTimeoutMs: 30_000,
       embedPerItemMs: 5_000,
       queryTimeoutMs: 30_000,
@@ -209,7 +198,7 @@ describe("recall retrieval benchmark", () => {
     console.log("\n=== embedWeight sweep (split condition) ===");
     for (const w of [0.15, 0.25, 0.3, 0.5, 0.7, 1.0]) {
       const ranks = await Promise.all(targets.map((t) => evaluate(t, "split", w)));
-      console.log(`weight ${w.toFixed(2)}  ${fmt(metrics(ranks))}${w === 0.3 ? "   ← current default" : ""}`);
+      console.log(`weight ${w.toFixed(2)}  ${fmt(metrics(ranks))}${w === 0.15 ? "   ← current default" : ""}`);
     }
 
     await client.dispose();

@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { EmbedClient, presetFor, type SpawnFn, type WorkerChild } from "../lib/embed-client";
+import { EmbedClient, type SpawnFn, type WorkerChild } from "../lib/embed-client";
 import { EMBED_DIMS } from "../lib/vecstore";
 
 class FakeChild implements WorkerChild {
@@ -376,34 +376,10 @@ describe("EmbedClient over a real child process", () => {
   });
 });
 
-describe("presetFor", () => {
-  it("resolves prefixes and dims by model id substring", () => {
-    expect(presetFor(undefined)).toEqual({
-      queryPrefix: "task: search result | query: ",
-      docPrefix: "title: none | text: ",
-      dims: 768,
-    });
-    expect(presetFor("")).toEqual(presetFor(undefined)); // trimmed-empty ids resolve to the default
-    expect(presetFor("onnx-community/Qwen3-Embedding-0.6B-ONNX").dims).toBe(1024);
-    expect(presetFor("onnx-community/Qwen3-Embedding-0.6B-ONNX").queryPrefix).toContain("Instruct:");
-    expect(presetFor("jina-code-embeddings-0.5b").docPrefix).toBe("Candidate answer:\n");
-    expect(presetFor("jina-code-embeddings-0.5b").dims).toBe(896);
-    expect(presetFor("jinaai/jina-embeddings-v5-text-nano-retrieval")).toEqual({
-      queryPrefix: "Query: ",
-      docPrefix: "Document: ",
-      dims: 768,
-    });
-    expect(presetFor("some-unknown-model")).toEqual({ queryPrefix: "", docPrefix: "", dims: 768 });
-  });
-});
-
 describe("model prefixes on the wire", () => {
   it("query and embed texts carry the model's prefixes", async () => {
     const child = new FakeChild();
-    const client = makeClient(child, [], {
-      model: "jina-code-embeddings-0.5b",
-      dims: 896,
-    });
+    const client = makeClient(child);
     client.start();
     const origWrite = child.stdin.write.bind(child.stdin);
     child.stdin.write = (data: string) => {
@@ -423,10 +399,10 @@ describe("model prefixes on the wire", () => {
     };
     await client.query("how does compaction gate?");
     const qline = JSON.parse(child.stdinWrites[0]) as { text: string };
-    expect(qline.text).toBe("Find the most relevant answer given the following question:\nhow does compaction gate?");
+    expect(qline.text).toBe("Query: how does compaction gate?");
     await client.embed([{ key: "k", text: "compact() reclaims dead bytes" }]);
     const eline = JSON.parse(child.stdinWrites[1]) as { items: Array<{ text: string }> };
-    expect(eline.items[0]?.text).toBe("Candidate answer:\ncompact() reclaims dead bytes");
+    expect(eline.items[0]?.text).toBe("Document: compact() reclaims dead bytes");
     client.dispose();
   });
 });
@@ -471,16 +447,5 @@ describe("wrong-width replies surface, fail open", () => {
     expect(await client.query("t")).toBeUndefined();
     expect(notices.some((n) => n.includes("8-wide"))).toBe(true);
     client.dispose();
-  });
-
-  it("spawns with PI_RECALL_EMBED_MODEL always set (empty reads as default in the worker)", async () => {
-    const seen: string[] = [];
-    const spawnFn: SpawnFn = (_p, env) => {
-      seen.push(env.PI_RECALL_EMBED_MODEL ?? "<unset>");
-      return new FakeChild();
-    };
-    new EmbedClient({ workerPath: "/w", dtype: "q8", modelDir: "/m", spawnFn }).start();
-    new EmbedClient({ workerPath: "/w", dtype: "q8", modelDir: "/m", spawnFn, model: "some-model" }).start();
-    expect(seen).toEqual(["", "some-model"]);
   });
 });
