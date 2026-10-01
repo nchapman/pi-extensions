@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_COMPACTION_SETTINGS } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { chunkKey } from "../lib/vecstore";
+import { chunkKey, KEY_HEX } from "../lib/vecstore";
 import {
   buildArchiveChunks,
   buildFileCorpus,
@@ -1138,8 +1138,13 @@ function fakeEmbedSeam(overrides: { queryVector?: Float32Array } = {}) {
 }
 
 function fakeVectorStore(seed: Array<{ key: string; vector: Float32Array }> = []) {
+  const RECORD_BYTES = KEY_HEX / 2 + VDIM * 4; // mirrors the real store's record size
   const vectors = new Map(seed.map((s) => [s.key, s.vector] as const));
-  const calls = { added: [] as Array<{ key: string; vector: Float32Array }>, closed: 0 };
+  const calls = {
+    added: [] as Array<{ key: string; vector: Float32Array }>,
+    closed: 0,
+    compactions: [] as Array<Set<string>>,
+  };
   const store = {
     calls,
     vectors,
@@ -1147,6 +1152,16 @@ function fakeVectorStore(seed: Array<{ key: string; vector: Float32Array }> = []
     async add(items: readonly { key: string; vector: Float32Array }[]) {
       calls.added.push(...items);
       for (const item of items) vectors.set(item.key, item.vector);
+    },
+    async compact(keep: ReadonlySet<string>) {
+      calls.compactions.push(new Set(keep));
+      let reclaimed = 0;
+      for (const key of vectors.keys())
+        if (!keep.has(key)) {
+          vectors.delete(key);
+          reclaimed++;
+        }
+      return reclaimed * RECORD_BYTES;
     },
     topK(query: Float32Array, candidates: Iterable<string>, k: number) {
       const hits: Array<{ key: string; similarity: number }> = [];
@@ -1269,8 +1284,12 @@ describe("semantic hybrid search", () => {
 });
 
 describe("embedding catch-up wiring", () => {
-  function catchUpSetup(configOverrides: Partial<RecallConfig> = {}, reader: ProjectReader = fsProjectReader) {
-    const store = fakeVectorStore();
+  function catchUpSetup(
+    configOverrides: Partial<RecallConfig> = {},
+    reader: ProjectReader = fsProjectReader,
+    seed: Array<{ key: string; vector: Float32Array }> = [],
+  ) {
+    const store = fakeVectorStore(seed);
     const embed = fakeEmbedSeam();
     const openedFiles: string[] = [];
     const { pi, events } = makePi();
@@ -1402,6 +1421,77 @@ describe("embedding catch-up wiring", () => {
     await fire(budgeted.events, "session_start", withDir);
     await flush();
     expect(budgeted.embed.calls.embeds[0].some((i) => i.text.includes("foreign embed me"))).toBe(true);
+  });
+
+  it("compaction keeps the full corpus view, not the embed budget", async () => {
+    const sid = "1e2dcafe-aaaa-bbbb-cccc-dddddddddddd";
+    const foreignText = "foreign chunk beyond the embed budget but inside the corpus view ".repeat(40); // <chunkChars, single chunk
+    const line = userLine(foreignText); // one id for both the file and the key derivation
+    const f1 = sessionFile({ id: sid, entries: [line] }); // ~2.9KB file: alone exceeds a 1KB embed budget
+    const { reader, dir } = fakeReader([f1]);
+    const { ctx } = hybridCtx();
+    const withDir = sessionCtx({
+      branch: ctx.sessionManager.getBranch(),
+      contextEntries: [ctx.sessionManager.getBranch()[2], ctx.sessionManager.getBranch()[3]],
+      sessionDir: dir,
+      sessionFile: `${dir}/current.jsonl`,
+    });
+    const foreignEntry = JSON.parse(line) as { id: string };
+    const foreignKey = chunkKey(sid, foreignEntry.id, 0, 0, foreignText);
+    const deadKey = "0123456789abcdef0123456789abcdef"; // a deleted session's vector
+    const setup = catchUpSetup({ defaultScope: "project", embedForeignMaxBytes: 1024 }, reader, [
+      { key: foreignKey, vector: vec(1) },
+      { key: deadKey, vector: vec(1) },
+    ]);
+    await fire(setup.events, "session_start", withDir);
+    await flush();
+    // The budget skipped the foreign file for embedding…
+    expect(setup.embed.calls.embeds.flat().some((i) => i.key === foreignKey)).toBe(false);
+    // …but compaction kept its vector anyway, dropped only the dead key, and kept current-session chunks live.
+    expect(setup.store.calls.compactions).toHaveLength(1);
+    const keep = setup.store.calls.compactions[0];
+    expect(keep.has(foreignKey)).toBe(true);
+    expect(keep.has(deadKey)).toBe(false);
+    expect([...keep].length).toBeGreaterThan(1); // current-session archive chunks are live too
+    expect(setup.store.vectors.has(deadKey)).toBe(false);
+    expect(setup.store.vectors.has(foreignKey)).toBe(true);
+  });
+
+  it("a corpus refresh failure skips compaction without breaking the session", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const f1 = sessionFile({ entries: [userLine("foreign text")] });
+      const { reader } = fakeReader([f1]);
+      reader.listJsonlFiles = async () => {
+        throw new Error("dir gone");
+      };
+      const { ctx } = hybridCtx();
+      const setup = catchUpSetup({ defaultScope: "project" }, reader, [{ key: "0".repeat(32), vector: vec(1) }]);
+      await fire(setup.events, "session_start", ctx);
+      await flush();
+      expect(setup.store.calls.compactions).toHaveLength(0); // fail open, no rewrite
+      expect(setup.embed.calls.embeds.length).toBeGreaterThanOrEqual(1); // catch-up still ran
+      expect(err).toHaveBeenCalled();
+    } finally {
+      err.mockRestore();
+    }
+  });
+
+  it("session scope never compacts — its corpus view would drop every foreign vector", async () => {
+    const f1 = sessionFile({ entries: [userLine("foreign vector kept through a session-scope detour")] });
+    const { reader, dir } = fakeReader([f1]);
+    const { ctx } = hybridCtx();
+    const withDir = sessionCtx({
+      branch: ctx.sessionManager.getBranch(),
+      contextEntries: [ctx.sessionManager.getBranch()[2], ctx.sessionManager.getBranch()[3]],
+      sessionDir: dir,
+      sessionFile: `${dir}/current.jsonl`,
+    });
+    const seeded = catchUpSetup({ defaultScope: "session" }, reader, [{ key: "0".repeat(32), vector: vec(1) }]);
+    await fire(seeded.events, "session_start", withDir);
+    await flush();
+    expect(seeded.store.calls.compactions).toHaveLength(0);
+    expect(seeded.store.vectors.has("0".repeat(32))).toBe(true);
   });
 
   it("skips foreign embedding when the scope is session-only", async () => {

@@ -642,6 +642,8 @@ const EMBED_BATCH_LIMIT = 128;
 export interface VectorStoreLike {
   has(keys: readonly string[]): Set<string>;
   add(items: readonly { key: string; vector: Float32Array }[]): Promise<void>;
+  /** Reclaim records whose key is not in `keep`; returns bytes reclaimed (self-gated, 0 = no-op). */
+  compact(keep: ReadonlySet<string>): Promise<number>;
   topK(query: Float32Array, candidates: Iterable<string>, k: number): VectorHit[];
   close(): Promise<void>;
 }
@@ -1235,6 +1237,38 @@ export function registerRecallTool(
     }
   };
 
+  /**
+   * Reclaim dead vector bytes so the store tracks what search can see. Live
+   * keys = the current archive plus the ENTIRE post-LRU foreign corpus —
+   * not the embed-budgeted subset, or BM25-visible foreign files would lose
+   * their semantic side to a cost-control budget they were never meant to
+   * follow. Session scope never compacts: its corpus view excludes foreign
+   * files, and dropping their vectors on a transient scope change would
+   * re-embed the whole project on the way back to project scope.
+   */
+  const compactIfNeeded = async (ctx: ExtensionContext, store: VectorStoreLike): Promise<void> => {
+    if (config.defaultScope !== "project") return;
+    try {
+      const sm = ctx.sessionManager;
+      // Always refresh: unlike catch-up, compaction needs the full foreign
+      // view even when the embed budget is zero.
+      await corpusCache.refresh(sm.getSessionDir(), sm.getSessionFile());
+      const live = new Set(
+        buildArchiveChunks(sm.getBranch(), visibleEntryIds(sm.buildSessionProjection()), sm.getSessionId(), config).map(
+          (c) => c.key,
+        ),
+      );
+      for (const corpus of corpusCache.list()) for (const chunk of corpus.chunks) live.add(chunk.key);
+      const reclaimed = await store.compact(live);
+      if (reclaimed > 0)
+        console.error(
+          `recall: compacted vector cache, reclaimed ${(reclaimed / (1024 * 1024)).toFixed(1)} MB of dead vectors`,
+        );
+    } catch (err) {
+      console.error(`recall: vector cache compaction skipped: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
   pi.on("session_start", (_event, ctx) => {
     reminderPending = false;
     autoCompactInFlight = false;
@@ -1252,6 +1286,9 @@ export function registerRecallTool(
         vectorSupport = { store, embed };
         embed.start();
         await catchUp(ctx);
+        // After catch-up so the corpus cache is warm and fresh embeds are
+        // already on disk — they are live keys, so the rewrite keeps them.
+        await compactIfNeeded(ctx, store);
       } catch (err) {
         vectorSupport = null;
         console.error(`recall: semantic search unavailable: ${err instanceof Error ? err.message : String(err)}`);

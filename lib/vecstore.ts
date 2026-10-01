@@ -11,17 +11,20 @@
  * "BM25 covers it," never to wrong search results. Concurrent writers (two
  * pi sessions in one project dir) append fixed-size records in single
  * write() calls, which local filesystems serialize; the load-time tear check
- * backstops that assumption. Orphaned keys (rewound branches, deleted
- * sessions) are harmless dead bytes and are deliberately not collected —
- * compaction would be real machinery for ~3KB per embedded chunk.
+ * backstops that assumption.
  *
  * Vector bytes are stored in platform endianness (every platform pi runs on
  * is little-endian); the header records the format so a mismatch resets
- * rather than misreads.
+ * rather than misreads. Dead bytes (rewound branches, deleted sessions,
+ * edited text) are reclaimed by compact() — the caller passes the keys its
+ * corpus view can still see, and the rewrite is self-gated so it only runs
+ * when dead bytes dominate the file (amortized O(1) rewrites per appended
+ * byte). Until that gate trips, dead records are harmless: invisible to
+ * search, ~3KB each.
  */
 
 import { createHash } from "node:crypto";
-import { mkdir, open } from "node:fs/promises";
+import { mkdir, open, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 
 export const EMBED_DIMS = 768;
@@ -64,9 +67,14 @@ export interface VectorHit {
 export class VectorStore {
   private vectors = new Map<string, Float32Array>();
   private file: Awaited<ReturnType<typeof open>> | null = null;
+  private readonly filePath: string;
+  // Set synchronously at close() so an in-flight compact() observes it before
+  // reopening — otherwise compact resurrects a handle nobody owns (fd leak).
+  private closed = false;
 
-  private constructor(file: Awaited<ReturnType<typeof open>>) {
+  private constructor(file: Awaited<ReturnType<typeof open>>, filePath: string) {
     this.file = file;
+    this.filePath = filePath;
   }
 
   /** Records currently cached. */
@@ -84,7 +92,7 @@ export class VectorStore {
   static async open(file: string): Promise<VectorStore> {
     await mkdir(path.dirname(file), { recursive: true });
     const handle = await open(file, "a+");
-    const store = new VectorStore(handle);
+    const store = new VectorStore(handle, file);
     const buf = await handle.readFile();
     if (!store.headerMatches(buf)) {
       if (buf.length > 0)
@@ -120,12 +128,7 @@ export class VectorStore {
   /** Rewrite the file from scratch: truncate first — the handle is append-mode, so the header write then lands at offset 0. */
   private async reset(): Promise<void> {
     await this.file!.truncate(0);
-    const header = Buffer.alloc(HEADER_BYTES);
-    header.write(MAGIC, 0, "latin1");
-    header[4] = FORMAT_VERSION;
-    header.writeUInt16LE(EMBED_DIMS, 5);
-    header[7] = KEY_BYTES;
-    await this.file!.write(header, 0, HEADER_BYTES);
+    await this.file!.write(makeHeader(), 0, HEADER_BYTES);
   }
 
   /** Which of `keys` are already cached. */
@@ -164,7 +167,91 @@ export class VectorStore {
   }
 
   /**
-   * Top-K keys by cosine similarity to the query, restricted to `candidates`
+   * Reclaim dead bytes: rewrite the file keeping only records whose key is in
+   * `keep`, preserving order. Self-gated — returns 0 without touching disk
+   * unless dead bytes clear both a floor (default 4MB) and a fraction of the
+   * file (default half), so a compaction roughly halves the file and rewrites
+   * amortize to O(1) per appended byte. One consequence of the corpus-view
+   * rule: a chunk that leaves the view (rewind, branch switch) loses its
+   * vector at a gate-tripping compaction and re-embeds if it re-enters —
+   * the one "embeds twice" path, correct because search can't see what the
+   * view can't. Atomic via tmp+rename; on any failure
+   * the store rolls back to its pre-compaction state (old file untouched
+   * unless the rename won the race, in which case the lost vectors simply
+   * re-embed). A concurrent writer appending between our close and rename
+   * lands on the unlinked inode — its map keeps the key, the bytes re-embed
+   * after restart; rare enough (two live sessions, one compaction window)
+   * and self-healing, like every other failure here.
+   */
+  async compact(
+    keep: ReadonlySet<string>,
+    opts: { minDeadBytes?: number; minDeadRatio?: number } = {},
+  ): Promise<number> {
+    const handle = this.file;
+    if (handle === null || this.closed) return 0;
+    const kept: Array<[string, Float32Array]> = [];
+    for (const entry of this.vectors) if (keep.has(entry[0])) kept.push(entry);
+    const deadBytes = (this.vectors.size - kept.length) * RECORD_BYTES;
+    const fileBytes = HEADER_BYTES + this.vectors.size * RECORD_BYTES;
+    const minDeadBytes = opts.minDeadBytes ?? 4 * 1024 * 1024;
+    const minDeadRatio = opts.minDeadRatio ?? 0.5;
+    if (kept.length === this.vectors.size) return 0; // zero-dead: nothing to reclaim
+    if (deadBytes < minDeadBytes || deadBytes < minDeadRatio * fileBytes) return 0;
+    const out = Buffer.alloc(HEADER_BYTES + kept.length * RECORD_BYTES);
+    makeHeader().copy(out, 0);
+    let at = HEADER_BYTES;
+    for (const [key, v] of kept) {
+      out.write(key, at, KEY_BYTES, "hex");
+      Buffer.from(v.buffer, v.byteOffset, v.byteLength).copy(out, at + KEY_BYTES);
+      at += RECORD_BYTES;
+    }
+    const tmp = `${this.filePath}.${process.pid}.tmp`; // per-process: concurrent sessions never share a tmp
+    try {
+      const tmpHandle = await open(tmp, "w");
+      try {
+        await tmpHandle.write(out, 0, out.length);
+      } finally {
+        await tmpHandle.close();
+      }
+      await handle.close();
+      await rename(tmp, this.filePath);
+      if (this.closed) {
+        // close() won the race during the swap: the renamed file is correct on
+        // disk, but nobody owns the store — stay closed, don't resurrect an fd.
+        this.file = null;
+        return deadBytes;
+      }
+      // The old handle now points at the unlinked inode — swap it before any
+      // further add() or those appends would vanish with it.
+      this.file = await open(this.filePath, "a+");
+      this.vectors = new Map(kept);
+      return deadBytes;
+    } catch (err) {
+      console.error(`recall: vector store compaction failed (${err instanceof Error ? err.message : String(err)})`);
+      try {
+        if (this.file !== null) await this.file.close();
+      } catch {
+        // already closed
+      }
+      if (this.closed) {
+        this.file = null; // close() raced us; honor it
+      } else {
+        try {
+          this.file = await open(this.filePath, "a+");
+        } catch {
+          this.file = null; // store degraded to map-only; add() tolerates a null handle
+        }
+      }
+      try {
+        await unlink(tmp);
+      } catch {
+        // no tmp to clean (the failure was creating it)
+      }
+      return 0;
+    }
+  }
+
+  /** Top-K keys by cosine similarity to the query, restricted to `candidates`
    * — the current corpus's keys; everything else in the file is invisible to
    * this search. Brute force: recall's corpus is thousands to tens of
    * thousands of chunks, well inside JavaScript's scan budget.
@@ -185,6 +272,7 @@ export class VectorStore {
 
   /** Closes the handle; pending appends are awaited by callers of add(). */
   async close(): Promise<void> {
+    this.closed = true; // synchronous: visible to an in-flight compact()
     if (this.file !== null) await this.file.close();
     this.file = null;
     this.vectors.clear();
@@ -195,6 +283,16 @@ export class VectorStore {
 function readVector(buf: Buffer, at: number): Float32Array {
   const bytes = buf.subarray(at + KEY_BYTES, at + RECORD_BYTES);
   return new Float32Array(bytes.buffer, bytes.byteOffset, EMBED_DIMS);
+}
+
+/** Canonical 8-byte header: magic, format version, dims, key width. */
+function makeHeader(): Buffer {
+  const header = Buffer.alloc(HEADER_BYTES);
+  header.write(MAGIC, 0, "latin1");
+  header[4] = FORMAT_VERSION;
+  header.writeUInt16LE(EMBED_DIMS, 5);
+  header[7] = KEY_BYTES;
+  return header;
 }
 
 /** L2-normalize to the unit sphere; zero vectors pass through unchanged. */

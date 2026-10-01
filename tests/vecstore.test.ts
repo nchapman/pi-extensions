@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -158,5 +158,95 @@ describe("VectorStore", () => {
     const store = await VectorStore.open(file);
     await store.close();
     await store.add([{ key: chunkKey("s", "e", 0, 0, "t"), vector: basis(0) }]);
+  });
+
+  it("compact() keeps only live keys, preserves order, and appends land in the new file", async () => {
+    const keys = [1, 2, 3, 4].map((n) => chunkKey("s", `e${n}`, 0, 0, `text ${n}`));
+    const store = await VectorStore.open(file);
+    await store.add(keys.map((k, i) => ({ key: k, vector: basis(i) })));
+    const live = new Set([keys[0], keys[3]]);
+    const reclaimed = await store.compact(live, { minDeadBytes: 0, minDeadRatio: 0 });
+    expect(reclaimed).toBe(2 * RECORD_BYTES);
+    expect(store.size).toBe(2);
+    // Stale-handle regression: after the tmp+rename swap, appends must reach
+    // the NEW file, and a reopen must see exactly live + appended.
+    const fresh = chunkKey("s", "e9", 0, 0, "fresh");
+    await store.add([{ key: fresh, vector: basis(5) }]);
+    await store.close();
+    const reopened = await VectorStore.open(file);
+    expect(reopened.has([keys[0], keys[3], fresh, keys[1]])).toEqual(new Set([keys[0], keys[3], fresh]));
+    await reopened.close();
+    const bytes = await readFile(file);
+    expect(bytes.length).toBe(HEADER_BYTES + 3 * RECORD_BYTES);
+    // Record order on disk is preserved (keep order, then later appends).
+    const keysInOrder: string[] = [];
+    for (let i = 0; i < 3; i++)
+      keysInOrder.push(
+        bytes.subarray(HEADER_BYTES + i * RECORD_BYTES, HEADER_BYTES + i * RECORD_BYTES + KEY_HEX / 2).toString("hex"),
+      );
+    expect(keysInOrder).toEqual([keys[0], keys[3], fresh]);
+  });
+
+  it("compact() is a no-op below the dead-byte gates", async () => {
+    const keys = [1, 2].map((n) => chunkKey("s", `e${n}`, 0, 0, `text ${n}`));
+    const store = await VectorStore.open(file);
+    await store.add(keys.map((k, i) => ({ key: k, vector: basis(i) })));
+    const bytesBefore = (await readFile(file)).length;
+    expect(await store.compact(new Set([keys[0]]))).toBe(0); // defaults: 4MB floor not met
+    expect(store.size).toBe(2);
+    expect((await readFile(file)).length).toBe(bytesBefore);
+    await store.close();
+  });
+
+  it("compact() on a closed store is a no-op, never a resurrected handle", async () => {
+    const keys = [1, 2, 3].map((n) => chunkKey("s", `e${n}`, 0, 0, `text ${n}`));
+    const store = await VectorStore.open(file);
+    await store.add(keys.map((k, i) => ({ key: k, vector: basis(i) })));
+    await store.close();
+    expect(await store.compact(new Set([keys[0]]), { minDeadBytes: 0, minDeadRatio: 0 })).toBe(0);
+    expect(store.size).toBe(0); // close() cleared the map; compact must not repopulate it
+  });
+
+  it("an all-dead compaction empties the file and later appends still land", async () => {
+    const keys = [1, 2].map((n) => chunkKey("s", `e${n}`, 0, 0, `text ${n}`));
+    const store = await VectorStore.open(file);
+    await store.add(keys.map((k, i) => ({ key: k, vector: basis(i) })));
+    expect((await store.compact(new Set(), { minDeadBytes: 0, minDeadRatio: 0 })).valueOf()).toBeGreaterThan(0);
+    expect(store.size).toBe(0);
+    const fresh = chunkKey("s", "e9", 0, 0, "fresh after empty");
+    await store.add([{ key: fresh, vector: basis(1) }]);
+    await store.close();
+    expect((await readFile(file)).length).toBe(HEADER_BYTES + RECORD_BYTES); // header-only, then one record
+    const reopened = await VectorStore.open(file);
+    expect(reopened.size).toBe(1);
+    await reopened.close();
+  });
+
+  it("a zero-dead compaction is a no-op even with zeroed gates", async () => {
+    const keys = [1, 2].map((n) => chunkKey("s", `e${n}`, 0, 0, `text ${n}`));
+    const store = await VectorStore.open(file);
+    await store.add(keys.map((k, i) => ({ key: k, vector: basis(i) })));
+    expect(await store.compact(new Set(keys), { minDeadBytes: 0, minDeadRatio: 0 })).toBe(0);
+    await store.close();
+  });
+
+  it("compact() fails open when the tmp file cannot be written", async () => {
+    const keys = [1, 2, 3].map((n) => chunkKey("s", `e${n}`, 0, 0, `text ${n}`));
+    const store = await VectorStore.open(file);
+    await store.add(keys.map((k, i) => ({ key: k, vector: basis(i) })));
+    // Read-only directory: tmp creation fails inside compact, not at open.
+    // (chmod does not restrict root, so this test assumes a non-root runner —
+    // fine for a personal macOS package.)
+    await chmod(path.dirname(file), 0o500);
+    try {
+      expect(await store.compact(new Set([keys[0]]), { minDeadBytes: 0, minDeadRatio: 0 })).toBe(0);
+      expect(store.size).toBe(3); // map untouched
+      const appended = chunkKey("s", "e8", 0, 0, "appended after failed compaction");
+      await store.add([{ key: appended, vector: basis(1) }]); // rollback kept a working handle
+      expect(store.has([appended]).size).toBe(1);
+    } finally {
+      await chmod(path.dirname(file), 0o700);
+      await store.close();
+    }
   });
 });
