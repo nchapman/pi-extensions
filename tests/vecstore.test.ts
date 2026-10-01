@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { chunkKey, EMBED_DIMS, KEY_HEX, VectorStore } from "../lib/vecstore";
 
 const RECORD_BYTES = KEY_HEX / 2 + EMBED_DIMS * 4;
-const HEADER_BYTES = 8;
+const HEADER_BYTES = 16; // v2: dims + model fingerprint
 
 let dir: string;
 let file: string;
@@ -248,5 +248,101 @@ describe("VectorStore", () => {
       await chmod(path.dirname(file), 0o700);
       await store.close();
     }
+  });
+});
+
+describe("VectorStore dims flexibility", () => {
+  it("stores and reloads 384-dim vectors (dims are the file's property)", async () => {
+    const file = path.join(dir, "dims384.bin");
+    const store = await VectorStore.open(file, { dims: 384 });
+    await store.add([{ key: "a".repeat(KEY_HEX), vector: new Float32Array(384).fill(0.5) }]);
+    await store.close();
+    // Reopen WITHOUT opts: the header is authoritative, not the default.
+    const re = await VectorStore.open(file);
+    expect(re.size).toBe(1);
+    const hits = re.topK(new Float32Array(384).fill(0.5), ["a".repeat(KEY_HEX)], 1);
+    expect(hits[0]?.similarity).toBeCloseTo(1, 5);
+    await re.close();
+  });
+
+  it("resets when the model's dims disagree with the file (model switched)", async () => {
+    const file = path.join(dir, "switchdims.bin");
+    const first = await VectorStore.open(file, { dims: 768 });
+    await first.add([{ key: "b".repeat(KEY_HEX), vector: new Float32Array(768).fill(0.1) }]);
+    await first.close();
+    const second = await VectorStore.open(file, { dims: 1024 });
+    expect(second.size).toBe(0); // cache invalidated, not misread
+    // And the reopened file now round-trips 1024-wide vectors.
+    await second.add([{ key: "c".repeat(KEY_HEX), vector: new Float32Array(1024).fill(0.2) }]);
+    await second.close();
+    const third = await VectorStore.open(file, { dims: 1024 });
+    expect(third.size).toBe(1);
+    await third.close();
+  });
+
+  it("skips vectors whose width disagrees with the store instead of corrupting records", async () => {
+    const file = path.join(dir, "mixedwidth.bin");
+    const store = await VectorStore.open(file, { dims: 64 });
+    await store.add([
+      { key: "d".repeat(KEY_HEX), vector: new Float32Array(64).fill(1) },
+      { key: "e".repeat(KEY_HEX), vector: new Float32Array(128).fill(1) }, // wrong width: dropped
+    ]);
+    expect(store.size).toBe(1);
+    await store.close();
+  });
+
+  it("topK with a wrong-width query returns nothing rather than garbage", async () => {
+    const file = path.join(dir, "qwidth.bin");
+    const store = await VectorStore.open(file, { dims: 64 });
+    await store.add([{ key: "f".repeat(KEY_HEX), vector: new Float32Array(64).fill(1) }]);
+    expect(store.topK(new Float32Array(128).fill(1), ["f".repeat(KEY_HEX)], 1)).toEqual([]);
+    await store.close();
+  });
+
+  it("rejects absurd dims at open", async () => {
+    const file = path.join(dir, "baddims.bin");
+    await expect(VectorStore.open(file, { dims: 0 })).rejects.toThrow(/invalid dims/);
+    await expect(VectorStore.open(file, { dims: 9999 })).rejects.toThrow(/invalid dims/);
+  });
+});
+
+describe("VectorStore model fingerprint", () => {
+  it("resets on a same-width model switch (dims alone are not identity)", async () => {
+    const file = path.join(dir, "samewidth.bin");
+    const a = await VectorStore.open(file, { dims: 768, model: "onnx-community/embeddinggemma-300m-ONNX" });
+    await a.add([{ key: "a".repeat(KEY_HEX), vector: new Float32Array(768).fill(0.1) }]);
+    await a.close();
+    const b = await VectorStore.open(file, { dims: 768, model: "some-other-768-model" });
+    expect(b.size).toBe(0); // different model: cache invalidated, not mixed
+    await b.close();
+  });
+
+  it("adopts when model is omitted, revalidates when repeated", async () => {
+    const file = path.join(dir, "adoptmodel.bin");
+    const a = await VectorStore.open(file, { dims: 896, model: "jina-code-embeddings-0.5b" });
+    await a.add([{ key: "b".repeat(KEY_HEX), vector: new Float32Array(896).fill(0.2) }]);
+    await a.close();
+    expect((await VectorStore.open(file)).size).toBe(1); // omitted: adopt
+    await (await VectorStore.open(file)).close();
+    expect((await VectorStore.open(file, { model: "jina-code-embeddings-0.5b" })).size).toBe(1); // same model: keep
+    await (await VectorStore.open(file, { model: "jina-code-embeddings-0.5b" })).close();
+  });
+
+  it("resets v1 (8-byte header) files via the version bump", async () => {
+    const file = path.join(dir, "v1file.bin");
+    await writeFile(file, Buffer.from("RVEC\x01\x00\x03\x10")); // v1 header, 768 dims, no fingerprint
+    const store = await VectorStore.open(file, { dims: 768, model: "m" });
+    expect(store.size).toBe(0);
+    await store.close();
+  });
+
+  it("invalid header with dims omitted resets at the default width", async () => {
+    const file = path.join(dir, "garbage.bin");
+    await writeFile(file, Buffer.from("not-a-vector-store-at-all"));
+    const store = await VectorStore.open(file);
+    expect(store.size).toBe(0);
+    await store.add([{ key: "c".repeat(KEY_HEX), vector: new Float32Array(EMBED_DIMS).fill(0.3) }]);
+    expect(store.size).toBe(1); // usable at the default width after reset
+    await store.close();
   });
 });

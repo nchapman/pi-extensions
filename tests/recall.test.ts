@@ -67,6 +67,8 @@ const CONFIG: RecallConfig = {
   projectMaxBytes: 64 * 1024 * 1024,
   embedEnabled: false, // per-test: hybrid tests opt in with injected fakes — never a real worker
   embedDtype: "q8",
+  embedModel: "onnx-community/embeddinggemma-300m-ONNX",
+  embedDims: 768,
   embedWeight: 0.7,
   embedForeignMaxBytes: 32 * 1024 * 1024,
   embedModelDir: "/virtual/models",
@@ -1654,6 +1656,17 @@ describe("embed config", () => {
 
   it("PI_RECALL_EMBED=0 disables the semantic side", () => {
     expect(configFromEnv({ PI_RECALL_EMBED: "0" }).embedEnabled).toBe(false);
+  });
+
+  it("PI_RECALL_EMBED_MODEL selects the model; dims follow the preset unless overridden", () => {
+    const base = configFromEnv({});
+    expect(base.embedModel).toBe("onnx-community/embeddinggemma-300m-ONNX");
+    expect(base.embedDims).toBe(768);
+    const qwen = configFromEnv({ PI_RECALL_EMBED_MODEL: "onnx-community/Qwen3-Embedding-0.6B-ONNX" });
+    expect(qwen.embedModel).toBe("onnx-community/Qwen3-Embedding-0.6B-ONNX");
+    expect(qwen.embedDims).toBe(1024); // preset, no env needed
+    expect(configFromEnv({ PI_RECALL_EMBED_MODEL: "x", PI_RECALL_EMBED_DIMS: "9999" }).embedDims).toBe(4096); // clamped
+    expect(configFromEnv({ PI_RECALL_EMBED_MODEL: "x", PI_RECALL_EMBED_DIMS: "128" }).embedDims).toBe(128);
   });
 
   it("invalid dtype falls back with an explicit error; weights clamp", () => {

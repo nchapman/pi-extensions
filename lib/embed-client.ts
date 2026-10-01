@@ -26,6 +26,56 @@ export interface WorkerChild {
   kill(): void;
 }
 
+/** Default model id — must stay in sync with the worker's own fallback. */
+export const DEFAULT_EMBED_MODEL = "onnx-community/embeddinggemma-300m-ONNX";
+
+export interface EmbedPreset {
+  queryPrefix: string;
+  docPrefix: string;
+  dims: number;
+}
+
+/**
+ * Per-model knowledge, resolved by substring match on the model id: the
+ * asymmetric retrieval prefixes from each model card (prefixes are part of
+ * the training format — wrong ones silently degrade quality) and the output
+ * dims (reply validation + store record width). Unknown models get no
+ * prefixes and 768 dims; every field is overridable via EmbedClientOptions.
+ */
+const EMBED_PRESETS: Array<{ match: string; preset: EmbedPreset }> = [
+  {
+    match: "embeddinggemma",
+    preset: { queryPrefix: "task: search result | query: ", docPrefix: "title: none | text: ", dims: 768 },
+  },
+  {
+    // Qwen3-Embedding card: queries get a one-line task instruct, documents stay raw.
+    match: "qwen3-embedding",
+    preset: {
+      queryPrefix: "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: ",
+      docPrefix: "",
+      dims: 1024,
+    },
+  },
+  {
+    // jina-code card, "qa" task prompts (config_sentence_transformers.json) —
+    // chosen over nl2code because recall's semantic query is a natural-language
+    // description seeking any passage (prose or code); nl2code assumes code targets.
+    match: "jina-code",
+    preset: {
+      queryPrefix: "Find the most relevant answer given the following question:\n",
+      docPrefix: "Candidate answer:\n",
+      dims: 896,
+    },
+  },
+];
+
+export function presetFor(model?: string): EmbedPreset {
+  if (model === undefined || model === "") return presetFor(DEFAULT_EMBED_MODEL);
+  const id = model.toLowerCase();
+  for (const p of EMBED_PRESETS) if (id.includes(p.match)) return p.preset;
+  return { queryPrefix: "", docPrefix: "", dims: 768 };
+}
+
 export type SpawnFn = (workerPath: string, env: NodeJS.ProcessEnv) => WorkerChild;
 
 const defaultSpawn: SpawnFn = (workerPath, env) => {
@@ -62,6 +112,11 @@ export interface EmbedClientOptions {
   workerPath: string;
   dtype: string;
   modelDir: string;
+  /** HF model id or local dir the worker should load (env PI_RECALL_EMBED_MODEL to the child). Default: EmbeddingGemma. */
+  model?: string;
+  /** Prefix prepended to query/document texts before sending. Defaults from presetFor(model). */
+  queryPrefix?: string;
+  docPrefix?: string;
   spawnFn?: SpawnFn;
   onNotice?: (message: string) => void;
   maxStartAttempts?: number;
@@ -87,9 +142,18 @@ export class EmbedClient {
   private idleTimer: NodeJS.Timeout | null = null;
   private disposed = false;
   private readonly opts: EmbedClientOptions;
+  private readonly queryPrefix: string;
+  private readonly docPrefix: string;
+  private readonly dims: number;
 
   constructor(opts: EmbedClientOptions) {
     this.opts = opts;
+    // Prefixes and dims are the model's properties — training-format prefixes
+    // and output width — resolved once here from the preset unless overridden.
+    const preset = presetFor(opts.model);
+    this.queryPrefix = opts.queryPrefix ?? preset.queryPrefix;
+    this.docPrefix = opts.docPrefix ?? preset.docPrefix;
+    this.dims = opts.dims ?? preset.dims;
   }
 
   /** True while a child is alive and this client hasn't permanently given up. */
@@ -113,6 +177,11 @@ export class EmbedClient {
         ...process.env,
         PI_RECALL_EMBED_DTYPE: this.opts.dtype,
         PI_RECALL_MODEL_DIR: this.opts.modelDir,
+        // Set unconditionally: an ambient PI_RECALL_EMBED_MODEL from the parent
+        // env would otherwise leak into a model-less client's child, splitting
+        // the model actually loaded from the prefixes/dims assumed for it.
+        // Empty string reads as unset in the worker's `trim() || DEFAULT`.
+        PI_RECALL_EMBED_MODEL: this.opts.model ?? "",
       });
     } catch (err) {
       this.notice(`embed worker spawn failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -146,10 +215,21 @@ export class EmbedClient {
     this.idleTimer.unref?.();
   }
 
-  /** Query embedding (short text, 'query' prefix mode). Undefined = fail open. */
+  /** Query embedding (short text, query-prefixed per the model preset). Undefined = fail open. */
   async query(text: string): Promise<Float32Array | undefined> {
-    const reply = await this.request({ op: "query", id: 0, text }, this.opts.queryTimeoutMs ?? 5000);
+    const reply = await this.request(
+      { op: "query", id: 0, text: this.queryPrefix + text },
+      this.opts.queryTimeoutMs ?? 5000,
+    );
     if (reply === undefined || !Array.isArray(reply.vector)) return undefined;
+    if (reply.vector.length !== this.dims) {
+      // A wrong-width query can only mean the loaded model isn't the one
+      // configured — surface it rather than scoring garbage downstream.
+      this.notice(
+        `embed query returned a ${reply.vector.length}-wide vector but ${this.dims} was expected — check PI_RECALL_EMBED_MODEL/PI_RECALL_EMBED_DIMS`,
+      );
+      return undefined;
+    }
     return Float32Array.from(reply.vector as number[]);
   }
 
@@ -159,17 +239,30 @@ export class EmbedClient {
   ): Promise<Array<{ key: string; vector: Float32Array }> | undefined> {
     if (items.length === 0) return [];
     const timeout = (this.opts.embedBaseTimeoutMs ?? 10_000) + items.length * (this.opts.embedPerItemMs ?? 2000);
-    const reply = await this.request({ op: "embed", id: 0, items }, timeout);
+    const prefixed = items.map((item) => ({ key: item.key, text: this.docPrefix + item.text }));
+    const reply = await this.request({ op: "embed", id: 0, items: prefixed }, timeout);
     if (reply === undefined || !Array.isArray(reply.items)) return undefined;
     // Malformed items are dropped, never thrown — the never-reject contract
     // holds even against a buggy worker; dims must match the store's format.
-    const dims = this.opts.dims ?? 768;
     const out: Array<{ key: string; vector: Float32Array }> = [];
     for (const item of reply.items as Array<{ key?: unknown; vector?: unknown }>) {
-      if (typeof item?.key !== "string" || !Array.isArray(item.vector) || item.vector.length !== dims) continue;
+      if (typeof item?.key !== "string" || !Array.isArray(item.vector) || item.vector.length !== this.dims) continue;
       out.push({ key: item.key, vector: Float32Array.from(item.vector as number[]) });
     }
-    return out.length === 0 ? undefined : out;
+    if (out.length === 0) {
+      // Items existed but every one was dropped for width: the configured dims
+      // don't match the loaded model. Without this line the misconfiguration is
+      // invisible — catch-up would retry the same dead batch forever, silently.
+      const replies = reply.items as Array<{ vector?: unknown }>;
+      if (replies.length > 0)
+        this.notice(
+          `embed reply dropped all ${replies.length} items: vectors are ${
+            Array.isArray(replies[0]?.vector) ? replies[0].vector.length : "?"
+          }-wide but ${this.dims} was expected — check PI_RECALL_EMBED_MODEL/PI_RECALL_EMBED_DIMS`,
+        );
+      return undefined;
+    }
+    return out;
   }
 
   /** Kill AND refuse every later request. Unlike kill(), no lazy respawn is possible afterwards — without this, an in-flight catch-up whose request lands after session_shutdown would respawn the worker, and its pipes would hold the host's event loop open forever. */

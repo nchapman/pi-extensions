@@ -3,18 +3,24 @@
  *
  * A bare child process, spawned by lib/embed-client.ts and run directly by
  * Node's TypeScript stripping (no relative imports on purpose — the file must
- * execute standalone). It owns the EmbeddingGemma ONNX model: loading it
- * costs ~1s warm and running it parks ~1.7GB of non-returnable ONNX arena in
- * the process, which is precisely why it is a child — memory is reclaimed on
- * exit and a native crash cannot take pi down. The parent never imports
- * transformers.js.
+ * execute standalone). It owns whichever ONNX embedding model it is pointed
+ * at (default EmbeddingGemma; PI_RECALL_EMBED_MODEL selects any
+ * transformers.js-compatible id or local dir): loading costs ~1s warm and
+ * running parks ~1.7GB of non-returnable ONNX arena in the process, which is
+ * precisely why it is a child — memory is reclaimed on exit and a native
+ * crash cannot take pi down. The parent never imports transformers.js.
+ *
+ * The worker is a pure model runner: it embeds the text it is given, as-is.
+ * Model-specific query/document prefixes live client-side
+ * (lib/embed-client.ts presetFor) so they stay unit-testable — this file
+ * cannot be imported by tests without spawning the stdin listener.
  *
  * Contract (JSONL on stdin/stdout, one message per line):
  *   parent → child:
  *     {"op":"embed","id":N,"items":[{"key","text"},...]}     — document embeddings
  *     {"op":"query","id":N,"text":"..."}                     — query embedding
  *   child → parent:
- *     {"ev":"embed","id":N,"items":[{"key","vector":[...]}]} — unit vectors, 768 dims
+ *     {"ev":"embed","id":N,"items":[{"key","vector":[...]}]} — unit vectors, model dims
  *     {"ev":"query","id":N,"vector":[...]}
  *     {"ev":"error","id":N,"message":"..."}                  — one request failed; worker lives
  *     {"ev":"fatal","message":"..."}                         — model load failed; worker exits
@@ -26,7 +32,8 @@
  * node_modules where an npm install would wipe it.
  */
 
-const MODEL_ID = "onnx-community/embeddinggemma-300m-ONNX";
+const DEFAULT_MODEL_ID = "onnx-community/embeddinggemma-300m-ONNX";
+const MODEL_ID = process.env.PI_RECALL_EMBED_MODEL?.trim() || DEFAULT_MODEL_ID;
 const MODEL_DIR = process.env.PI_RECALL_MODEL_DIR?.trim() || `${process.env.HOME ?? "~"}/.pi/agent/models`;
 /** dtype whitelist mirrors transformers.js' union, narrowed to the EmbeddingGemma builds worth using. */
 type Dtype = "fp32" | "fp16" | "q8" | "q4" | "q4f16";
@@ -34,16 +41,22 @@ const DTYPES = new Set<Dtype>(["fp32", "fp16", "q8", "q4", "q4f16"]);
 const rawDtype = process.env.PI_RECALL_EMBED_DTYPE?.trim() as Dtype | undefined;
 const DTYPE: Dtype = rawDtype !== undefined && DTYPES.has(rawDtype) ? rawDtype : "q8";
 
-/** EmbeddingGemma's asymmetric retrieval prefixes (from the model card) — documents and queries embed differently. */
-function prefixed(text: string, mode: "document" | "query"): string {
-  return mode === "query" ? `task: search result | query: ${text}` : `title: none | text: ${text}`;
+/** Model output as produced by transformers.js: pooled (sentence_embedding,
+ * Gemma-style), per-token (last_hidden_state, LLM-style embedders like
+ * Qwen3-Embedding — those pool the LAST token per their model cards), or a
+ * single custom-named tensor (community ONNX exports, e.g. jina-code's
+ * pre-pooled "embeddings"). */
+interface ModelTensor {
+  dims: number[];
+  data: Float32Array;
 }
+type ModelOutput = Record<string, ModelTensor | undefined>;
 
 type EmbedOp =
   { op: "embed"; id: number; items: Array<{ key: string; text: string }> } | { op: "query"; id: number; text: string };
 
 let tokenizer: { (text: string, opts: { padding: boolean; truncation: boolean }): unknown } | null = null;
-let model: ((inputs: unknown) => Promise<unknown>) | null = null;
+let model: ((inputs: unknown) => Promise<ModelOutput>) | null = null;
 let loading: Promise<void> | null = null;
 
 function reply(msg: unknown): void {
@@ -72,18 +85,45 @@ async function ensureModel(): Promise<void> {
   return loading;
 }
 
-async function embed(text: string, mode: "document" | "query"): Promise<Float32Array> {
+async function embed(text: string): Promise<Float32Array> {
   if (tokenizer === null || model === null) throw new Error("model not loaded");
-  const inputs = tokenizer(prefixed(text, mode), { padding: true, truncation: true });
-  const output = (await model(inputs)) as { sentence_embedding?: { data: Float32Array } };
-  if (!output?.sentence_embedding?.data) throw new Error("model output missing sentence_embedding");
-  const raw = output.sentence_embedding.data;
+  const inputs = tokenizer(text, { padding: true, truncation: true });
+  const output = await model(inputs);
+  const tensor = pickTensor(output);
+  if (tensor === undefined) throw new Error("model output has no embedding tensor");
+  let raw: Float32Array;
+  if (tensor.dims.length === 1 || (tensor.dims.length === 2 && tensor.dims[0] === 1)) {
+    raw = tensor.data; // already pooled [D] or [1, D]
+  } else if (tensor.dims.length === 2) {
+    // [S, D] without a batch dim is ambiguous — per-token output that this
+    // embedder can't pool by position. Refuse loudly rather than flatten S·D
+    // floats into one meaningless vector.
+    throw new Error("rank-2 embedding tensor is [S,D] (no batch dim) — ambiguous, refusing to guess");
+  } else if (tensor.dims.length === 3) {
+    // Single text per call — no padding — so the last position IS the last
+    // token (verified for Qwen3-Embedding-0.6B-ONNX: the tokenizer's
+    // post-processor appends <|endoftext|>, so the last position is EOS,
+    // exactly the token the card's last-token pooling expects).
+    const [, seq, d] = tensor.dims;
+    raw = tensor.data.subarray((seq - 1) * d, seq * d);
+  } else {
+    throw new Error(`unexpected embedding tensor rank ${tensor.dims.length}`);
+  }
   let sum = 0;
   for (let i = 0; i < raw.length; i++) sum += raw[i] * raw[i];
   const norm = Math.sqrt(sum);
   const unit = new Float32Array(raw.length);
   for (let i = 0; i < raw.length; i++) unit[i] = raw[i] / (norm || 1);
   return unit;
+}
+
+/** Canonical keys first; otherwise a lone custom-named tensor (community
+ * exports) is taken as the embedding — anything else is ambiguous. */
+function pickTensor(output: ModelOutput): ModelTensor | undefined {
+  const known = output.sentence_embedding ?? output.last_hidden_state;
+  if (known !== undefined) return known;
+  const tensors = Object.values(output).filter((v): v is ModelTensor => v !== undefined);
+  return tensors.length === 1 ? tensors[0] : undefined;
 }
 
 async function handle(op: EmbedOp): Promise<void> {
@@ -95,11 +135,11 @@ async function handle(op: EmbedOp): Promise<void> {
   }
   try {
     if (op.op === "query") {
-      reply({ ev: "query", id: op.id, vector: Array.from(await embed(op.text, "query")) });
+      reply({ ev: "query", id: op.id, vector: Array.from(await embed(op.text)) });
       return;
     }
     const items: Array<{ key: string; vector: number[] }> = [];
-    for (const item of op.items) items.push({ key: item.key, vector: Array.from(await embed(item.text, "document")) });
+    for (const item of op.items) items.push({ key: item.key, vector: Array.from(await embed(item.text)) });
     reply({ ev: "embed", id: op.id, items });
   } catch (err) {
     reply({

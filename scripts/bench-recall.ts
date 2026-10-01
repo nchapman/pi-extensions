@@ -12,17 +12,23 @@
  * the semantic side honestly.
  *
  * Usage: npm run bench:recall — with optional env: BENCH_DIR=<sessionDir>
- *       BENCH_TARGETS=50 BENCH_CORPUS=900 BENCH_FRESH=1
+ *       BENCH_TARGETS=50 BENCH_CORPUS=900 BENCH_FRESH=1 BENCH_SNAPSHOT=1
+ *       BENCH_MODEL=<HF id or local dir> (default: EmbeddingGemma)
  * Not part of `npm test` (separate vitest config); spawns the real embed
- * worker. Vector cache lives in /tmp so reruns are fast.
+ * worker. The corpus is snapshotted into /tmp once (BENCH_SNAPSHOT=1
+ * refreshes) so every run — and every model comparison — scores the exact
+ * same frozen targets; the live session dir keeps growing, which made
+ * earlier runs wobble by points. Vector cache lives in /tmp, one file per
+ * model (dims differ; files are dims-authoritative).
  */
 
-import { copyFile, stat } from "node:fs/promises";
+import { copyFile, mkdir, readdir, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { EmbedClient } from "../lib/embed-client";
+import { DEFAULT_EMBED_MODEL, EmbedClient, presetFor } from "../lib/embed-client";
 import { VectorStore } from "../lib/vecstore";
 import {
   archiveFrontier,
@@ -101,10 +107,36 @@ describe("recall retrieval benchmark", () => {
     const wantTargets = arg("targets", 50);
     const corpusCap = arg("corpus", 900);
     const fresh = process.env.BENCH_FRESH === "1";
+    const model = process.env.BENCH_MODEL?.trim() || DEFAULT_EMBED_MODEL;
+    const preset = presetFor(model);
+    const slug = model.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "").slice(-48);
+
+    // -- corpus: frozen snapshot (stable targets across runs and models) -----
+    // The live session dir grows while we work; a frozen copy makes run-to-run
+    // and model-to-model numbers comparable. The snapshot dir is keyed to the
+    // SOURCE dir (path hash) so pointing BENCH_DIR at another project can never
+    // silently score a stale snapshot of the previous one. BENCH_SNAPSHOT=1 re-freezes.
+    const snapDir = path.join(
+      os.tmpdir(),
+      `recall-bench-corpus-${createHash("sha256").update(dir).digest("hex").slice(0, 8)}`,
+    );
+    const snapFiles = () => readdir(snapDir).then((f) => f.filter((n) => n.endsWith(".jsonl")));
+    const existing = await snapFiles().then(
+      (f) => f.length > 0,
+      () => false,
+    );
+    if (!existing || process.env.BENCH_SNAPSHOT === "1") {
+      await mkdir(snapDir, { recursive: true });
+      for (const f of await readdir(dir))
+        if (f.endsWith(".jsonl")) await copyFile(path.join(dir, f), path.join(snapDir, f));
+      console.log(
+        `corpus snapshot: ${await snapFiles().then((f) => f.length)} files copied ${dir} → ${snapDir} (frozen; BENCH_SNAPSHOT=1 refreshes)`,
+      );
+    }
 
     // -- corpus: newest sessions first, capped ---------------------------------
     const cache = new ProjectCorpusCache(fsProjectReader, 512 * 1024 * 1024);
-    const unreadable = await cache.refresh(dir, undefined);
+    const unreadable = await cache.refresh(snapDir, undefined);
     const corpora = [...cache.list()].sort((a, b) => b.mtimeMs - a.mtimeMs);
     // Newest sessions first; the cap trims mid-session (bench-only; a partial
     // session's entries are still self-consistent retrieval targets).
@@ -112,22 +144,25 @@ describe("recall retrieval benchmark", () => {
       .flatMap((c) => c.chunks)
       .slice(0, corpusCap);
     expect(corpus.length, `no corpus chunks under ${dir}`).toBeGreaterThan(100);
-    console.log(`\ncorpus: ${corpus.length} chunks / ${corpora.length} sessions (${dir}), ${unreadable} unreadable`);
+    console.log(`\ncorpus: ${corpus.length} chunks / ${corpora.length} sessions (${snapDir}), ${unreadable} unreadable`);
 
-    // -- embeddings: real worker, /tmp cache seeded from the prod store --------
-    // Seed from the prod store once — afterwards the bench cache is strictly
-    // larger (it accumulates every run's corpus), so re-seeding would wipe it
-    // and force a full re-embed on every rerun.
-    const benchVec = path.join(os.tmpdir(), "recall-bench-vectors.bin");
+    // -- embeddings: real worker, /tmp cache per model ------------------------
+    // One cache file per model: files are dims-authoritative (768/1024/896),
+    // so sharing would just reset on every model switch.
+    const benchVec = path.join(os.tmpdir(), `recall-bench-vectors-${slug}.bin`);
     const prodVec = path.join(dir, "recall-vectors.bin");
-    if (!fresh && !(await stat(benchVec).then(() => true, () => false)))
+    if (!fresh && model === DEFAULT_EMBED_MODEL && !(await stat(benchVec).then(() => true, () => false)))
       await copyFile(prodVec, benchVec).catch(() => {});
-    const store = await VectorStore.open(benchVec);
+    const store = await VectorStore.open(benchVec, { dims: preset.dims, model });
     const pending = corpus.filter((c) => !store.has([c.key]).has(c.key));
     const client = new EmbedClient({
       workerPath: fileURLToPath(new URL("../lib/embed-worker.ts", import.meta.url)),
+      model,
       dtype: process.env.PI_RECALL_EMBED_DTYPE ?? "q8",
       modelDir: process.env.PI_RECALL_MODEL_DIR ?? path.join(os.homedir(), ".pi/agent/models"),
+      dims: preset.dims,
+      queryPrefix: preset.queryPrefix,
+      docPrefix: preset.docPrefix,
       embedBaseTimeoutMs: 30_000,
       embedPerItemMs: 5_000,
       queryTimeoutMs: 30_000,

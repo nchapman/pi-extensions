@@ -80,7 +80,7 @@ import {
   type SessionEntry,
   type Theme,
 } from "@earendil-works/pi-coding-agent";
-import { EmbedClient } from "../lib/embed-client";
+import { DEFAULT_EMBED_MODEL, EmbedClient, presetFor } from "../lib/embed-client";
 import { fuseRankings, type MatchSides } from "../lib/embed";
 import { chunkKey, VectorStore, type VectorHit } from "../lib/vecstore";
 import { PLAN_MESSAGE_TYPE, PLAN_SECTION_HEADER, lastTodoSnapshot, renderPlainList } from "./todo";
@@ -120,6 +120,10 @@ export interface RecallConfig {
   embedWeight: number;
   /** Byte budget for embedding foreign-session text per catch-up (0 = current session only). */
   embedForeignMaxBytes: number;
+  /** HF id or local dir of the embedding model (worker env PI_RECALL_EMBED_MODEL). */
+  embedModel: string;
+  /** Output width of that model — sizes store records and validates worker replies. */
+  embedDims: number;
   /** Where the ONNX model caches (must survive npm installs — never inside node_modules). */
   embedModelDir: string;
 }
@@ -141,6 +145,8 @@ const DEFAULTS: RecallConfig = {
   projectMaxBytes: 64 * 1024 * 1024,
   embedEnabled: true,
   embedDtype: "q8",
+  embedModel: DEFAULT_EMBED_MODEL,
+  embedDims: presetFor(DEFAULT_EMBED_MODEL).dims,
   embedWeight: 0.3,
   embedForeignMaxBytes: 32 * 1024 * 1024,
   embedModelDir: `${process.env.HOME ?? "~"}/.pi/agent/models`,
@@ -222,6 +228,18 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): RecallConfi
     projectMaxBytes: Math.floor(numFromEnv(env, "PI_RECALL_PROJECT_MAX_MB", 64, 4, 4096) * 1024 * 1024),
     embedEnabled: boolFromEnv(env, "PI_RECALL_EMBED", DEFAULTS.embedEnabled),
     embedDtype: dtypeFromEnv(env),
+    embedModel: env.PI_RECALL_EMBED_MODEL?.trim() || DEFAULTS.embedModel,
+    // Dims default to the model preset (a model property, like its prefixes)
+    // with an env escape hatch for models the preset table doesn't know.
+    embedDims: Math.floor(
+      numFromEnv(
+        env,
+        "PI_RECALL_EMBED_DIMS",
+        presetFor(env.PI_RECALL_EMBED_MODEL?.trim() || DEFAULTS.embedModel).dims,
+        32,
+        4096,
+      ),
+    ),
     embedWeight: numFromEnv(env, "PI_RECALL_EMBED_WEIGHT", DEFAULTS.embedWeight, 0, 2),
     embedForeignMaxBytes: Math.floor(numFromEnv(env, "PI_RECALL_EMBED_MAX_MB", 32, 0, 4096) * 1024 * 1024),
     embedModelDir: env.PI_RECALL_MODEL_DIR?.trim() || DEFAULTS.embedModelDir,
@@ -1164,9 +1182,12 @@ export function registerRecallTool(
       })(),
       dtype: config.embedDtype,
       modelDir: config.embedModelDir,
+      model: config.embedModel,
+      dims: config.embedDims,
       onNotice: (message) => console.error(`recall: ${message}`),
     });
-  const openStore = deps.openStore ?? ((file: string) => VectorStore.open(file));
+  const openStore =
+    deps.openStore ?? ((file: string) => VectorStore.open(file, { dims: config.embedDims, model: config.embedModel }));
   let vectorSupport: { store: VectorStoreLike; embed: EmbedSeam } | null = null;
   let catchUpInFlight = false;
   // Breadcrumb for compaction failures — ctx.compact() failures are otherwise

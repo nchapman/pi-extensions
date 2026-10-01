@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { EmbedClient, type SpawnFn, type WorkerChild } from "../lib/embed-client";
+import { EmbedClient, presetFor, type SpawnFn, type WorkerChild } from "../lib/embed-client";
 import { EMBED_DIMS } from "../lib/vecstore";
 
 class FakeChild implements WorkerChild {
@@ -373,5 +373,109 @@ describe("EmbedClient over a real child process", () => {
     } finally {
       client.kill();
     }
+  });
+});
+
+describe("presetFor", () => {
+  it("resolves prefixes and dims by model id substring", () => {
+    expect(presetFor(undefined)).toEqual({
+      queryPrefix: "task: search result | query: ",
+      docPrefix: "title: none | text: ",
+      dims: 768,
+    });
+    expect(presetFor("")).toEqual(presetFor(undefined)); // trimmed-empty ids resolve to the default
+    expect(presetFor("onnx-community/Qwen3-Embedding-0.6B-ONNX").dims).toBe(1024);
+    expect(presetFor("onnx-community/Qwen3-Embedding-0.6B-ONNX").queryPrefix).toContain("Instruct:");
+    expect(presetFor("jina-code-embeddings-0.5b").docPrefix).toBe("Candidate answer:\n");
+    expect(presetFor("jina-code-embeddings-0.5b").dims).toBe(896);
+    expect(presetFor("some-unknown-model")).toEqual({ queryPrefix: "", docPrefix: "", dims: 768 });
+  });
+});
+
+describe("model prefixes on the wire", () => {
+  it("query and embed texts carry the model's prefixes", async () => {
+    const child = new FakeChild();
+    const client = makeClient(child, [], {
+      model: "jina-code-embeddings-0.5b",
+      dims: 896,
+    });
+    client.start();
+    const origWrite = child.stdin.write.bind(child.stdin);
+    child.stdin.write = (data: string) => {
+      origWrite(data);
+      const op = JSON.parse(data.trim()) as { op: string; id: number; items: Array<{ key: string }> };
+      if (op.op === "query")
+        child.emitLine(JSON.stringify({ ev: "query", id: op.id, vector: new Array(896).fill(0.1) }));
+      if (op.op === "embed")
+        child.emitLine(
+          JSON.stringify({
+            ev: "embed",
+            id: op.id,
+            items: op.items.map((i) => ({ key: i.key, vector: new Array(896).fill(0.1) })),
+          }),
+        );
+      return true;
+    };
+    await client.query("how does compaction gate?");
+    const qline = JSON.parse(child.stdinWrites[0]) as { text: string };
+    expect(qline.text).toBe("Find the most relevant answer given the following question:\nhow does compaction gate?");
+    await client.embed([{ key: "k", text: "compact() reclaims dead bytes" }]);
+    const eline = JSON.parse(child.stdinWrites[1]) as { items: Array<{ text: string }> };
+    expect(eline.items[0]?.text).toBe("Candidate answer:\ncompact() reclaims dead bytes");
+    client.dispose();
+  });
+});
+
+describe("wrong-width replies surface, fail open", () => {
+  it("embed() reports the mismatch instead of silently dropping every item", async () => {
+    const child = new FakeChild();
+    const notices: string[] = [];
+    const client = makeClient(child, notices); // gemma preset: expects 768
+    client.start();
+    const origWrite = child.stdin.write.bind(child.stdin);
+    child.stdin.write = (data: string) => {
+      origWrite(data);
+      const op = JSON.parse(data.trim()) as { op: string; id: number };
+      if (op.op === "embed")
+        child.emitLine(
+          JSON.stringify({
+            ev: "embed",
+            id: op.id,
+            items: [{ key: "k", vector: new Array(1024).fill(0.1) }], // wrong model's width
+          }),
+        );
+      return true;
+    };
+    expect(await client.embed([{ key: "k", text: "t" }])).toBeUndefined();
+    expect(notices.some((n) => n.includes("1024") && n.includes("768"))).toBe(true);
+    client.dispose();
+  });
+
+  it("query() rejects a wrong-width vector with a notice", async () => {
+    const child = new FakeChild();
+    const notices: string[] = [];
+    const client = makeClient(child, notices);
+    client.start();
+    const origWrite = child.stdin.write.bind(child.stdin);
+    child.stdin.write = (data: string) => {
+      origWrite(data);
+      const op = JSON.parse(data.trim()) as { op: string; id: number };
+      if (op.op === "query") child.emitLine(JSON.stringify({ ev: "query", id: op.id, vector: new Array(8).fill(1) }));
+      return true;
+    };
+    expect(await client.query("t")).toBeUndefined();
+    expect(notices.some((n) => n.includes("8-wide"))).toBe(true);
+    client.dispose();
+  });
+
+  it("spawns with PI_RECALL_EMBED_MODEL always set (empty reads as default in the worker)", async () => {
+    const seen: string[] = [];
+    const spawnFn: SpawnFn = (_p, env) => {
+      seen.push(env.PI_RECALL_EMBED_MODEL ?? "<unset>");
+      return new FakeChild();
+    };
+    new EmbedClient({ workerPath: "/w", dtype: "q8", modelDir: "/m", spawnFn }).start();
+    new EmbedClient({ workerPath: "/w", dtype: "q8", modelDir: "/m", spawnFn, model: "some-model" }).start();
+    expect(seen).toEqual(["", "some-model"]);
   });
 });
