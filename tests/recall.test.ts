@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_COMPACTION_SETTINGS } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
+import { chunkKey } from "../lib/vecstore";
 import {
   buildArchiveChunks,
   buildFileCorpus,
@@ -20,7 +21,13 @@ import {
   kindLabel,
   parseRef,
   ProjectCorpusCache,
+  type ProjectReader,
   rankChunks,
+  type RecallChunk,
+  type EmbedSeam,
+  type VectorStoreLike,
+  semanticRankedKeys,
+  fuseHybrid,
   recencyFactor,
   carryForwardFileLists,
   effectiveCompactTarget,
@@ -58,6 +65,11 @@ const CONFIG: RecallConfig = {
   maxResults: 5,
   readChars: 4000,
   projectMaxBytes: 64 * 1024 * 1024,
+  embedEnabled: false, // per-test: hybrid tests opt in with injected fakes — never a real worker
+  embedDtype: "q8",
+  embedWeight: 0.7,
+  embedForeignMaxBytes: 32 * 1024 * 1024,
+  embedModelDir: "/virtual/models",
 };
 
 let nextId = 0;
@@ -1062,6 +1074,439 @@ describe("registerRecallTool", () => {
 // ---------------------------------------------------------------------------
 // Renderers & config
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Semantic side (hybrid search + embedding catch-up)
+// ---------------------------------------------------------------------------
+
+/** Toy vector space: one axis per topic, believable dot-product similarity. */
+const VDIM = 8;
+function vec(...axes: number[]): Float32Array {
+  const v = new Float32Array(VDIM);
+  axes.forEach((a, i) => (v[i] = a));
+  return v;
+}
+
+function fakeEmbedSeam(overrides: { queryVector?: Float32Array } = {}) {
+  // Mutable state so tests can flip failure modes between settles; kill is
+  // running-aware so it stays idempotent like the real client.
+  const state = { failQuery: false, failEmbed: false, queryVector: overrides.queryVector ?? vec(1), running: false };
+  const calls = {
+    started: 0,
+    killed: 0,
+    queries: [] as string[],
+    embeds: [] as Array<Array<{ key: string; text: string }>>,
+  };
+  const seam = {
+    calls,
+    state,
+    get available() {
+      return true;
+    },
+    start: () => {
+      calls.started++;
+      state.running = true;
+      return true;
+    },
+    async query(text: string) {
+      calls.queries.push(text);
+      return state.failQuery ? undefined : state.queryVector;
+    },
+    async embed(items: readonly { key: string; text: string }[]) {
+      calls.embeds.push([...items]);
+      return state.failEmbed ? undefined : items.map((item) => ({ key: item.key, vector: vec(1) }));
+    },
+    kill: () => {
+      if (!state.running) return;
+      state.running = false;
+      calls.killed++;
+    },
+  };
+  return seam as unknown as EmbedSeam & { calls: typeof calls; state: typeof state };
+}
+
+function fakeVectorStore(seed: Array<{ key: string; vector: Float32Array }> = []) {
+  const vectors = new Map(seed.map((s) => [s.key, s.vector] as const));
+  const calls = { added: [] as Array<{ key: string; vector: Float32Array }>, closed: 0 };
+  const store = {
+    calls,
+    vectors,
+    has: (keys: readonly string[]) => new Set(keys.filter((k) => vectors.has(k))),
+    async add(items: readonly { key: string; vector: Float32Array }[]) {
+      calls.added.push(...items);
+      for (const item of items) vectors.set(item.key, item.vector);
+    },
+    topK(query: Float32Array, candidates: Iterable<string>, k: number) {
+      const hits: Array<{ key: string; similarity: number }> = [];
+      for (const key of candidates) {
+        const v = vectors.get(key);
+        if (v === undefined) continue;
+        let dot = 0;
+        for (let i = 0; i < VDIM; i++) dot += query[i] * v[i];
+        hits.push({ key, similarity: dot });
+      }
+      hits.sort((a, b) => b.similarity - a.similarity || (a.key < b.key ? -1 : 1));
+      return hits.slice(0, k);
+    },
+    async close() {
+      calls.closed++;
+    },
+  };
+  return store as unknown as VectorStoreLike & { calls: typeof calls; vectors: Map<string, Float32Array> };
+}
+
+/** Branch with two archived user messages — one lexical target, one semantic target — plus a kept tail. */
+function hybridCtx() {
+  const semantic = msgEntry("user", { content: "Fluffy curled up asleep in the corner of the rug." });
+  const lexical = msgEntry("user", { content: "rotate the tokens on every refresh" });
+  const compaction = compactionEntry("## Goal\nHybrid", "kept1");
+  const kept = msgEntry("user", { content: "now continue" });
+  kept.id = "kept1";
+  return {
+    ctx: sessionCtx({ branch: [semantic, lexical, compaction, kept], contextEntries: [compaction, kept] }),
+    semantic,
+    lexical,
+  };
+}
+
+const SID = "aaaaaaaa-1111-2222-3333-444444444444";
+function firstKey(entry: SessionEntry): string {
+  return chunksFromEntry(entry, { origin: "current", sessionId: SID, sessionLabel: "current session" }, 3000)[0].key;
+}
+
+/** settle loop: flush the fire-and-forget catch-up chains */
+async function flush() {
+  await new Promise((r) => setTimeout(r, 0));
+}
+
+describe("semantic hybrid search", () => {
+  async function hybridSetup(
+    embedSeam: EmbedSeam,
+    store: VectorStoreLike,
+    configOverrides: Partial<RecallConfig> = {},
+  ) {
+    const { pi, tools, events } = makePi();
+    registerRecallTool(pi, { ...CONFIG, embedEnabled: true, ...configOverrides } as RecallConfig, fsProjectReader, {
+      embed: embedSeam,
+      openStore: async () => store,
+    });
+    // Open the semantic side (a session_start on the default branch) so the
+    // search path sees non-null vector support; its catch-up round touches
+    // only default-branch keys, never the hybrid test branch's.
+    await fire(events, "session_start", sessionCtx());
+    await flush();
+    return {
+      run: (params: unknown, ctx = sessionCtx()) =>
+        tools.get(RECALL_TOOL_NAME)!.execute("t", params, undefined, undefined, ctx),
+    };
+  }
+
+  it("surfaces a semantic hit that shares no query terms, marked as semantic", async () => {
+    const { ctx, semantic } = hybridCtx();
+    const store = fakeVectorStore([{ key: firstKey(semantic), vector: vec(1) }]);
+    const embed = fakeEmbedSeam({ queryVector: vec(1) });
+    const { run } = await hybridSetup(embed, store);
+    const result = (await run({ query: "kitten napping sunny spot" }, ctx)) as { content: Array<{ text: string }> };
+    expect(result.content[0].text).toContain("Fluffy");
+    expect(result.content[0].text).toContain("· sem");
+  });
+  it("ranks a both-match above single-side hits and marks it", async () => {
+    const { ctx, semantic, lexical } = hybridCtx();
+    const store = fakeVectorStore([
+      { key: firstKey(semantic), vector: vec(1) },
+      { key: firstKey(lexical), vector: vec(0.5, 0.5) }, // partially aligned AND lexically matching
+    ]);
+    const embed = fakeEmbedSeam({ queryVector: vec(1) });
+    const { run } = await hybridSetup(embed, store);
+    const result = (await run({ query: "rotate tokens" }, ctx)) as { content: Array<{ text: string }> };
+    expect(result.content[0].text).toContain("· lex+sem");
+    expect(result.content[0].text.indexOf("rotate")).toBeLessThan(result.content[0].text.indexOf("Fluffy"));
+  });
+
+  it("fails open to lexical-only when the query embed times out", async () => {
+    const { ctx } = hybridCtx();
+    const lexicalRun = (await (function () {
+      const { pi, tools } = makePi();
+      registerRecallTool(pi, CONFIG);
+      return tools.get(RECALL_TOOL_NAME)!.execute("t", { query: "rotate tokens" }, undefined, undefined, ctx);
+    })()) as { content: Array<{ text: string }> };
+    const embed = fakeEmbedSeam();
+    embed.state.failQuery = true;
+    const { run } = await hybridSetup(embed, fakeVectorStore());
+    const hybridRun = (await run({ query: "rotate tokens" }, ctx)) as { content: Array<{ text: string }> };
+    expect(hybridRun.content[0].text).toBe(lexicalRun.content[0].text);
+    expect(embed.calls.queries).toHaveLength(1);
+  });
+
+  it("skips the vector side entirely at weight 0", async () => {
+    const { ctx } = hybridCtx();
+    const embed = fakeEmbedSeam({ queryVector: vec(1) });
+    const { run } = await hybridSetup(embed, fakeVectorStore(), { embedWeight: 0 });
+    await run({ query: "rotate tokens" }, ctx);
+    expect(embed.calls.queries).toHaveLength(0);
+  });
+
+  it("leaves ranking untouched when nothing is cached yet", async () => {
+    const { ctx } = hybridCtx();
+    const embed = fakeEmbedSeam({ queryVector: vec(1) });
+    const { run } = await hybridSetup(embed, fakeVectorStore());
+    const result = (await run({ query: "rotate tokens" }, ctx)) as { content: Array<{ text: string }> };
+    expect(result.content[0].text).toContain("rotate");
+    expect(result.content[0].text).not.toContain("· sem");
+  });
+});
+
+describe("embedding catch-up wiring", () => {
+  function catchUpSetup(configOverrides: Partial<RecallConfig> = {}, reader: ProjectReader = fsProjectReader) {
+    const store = fakeVectorStore();
+    const embed = fakeEmbedSeam();
+    const openedFiles: string[] = [];
+    const { pi, events } = makePi();
+    registerRecallTool(pi, { ...CONFIG, embedEnabled: true, ...configOverrides } as RecallConfig, reader, {
+      embed,
+      openStore: async (file) => {
+        openedFiles.push(file);
+        return store;
+      },
+    });
+    return { events, store, embed, openedFiles };
+  }
+
+  it("session_start opens the store, starts the worker, and embeds archived chunks", async () => {
+    const { ctx, semantic, lexical } = hybridCtx();
+    const { events, store, embed, openedFiles } = catchUpSetup();
+    await fire(events, "session_start", ctx);
+    await flush();
+    expect(openedFiles).toEqual([`${ctx.sessionManager.getSessionDir()}/recall-vectors.bin`]);
+    expect(embed.calls.started).toBe(1);
+    const embeddedTexts = embed.calls.embeds[0].map((i) => i.text);
+    expect(embeddedTexts.some((t) => t.includes("Fluffy"))).toBe(true);
+    expect(embeddedTexts.some((t) => t.includes("rotate"))).toBe(true);
+    expect(store.calls.added).toHaveLength(embed.calls.embeds[0].length);
+    expect(embed.calls.embeds[0].some((i) => i.key === firstKey(semantic))).toBe(true);
+    expect(embed.calls.embeds[0].some((i) => i.key === firstKey(lexical))).toBe(true);
+  });
+
+  it("a settle after everything is cached embeds nothing new", async () => {
+    const { ctx } = hybridCtx();
+    const { events, embed } = catchUpSetup();
+    await fire(events, "session_start", ctx);
+    await flush();
+    await fire(events, "agent_settled", ctx);
+    await flush();
+    expect(embed.calls.embeds).toHaveLength(1); // only the session_start round
+  });
+
+  it("a failed embed round retries on the next settle", async () => {
+    const { ctx } = hybridCtx();
+    const { events, embed, store } = catchUpSetup();
+    embed.state.failEmbed = true;
+    await fire(events, "session_start", ctx);
+    await flush();
+    expect(store.calls.added).toHaveLength(0);
+    embed.state.failEmbed = false;
+    await fire(events, "agent_settled", ctx);
+    await flush();
+    expect(store.calls.added.length).toBeGreaterThan(0);
+  });
+
+  it("store open failure disables the semantic side without breaking search", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { ctx } = hybridCtx();
+      const embed = fakeEmbedSeam();
+      const { pi, events, tools } = makePi();
+      registerRecallTool(pi, { ...CONFIG, embedEnabled: true } as RecallConfig, fsProjectReader, {
+        embed,
+        openStore: async () => {
+          throw new Error("disk full");
+        },
+      });
+      await fire(events, "session_start", ctx);
+      await flush();
+      expect(embed.calls.started).toBe(0); // spawn only after the store opens
+      const result = (await tools
+        .get(RECALL_TOOL_NAME)!
+        .execute("t", { query: "rotate tokens" }, undefined, undefined, ctx)) as { content: Array<{ text: string }> };
+      expect(result.content[0].text).toContain("rotate");
+      expect(err).toHaveBeenCalled();
+    } finally {
+      err.mockRestore();
+    }
+  });
+
+  it("session_shutdown kills the worker and closes the store exactly once", async () => {
+    const { ctx } = hybridCtx();
+    const { events, embed, store } = catchUpSetup();
+    await fire(events, "session_start", ctx);
+    await flush();
+    await fire(events, "session_shutdown", ctx);
+    await fire(events, "session_shutdown", ctx);
+    expect(embed.calls.killed).toBe(1);
+    expect(store.calls.closed).toBe(1);
+  });
+
+  it("a replacement session_start tears down the previous store and respawns", async () => {
+    const { ctx } = hybridCtx();
+    const embed = fakeEmbedSeam();
+    const first = fakeVectorStore();
+    const second = fakeVectorStore(); // one store per session dir
+    let openCount = 0;
+    const { pi, events } = makePi();
+    registerRecallTool(pi, { ...CONFIG, embedEnabled: true } as RecallConfig, fsProjectReader, {
+      embed,
+      openStore: async () => (openCount++ === 0 ? first : second),
+    });
+    await fire(events, "session_start", ctx);
+    await flush();
+    await fire(events, "session_start", ctx); // new/resume/fork in the same process
+    await flush();
+    expect(first.calls.closed).toBe(1); // replaced session's handle closed, not leaked
+    expect(second.calls.closed).toBe(0); // the new session's store stays open
+    expect(embed.calls.killed).toBe(1); // old worker killed…
+    expect(embed.calls.started).toBe(2); // ...and a fresh one spawned
+    expect(embed.calls.embeds).toHaveLength(2); // both sessions ran catch-up
+  });
+
+  it("embeds foreign sessions within the byte budget, newest first", async () => {
+    const f1 = sessionFile({ entries: [userLine("foreign embed me please")] });
+    const { reader, dir } = fakeReader([f1]);
+    const { ctx } = hybridCtx();
+    const withDir = sessionCtx({
+      branch: ctx.sessionManager.getBranch(),
+      contextEntries: [ctx.sessionManager.getBranch()[2], ctx.sessionManager.getBranch()[3]],
+      sessionDir: dir,
+      sessionFile: `${dir}/current.jsonl`,
+    });
+
+    // Budget 0: current session only.
+    const zero = catchUpSetup({ defaultScope: "project", embedForeignMaxBytes: 0 }, reader);
+    await fire(zero.events, "session_start", withDir);
+    await flush();
+    expect(zero.embed.calls.embeds[0].some((i) => i.text.includes("foreign embed me"))).toBe(false);
+
+    // Budget allows the foreign file: its chunks join the queue.
+    const budgeted = catchUpSetup({ defaultScope: "project", embedForeignMaxBytes: 1024 * 1024 }, reader);
+    await fire(budgeted.events, "session_start", withDir);
+    await flush();
+    expect(budgeted.embed.calls.embeds[0].some((i) => i.text.includes("foreign embed me"))).toBe(true);
+  });
+
+  it("skips foreign embedding when the scope is session-only", async () => {
+    const f1 = sessionFile({ entries: [userLine("never embed foreign")] });
+    const { reader, dir } = fakeReader([f1]);
+    const { ctx } = hybridCtx();
+    const withDir = sessionCtx({
+      branch: ctx.sessionManager.getBranch(),
+      contextEntries: [ctx.sessionManager.getBranch()[2], ctx.sessionManager.getBranch()[3]],
+      sessionDir: dir,
+      sessionFile: `${dir}/current.jsonl`,
+    });
+    const { events, embed } = catchUpSetup({ embedForeignMaxBytes: 1024 * 1024 }, reader); // scope stays "session"
+    await fire(events, "session_start", withDir);
+    await flush();
+    expect(embed.calls.embeds[0].some((i) => i.text.includes("never embed foreign"))).toBe(false);
+  });
+});
+
+describe("semantic ranking policy", () => {
+  const policy = { foreignWeight: 0.5, halfLifeHours: 4, recencyFloor: 0.25, embedWeight: 0.7 };
+
+  function chunked(text: string, timestamp: string, origin: "current" | "foreign" = "current"): RecallChunk {
+    return {
+      ref: "r",
+      entryId: "e",
+      key: chunkKey(SID, "e", 0, 0, text),
+      origin,
+      sessionLabel: origin === "current" ? "current session" : "past session",
+      kind: "user",
+      timestamp,
+      text,
+    };
+  }
+
+  it("semanticRankedKeys down-weights foreign and decayed chunks", () => {
+    const now = "2026-05-01T12:00:00Z";
+    const current = chunked("current discussion", now);
+    const foreign = chunked("foreign discussion", now, "foreign");
+    const old = chunked("old discussion", "2026-05-01T04:00:00Z"); // 8h old: past several half-lives
+    const byKey = new Map([current, foreign, old].map((c) => [c.key, c]));
+    const hits = [
+      { key: foreign.key, similarity: 0.8 },
+      { key: old.key, similarity: 0.9 },
+      { key: current.key, similarity: 0.5 },
+    ];
+    const ranked = semanticRankedKeys(hits, byKey, policy, Date.parse(now));
+    // current: 0.5×1; foreign: 0.8×0.5=0.4; old: 0.9×0.25(floor)≈0.225 — raw order reversed.
+    expect(ranked[0]).toBe(current.key);
+    expect(ranked[1]).toBe(foreign.key);
+    expect(ranked[2]).toBe(old.key);
+  });
+
+  it("fuseHybrid returns the lexical ranking untouched without semantic keys", () => {
+    const lexical = rankChunks([chunked("alpha beta", "2026-05-01T12:00:00Z")], "alpha", 0.5);
+    const out = fuseHybrid(lexical, [], new Map(), policy, 0);
+    expect(out.map((r) => r.chunk.key)).toEqual(lexical.map((r) => r.chunk.key));
+    expect(out.every((r) => r.sides === undefined)).toBe(true);
+  });
+
+  it("fuseHybrid carries provenance and lexical rawScores", () => {
+    const c = chunked("alpha beta", "2026-05-01T12:00:00Z");
+    const byKey = new Map([[c.key, c]]);
+    const lexical = rankChunks([c], "alpha", 0.5);
+    const fused = fuseHybrid(lexical, [c.key], byKey, policy, Date.parse("2026-05-01T12:00:00Z"));
+    expect(fused[0].sides).toBe("both");
+    expect(fused[0].rawScore).toBe(lexical[0].rawScore);
+    // Keys not in the corpus are dropped, not fatal.
+    expect(fuseHybrid(lexical, ["missing-key"], byKey, policy, 0)).toHaveLength(1);
+  });
+});
+
+describe("chunk key identity", () => {
+  it("is stable across the current→foreign session transition", () => {
+    const entry = msgEntry("user", { content: "the exact same text" });
+    const current = chunksFromEntry(
+      entry,
+      { origin: "current", sessionId: SID, sessionLabel: "current session" },
+      3000,
+    );
+    const foreign = chunksFromEntry(
+      entry,
+      { origin: "foreign", sessionId: SID, sessionLabel: "past session later" },
+      3000,
+    );
+    expect(current[0].key).toBe(foreign[0].key);
+  });
+});
+
+describe("embed config", () => {
+  it("defaults to enabled q8 with a 0.7 fusion weight", () => {
+    const config = configFromEnv({});
+    expect(config.embedEnabled).toBe(true);
+    expect(config.embedDtype).toBe("q8");
+    expect(config.embedWeight).toBe(0.7);
+    expect(config.embedForeignMaxBytes).toBe(32 * 1024 * 1024);
+    expect(config.embedModelDir).toBe(`${process.env.HOME}/.pi/agent/models`);
+  });
+
+  it("PI_RECALL_EMBED=0 disables the semantic side", () => {
+    expect(configFromEnv({ PI_RECALL_EMBED: "0" }).embedEnabled).toBe(false);
+  });
+
+  it("invalid dtype falls back with an explicit error; weights clamp", () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(configFromEnv({ PI_RECALL_EMBED_DTYPE: "int4" }).embedDtype).toBe("q8");
+      expect(configFromEnv({ PI_RECALL_EMBED_DTYPE: "fp16" }).embedDtype).toBe("fp16");
+      expect(configFromEnv({ PI_RECALL_EMBED_WEIGHT: "9" }).embedWeight).toBe(2);
+      expect(configFromEnv({ PI_RECALL_EMBED_MAX_MB: "0" }).embedForeignMaxBytes).toBe(0);
+      expect(configFromEnv({ PI_RECALL_MODEL_DIR: "/custom/models" }).embedModelDir).toBe("/custom/models");
+      expect(err).toHaveBeenCalled();
+    } finally {
+      err.mockRestore();
+    }
+  });
+});
 
 describe("renderers", () => {
   const theme = { fg: (_k: string, s: string) => s, bold: (s: string) => s } as never;

@@ -18,6 +18,16 @@
  *   back still surface. Lexical match is deliberate: recall returns verbatim
  *   text, the regime where models are strongest (NoLiMa), and every hit
  *   carries provenance.
+ * - Hybrid: a local EmbeddingGemma (300M, ONNX) adds a semantic ranking over
+ *   the same chunks, fused into BM25 by weighted reciprocal-rank fusion
+ *   (`PI_RECALL_EMBED_WEIGHT`, default 0.7 — lexical stays primary) so
+ *   paraphrase queries surface discussions that share no terms. Embeddings
+ *   run in a disposable child process (the model parks ~1.7GB of arena that
+ *   only exit reclaims) and persist in a flat append-only file per session
+ *   dir, keyed by content hash — a pure derived cache: vectors are only ever
+ *   missing, never wrong, and every failure (worker dead, model absent,
+ *   nothing cached yet) degrades to lexical-only ranking. Catch-up embedding
+ *   drains in budgeted batches from session_start/agent_settled.
  * - Scope `session` (default) indexes the in-memory branch on demand — always
  *   fresh, branch/rewind-correct, nothing persisted. Scope `project` adds
  *   sibling session files from the cwd-scoped session directory, labeled and
@@ -53,6 +63,7 @@
 
 import fsp from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
@@ -68,6 +79,9 @@ import {
   type SessionEntry,
   type Theme,
 } from "@earendil-works/pi-coding-agent";
+import { EmbedClient } from "../lib/embed-client";
+import { fuseRankings, type MatchSides } from "../lib/embed";
+import { chunkKey, VectorStore, type VectorHit } from "../lib/vecstore";
 import { PLAN_MESSAGE_TYPE, PLAN_SECTION_HEADER, lastTodoSnapshot, renderPlainList } from "./todo";
 
 export const RECALL_TOOL_NAME = "recall";
@@ -98,6 +112,15 @@ export interface RecallConfig {
   maxResults: number;
   readChars: number;
   projectMaxBytes: number;
+  /** Semantic side of hybrid search: local EmbeddingGemma embeddings, fused into lexical ranking by RRF. */
+  embedEnabled: boolean;
+  embedDtype: EmbedDtype;
+  /** RRF weight of the semantic ranking (lexical is 1.0). 0 keeps ranking purely lexical. */
+  embedWeight: number;
+  /** Byte budget for embedding foreign-session text per catch-up (0 = current session only). */
+  embedForeignMaxBytes: number;
+  /** Where the ONNX model caches (must survive npm installs — never inside node_modules). */
+  embedModelDir: string;
 }
 
 const DEFAULTS: RecallConfig = {
@@ -115,6 +138,11 @@ const DEFAULTS: RecallConfig = {
   maxResults: 5,
   readChars: 4000,
   projectMaxBytes: 64 * 1024 * 1024,
+  embedEnabled: true,
+  embedDtype: "q8",
+  embedWeight: 0.7,
+  embedForeignMaxBytes: 32 * 1024 * 1024,
+  embedModelDir: `${process.env.HOME ?? "~"}/.pi/agent/models`,
 };
 
 /** Minimum for PI_RECALL_SUMMARY_CHARS. */
@@ -154,6 +182,19 @@ function summaryThinkingFromEnv(env: NodeJS.ProcessEnv): RecallConfig["summaryTh
   return raw as RecallConfig["summaryThinking"];
 }
 
+export type EmbedDtype = "fp32" | "fp16" | "q8" | "q4" | "q4f16";
+const EMBED_DTYPES = new Set<EmbedDtype>(["fp32", "fp16", "q8", "q4", "q4f16"]);
+
+function dtypeFromEnv(env: NodeJS.ProcessEnv): EmbedDtype {
+  const raw = env.PI_RECALL_EMBED_DTYPE?.trim().toLowerCase();
+  if (raw === undefined || raw === "") return DEFAULTS.embedDtype;
+  if (EMBED_DTYPES.has(raw as EmbedDtype)) return raw as EmbedDtype;
+  console.error(
+    `recall: PI_RECALL_EMBED_DTYPE=${raw} is invalid (fp32|fp16|q8|q4|q4f16) — using ${DEFAULTS.embedDtype}`,
+  );
+  return DEFAULTS.embedDtype;
+}
+
 export function configFromEnv(env: NodeJS.ProcessEnv = process.env): RecallConfig {
   const scope = env.PI_RECALL_SCOPE?.trim().toLowerCase();
   if (scope !== undefined && scope !== "" && scope !== "session" && scope !== "project") {
@@ -178,6 +219,11 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): RecallConfi
     maxResults: Math.floor(numFromEnv(env, "PI_RECALL_MAX_RESULTS", DEFAULTS.maxResults, 1, 25)),
     readChars: Math.floor(numFromEnv(env, "PI_RECALL_READ_CHARS", DEFAULTS.readChars, 500, 100_000)),
     projectMaxBytes: Math.floor(numFromEnv(env, "PI_RECALL_PROJECT_MAX_MB", 64, 4, 4096) * 1024 * 1024),
+    embedEnabled: boolFromEnv(env, "PI_RECALL_EMBED", DEFAULTS.embedEnabled),
+    embedDtype: dtypeFromEnv(env),
+    embedWeight: numFromEnv(env, "PI_RECALL_EMBED_WEIGHT", DEFAULTS.embedWeight, 0, 2),
+    embedForeignMaxBytes: Math.floor(numFromEnv(env, "PI_RECALL_EMBED_MAX_MB", 32, 0, 4096) * 1024 * 1024),
+    embedModelDir: env.PI_RECALL_MODEL_DIR?.trim() || DEFAULTS.embedModelDir,
   };
 }
 
@@ -383,6 +429,8 @@ export function chunkText(text: string, maxChars: number): TextChunk[] {
 export interface RecallChunk {
   ref: string; // stable read reference (entryId, or entryId.sess for foreign)
   entryId: string;
+  /** Content hash identity — the semantic cache key, stable across sessions that parse the same entry. */
+  key: string;
   origin: "current" | "foreign";
   sessionLabel: string; // "current session" or "past session <name> <date>"
   kind: RecallKind;
@@ -406,18 +454,19 @@ export function parseRef(ref: string): { entryId: string; sessionIdShort?: strin
   return { entryId: parts[0], sessionIdShort: parts[1] };
 }
 
-/** Chunk every indexable section of one entry. */
+/** Chunk every indexable section of one entry, keyed by content hash. */
 export function chunksFromEntry(
   entry: SessionEntry,
   meta: { origin: "current" | "foreign"; sessionId: string; sessionLabel: string },
   chunkChars: number,
 ): RecallChunk[] {
   const chunks: RecallChunk[] = [];
-  for (const section of extractEntrySections(entry)) {
-    for (const piece of chunkText(section.text, chunkChars)) {
+  for (const [sectionIdx, section] of extractEntrySections(entry).entries()) {
+    for (const [chunkIdx, piece] of chunkText(section.text, chunkChars).entries()) {
       chunks.push({
         ref: makeRef(entry.id, meta.origin, meta.sessionId),
         entryId: entry.id,
+        key: chunkKey(meta.sessionId, entry.id, sectionIdx, chunkIdx, piece.text),
         origin: meta.origin,
         sessionLabel: meta.sessionLabel,
         kind: section.kind,
@@ -480,6 +529,8 @@ export interface ScoredChunk {
   score: number; // weighted, decayed, descending sort key
   rawScore: number; // unweighted BM25
   recencyFactor: number; // 1 at the frontier, halving per half-life, floored
+  /** Which rankings matched (hybrid path only; undefined = lexical-only ranking). */
+  sides?: MatchSides;
 }
 
 interface ChunkTerms {
@@ -520,11 +571,7 @@ export function rankChunks(
 ): ScoredChunk[] {
   const queryTokens = [...new Set(tokenize(query))];
   if (queryTokens.length === 0 || chunks.length === 0) return [];
-  const frontier = (() => {
-    let newest = -Infinity;
-    for (const c of chunks) newest = Math.max(newest, tsMs(c.timestamp));
-    return newest;
-  })();
+  const frontier = archiveFrontier(chunks);
   const halfLifeMs = halfLifeHours * 3_600_000;
   const { terms, df, avgLength } = indexChunks(chunks);
   const N = chunks.length;
@@ -560,10 +607,117 @@ function tsMs(timestamp: string): number {
   return Number.isNaN(ms) ? Number.NEGATIVE_INFINITY : ms;
 }
 
+/** The archive frontier: newest chunk timestamp in the corpus, in epoch ms. */
+export function archiveFrontier(chunks: RecallChunk[]): number {
+  let newest = -Infinity;
+  for (const c of chunks) newest = Math.max(newest, tsMs(c.timestamp));
+  return newest;
+}
+
 /** Exponential memory decay: 1 at the frontier, halving per half-life, never below the floor. */
 export function recencyFactor(ageMs: number, halfLifeMs: number, floor: number): number {
   if (!Number.isFinite(ageMs) || ageMs <= 0) return ageMs === 0 ? 1 : floor;
   return Math.max(floor, 0.5 ** (ageMs / halfLifeMs));
+}
+
+// ---------------------------------------------------------------------------
+// Semantic side (hybrid)
+// ---------------------------------------------------------------------------
+
+/**
+ * How deep each ranking feeds RRF. 64 keeps the fusion candidate set well
+ * past maxResults (25 cap) while staying far below corpus size — decay can
+ * reorder within it freely; a chunk outside the top 64 of both rankings has
+ * neither strong lexical nor semantic evidence for a 5-result page.
+ */
+const FUSION_DEPTH = 64;
+
+/** Fused RRF scores land in [0, ~0.03]; ×100 puts them in a readable range for the result format. */
+const FUSED_SCORE_SCALE = 100;
+
+/** One catch-up round embeds at most this many chunks — a large backlog drains across settles. */
+const EMBED_BATCH_LIMIT = 128;
+
+/** The structural slice of VectorStore the extension touches — injectable for tests. */
+export interface VectorStoreLike {
+  has(keys: readonly string[]): Set<string>;
+  add(items: readonly { key: string; vector: Float32Array }[]): Promise<void>;
+  topK(query: Float32Array, candidates: Iterable<string>, k: number): VectorHit[];
+  close(): Promise<void>;
+}
+
+/** The structural slice of EmbedClient — injectable for tests. */
+export interface EmbedSeam {
+  readonly available: boolean;
+  start(): boolean;
+  query(text: string): Promise<Float32Array | undefined>;
+  embed(
+    items: readonly { key: string; text: string }[],
+  ): Promise<Array<{ key: string; vector: Float32Array }> | undefined>;
+  kill(): void;
+}
+
+/**
+ * Rank vector hits best-first under the same policy as the lexical side —
+ * foreign weight and memory-horizon decay applied to similarity — so both
+ * rankings entering RRF already encode the extension's notion of relevance.
+ */
+export function semanticRankedKeys(
+  hits: readonly VectorHit[],
+  chunksByKey: ReadonlyMap<string, RecallChunk>,
+  config: Pick<RecallConfig, "foreignWeight" | "halfLifeHours" | "recencyFloor">,
+  frontier: number,
+): string[] {
+  const halfLifeMs = config.halfLifeHours * 3_600_000;
+  const scored = hits
+    .map((hit) => {
+      const chunk = chunksByKey.get(hit.key);
+      if (chunk === undefined) return undefined;
+      const weight = chunk.origin === "current" ? 1 : config.foreignWeight;
+      const recency = recencyFactor(frontier - tsMs(chunk.timestamp), halfLifeMs, config.recencyFloor);
+      return { key: hit.key, score: hit.similarity * weight * recency };
+    })
+    .filter((x): x is { key: string; score: number } => x !== undefined);
+  scored.sort((a, b) => b.score - a.score || (a.key < b.key ? -1 : 1));
+  return scored.map((x) => x.key);
+}
+
+/**
+ * Hybrid ranking: fuse the (already policy-weighted) lexical and semantic
+ * key rankings with RRF, then rebuild ScoredChunks in fused order. Purely
+ * lexical input (no semantic keys) returns the lexical ranking unchanged —
+ * vectors widen recall, they never gate it.
+ */
+export function fuseHybrid(
+  lexical: readonly ScoredChunk[],
+  semanticKeys: readonly string[],
+  chunksByKey: ReadonlyMap<string, RecallChunk>,
+  config: Pick<RecallConfig, "foreignWeight" | "halfLifeHours" | "recencyFloor" | "embedWeight">,
+  frontier: number,
+): ScoredChunk[] {
+  if (semanticKeys.length === 0) return [...lexical];
+  const fused = fuseRankings(
+    lexical.slice(0, FUSION_DEPTH).map((r) => r.chunk.key),
+    semanticKeys.slice(0, FUSION_DEPTH),
+    { lexical: 1, semantic: config.embedWeight },
+  );
+  const halfLifeMs = config.halfLifeHours * 3_600_000;
+  const byScored = new Map(lexical.map((r) => [r.chunk.key, r]));
+  return fused.flatMap((f) => {
+    const chunk = chunksByKey.get(f.key);
+    if (chunk === undefined) return [];
+    const recency = recencyFactor(frontier - tsMs(chunk.timestamp), halfLifeMs, config.recencyFloor);
+    const lexicalRaw = byScored.get(f.key);
+    return [
+      {
+        chunk,
+        score: f.score * FUSED_SCORE_SCALE,
+        rawScore: lexicalRaw?.rawScore ?? 0,
+        recencyFactor: recency,
+        sides: f.sides,
+      },
+    ];
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -619,6 +773,8 @@ export interface SearchHit {
   score: number;
   /** Recency multiplier already folded into score; surfaced so ranking is explainable. */
   recencyFactor?: number;
+  /** Which rankings matched (hybrid path only). */
+  match?: MatchSides;
   snippet: string;
 }
 
@@ -645,8 +801,9 @@ export function formatSearchResult(
       `Top ${hits.length} match${hits.length === 1 ? "" : "es"} (of ${meta.archiveEntries} archived entries searched):`,
     );
     for (const [i, hit] of hits.entries()) {
+      const match = hit.match === "both" ? " · lex+sem" : hit.match === "semantic" ? " · sem" : "";
       lines.push(
-        `${i + 1}. ${hit.sessionLabel} · ${kindLabel(hit.kind, hit.label)} · ${shortDate(hit.timestamp)} · score ${hit.score.toFixed(1)}${
+        `${i + 1}. ${hit.sessionLabel} · ${kindLabel(hit.kind, hit.label)} · ${shortDate(hit.timestamp)} · score ${hit.score.toFixed(1)}${match}${
           hit.recencyFactor !== undefined && hit.recencyFactor < 0.95
             ? ` (recency ×${hit.recencyFactor.toFixed(2)})`
             : ""
@@ -958,12 +1115,43 @@ export function registerRecallTool(
   pi: ExtensionAPI,
   config: RecallConfig = configFromEnv(),
   reader: ProjectReader = fsProjectReader,
-  deps: { summarize?: SummaryFn; logCompactionError?: (line: string) => void; retryDelayMs?: number } = {},
+  deps: {
+    summarize?: SummaryFn;
+    logCompactionError?: (line: string) => void;
+    retryDelayMs?: number;
+    /** Semantic-side seams — inject fakes in tests; defaults are the real worker client and vector store. */
+    embed?: EmbedSeam;
+    openStore?: (file: string) => Promise<VectorStoreLike>;
+  } = {},
 ): void {
   let reminderPending = false;
   let autoCompactInFlight = false;
   const corpusCache = new ProjectCorpusCache(reader, config.projectMaxBytes, config.chunkChars);
   const summarize = deps.summarize ?? defaultSummaryFn;
+  // Semantic support, opened lazily at session_start and torn down at
+  // session_shutdown. `vectors` is null whenever the feature is off, the
+  // store failed to open, or the session ended — search treats null as
+  // "lexical only" and never blocks on it.
+  const embed: EmbedSeam =
+    deps.embed ??
+    new EmbedClient({
+      // Registration must never throw — if the loader yields an exotic
+      // import.meta.url, fall back to a best-effort path and let the spawn
+      // fail open (one notice, lexical-only search).
+      workerPath: (() => {
+        try {
+          return fileURLToPath(new URL("../lib/embed-worker.ts", import.meta.url));
+        } catch {
+          return path.resolve("lib/embed-worker.ts");
+        }
+      })(),
+      dtype: config.embedDtype,
+      modelDir: config.embedModelDir,
+      onNotice: (message) => console.error(`recall: ${message}`),
+    });
+  const openStore = deps.openStore ?? ((file: string) => VectorStore.open(file));
+  let vectorSupport: { store: VectorStoreLike; embed: EmbedSeam } | null = null;
+  let catchUpInFlight = false;
   // Breadcrumb for compaction failures — ctx.compact() failures are otherwise
   // invisible (async, no UI surface). One line per failure, never throws.
   const logCompactionError =
@@ -978,13 +1166,110 @@ export function registerRecallTool(
         .catch(() => {});
     });
 
-  pi.on("session_start", () => {
+  /** Chunks awaiting embedding: archived current-session chunks always, plus foreign sessions newest-first within the byte budget. */
+  const pendingEmbeddings = async (
+    ctx: ExtensionContext,
+    support: { store: VectorStoreLike; embed: EmbedSeam },
+  ): Promise<Array<{ key: string; text: string }>> => {
+    const sm = ctx.sessionManager;
+    const candidates = buildArchiveChunks(
+      sm.getBranch(),
+      visibleEntryIds(sm.buildSessionProjection()),
+      sm.getSessionId(),
+      config,
+    );
+    if (config.embedForeignMaxBytes > 0 && config.defaultScope === "project") {
+      try {
+        await corpusCache.refresh(sm.getSessionDir(), sm.getSessionFile());
+        // Newest files first: recent sessions are the likeliest searches. A
+        // corpus that alone exceeds the remaining budget is skipped, not
+        // squeezed in — one giant newest session must not starve older ones.
+        const corpora = [...corpusCache.list()].sort((a, b) => b.mtimeMs - a.mtimeMs);
+        let budget = config.embedForeignMaxBytes;
+        for (const corpus of corpora) {
+          if (corpus.bytes > budget) continue;
+          candidates.push(...corpus.chunks);
+          budget -= corpus.bytes;
+          if (budget <= 0) break;
+        }
+      } catch {
+        // Foreign embedding is best-effort — search still reports unreadable files.
+      }
+    }
+    const unique: RecallChunk[] = [];
+    const seen = new Set<string>();
+    for (const chunk of candidates)
+      if (!seen.has(chunk.key)) {
+        seen.add(chunk.key);
+        unique.push(chunk);
+      }
+    const present = support.store.has(unique.map((c) => c.key));
+    return unique.filter((c) => !present.has(c.key)).map((c) => ({ key: c.key, text: c.text }));
+  };
+
+  /**
+   * Background embedding catch-up, budgeted per round: one batch of at most
+   * EMBED_BATCH_LIMIT chunks per trigger (session_start, agent_settled) so a
+   * large backlog drains across settles instead of hogging the worker.
+   * Failures are silent-but-retryable — the next trigger diffs again and
+   * re-sends only what is still missing.
+   */
+  const catchUp = async (ctx: ExtensionContext): Promise<void> => {
+    const support = vectorSupport;
+    // No `embed.available` gate: a dead worker is respawned lazily by the
+    // request (bounded by maxStartAttempts, reset on health evidence) so one
+    // transient crash doesn't disable the semantic side for the session.
+    if (support === null || catchUpInFlight) return;
+    catchUpInFlight = true;
+    try {
+      const pending = await pendingEmbeddings(ctx, support);
+      if (pending.length === 0) return;
+      const vectors = await support.embed.embed(pending.slice(0, EMBED_BATCH_LIMIT));
+      if (vectors !== undefined && vectors.length > 0) await support.store.add(vectors);
+    } catch (err) {
+      console.error(`recall: embedding catch-up failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      catchUpInFlight = false;
+    }
+  };
+
+  pi.on("session_start", (_event, ctx) => {
     reminderPending = false;
     autoCompactInFlight = false;
+    if (!config.embedEnabled) return;
+    void (async () => {
+      try {
+        // A session replacement (new/resume/fork) in the same process must not
+        // leak the previous session's store handle or worker — shutdown
+        // normally did this, belt and braces if it did not.
+        const previous = vectorSupport;
+        vectorSupport = null;
+        embed.kill();
+        await previous?.store.close();
+        const store = await openStore(path.join(ctx.sessionManager.getSessionDir(), "recall-vectors.bin"));
+        vectorSupport = { store, embed };
+        embed.start();
+        await catchUp(ctx);
+      } catch (err) {
+        vectorSupport = null;
+        console.error(`recall: semantic search unavailable: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    })();
   });
   pi.on("session_compact", () => {
     reminderPending = true;
     autoCompactInFlight = false;
+  });
+
+  // Torn down on quit, reload, and session replacement — the worker child
+  // must not outlive the session that spawned it (its result would have no
+  // consumer), and the store handle belongs to one session directory.
+  pi.on("session_shutdown", () => {
+    embed.kill();
+    const support = vectorSupport;
+    vectorSupport = null;
+    catchUpInFlight = false;
+    void support?.store.close();
   });
 
   pi.on("before_agent_start", (_event, _ctx) => {
@@ -1000,8 +1285,10 @@ export function registerRecallTool(
   // Context budget: auto-compact between turns, once the run has fully settled
   // (idle — nothing to abort, nothing to race). pi's own near-limit threshold
   // stays as the backstop for anything this trigger cannot see.
-  // PI_RECALL_COMPACT_TARGET=0 disables.
+  // PI_RECALL_COMPACT_TARGET=0 disables. Also drains the embedding backlog —
+  // settled moments are exactly when background CPU is free.
   pi.on("agent_settled", (_event, ctx) => {
+    void catchUp(ctx);
     const usage = ctx.getContextUsage();
     if (
       !shouldAutoCompact(
@@ -1213,7 +1500,7 @@ export function registerRecallTool(
     name: RECALL_TOOL_NAME,
     label: "Recall",
     description:
-      "Search conversation history that is no longer in your context (compacted away). Compaction folds dropped turns into a summary — the newest messages stay in context, and the verbatim transcript remains on disk where this tool retrieves it. Use it when you need earlier details you cannot see: decisions, prior failed attempts, file paths, command outputs, error strings. mode 'search' (default) takes a query and returns ranked verbatim excerpts with provenance; mode 'read' takes an id from a prior result and returns the full entry. scope 'session' (default) searches this session's compacted history; scope 'project' also searches past sessions in this directory (labeled and down-ranked). Prefer recall over re-deriving or guessing at earlier state.",
+      "Search conversation history that is no longer in your context (compacted away). Compaction folds dropped turns into a summary — the newest messages stay in context, and the verbatim transcript remains on disk where this tool retrieves it. Use it when you need earlier details you cannot see: decisions, prior failed attempts, file paths, command outputs, error strings. mode 'search' (default) takes a query and returns ranked verbatim excerpts with provenance (hybrid lexical + semantic ranking — plain words, identifiers, or paraphrases all work); mode 'read' takes an id from a prior result and returns the full entry. scope 'session' (default) searches this session's compacted history; scope 'project' also searches past sessions in this directory (labeled and down-ranked). Prefer recall over re-deriving or guessing at earlier state.",
     promptSnippet: "recall — search compacted-away session history verbatim (scope 'project' adds past sessions)",
     parameters: RecallParams,
     async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -1222,7 +1509,7 @@ export function registerRecallTool(
         const details = await readEntry(params, ctx, corpusCache, config);
         return { content: [{ type: "text", text: details.text }], details: details.details };
       }
-      return search(params, ctx, corpusCache, config);
+      return search(params, ctx, corpusCache, config, vectorSupport);
     },
     renderCall(args, theme, context) {
       const text = reuseText(context);
@@ -1722,6 +2009,7 @@ async function search(
   ctx: ExtensionContext,
   corpusCache: ProjectCorpusCache,
   config: RecallConfig,
+  vectors: { store: VectorStoreLike; embed: EmbedSeam } | null,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: RecallDetails }> {
   const query = params.query?.trim() ?? "";
   const scope = params.scope ?? config.defaultScope;
@@ -1764,7 +2052,21 @@ async function search(
     allChunks = [...archiveChunks, ...corpora.flatMap((c) => c.chunks)];
   }
 
-  const rankedAll = rankChunks(allChunks, query, config.foreignWeight, config.halfLifeHours, config.recencyFloor);
+  let rankedAll = rankChunks(allChunks, query, config.foreignWeight, config.halfLifeHours, config.recencyFloor);
+  // Semantic side: embed the query, scan the cached vectors over this
+  // corpus's keys, and fuse by rank. Every step fails open — worker down
+  // (lazily respawned by the request itself, bounded), query timeout, or
+  // nothing cached yet leaves rankedAll exactly as BM25 produced it.
+  if (vectors !== null && config.embedWeight > 0) {
+    const queryVector = await vectors.embed.query(query);
+    if (queryVector !== undefined) {
+      const chunksByKey = new Map(allChunks.map((c) => [c.key, c]));
+      const frontier = archiveFrontier(allChunks);
+      const hits = vectors.store.topK(queryVector, chunksByKey.keys(), FUSION_DEPTH);
+      const semanticKeys = semanticRankedKeys(hits, chunksByKey, config, frontier);
+      rankedAll = fuseHybrid(rankedAll, semanticKeys, chunksByKey, config, frontier);
+    }
+  }
   const ranked = rankedAll.slice(0, limit);
   const hits: SearchHit[] = ranked.map((r) => ({
     ref: r.chunk.ref,
@@ -1774,6 +2076,7 @@ async function search(
     timestamp: r.chunk.timestamp,
     score: r.score,
     recencyFactor: r.recencyFactor,
+    match: r.sides,
     snippet: extractSnippet(r.chunk.text, query, config.snippetChars),
   }));
   const archiveEntries = new Set(allChunks.map((c) => c.ref)).size;
