@@ -41,7 +41,7 @@ const PACKED_BYTES = BITS / 8;
 /** Truncated sha256: 128-bit keys make collisions negligible at recall scale (~10⁻²³ at 100k chunks). */
 export const KEY_HEX = 32;
 const KEY_BYTES = KEY_HEX / 2;
-const RECORD_BYTES = KEY_BYTES + PACKED_BYTES;
+export const RECORD_BYTES = KEY_BYTES + PACKED_BYTES;
 
 const MAGIC = "RVEC";
 const FORMAT_VERSION = 3;

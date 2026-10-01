@@ -33,8 +33,8 @@
   "scripts": {
     "bench:recall": "vitest run --config scripts/bench.config.ts",
     "check": "tsc --noEmit && vitest run",
-    "check:format": "prettier --check extensions lib tests",
-    "format": "prettier --write extensions lib tests",
+    "check:format": "prettier --check extensions lib scripts tests",
+    "format": "prettier --write extensions lib scripts tests",
     "postinstall": "node scripts/fetch-model.mjs",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",

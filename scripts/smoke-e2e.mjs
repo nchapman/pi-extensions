@@ -21,9 +21,18 @@ const store = await VectorStore.open(path.join(dir, "recall-vectors.bin"));
 try {
   client.start();
   const docs = [
-    { key: chunkKey("s", "e1", 0, 0, "The auth token refresh must use rotation."), text: "The auth token refresh must use rotation." },
-    { key: chunkKey("s", "e2", 0, 0, "Fluffy curled up asleep in the corner of the rug."), text: "Fluffy curled up asleep in the corner of the rug." },
-    { key: chunkKey("s", "e3", 0, 0, "sqlite-vec brute-force scans 10k vectors in a millisecond."), text: "sqlite-vec brute-force scans 10k vectors in a millisecond." },
+    {
+      key: chunkKey("s", "e1", 0, 0, "The auth token refresh must use rotation."),
+      text: "The auth token refresh must use rotation.",
+    },
+    {
+      key: chunkKey("s", "e2", 0, 0, "Fluffy curled up asleep in the corner of the rug."),
+      text: "Fluffy curled up asleep in the corner of the rug.",
+    },
+    {
+      key: chunkKey("s", "e3", 0, 0, "sqlite-vec brute-force scans 10k vectors in a millisecond."),
+      text: "sqlite-vec brute-force scans 10k vectors in a millisecond.",
+    },
   ];
   const t0 = Date.now();
   const vectors = await client.embed(docs);
@@ -34,8 +43,13 @@ try {
   const t1 = Date.now();
   const qv = await client.query("kitten napping on the carpet");
   console.log(`query embed: ${Date.now() - t1}ms`);
-  const hits = store.topK(qv, docs.map((d) => d.key), 3);
-  for (const [i, h] of hits.entries()) console.log(`  ${i + 1}. ${docs.find((d) => d.key === h.key)?.text.slice(0, 50)} — cos ${h.similarity.toFixed(3)}`);
+  const hits = store.topK(
+    qv,
+    docs.map((d) => d.key),
+    3,
+  );
+  for (const [i, h] of hits.entries())
+    console.log(`  ${i + 1}. ${docs.find((d) => d.key === h.key)?.text.slice(0, 50)} — cos ${h.similarity.toFixed(3)}`);
   if (hits[0].key !== docs[1].key) throw new Error("paraphrase did not rank first");
 
   // Persistence round-trip.

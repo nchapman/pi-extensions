@@ -51,6 +51,8 @@ function fail(reason) {
   failed = true;
   clearTimeout(timer);
   child.kill();
-  console.error(`recall: embedding model fetch skipped (${reason}) — semantic search will degrade to lexical-only. Re-run: node scripts/fetch-model.mjs`);
+  console.error(
+    `recall: embedding model fetch skipped (${reason}) — semantic search will degrade to lexical-only. Re-run: node scripts/fetch-model.mjs`,
+  );
   process.exit(0); // fail-soft: never break npm install
 }
