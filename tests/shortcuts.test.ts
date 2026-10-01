@@ -53,7 +53,35 @@ describe("SHORTCUTS", () => {
   });
 
   it("does not collide with known built-in command names", () => {
-    const builtins = ["quit", "new", "compact", "name", "session", "tree", "reload", "help"];
+    // The full documented set of pi's built-in slash commands. A shortcut that
+    // shadows any of these would steal a command the user already expects.
+    const builtins = [
+      "settings",
+      "model",
+      "thinking",
+      "scoped-models",
+      "login",
+      "logout",
+      "llama",
+      "new",
+      "resume",
+      "name",
+      "session",
+      "tree",
+      "fork",
+      "clone",
+      "compact",
+      "import",
+      "copy",
+      "export",
+      "share",
+      "bug",
+      "trust",
+      "reload",
+      "hotkeys",
+      "changelog",
+      "quit",
+    ];
     for (const s of SHORTCUTS) {
       expect(builtins).not.toContain(s.name);
     }
@@ -138,6 +166,24 @@ describe("info shortcut", () => {
     expect(notifyCalls[0]).toContain("unnamed");
     expect(notifyCalls[0]).toContain("unknown");
   });
+
+  it("reports unknown when usage exists but tokens is null (e.g. right after compaction)", async () => {
+    const { pi, commands } = makePi();
+    registerShortcuts(pi);
+    const notifyCalls: string[] = [];
+    const ctx = {
+      cwd: "/somewhere",
+      sessionManager: { getSessionName: () => "my-session" },
+      // tokens/percent null is the documented post-compaction state.
+      getContextUsage: () => ({ tokens: null, contextWindow: 100000, percent: null }),
+      ui: {
+        notify: (m: string) => void notifyCalls.push(m),
+      },
+    } as unknown as ExtensionCommandContext;
+    await fire(commands, "info", ctx);
+    expect(notifyCalls[0]).not.toContain("null");
+    expect(notifyCalls[0]).toContain("unknown");
+  });
 });
 
 describe("time shortcut", () => {
@@ -147,7 +193,9 @@ describe("time shortcut", () => {
     const { ctx, notifyCalls } = makeCtx();
     await fire(commands, "time", ctx);
     expect(notifyCalls[0][1]).toBe("info");
-    expect(new Date(notifyCalls[0][0]).toString()).toBe(new Date().toString());
+    // Second-granular toString() can differ by 1s if the clock ticks between
+    // the command and the assertion, so compare as an absolute delta instead.
+    expect(Math.abs(Date.parse(notifyCalls[0][0]) - Date.now())).toBeLessThan(5000);
   });
 });
 

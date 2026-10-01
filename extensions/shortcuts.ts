@@ -41,7 +41,9 @@ async function infoAction(ctx: ExtensionCommandContext): Promise<void> {
   const lines = [
     `session: ${name ?? "(unnamed)"}`,
     `dir: ${ctx.cwd}`,
-    usage ? `context: ${usage.tokens}/${usage.contextWindow}` : "context: unknown",
+    // tokens can be null right after compaction (before the next LLM response),
+    // so a plain truthy check would print "null/100000"; treat null like unknown.
+    usage && usage.tokens != null ? `context: ${usage.tokens}/${usage.contextWindow}` : "context: unknown",
   ];
   ctx.ui.notify(lines.join("     "), "info");
 }
