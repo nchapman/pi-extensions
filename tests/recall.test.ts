@@ -33,6 +33,7 @@ import {
   effectiveCompactTarget,
   lastCompactionDetails,
   buildSummarizationPrompt,
+  salvageLengthStoppedSummary,
   shouldAutoCompact,
   type SummaryFn,
   registerRecallTool,
@@ -2072,7 +2073,7 @@ describe("summarization prompt", () => {
     expect(prompt).not.toContain("\n<previous-summary>\n");
     // The hard budget keeps the generation under our output cap.
     expect(prompt).toContain("under 5,000 characters");
-    expect(prompt).toContain("discarded whole");
+    expect(prompt).toContain("loses everything past the cut");
     // Fully owned: nothing rides pi's built-in summarizer prompt.
     expect(prompt).not.toContain("Additional focus");
     // Meta-sessions (editing this very prompt) must not hijack the format.
@@ -2130,6 +2131,48 @@ describe("summarization prompt", () => {
     const prompt = buildSummarizationPrompt("[User]: hi", "## Goal\n- stale", "focus on auth");
     expect(prompt).toContain("<previous-summary>\n## Goal\n- stale\n</previous-summary>");
     expect(prompt).toContain("User focus for this compaction: focus on auth");
+  });
+});
+
+describe("length-stopped summary salvage", () => {
+  const MARKER = "[summary truncated at the output cap — use recall for missing detail]";
+
+  it("rejects a partial too small to be a map", () => {
+    expect(salvageLengthStoppedSummary("partial", 5_000)).toBeNull();
+    // Exactly at the floor (25% of budget) is enough; one under is not.
+    expect(salvageLengthStoppedSummary("x".repeat(1_250), 5_000)).not.toBeNull();
+    expect(salvageLengthStoppedSummary("x".repeat(1_249), 5_000)).toBeNull();
+    expect(salvageLengthStoppedSummary("", 5_000)).toBeNull();
+  });
+
+  it("accepts an in-budget partial verbatim, marked as truncated", () => {
+    const partial = "## Goal\n- " + "x".repeat(2_000);
+    const salvaged = salvageLengthStoppedSummary(partial, 5_000)!;
+    expect(salvaged.startsWith(partial)).toBe(true);
+    expect(salvaged.endsWith(`\n\n${MARKER}`)).toBe(true);
+  });
+
+  it("trims an over-budget partial at a line boundary inside the budget", () => {
+    const partial = ["## Goal", "- line one", "- line two", "- line three"]
+      .concat(Array.from({ length: 200 }, (_, i) => `- filler ${i} ${"y".repeat(40)}`))
+      .join("\n");
+    const salvaged = salvageLengthStoppedSummary(partial, 5_000)!;
+    expect(salvaged.length).toBeLessThanOrEqual(5_000);
+    expect(salvaged.endsWith(`\n\n${MARKER}`)).toBe(true);
+    // The cut lands between lines: every retained line is an exact member of
+    // the original (a mid-line hard cut would leave a prefix line — a substring
+    // `toContain` would miss it, set membership catches it).
+    const partialLines = partial.split("\n");
+    const body = salvaged.slice(0, salvaged.indexOf("\n\n[summary truncated"));
+    for (const line of body.split("\n")) expect(partialLines).toContain(line);
+    // The head of the map survives the trim.
+    expect(body.startsWith("## Goal\n- line one")).toBe(true);
+  });
+
+  it("hard-cuts when the over-budget window has no line boundary", () => {
+    const salvaged = salvageLengthStoppedSummary("z".repeat(9_000), 5_000)!;
+    expect(salvaged.length).toBeLessThanOrEqual(5_000);
+    expect(salvaged.endsWith(`\n\n${MARKER}`)).toBe(true);
   });
 });
 
@@ -2477,6 +2520,127 @@ describe("compaction summary ownership", () => {
     const { pi, events } = makePi();
     registerRecallTool(pi, CONFIG, undefined, { logCompactionError: (l) => crumbs.push(l) });
     expect(await fire(events, "session_before_compact", hookCtx(capped), beforeCompactEvent())).toBeUndefined();
+    expect(crumbs).toEqual([expect.stringContaining("fell back to pi default: summarizer hit the output cap")]);
+  });
+
+  it("commits a salvaged partial on a length-stop instead of skipping compaction", async () => {
+    const crumbs: string[] = [];
+    const calls: CapturedCall[] = [];
+    // A cut mid-generation that still streamed a substantial map: better than
+    // no checkpoint (mid-run drafts have no fallback at all).
+    const partial = "## Goal\n- " + "x".repeat(2_000);
+    const capped = async (model: unknown, context: unknown, options?: unknown) => {
+      calls.push({
+        model,
+        context: context as CapturedCall["context"],
+        options: (options ?? {}) as Record<string, unknown>,
+      });
+      return { content: [{ type: "text", text: partial }], usage: { totalTokens: 7 }, stopReason: "length" };
+    };
+    const { pi, events } = makePi();
+    registerRecallTool(pi, CONFIG, undefined, { logCompactionError: (l) => crumbs.push(l) });
+    const result = (await fire(events, "session_before_compact", hookCtx(capped), beforeCompactEvent())) as {
+      compaction: { summary: string; usage: unknown };
+    };
+    // Non-reasoning model: no thinking was pinned, so there is nothing to retry —
+    // the substantial partial is the checkpoint, marked as truncated.
+    expect(calls).toHaveLength(1);
+    expect(result.compaction.summary.startsWith(partial)).toBe(true);
+    expect(result.compaction.summary).toContain("[summary truncated at the output cap");
+    expect(result.compaction.summary.length).toBeLessThanOrEqual(CONFIG.summaryChars);
+    expect(result.compaction.usage).toEqual({ totalTokens: 7 });
+    expect(crumbs).toEqual([]);
+  });
+
+  it("retries a starved length-stop with thinking dropped, then uses the clean retry", async () => {
+    const crumbs: string[] = [];
+    const calls: CapturedCall[] = [];
+    // Reasoning shares the output allocation: the pinned level burned the cap
+    // before any text streamed; the retry frees it for summary text.
+    const responses = [
+      { content: [], usage: {}, stopReason: "length" },
+      {
+        content: [{ type: "text", text: "## Goal\n- Recovered without thinking" }],
+        usage: { totalTokens: 9 },
+        stopReason: "stop",
+      },
+    ];
+    const complete = async (model: unknown, context: unknown, options?: unknown) => {
+      calls.push({
+        model,
+        context: context as CapturedCall["context"],
+        options: (options ?? {}) as Record<string, unknown>,
+      });
+      return responses[Math.min(calls.length - 1, responses.length - 1)];
+    };
+    const { pi, events } = makePi();
+    registerRecallTool(pi, CONFIG, undefined, { logCompactionError: (l) => crumbs.push(l) });
+    const result = (await fire(
+      events,
+      "session_before_compact",
+      hookCtx(complete, { model: { id: "test-model", reasoning: true } }),
+      beforeCompactEvent(),
+    )) as { compaction: { summary: string } };
+    expect(calls).toHaveLength(2);
+    expect(calls[0].options.reasoning).toBe("high"); // CONFIG pins "high"
+    expect(calls[1].options.reasoning).toBeUndefined();
+    // A completed generation is used as-is — no truncation marker.
+    expect(result.compaction.summary).toBe("## Goal\n- Recovered without thinking");
+    expect(crumbs).toEqual([]);
+  });
+
+  it("salvages the thinking-free retry when it also length-stops", async () => {
+    const crumbs: string[] = [];
+    const calls: CapturedCall[] = [];
+    const substantial = "## Progress\n- " + "x".repeat(1_500);
+    const responses = [
+      { content: [{ type: "text", text: "tiny" }], usage: {}, stopReason: "length" },
+      { content: [{ type: "text", text: substantial }], usage: { totalTokens: 11 }, stopReason: "length" },
+    ];
+    const complete = async (model: unknown, context: unknown, options?: unknown) => {
+      calls.push({
+        model,
+        context: context as CapturedCall["context"],
+        options: (options ?? {}) as Record<string, unknown>,
+      });
+      return responses[Math.min(calls.length - 1, responses.length - 1)];
+    };
+    const { pi, events } = makePi();
+    registerRecallTool(pi, CONFIG, undefined, { logCompactionError: (l) => crumbs.push(l) });
+    const result = (await fire(
+      events,
+      "session_before_compact",
+      hookCtx(complete, { model: { id: "test-model", reasoning: true } }),
+      beforeCompactEvent(),
+    )) as { compaction: { summary: string } };
+    expect(calls).toHaveLength(2);
+    expect(result.compaction.summary.startsWith(substantial)).toBe(true);
+    expect(result.compaction.summary).toContain("[summary truncated at the output cap");
+    expect(crumbs).toEqual([]);
+  });
+
+  it("still falls back when both the partial and the thinking-free retry come up empty", async () => {
+    const crumbs: string[] = [];
+    const calls: CapturedCall[] = [];
+    const capped = async (model: unknown, context: unknown, options?: unknown) => {
+      calls.push({
+        model,
+        context: context as CapturedCall["context"],
+        options: (options ?? {}) as Record<string, unknown>,
+      });
+      return { content: [{ type: "text", text: "tiny" }], usage: {}, stopReason: "length" };
+    };
+    const { pi, events } = makePi();
+    registerRecallTool(pi, CONFIG, undefined, { logCompactionError: (l) => crumbs.push(l) });
+    expect(
+      await fire(
+        events,
+        "session_before_compact",
+        hookCtx(capped, { model: { id: "test-model", reasoning: true } }),
+        beforeCompactEvent(),
+      ),
+    ).toBeUndefined();
+    expect(calls).toHaveLength(2); // pinned-level attempt, then the thinking-free retry
     expect(crumbs).toEqual([expect.stringContaining("fell back to pi default: summarizer hit the output cap")]);
   });
 

@@ -1513,12 +1513,14 @@ export function registerRecallTool(
           summarize({
             model,
             complete: (m, context, options) => ctx.modelRegistry.complete(m, context, options),
-            // Compaction is a one-shot hard task: default pins "high" instead of
-            // mirroring the session's (often low) interactive level — measured on
-            // glm-5.3, "low" effort followed the template ~1/3 runs on a long input
-            // while "high" adhered. PI_RECALL_SUMMARY_THINKING restores "session" or
-            // pins another level; "off" frees the whole output cap for summary text
-            // where the provider supports disabling thinking.
+            // Default "off": no thinking is requested (the provider applies its
+            // own default) — the instruction-sandwich prompt holds template
+            // adherence at zero reasoning tokens across the fleet, and nothing
+            // can starve the output cap from the reasoning side.
+            // PI_RECALL_SUMMARY_THINKING pins another level or mirrors the
+            // session's (often low) interactive level with "session" — measured
+            // on glm-5.3, "low" effort followed the template ~1/3 runs on a long
+            // input while "high" adhered.
             thinkingLevel: config.summaryThinking === "session" ? ctx.thinkingLevel : config.summaryThinking,
             // Chronological: older spans first, split-turn prefix last, so the
             // newest state the prompt re-derives sits at the end of the transcript.
@@ -1617,7 +1619,8 @@ const MIN_ACHIEVABLE_COMPACT_TARGET = DEFAULT_COMPACTION_SETTINGS.keepRecentToke
  * prompt budgets the summary at summaryChars (default 5,000 ≈ 1.7k tokens);
  * the wide gap is reasoning headroom (thinking tokens share the output
  * budget), so a thinking model cannot crowd the text into a length-stop.
- * A length-stop means the text was cut mid-sentence and is discarded whole.
+ * A length-stop still cuts the text mid-generation — salvageLengthStoppedSummary
+ * recovers a substantial partial, and only an unrecoverable one discards whole.
  * Sized for reasoning models, whose thinking shares the output allocation —
  * observed reasoning usage runs 6–9k tokens with outliers past 17k (glm-5.3),
  * which would starve the summary to zero content at smaller caps.
@@ -1743,7 +1746,7 @@ export function buildSummarizationPrompt(
       "forward unchanged — rewrite them from the newest messages.",
     "- Hard budget: the entire summary must stay under " +
       budgetChars.toLocaleString("en-US") +
-      " characters — a cut-off generation is discarded whole. " +
+      " characters — a cut-off generation loses everything past the cut. " +
       "When space is tight, compress Done and Critical Context first; never Next Steps, active decisions' rationale, " +
       "or exact strings still in use.",
     "- Only summarize what appears in <conversation>; never invent events outside it.",
@@ -2031,11 +2034,39 @@ const defaultSummaryFn: SummaryFn = async ({
   if (model.reasoning && thinkingLevel && thinkingLevel !== "off") {
     options.reasoning = thinkingLevel;
   }
-  const response = await complete(
-    model,
-    { messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }] },
-    options,
-  );
+  const context: Parameters<SummaryComplete>[1] = {
+    messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }],
+  };
+  const textOf = (r: Awaited<ReturnType<typeof complete>>) =>
+    r.content
+      .filter((block): block is { type: "text"; text: string } => block.type === "text")
+      .map((block) => block.text)
+      .join("\n")
+      .trim();
+  let response = await complete(model, context, options);
+  if (response.stopReason === "length") {
+    // A length-stop cuts the summary mid-generation, but the dropped transcript
+    // stays recall-searchable and the kept tail carries the newest work — a
+    // substantial partial is a safer checkpoint than a skipped compaction
+    // (mid-run drafts have no fallback; a skip pins the session at the ceiling).
+    const salvaged = salvageLengthStoppedSummary(textOf(response), budgetChars);
+    if (salvaged) return { text: salvaged, usage: response.usage };
+    // Reasoning shares the output allocation: when a level was pinned, thinking
+    // may have starved the text before any of it streamed. One retry with the
+    // level dropped hands the whole cap to summary text before giving up.
+    if (options.reasoning !== undefined) {
+      const reasoningFree: typeof options = { ...options };
+      delete reasoningFree.reasoning;
+      response = await complete(model, context, reasoningFree);
+      if (response.stopReason === "length") {
+        const retrySalvaged = salvageLengthStoppedSummary(textOf(response), budgetChars);
+        if (retrySalvaged) return { text: retrySalvaged, usage: response.usage };
+        throw new Error(`summarizer hit the output cap (${options.maxTokens} tokens)`);
+      }
+    } else {
+      throw new Error(`summarizer hit the output cap (${options.maxTokens} tokens)`);
+    }
+  }
   // complete() resolves (never rejects) error and abort terminations, keeping any
   // partial content — a partial text must never become the session checkpoint.
   // Throwing routes aborts into the hook's silent return and errors into the crumb.
@@ -2047,18 +2078,40 @@ const defaultSummaryFn: SummaryFn = async ({
     if (response.stopReason === "error") Object.assign(err, { retryable: true });
     throw err;
   }
-  if (response.stopReason === "length") {
-    throw new Error(`summarizer hit the output cap (${options.maxTokens} tokens)`);
-  }
   if (response.content.some((block) => block.type === "toolCall")) {
     throw new Error("Summarization attempted to call a tool");
   }
-  const text = response.content
-    .filter((block): block is { type: "text"; text: string } => block.type === "text")
-    .map((block) => block.text)
-    .join("\n");
-  return { text, usage: response.usage };
+  return { text: textOf(response), usage: response.usage };
 };
+
+/** Appended to every salvaged summary: the map is cut, the transcript is not lost. */
+const SALVAGE_MARKER = "[summary truncated at the output cap — use recall for missing detail]";
+
+/** A partial below this fraction of the character budget is not a map at all. */
+const SALVAGE_MIN_FRACTION = 0.25;
+
+/**
+ * Recover a summary from a length-stopped generation. The text was cut
+ * mid-generation, but the dropped transcript stays recall-searchable and the
+ * kept tail carries the newest work, so an incomplete map costs recall-ability,
+ * not correctness — while a skipped compaction (drafts have no fallback) pins
+ * the session at the context ceiling. Returns the partial, trimmed into the
+ * character budget at a line boundary and marked as truncated, or null when
+ * the partial is too small to serve as a checkpoint.
+ */
+export function salvageLengthStoppedSummary(text: string, budgetChars: number): string | null {
+  const partial = text.trim();
+  if (partial.length < Math.max(Math.floor(budgetChars * SALVAGE_MIN_FRACTION), 1)) return null;
+  // The marker rides inside the budget: the returned summary never exceeds budgetChars.
+  const bodyBudget = Math.max(budgetChars - SALVAGE_MARKER.length - 2, 0);
+  if (partial.length <= bodyBudget) return `${partial}\n\n${SALVAGE_MARKER}`;
+  // The map is line-oriented (## sections, bullets), so a line-boundary cut
+  // keeps it structurally readable where a hard cut could split a bullet.
+  const window = partial.slice(0, bodyBudget);
+  const lastLine = window.lastIndexOf("\n");
+  const trimmed = (lastLine > 0 ? window.slice(0, lastLine) : window).trimEnd();
+  return `${trimmed}\n\n${SALVAGE_MARKER}`;
+}
 
 // ---------------------------------------------------------------------------
 // Tool internals (kept out of the registration closure for testability)
