@@ -1191,10 +1191,9 @@ export function registerRecallTool(
 
   /** Chunks awaiting embedding: archived current-session chunks always, plus foreign sessions newest-first within the byte budget. */
   const pendingEmbeddings = async (
-    ctx: ExtensionContext,
+    sm: ExtensionContext["sessionManager"],
     support: { store: VectorStoreLike; embed: EmbedSeam },
   ): Promise<Array<{ key: string; text: string }>> => {
-    const sm = ctx.sessionManager;
     const candidates = buildArchiveChunks(
       sm.getBranch(),
       visibleEntryIds(sm.buildSessionProjection()),
@@ -1237,7 +1236,7 @@ export function registerRecallTool(
    * Failures are silent-but-retryable — the next trigger diffs again and
    * re-sends only what is still missing.
    */
-  const catchUp = async (ctx: ExtensionContext): Promise<void> => {
+  const catchUp = async (sm: ExtensionContext["sessionManager"]): Promise<void> => {
     const support = vectorSupport;
     // No `embed.available` gate: a dead worker is respawned lazily by the
     // request (bounded by maxStartAttempts, reset on health evidence) so one
@@ -1245,7 +1244,7 @@ export function registerRecallTool(
     if (support === null || catchUpInFlight) return;
     catchUpInFlight = true;
     try {
-      const pending = await pendingEmbeddings(ctx, support);
+      const pending = await pendingEmbeddings(sm, support);
       if (pending.length === 0) return;
       const vectors = await support.embed.embed(pending.slice(0, EMBED_BATCH_LIMIT));
       if (vectors !== undefined && vectors.length > 0) await support.store.add(vectors);
@@ -1265,10 +1264,9 @@ export function registerRecallTool(
    * files, and dropping their vectors on a transient scope change would
    * re-embed the whole project on the way back to project scope.
    */
-  const compactIfNeeded = async (ctx: ExtensionContext, store: VectorStoreLike): Promise<void> => {
+  const compactIfNeeded = async (sm: ExtensionContext["sessionManager"], store: VectorStoreLike): Promise<void> => {
     if (config.defaultScope !== "project") return;
     try {
-      const sm = ctx.sessionManager;
       // Always refresh: unlike catch-up, compaction needs the full foreign
       // view even when the embed budget is zero.
       await corpusCache.refresh(sm.getSessionDir(), sm.getSessionFile());
@@ -1292,6 +1290,13 @@ export function registerRecallTool(
     reminderPending = false;
     autoCompactInFlight = false;
     if (!config.embedEnabled) return;
+    // Capture the session manager synchronously, before the first await: a
+    // session replacement (pi -p forks the latest session in the cwd) or
+    // reload invalidates the ctx facade mid-flight, and every later ctx
+    // access would throw staleness. The captured manager stays usable — at
+    // worst it is the outgoing session's, and the replacement's own
+    // session_start re-runs catch-up for the new one.
+    const sm = ctx.sessionManager;
     void (async () => {
       try {
         // A session replacement (new/resume/fork) in the same process must not
@@ -1301,13 +1306,13 @@ export function registerRecallTool(
         vectorSupport = null;
         embed.kill();
         await previous?.store.close();
-        const store = await openStore(path.join(ctx.sessionManager.getSessionDir(), "recall-vectors.bin"));
+        const store = await openStore(path.join(sm.getSessionDir(), "recall-vectors.bin"));
         vectorSupport = { store, embed };
         embed.start();
-        await catchUp(ctx);
+        await catchUp(sm);
         // After catch-up so the corpus cache is warm and fresh embeds are
         // already on disk — they are live keys, so the rewrite keeps them.
-        await compactIfNeeded(ctx, store);
+        await compactIfNeeded(sm, store);
       } catch (err) {
         vectorSupport = null;
         console.error(`recall: semantic search unavailable: ${err instanceof Error ? err.message : String(err)}`);
@@ -1349,7 +1354,8 @@ export function registerRecallTool(
   // PI_RECALL_COMPACT_TARGET=0 disables. Also drains the embedding backlog —
   // settled moments are exactly when background CPU is free.
   pi.on("agent_settled", (_event, ctx) => {
-    void catchUp(ctx);
+    // ctx access is synchronous here; catchUp holds only the manager.
+    void catchUp(ctx.sessionManager);
     const usage = ctx.getContextUsage();
     if (
       !shouldAutoCompact(

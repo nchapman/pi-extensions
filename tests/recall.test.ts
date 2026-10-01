@@ -1523,6 +1523,29 @@ describe("embedding catch-up wiring", () => {
     }
   });
 
+  it("a ctx staled mid-session_start by a session replacement does not break catch-up", async () => {
+    // pi -p forks the latest session in the cwd: session_start fires, the
+    // replacement invalidates the ctx facade, and the async catch-up chain
+    // used to touch ctx after an await and throw staleness. The manager is
+    // captured synchronously, so a ctx that goes stale immediately after the
+    // handler body must not break the round.
+    const base = hybridCtx();
+    let stale = false;
+    const ctx = {
+      ...base.ctx,
+      get sessionManager() {
+        if (stale) throw new Error("This extension ctx is stale after session replacement or reload.");
+        return base.ctx.sessionManager;
+      },
+    };
+    const { events, store, embed } = catchUpSetup();
+    await fire(events, "session_start", ctx);
+    stale = true; // replacement lands while openStore is still in flight
+    await flush();
+    expect(store.calls.added.length).toBeGreaterThan(0);
+    expect(embed.calls.started).toBe(1);
+  });
+
   it("session_shutdown kills the worker and closes the store exactly once", async () => {
     const { ctx } = hybridCtx();
     const { events, embed, store } = catchUpSetup();
