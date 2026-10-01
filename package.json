@@ -38,6 +38,7 @@
     "postinstall": "node scripts/fetch-model.mjs",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
-    "bench:mrl": "vitest run --config scripts/bench-mrl.config.ts"
+    "bench:mrl": "vitest run --config scripts/bench-mrl.config.ts",
+    "bench:binary": "vitest run --config scripts/bench-binary.config.ts"
   }
 }
