@@ -19,6 +19,7 @@
   "include": [
     "extensions",
     "lib",
-    "tests"
+    "tests",
+    "scripts"
   ]
 }

@@ -1647,7 +1647,7 @@ describe("embed config", () => {
     const config = configFromEnv({});
     expect(config.embedEnabled).toBe(true);
     expect(config.embedDtype).toBe("q8");
-    expect(config.embedWeight).toBe(0.7);
+    expect(config.embedWeight).toBe(0.3);
     expect(config.embedForeignMaxBytes).toBe(32 * 1024 * 1024);
     expect(config.embedModelDir).toBe(`${process.env.HOME}/.pi/agent/models`);
   });

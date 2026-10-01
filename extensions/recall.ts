@@ -20,7 +20,8 @@
  *   carries provenance.
  * - Hybrid: a local EmbeddingGemma (300M, ONNX) adds a semantic ranking over
  *   the same chunks, fused into BM25 by weighted reciprocal-rank fusion
- *   (`PI_RECALL_EMBED_WEIGHT`, default 0.7 — lexical stays primary) so
+ *   (`PI_RECALL_EMBED_WEIGHT`, default 0.3 — benchmarked on real session
+ *   data, flat optimum 0.15–0.5, lexical stays primary) so
  *   paraphrase queries surface discussions that share no terms. Embeddings
  *   run in a disposable child process (the model parks ~1.7GB of arena that
  *   only exit reclaims) and persist in a flat append-only file per session
@@ -140,7 +141,7 @@ const DEFAULTS: RecallConfig = {
   projectMaxBytes: 64 * 1024 * 1024,
   embedEnabled: true,
   embedDtype: "q8",
-  embedWeight: 0.7,
+  embedWeight: 0.3,
   embedForeignMaxBytes: 32 * 1024 * 1024,
   embedModelDir: `${process.env.HOME ?? "~"}/.pi/agent/models`,
 };

@@ -31,11 +31,12 @@
 		"vitest": "^5.0.2"
 	},
 	"scripts": {
-		"test": "vitest run",
+		"bench:recall": "vitest run --config scripts/bench.config.ts",
 		"check": "tsc --noEmit && vitest run",
-		"test:coverage": "vitest run --coverage",
-		"format": "prettier --write extensions lib tests",
 		"check:format": "prettier --check extensions lib tests",
-		"postinstall": "node scripts/fetch-model.mjs"
+		"format": "prettier --write extensions lib tests",
+		"postinstall": "node scripts/fetch-model.mjs",
+		"test": "vitest run",
+		"test:coverage": "vitest run --coverage"
 	}
 }
