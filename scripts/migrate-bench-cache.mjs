@@ -29,6 +29,8 @@ v2[7] = head[7];
 v2.write(createHash("sha256").update(model).digest("hex").slice(0, 16), 8, 8, "hex");
 records.copy(v2, 16);
 await h.truncate(0);
-await h.write(v2, 0, v2.length);
+// Explicit position 0: without it the write lands at the handle's current
+// position — EOF after readFile() — producing a sparse corrupt file.
+await h.write(v2, 0, v2.length, 0);
 await h.close();
 console.log(`${file}: migrated v1→v2 (dims ${dims}, ${(records.length / (head[7] + dims * 4)) | 0} records)`);
