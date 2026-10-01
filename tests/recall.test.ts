@@ -967,6 +967,75 @@ describe("registerRecallTool", () => {
     expect(result.details.hits[0].ref).toContain("."); // dotted = foreign-session ref
   });
 
+  it("drops chunks that quote the description verbatim — the search's own echo", async () => {
+    // Real echo shape: an assistant toolCall whose arguments serialize the
+    // description with JSON escapes (quotes, newline) — the haystack decode
+    // must see through them. Pre-fix the echo wins on BM25 term coverage
+    // AND recency: the question served back as its own top answer.
+    const description = 'A "bug" where the worker process\nnever exits and blocks shutdown ECHOFINGERPRINT';
+    const genuine = msgEntry(
+      "user",
+      { content: "the worker process never exits and blocks shutdown because the stdin watcher never fires" },
+      "2026-09-26T09:00:00.000Z",
+    );
+    const echo = msgEntry(
+      "assistant",
+      { content: [{ type: "toolCall", name: RECALL_TOOL_NAME, arguments: { description } }] },
+      "2026-09-26T11:00:00.000Z",
+    );
+    const kept = msgEntry("user", { content: "current turn" }, "2026-09-26T12:00:00.000Z");
+    const ctx = sessionCtx({ branch: [genuine, echo, compactionEntry("", "k"), kept], contextEntries: [kept] });
+    const { run } = setup();
+    const result = (await run({ description }, ctx)) as { details: { hits: Array<{ snippet: string }> } };
+    expect(result.details.hits.length).toBeGreaterThan(0);
+    expect(result.details.hits.some((h) => h.snippet.includes("ECHOFINGERPRINT"))).toBe(false);
+    expect(result.details.hits[0].snippet).toContain("stdin watcher");
+  });
+
+  it("filters at exactly 32 normalized chars but not one fewer", async () => {
+    // Load-bearing boundary: at 32 the quote is an echo fingerprint; at 31 it
+    // is a legitimate exact term whose verbatim chunks may be the real target.
+    // The genuine hit shares the terms reordered, never the full needle.
+    const runBoundary = async (needle: string) => {
+      const echo = msgEntry("user", { content: `recall it: ${needle}` }, "2026-09-26T11:00:00.000Z");
+      const genuine = msgEntry(
+        "user",
+        { content: "notes about uvwxyz0123, klmnopqrst, and abcdefhij ordering" },
+        "2026-09-26T09:00:00.000Z",
+      );
+      const kept = msgEntry("user", { content: "current turn" }, "2026-09-26T12:00:00.000Z");
+      const ctx = sessionCtx({ branch: [genuine, echo, compactionEntry("", "k"), kept], contextEntries: [kept] });
+      const { run } = setup();
+      return (await run({ description: needle }, ctx)) as { details: { hits: Array<{ snippet: string }> } };
+    };
+    const at32 = await runBoundary("abcdefghij klmnopqrst uvwxyz0123"); // 32 after normalization
+    expect(at32.details.hits.some((h) => h.snippet.includes("abcdefghij klmnopqrst"))).toBe(false);
+    expect(at32.details.hits.some((h) => h.snippet.includes("uvwxyz0123"))).toBe(true);
+    const at31 = await runBoundary("abcdefghij klmnopqrst uvwxyz012"); // 31: verbatim chunk is a legit hit
+    expect(at31.details.hits.some((h) => h.snippet.includes("abcdefghij klmnopqrst"))).toBe(true);
+  });
+
+  it("echo exclusion also covers foreign sessions quoting the description", async () => {
+    const description = "a slow grinding data migration that we eventually throttled ECHOFINGERPRINT";
+    const foreign = sessionFile({
+      entries: [
+        userLine("the data migration ran slowly until we throttled it to one core"),
+        userLine(`bash recall --description "${description}"`),
+      ],
+    });
+    const { reader, dir } = fakeReader([foreign]);
+    const { pi, tools } = makePi();
+    registerRecallTool(pi, CONFIG, reader);
+    const ctx = sessionCtx({ sessionDir: dir });
+    const result = (await tools
+      .get(RECALL_TOOL_NAME)!
+      .execute("t", { description, scope: "project" }, undefined, undefined, ctx)) as {
+      details: { hits: Array<{ snippet: string }> };
+    };
+    expect(result.details.hits.some((h) => h.snippet.includes("ECHOFINGERPRINT"))).toBe(false);
+    expect(result.details.hits.some((h) => h.snippet.includes("one core"))).toBe(true);
+  });
+
   it("read mode requires a valid id", async () => {
     const { run } = setup();
     const noId = (await run({ mode: "read" })) as { content: Array<{ text: string }> };
@@ -1239,6 +1308,32 @@ describe("semantic hybrid search", () => {
     expect(result.content[0].text).toContain("Fluffy");
     expect(result.content[0].text).toContain("· sem");
   });
+  it("echo exclusion covers the semantic side — fused candidates come from the filtered list", async () => {
+    const description = "a cat sleeping somewhere warm and sunny all afternoon ECHOFINGERPRINT";
+    const echo = msgEntry("assistant", {
+      content: [{ type: "toolCall", name: RECALL_TOOL_NAME, arguments: { description } }],
+    });
+    const semantic = msgEntry("user", { content: "Fluffy curled up asleep in the corner of the rug." });
+    const compaction = compactionEntry("## Goal\nHybrid", "kept1");
+    const kept = msgEntry("user", { content: "now continue" });
+    kept.id = "kept1";
+    const ctx = sessionCtx({ branch: [semantic, echo, compaction, kept], contextEntries: [compaction, kept] });
+    // The query vector aligns MORE with the echo's vector than the genuine
+    // hit's — unfiltered, the echo wins the semantic side outright (and BM25:
+    // it contains the whole description). The filter must remove it before
+    // both candidate lists are built.
+    const store = fakeVectorStore([
+      { key: firstKey(semantic), vector: vec(0.5, 0.5) },
+      { key: firstKey(echo), vector: vec(1) },
+    ]);
+    const embed = fakeEmbedSeam({ queryVector: vec(1) });
+    const { run } = await hybridSetup(embed, store);
+    const result = (await run({ description }, ctx)) as { content: Array<{ text: string }> };
+    expect(result.content[0].text).toContain("Fluffy");
+    expect(result.content[0].text).toContain("· sem");
+    expect(result.content[0].text.includes("ECHOFINGERPRINT")).toBe(false);
+  });
+
   it("ranks a both-match above single-side hits and marks it", async () => {
     const { ctx, semantic, lexical } = hybridCtx();
     const store = fakeVectorStore([

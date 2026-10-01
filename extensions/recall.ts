@@ -633,6 +633,12 @@ export function recencyFactor(ageMs: number, halfLifeMs: number, floor: number):
  */
 const FUSION_DEPTH = 64;
 
+/** A description's normalized form must be at least this long before quoting
+ * it verbatim counts as an echo. Shorter descriptions are legitimate exact
+ * terms — every chunk containing "rotation" may be the real target, not a
+ * transcript echo. */
+const ECHO_NEEDLE_MIN_CHARS = 32;
+
 /** Fused RRF scores land in [0, ~0.03]; ×100 puts them in a readable range for the result format. */
 const FUSED_SCORE_SCALE = 100;
 
@@ -2125,6 +2131,17 @@ async function search(
     allChunks = [...archiveChunks, ...corpora.flatMap((c) => c.chunks)];
   }
 
+  // The search's own words are its own best match: any chunk quoting the
+  // description verbatim — this tool call echoed in the transcript, from this
+  // session or a foreign one — is the question served back as its top answer.
+  // The searcher already knows what they asked. Echoes drop before ranking
+  // (BM25 and semantic sides share allChunks). Keyword-only searches keep
+  // their echo risk by design: their short terms are the targets themselves.
+  const echoNeedle = normalizeWsCi(description);
+  if (echoNeedle.length >= ECHO_NEEDLE_MIN_CHARS) {
+    allChunks = allChunks.filter((c) => !normalizeWsCi(decodeJsonEscapes(c.text)).includes(echoNeedle));
+  }
+
   let rankedAll = rankChunks(allChunks, lexicalQuery, config.foreignWeight, config.halfLifeHours, config.recencyFloor);
   // Semantic side: embed the query, scan the cached vectors over this
   // corpus's keys, and fuse by rank. Every step fails open — worker down
@@ -2173,6 +2190,20 @@ async function search(
       })),
     },
   };
+}
+
+/** Collapse whitespace and case — the space both sides of an echo comparison
+ * live in. Punctuation differences (a retyped quote) stay unmatched by design. */
+function normalizeWsCi(s: string): string {
+  return s.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+/** Decode the escapes a transcript adds when it serializes a tool call
+ * (\" \\ \n) so an echoed description compares equal to the needle. Applied to
+ * chunk text only: pi hands the tool real characters, and decoding the needle
+ * too would corrupt descriptions that legitimately contain backslashes. */
+function decodeJsonEscapes(s: string): string {
+  return s.replace(/\\(.)/g, (_, ch: string) => (ch === "n" || ch === "r" || ch === "t" ? " " : ch));
 }
 
 /** Resolve the project cache through the injected reader (test seam). */
