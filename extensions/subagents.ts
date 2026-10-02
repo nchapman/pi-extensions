@@ -5,7 +5,13 @@ import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import type { AgentToolResult, ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import type {
+  AgentToolResult,
+  BashOperations,
+  ExtensionAPI,
+  ExtensionContext,
+  Theme,
+} from "@earendil-works/pi-coding-agent";
 import {
   type AdoptedHandle,
   type BackgroundRegistry,
@@ -14,7 +20,6 @@ import {
   createBgTool,
   createKillTaskTool,
   createTasksCommand,
-  type BashSpawnFn,
   DEFAULT_BG_AFTER_MS,
   formatSubagentWake,
   parseBgAfterMs,
@@ -1044,7 +1049,7 @@ export function registerSubagentCommands(pi: ExtensionAPI, agentsDir: string = A
  * with a fake pi and injected spawn. */
 export function registerSubagentsExtension(
   pi: ExtensionAPI,
-  opts: { agentsDir?: string; spawnFn?: SpawnFn; bgSpawnFn?: BashSpawnFn } = {},
+  opts: { agentsDir?: string; spawnFn?: SpawnFn; bgOperations?: () => BashOperations } = {},
 ): void {
   const agentsDir = opts.agentsDir ?? AGENTS_DIR;
   const agents = loadAgents(agentsDir);
@@ -1082,7 +1087,7 @@ export function registerSubagentsExtension(
   });
   registerSubagentTools(pi, agentsDir, opts.spawnFn ?? defaultSpawn, agents, registry);
   // bg shares the registry: one footer count, one shutdown kill, the same wake channel.
-  pi.registerTool(createBgTool(registry, { defaultTimeoutMs: DEFAULT_TIMEOUT_MS, spawnFn: opts.bgSpawnFn }));
+  pi.registerTool(createBgTool(registry, { defaultTimeoutMs: DEFAULT_TIMEOUT_MS, operations: opts.bgOperations?.() }));
   // Per-task control, agent side: kill by id; the terminal sees it happen.
   pi.registerTool(
     createKillTaskTool(registry, { onKilled: (id) => ui?.notify(`Background task killed: ${id}`, "warning") }),

@@ -1086,28 +1086,37 @@ describe("registerSubagentsExtension (full wiring)", () => {
     execute: (id: string, params: unknown, signal?: AbortSignal, onUpdate?: unknown, ctx?: unknown) => Promise<unknown>;
   }
 
-  /** Minimal bash child fake: enough surface for the bg tool's wiring path. */
-  function wireBgChild() {
-    const closers: Array<(code: number | null, signal: NodeJS.Signals | null) => void> = [];
-    const data: Array<(chunk: string) => void> = [];
-    const child = {
-      stdout: { on: (_event: "data", cb: (chunk: string) => void) => void data.push(cb) },
-      stderr: { on: () => undefined },
-      on: (event: string, cb: (...args: never[]) => void) => {
-        if (event === "close") closers.push(cb as never);
+  /** Minimal bash operations fake: enough surface for the bg tool's wiring path. */
+  function wireBgOps() {
+    let onData: ((chunk: Buffer) => void) | undefined;
+    let resolve: ((r: { exitCode: number | null }) => void) | undefined;
+    const fake = {
+      aborted: false,
+      exec: (
+        _command: string,
+        _cwd: string,
+        { onData: d, signal }: { onData: (c: Buffer) => void; signal?: AbortSignal },
+      ) => {
+        onData = d;
+        return new Promise((res, rej) => {
+          resolve = res;
+          // pi's local ops kill the tree and reject with "aborted" on signal.
+          signal?.addEventListener(
+            "abort",
+            () => {
+              fake.aborted = true;
+              rej(new Error("aborted"));
+            },
+            { once: true },
+          );
+        });
       },
-      pid: 4242,
-      killed: false,
-      kill: () => {
-        child.killed = true;
-        setImmediate(() => closers.forEach((h) => h(null, "SIGKILL")));
-      },
-      emit: (chunk: string) => data.forEach((h) => h(chunk)),
-      close: (code: number | null) => closers.forEach((h) => h(code, null)),
+      emit: (chunk: string) => onData?.(Buffer.from(chunk)),
+      exit: (code: number | null) => resolve?.({ exitCode: code }),
     };
-    return child;
+    return fake;
   }
-  type WireBgChild = ReturnType<typeof wireBgChild>;
+  type WireBgOps = ReturnType<typeof wireBgOps>;
 
   function wireUp() {
     const handlers = new Map<string, (event?: unknown, ctx?: unknown) => void>();
@@ -1116,7 +1125,7 @@ describe("registerSubagentsExtension (full wiring)", () => {
     const setStatus = vi.fn();
     const tools = new Map<string, WiredTool>();
     const children: FakeChild[] = [];
-    const bgChildren: WireBgChild[] = [];
+    const bgOps: WireBgOps[] = [];
     const pi = {
       registerTool: (t: { name: string }) => tools.set(t.name, t as unknown as WiredTool),
       registerCommand: () => undefined,
@@ -1130,14 +1139,14 @@ describe("registerSubagentsExtension (full wiring)", () => {
         children.push(child);
         return child;
       }) as unknown as SpawnFn,
-      bgSpawnFn: (() => {
-        const child = wireBgChild();
-        bgChildren.push(child);
-        return child;
+      bgOperations: (() => {
+        const ops = wireBgOps();
+        bgOps.push(ops);
+        return ops;
       }) as never,
     });
     handlers.get("session_start")!(undefined, { ui: { notify, setStatus } });
-    return { handlers, sendUserMessage, notify, setStatus, tools, children, bgChildren };
+    return { handlers, sendUserMessage, notify, setStatus, tools, children, bgOps };
   }
 
   async function runBackgroundedTask(tools: Map<string, WiredTool>, children: FakeChild[]) {
@@ -1175,8 +1184,8 @@ describe("registerSubagentsExtension (full wiring)", () => {
     // The bash kind must ride the same steered wake channel — a split
     // (bg queueing as followUp) would reintroduce the sleep-poll livelock
     // for shell tasks only.
-    wired.bgChildren[0].emit("ok\n");
-    wired.bgChildren[0].close(0);
+    wired.bgOps[0].emit("ok\n");
+    wired.bgOps[0].exit(0);
     await new Promise((r) => setTimeout(r, 10));
     expect(wired.sendUserMessage).toHaveBeenCalledTimes(1);
     const [text, options] = wired.sendUserMessage.mock.calls[0] as [string, { deliverAs?: string }];
@@ -1206,11 +1215,11 @@ describe("registerSubagentsExtension (full wiring)", () => {
       sessionManager: { getSessionDir: () => undefined },
     })) as { details: { id: string } };
     expect(result.details.id).toBe("bg-1");
-    expect(wired.bgChildren[0].killed).toBe(false);
+    expect(wired.bgOps[0].aborted).toBe(false);
 
     wired.handlers.get("session_shutdown")!({ reason: "fork" });
     await new Promise((r) => setTimeout(r, 10)); // killAll marks killed, then close lands
-    expect(wired.bgChildren[0].killed).toBe(true);
+    expect(wired.bgOps[0].aborted).toBe(true);
     expect(wired.sendUserMessage).not.toHaveBeenCalled(); // killed tasks never wake
     expect(wired.notify).toHaveBeenCalledWith(expect.stringContaining("killed 1"), "warning");
   });

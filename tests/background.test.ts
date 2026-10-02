@@ -1,11 +1,13 @@
 import { execSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import type { BashOperations } from "@earendil-works/pi-coding-agent";
 import {
   BASH_TAIL_CAP,
   bashCommandHead,
+  buildBashEnv,
   capResultText,
   clampTimeoutMs,
   createBackgroundRegistry,
@@ -13,12 +15,15 @@ import {
   createKillTaskTool,
   createTasksCommand,
   DEFAULT_BG_AFTER_MS,
-  MAX_TIMEOUT_MS,
   formatDuration,
   formatSubagentWake,
+  MAX_TIMEOUT_MS,
+  outputLogPath,
   parseBgAfterMs,
   parseWakeEnabled,
+  piAgentDir,
   stashPath,
+  tempOutputLogPath,
   WAKE_TEXT_CAP,
 } from "../lib/background";
 
@@ -76,6 +81,56 @@ describe("capResultText", () => {
     const long = "z".repeat(WAKE_TEXT_CAP + 10);
     const { text } = capResultText(long, notADir, "bg-1");
     expect(text).toContain("stashing the full reply failed");
+  });
+});
+
+describe("buildBashEnv", () => {
+  it("prepends pi's bin dir to PATH when missing and never duplicates it", () => {
+    expect(buildBashEnv({ PATH: "/usr/bin" }, { agentDir: "/agent" }).PATH).toBe("/agent/bin:/usr/bin");
+    expect(buildBashEnv({ PATH: "/agent/bin:/usr/bin" }, { agentDir: "/agent" }).PATH).toBe("/agent/bin:/usr/bin");
+  });
+
+  it("strips inherited PI_* session vars and re-adds this session's", () => {
+    const env = buildBashEnv(
+      { PI_SESSION_ID: "stale", PI_MODEL: "old", PI_REASONING_LEVEL: "high", PATH: "/usr/bin" },
+      { sessionId: "s1", sessionFile: "/s.jsonl", provider: "p1", model: "m1" },
+    );
+    expect(env.PI_SESSION_ID).toBe("s1");
+    expect(env.PI_SESSION_FILE).toBe("/s.jsonl");
+    expect(env.PI_PROVIDER).toBe("p1");
+    expect(env.PI_MODEL).toBe("m1");
+    expect(env.PI_REASONING_LEVEL).toBeUndefined(); // not re-added without a level
+  });
+
+  it("omits provider and model unless both are present", () => {
+    const env = buildBashEnv({}, { provider: "p1", model: "m1", thinkingLevel: "low" });
+    expect(env.PI_PROVIDER).toBe("p1");
+    expect(env.PI_MODEL).toBe("m1");
+    expect(env.PI_REASONING_LEVEL).toBe("low");
+    expect(buildBashEnv({}, { model: "m1" }).PI_MODEL).toBeUndefined();
+    expect(buildBashEnv({}, { provider: "p1" }).PI_PROVIDER).toBeUndefined();
+  });
+
+  it("leaves the base env otherwise untouched", () => {
+    expect(buildBashEnv({ HOME: "/home/x" }, {})).toEqual({ HOME: "/home/x" });
+  });
+});
+
+describe("piAgentDir", () => {
+  it("defaults to ~/.pi/agent and honors PI_CODING_AGENT_DIR including ~", () => {
+    expect(piAgentDir({})).toBe(join(homedir(), ".pi", "agent"));
+    expect(piAgentDir({ PI_CODING_AGENT_DIR: "~/.custom" })).toBe(join(homedir(), ".custom"));
+    expect(piAgentDir({ PI_CODING_AGENT_DIR: "/abs/dir" })).toBe("/abs/dir");
+  });
+});
+
+describe("output log paths", () => {
+  it("nests command logs under bg/ beside the session", () => {
+    expect(outputLogPath("/sessions/s1", "bg-3")).toBe(join("/sessions/s1", "bg", "bg-3.log"));
+  });
+
+  it("falls back to a temp file named after the task", () => {
+    expect(tempOutputLogPath("bg-3")).toBe(join(tmpdir(), "pi-bg-bg-3.log"));
   });
 });
 
@@ -216,41 +271,56 @@ describe("stashPath", () => {
 });
 
 describe("createBgTool", () => {
-  interface FakeBash {
-    killed: boolean;
-    emitData(chunk: string | Buffer): void;
-    emitErr(chunk: string): void;
-    close(code: number | null): void;
-    closeSignaled(): void;
-    fail(error: Error): void;
+  interface FakeOps extends BashOperations {
+    last: { command: string; cwd: string; timeout?: number; env: NodeJS.ProcessEnv } | undefined;
+    aborted: boolean;
+    emit(chunk: string | Buffer): void;
+    exit(code: number | null): void;
+    fail(message: string): void;
   }
 
-  function fakeBash(): FakeBash & import("../lib/background").BashChild {
-    const closers: Array<(code: number | null, signal: NodeJS.Signals | null) => void> = [];
-    const failers: Array<(error: Error) => void> = [];
-    const data: Array<(chunk: string | Buffer) => void> = [];
-    const errs: Array<(chunk: string) => void> = [];
-    const fake = {
-      stdout: { on: (_event: "data", cb: (chunk: string | Buffer) => void) => void data.push(cb) },
-      stderr: { on: (_event: "data", cb: (chunk: string) => void) => void errs.push(cb) },
-      on: (event: string, cb: (...args: never[]) => void) => {
-        if (event === "close") closers.push(cb as never);
-        else if (event === "error") failers.push(cb as never);
+  /**
+   * Hand-rolled fake of pi's local BashOperations. It mimics the contract the
+   * tool relies on: data chunks via onData, resolution with the exit code
+   * (signal kills already mapped to 128+signal by pi), rejection with
+   * "aborted"/"timeout:…"/spawn errors.
+   */
+  function fakeBashOps(): FakeOps {
+    let onData: ((chunk: Buffer) => void) | undefined;
+    let resolve: ((r: { exitCode: number | null }) => void) | undefined;
+    let reject: ((e: Error) => void) | undefined;
+    const fake: FakeOps = {
+      last: undefined,
+      aborted: false,
+      exec: (command, cwd, { onData: d, signal, timeout, env }) => {
+        fake.last = { command, cwd, timeout, env: env ?? {} };
+        onData = d;
+        return new Promise((res, rej) => {
+          resolve = res;
+          reject = rej;
+          signal?.addEventListener(
+            "abort",
+            () => {
+              fake.aborted = true;
+              rej(new Error("aborted"));
+            },
+            { once: true },
+          );
+        });
       },
-      pid: 4242,
-      killed: false,
-      // A real killed process emits close; the fake mirrors that so kill paths settle.
-      kill: () => {
-        fake.killed = true;
-        setImmediate(() => closers.forEach((h) => h(null, "SIGKILL")));
+      emit: (chunk) => onData?.(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)),
+      // resolve/reject are captured; resolving triggers the tool's settle on the
+      // next microtask, so exit/fail return a promise that resolves after it.
+      exit: (code) => {
+        resolve?.({ exitCode: code });
+        return new Promise<void>((r) => setImmediate(r));
       },
-      emitData: (chunk: string | Buffer) => data.forEach((h) => h(chunk)),
-      emitErr: (chunk: string) => errs.forEach((h) => h(chunk)),
-      close: (code: number | null) => closers.forEach((h) => h(code, null)),
-      closeSignaled: () => closers.forEach((h) => h(null, "SIGTERM")),
-      fail: (error: Error) => failers.forEach((h) => h(error)),
+      fail: (message) => {
+        reject?.(new Error(message));
+        return new Promise<void>((r) => setImmediate(r));
+      },
     };
-    return fake as unknown as FakeBash & import("../lib/background").BashChild;
+    return fake;
   }
 
   function toolDeps() {
@@ -264,19 +334,20 @@ describe("createBgTool", () => {
 
   it("teaches the wake contract in its description and guidelines", () => {
     const d = toolDeps();
-    const tool = createBgTool(d.registry, { spawnFn: () => fakeBash() });
+    const tool = createBgTool(d.registry, { operations: fakeBashOps() });
     expect(tool.description).toContain("even mid-run");
     expect(tool.description).toContain("Never sleep or poll");
     expect(tool.promptGuidelines.join("\n")).toContain("never sleep or poll");
   });
 
-  it("returns a task id immediately and adopts the still-running child", async () => {
+  it("returns a task id immediately and adopts the still-running command", async () => {
     const d = toolDeps();
-    const child = fakeBash();
-    const tool = createBgTool(d.registry, { spawnFn: () => child });
+    const ops = fakeBashOps();
+    const tool = createBgTool(d.registry, { operations: ops });
     const result = await tool.execute("1", { command: "sleep 30" }, undefined, undefined, CTX);
     expect(result.details).toEqual({ kind: "bash", id: "bg-1" });
-    expect(child.killed).toBe(false);
+    expect(ops.last?.command).toBe("sleep 30");
+    expect(ops.aborted).toBe(false);
     expect(d.registry.running()[0]).toMatchObject({ id: "bg-1", kind: "bash", name: "sleep 30" });
     // The result text carries the delivery contract: the wake steers in as
     // the next message, even mid-run — never sleep or poll for it.
@@ -287,11 +358,11 @@ describe("createBgTool", () => {
 
   it("wakes with exit status and the output tail on a clean exit", async () => {
     const d = toolDeps();
-    const child = fakeBash();
-    const tool = createBgTool(d.registry, { spawnFn: () => child });
+    const ops = fakeBashOps();
+    const tool = createBgTool(d.registry, { operations: ops });
     await tool.execute("1", { command: "echo hi" }, undefined, undefined, CTX);
-    child.emitData("hi\n");
-    child.close(0);
+    ops.emit("hi\n");
+    await ops.exit(0);
     expect(d.sendUserMessage).toHaveBeenCalledTimes(1);
     const wake = d.sendUserMessage.mock.calls[0][0] as string;
     expect(wake).toContain(`[background] bash (bg-1, 0s) exited 0 — echo hi`);
@@ -302,102 +373,180 @@ describe("createBgTool", () => {
 
   it("marks nonzero exits as failures", async () => {
     const d = toolDeps();
-    const child = fakeBash();
-    const tool = createBgTool(d.registry, { spawnFn: () => child });
+    const ops = fakeBashOps();
+    const tool = createBgTool(d.registry, { operations: ops });
     await tool.execute("1", { command: "false" }, undefined, undefined, CTX);
-    child.emitData("boom\n");
-    child.close(3);
+    ops.emit("boom\n");
+    await ops.exit(3);
     const wake = d.sendUserMessage.mock.calls[0][0] as string;
     expect(wake).toContain("exited 3 — false");
     expect(d.notify).toHaveBeenCalledWith(expect.stringContaining("exited 3"), "error");
   });
 
-  it("SIGKILLs on timeout and reports it as a failure", async () => {
+  it("passes a clamped timeout to the executor and reports timeout rejections", async () => {
     const d = toolDeps();
-    const child = fakeBash();
-    const tool = createBgTool(d.registry, { spawnFn: () => child, defaultTimeoutMs: 15 });
+    const ops = fakeBashOps();
+    const tool = createBgTool(d.registry, { operations: ops, defaultTimeoutMs: 15 });
     await tool.execute("1", { command: "hang" }, undefined, undefined, CTX);
-    await new Promise((r) => setTimeout(r, 40));
-    expect(child.killed).toBe(true);
+    expect(ops.last?.timeout).toBe(0.015); // executor takes seconds
+    await ops.fail("timeout:0.015");
     const wake = d.sendUserMessage.mock.calls[0][0] as string;
     expect(wake).toContain("timed out after 0s — hang");
     expect(d.notify).toHaveBeenCalledWith(expect.stringContaining("timed out"), "error");
   });
 
-  it("returns an error result without adopting when spawn throws", async () => {
+  it("settles as a failure when the executor throws synchronously", async () => {
     const d = toolDeps();
     const tool = createBgTool(d.registry, {
-      spawnFn: () => {
-        throw new Error("no bash");
+      operations: {
+        exec: () => {
+          throw new Error("no bash");
+        },
       },
     });
     const result = await tool.execute("1", { command: "x" }, undefined, undefined, CTX);
+    expect(result.details).toMatchObject({ kind: "bash" });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(d.registry.running()).toHaveLength(0);
+    const wake = d.sendUserMessage.mock.calls[0][0] as string;
+    expect(wake).toContain("failed: no bash");
+    expect(d.notify).toHaveBeenCalledWith(expect.stringContaining("failed: no bash"), "error");
+  });
+
+  it("rejects a missing working directory before adopting, like the bash tool", async () => {
+    const d = toolDeps();
+    const ops = fakeBashOps();
+    const tool = createBgTool(d.registry, { operations: ops });
+    const result = await tool.execute("1", { command: "x" }, undefined, undefined, {
+      cwd: "/no/such/bg-dir",
+      sessionManager: { getSessionDir: () => undefined },
+    } as never);
     expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Working directory does not exist");
+    expect(ops.last).toBeUndefined();
     expect(d.registry.running()).toHaveLength(0);
     expect(d.sendUserMessage).not.toHaveBeenCalled();
   });
 
   it("rejects an empty command", async () => {
     const d = toolDeps();
-    const tool = createBgTool(d.registry, { spawnFn: () => fakeBash() });
+    const tool = createBgTool(d.registry, { operations: fakeBashOps() });
     const result = await tool.execute("1", { command: "   " }, undefined, undefined, CTX);
     expect(result.isError).toBe(true);
     expect(d.registry.running()).toHaveLength(0);
   });
 
-  it("keeps a rolling tail, caps the wake, and stashes the overflow", async () => {
+  it("exposes the session environment like the built-in bash tool", async () => {
+    const d = toolDeps();
+    const ops = fakeBashOps();
+    const tool = createBgTool(d.registry, { operations: ops });
+    await tool.execute("1", { command: "x" }, undefined, undefined, {
+      sessionManager: {
+        getSessionDir: () => undefined,
+        getSessionId: () => "s-1",
+        getSessionFile: () => "/sessions/s-1.jsonl",
+      },
+      model: { provider: "anthropic", id: "claude-x" },
+      thinkingLevel: "medium",
+    } as never);
+    const env = ops.last?.env ?? {};
+    expect(env.PI_SESSION_ID).toBe("s-1");
+    expect(env.PI_SESSION_FILE).toBe("/sessions/s-1.jsonl");
+    expect(env.PI_PROVIDER).toBe("anthropic");
+    expect(env.PI_MODEL).toBe("claude-x");
+    expect(env.PI_REASONING_LEVEL).toBe("medium");
+    const pathKey = Object.keys(env).find((k) => k.toLowerCase() === "path") ?? "PATH";
+    expect(env[pathKey]).toContain(join(homedir(), ".pi", "agent", "bin"));
+  });
+
+  it("keeps a rolling tail, caps the wake, and stashes the full output", async () => {
     const dir = mkdtempSync(join(tmpdir(), "bg-tool-"));
     const d = toolDeps();
-    const child = fakeBash();
-    const tool = createBgTool(d.registry, { spawnFn: () => child });
+    const ops = fakeBashOps();
+    const tool = createBgTool(d.registry, { operations: ops });
     await tool.execute("1", { command: "spew" }, undefined, undefined, {
       sessionManager: { getSessionDir: () => dir },
     } as never);
-    child.emitData(`${"x".repeat(50)}HEAD${"x".repeat(BASH_TAIL_CAP)}`);
-    child.close(0);
+    ops.emit(`${"x".repeat(50)}HEAD${"x".repeat(BASH_TAIL_CAP)}`);
+    await ops.exit(0);
     const wake = d.sendUserMessage.mock.calls[0][0] as string;
-    expect(wake.length).toBeLessThan(BASH_TAIL_CAP); // capped well below the in-memory tail
+    expect(wake.length).toBeLessThan(BASH_TAIL_CAP); // inline body capped to the wake budget
     expect(wake).toContain("full output"); // stash pointer wording
-    const stashed = readFileSync(stashPath(dir, "bg-1"), "utf8");
-    expect(stashed.length).toBe(BASH_TAIL_CAP);
-    expect(stashed.startsWith("x")).toBe(true);
-    expect(stashed.includes("HEAD")).toBe(false); // rolled out of the tail window
+    // The log is written through an async stream; wait for it to flush.
+    await vi.waitFor(() => {
+      const stashed = readFileSync(outputLogPath(dir, "bg-1"), "utf8");
+      expect(stashed).toContain("HEAD"); // the full output is stashed, not just the tail
+      expect(stashed).toContain("x".repeat(100));
+    });
   });
 
   it("sends no wake for a task killed by shutdown", async () => {
     const d = toolDeps();
-    const child = fakeBash();
-    const tool = createBgTool(d.registry, { spawnFn: () => child });
+    const ops = fakeBashOps();
+    const tool = createBgTool(d.registry, { operations: ops });
     await tool.execute("1", { command: "long" }, undefined, undefined, CTX);
     d.registry.killAll();
     await new Promise((r) => setTimeout(r, 10));
+    expect(ops.aborted).toBe(true);
     expect(d.sendUserMessage).not.toHaveBeenCalled();
   });
 
-  it("leaves no orphaned stash when a killed task had over-cap output", async () => {
+  it("leaves no orphaned log when a killed task had over-cap output", async () => {
     const dir = mkdtempSync(join(tmpdir(), "bg-kill-"));
     const d = toolDeps();
-    const child = fakeBash();
-    const tool = createBgTool(d.registry, { spawnFn: () => child });
+    const ops = fakeBashOps();
+    const tool = createBgTool(d.registry, { operations: ops });
     await tool.execute("1", { command: "spew" }, undefined, undefined, {
       sessionManager: { getSessionDir: () => dir },
     } as never);
-    child.emitData("x".repeat(BASH_TAIL_CAP));
-    d.registry.killAll(); // marks killed before the close event lands
-    await new Promise((r) => setTimeout(r, 10));
-    expect(existsSync(stashPath(dir, "bg-1"))).toBe(false);
+    ops.emit("x".repeat(BASH_TAIL_CAP)); // > wake cap → the log is open
+    // The log is created asynchronously; wait for it before killing so the
+    // cleanup path — not async creation timing — is what we're testing.
+    await vi.waitFor(() => expect(existsSync(outputLogPath(dir, "bg-1"))).toBe(true));
+    d.registry.killAll(); // marks killed, tears the log down before the abort lands
+    await new Promise((r) => setTimeout(r, 20));
+    expect(existsSync(outputLogPath(dir, "bg-1"))).toBe(false);
+  });
+
+  it("does not resurrect the log from a chunk that arrives after a kill", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bg-kill2-"));
+    const d = toolDeps();
+    const ops = fakeBashOps();
+    const tool = createBgTool(d.registry, { operations: ops });
+    await tool.execute("1", { command: "spew" }, undefined, undefined, {
+      sessionManager: { getSessionDir: () => dir },
+    } as never);
+    ops.emit("x".repeat(BASH_TAIL_CAP)); // opens the log
+    await vi.waitFor(() => expect(existsSync(outputLogPath(dir, "bg-1"))).toBe(true));
+    d.registry.killAll(); // marks killed, tears the log down
+    ops.emit("more"); // a delayed pipe read would race in here
+    await new Promise((r) => setTimeout(r, 20));
+    expect(existsSync(outputLogPath(dir, "bg-1"))).toBe(false);
+  });
+
+  it("does not claim the output was lost when truncation is line-based under the cap", async () => {
+    const d = toolDeps();
+    const ops = fakeBashOps();
+    const tool = createBgTool(d.registry, { operations: ops });
+    await tool.execute("1", { command: "lines" }, undefined, undefined, CTX);
+    // >2000 lines but <4000 bytes: the line cap truncates the wake, but no log
+    // opens, so the wake must not say the output was lost.
+    ops.emit("\n".repeat(2001));
+    await ops.exit(0);
+    const wake = d.sendUserMessage.mock.calls[0][0] as string;
+    expect(wake).not.toContain("could not save the full output");
   });
 
   it("keeps multi-byte UTF-8 intact across chunk boundaries", async () => {
     const d = toolDeps();
-    const child = fakeBash();
-    const tool = createBgTool(d.registry, { spawnFn: () => child });
+    const ops = fakeBashOps();
+    const tool = createBgTool(d.registry, { operations: ops });
     await tool.execute("1", { command: "cjk" }, undefined, undefined, CTX);
     // Split "日日日" mid-codepoint: byte 4 falls inside the second character.
     const whole = Buffer.from("日日日");
-    child.emitData(whole.subarray(0, 4));
-    child.emitData(whole.subarray(4));
-    child.close(0);
+    ops.emit(whole.subarray(0, 4));
+    ops.emit(whole.subarray(4));
+    await ops.exit(0);
     const wake = d.sendUserMessage.mock.calls[0][0] as string;
     expect(wake).toContain("日日日");
     expect(wake).not.toContain("\uFFFD");
@@ -405,57 +554,82 @@ describe("createBgTool", () => {
 
   it("interleaves stdout and stderr into one tail", async () => {
     const d = toolDeps();
-    const child = fakeBash();
-    const tool = createBgTool(d.registry, { spawnFn: () => child });
+    const ops = fakeBashOps();
+    const tool = createBgTool(d.registry, { operations: ops });
     await tool.execute("1", { command: "both" }, undefined, undefined, CTX);
-    child.emitData("out-");
-    child.emitErr("err-");
-    child.emitData("done\n");
-    child.close(0);
+    // pi's local ops route both stdout and stderr through the single onData.
+    ops.emit("out-");
+    ops.emit("err-");
+    ops.emit("done\n");
+    await ops.exit(0);
     const wake = d.sendUserMessage.mock.calls[0][0] as string;
     expect(wake).toContain("out-err-done");
   });
 
-  it("reports an async spawn error and settles once despite a trailing close", async () => {
+  it("reports an executor error and settles once despite a trailing exit", async () => {
     const d = toolDeps();
-    const child = fakeBash();
-    const tool = createBgTool(d.registry, { spawnFn: () => child });
+    const ops = fakeBashOps();
+    const tool = createBgTool(d.registry, { operations: ops });
     await tool.execute("1", { command: "enoent" }, undefined, undefined, CTX);
-    child.fail(new Error("spawn enoent ENOENT"));
-    child.close(null); // real error paths are followed by close — fire-once absorbs it
+    ops.fail("spawn enoent ENOENT");
+    await ops.exit(0); // real error paths are followed by an exit — fire-once absorbs it
     const wake = d.sendUserMessage.mock.calls[0][0] as string;
     expect(wake).toContain("failed: spawn enoent ENOENT");
     expect(d.sendUserMessage).toHaveBeenCalledTimes(1);
   });
 
-  it("labels an external signal kill without the timeout wording", async () => {
+  it("reports signal kills by their 128+signal exit code, like the bash tool", async () => {
     const d = toolDeps();
-    const child = fakeBash();
-    const tool = createBgTool(d.registry, { spawnFn: () => child, defaultTimeoutMs: 5_000_000 });
+    const ops = fakeBashOps();
+    const tool = createBgTool(d.registry, { operations: ops });
     await tool.execute("1", { command: "victim" }, undefined, undefined, CTX);
-    child.closeSignaled(); // SIGTERM from outside, not our timeout
+    await ops.exit(143); // SIGTERM: pi's local ops resolve 128 + 15, not a raw signal
     const wake = d.sendUserMessage.mock.calls[0][0] as string;
-    expect(wake).toContain("killed (SIGTERM) — victim");
-    expect(d.notify).toHaveBeenCalledWith(expect.stringContaining("killed (SIGTERM)"), "error");
+    expect(wake).toContain("exited 143 — victim");
+    expect(d.notify).toHaveBeenCalledWith(expect.stringContaining("exited 143"), "error");
+  });
+
+  it("labels a codeless termination after the executor gives up", async () => {
+    const d = toolDeps();
+    const ops = fakeBashOps();
+    const tool = createBgTool(d.registry, { operations: ops });
+    await tool.execute("1", { command: "zombie" }, undefined, undefined, CTX);
+    await ops.exit(null);
+    const wake = d.sendUserMessage.mock.calls[0][0] as string;
+    expect(wake).toContain("terminated without an exit code");
+    expect(d.notify).toHaveBeenCalledWith(expect.stringContaining("terminated"), "error");
+  });
+
+  it("aborts the task when the tool call is interrupted", async () => {
+    const d = toolDeps();
+    const ops = fakeBashOps();
+    const tool = createBgTool(d.registry, { operations: ops });
+    const ac = new AbortController();
+    await tool.execute("1", { command: "long" }, ac.signal, undefined, CTX);
+    ac.abort();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(ops.aborted).toBe(true);
+    const wake = d.sendUserMessage.mock.calls[0][0] as string;
+    expect(wake).toContain("aborted");
+    expect(d.notify).toHaveBeenCalledWith(expect.stringContaining("aborted"), "error");
   });
 
   it("honors timeout_ms, clamps overflow to schedulable range, and falls back on invalid values", async () => {
     // Overflow would clamp inside Node to 1ms — an instant kill.
     const sane = toolDeps();
-    const saneChild = fakeBash();
-    const toolA = createBgTool(sane.registry, { spawnFn: () => saneChild });
+    const saneOps = fakeBashOps();
+    const toolA = createBgTool(sane.registry, { operations: saneOps });
     await toolA.execute("1", { command: "a", timeout_ms: 1e10 }, undefined, undefined, CTX);
-    await new Promise((r) => setTimeout(r, 25));
-    expect(saneChild.killed).toBe(false); // ~24 days, not 1ms
+    expect(saneOps.last?.timeout).toBe(MAX_TIMEOUT_MS / 1000); // ~24 days, not 1ms
     sane.registry.killAll();
 
-    // Invalid values fall back to the tool default (15ms here → timeout).
+    // Invalid values fall back to the tool default (15ms here → 0.015s).
     const fallback = toolDeps();
-    const fbChild = fakeBash();
-    const toolB = createBgTool(fallback.registry, { spawnFn: () => fbChild, defaultTimeoutMs: 15 });
+    const fbOps = fakeBashOps();
+    const toolB = createBgTool(fallback.registry, { operations: fbOps, defaultTimeoutMs: 15 });
     await toolB.execute("1", { command: "b", timeout_ms: -5 }, undefined, undefined, CTX);
-    await new Promise((r) => setTimeout(r, 40));
-    expect(fbChild.killed).toBe(true);
+    expect(fbOps.last?.timeout).toBe(0.015);
+    await fbOps.fail("timeout:0.015");
     const wake = fallback.sendUserMessage.mock.calls[0][0] as string;
     expect(wake).toContain("timed out after 0s");
   });
@@ -510,7 +684,7 @@ describe("kill and control surfaces", () => {
     const d = controlDeps();
     const child = fakeBashForControl();
     const onKilled = vi.fn();
-    const bg = createBgTool(d.registry, { spawnFn: () => child });
+    const bg = createBgTool(d.registry, { operations: child });
     const killTool = createKillTaskTool(d.registry, { onKilled });
     await bg.execute("1", { command: "spin" }, undefined, undefined, {
       sessionManager: { getSessionDir: () => undefined },
@@ -519,14 +693,14 @@ describe("kill and control surfaces", () => {
     expect(result.details).toEqual({ killed: true, id: "bg-1" });
     expect(onKilled).toHaveBeenCalledWith("bg-1");
     await new Promise((r) => setTimeout(r, 10));
-    expect(child.killed).toBe(true);
+    expect(child.aborted).toBe(true);
     expect(d.sendUserMessage).not.toHaveBeenCalled();
   });
 
   it("kill_task errors with the running list when the id is unknown", async () => {
     const d = controlDeps();
     const child = fakeBashForControl();
-    const bg = createBgTool(d.registry, { spawnFn: () => child });
+    const bg = createBgTool(d.registry, { operations: child });
     await bg.execute("1", { command: "live" }, undefined, undefined, {
       sessionManager: { getSessionDir: () => undefined },
     } as never);
@@ -536,18 +710,19 @@ describe("kill and control surfaces", () => {
     const text = result.content[0].text;
     expect(text).toContain("No running task bg-9");
     expect(text).toContain("bg-1 (bash,");
-    expect(child.killed).toBe(false);
+    expect(child.aborted).toBe(false);
   });
 
   it("/tasks lists, kills by `kill <id>`, kills all, and teaches its grammar on misuse", () => {
     const d = controlDeps();
     const childA = fakeBashForControl();
     const childB = fakeBashForControl();
-    const bg = createBgTool(d.registry, { spawnFn: (c) => (c === "a" ? childA : childB) });
+    const bg = createBgTool(d.registry, { operations: childA });
+    const bg2 = createBgTool(d.registry, { operations: childB });
     void bg.execute("1", { command: "a" }, undefined, undefined, {
       sessionManager: { getSessionDir: () => undefined },
     } as never);
-    void bg.execute("2", { command: "b" }, undefined, undefined, {
+    void bg2.execute("2", { command: "b" }, undefined, undefined, {
       sessionManager: { getSessionDir: () => undefined },
     } as never);
     const cmd = createTasksCommand(d.registry, { now: () => 4_000 });
@@ -560,18 +735,18 @@ describe("kill and control surfaces", () => {
     // Bare id — the old form — now teaches the grammar instead of killing.
     cmd.handler("bg-1", ctx);
     expect(notify).toHaveBeenCalledWith(expect.stringContaining("Usage: /tasks"), "info");
-    expect(childA.killed).toBe(false);
+    expect(childA.aborted).toBe(false);
 
     cmd.handler("kill bg-8", ctx);
     expect(notify).toHaveBeenCalledWith(expect.stringContaining("No running task bg-8"), "error");
 
     cmd.handler("kill bg-1", ctx);
     expect(notify).toHaveBeenCalledWith("Killed bg-1. Its wake will not arrive.", "warning");
-    expect(childA.killed).toBe(true);
+    expect(childA.aborted).toBe(true);
 
     cmd.handler("kill all", ctx);
     expect(notify).toHaveBeenCalledWith("Killed 1 task. Their wakes will not arrive.", "warning");
-    expect(childB.killed).toBe(true);
+    expect(childB.aborted).toBe(true);
 
     cmd.handler("kill all", ctx); // nothing left
     expect(notify).toHaveBeenCalledWith("No running tasks.", "info");
@@ -590,24 +765,24 @@ describe("kill and control surfaces", () => {
   });
 });
 
-/** Shared minimal bash fake for the control-surface tests. */
+/** Shared minimal bash-operations fake for the control-surface tests. */
 function fakeBashForControl() {
-  const closers: Array<(code: number | null, signal: NodeJS.Signals | null) => void> = [];
-  const data: Array<(chunk: string) => void> = [];
-  const child = {
-    stdout: { on: (_event: "data", cb: (chunk: string) => void) => void data.push(cb) },
-    stderr: { on: () => undefined },
-    on: (event: string, cb: (...args: never[]) => void) => {
-      if (event === "close") closers.push(cb as never);
-    },
-    pid: 4242,
-    killed: false,
-    kill: () => {
-      child.killed = true;
-      setImmediate(() => closers.forEach((h) => h(null, "SIGKILL")));
-    },
+  const fake = {
+    aborted: false,
+    exec: (_command: string, _cwd: string, { signal }: { signal?: AbortSignal }) =>
+      new Promise((_res, rej) => {
+        // pi's local ops kill the tree and reject with "aborted" on signal.
+        signal?.addEventListener(
+          "abort",
+          () => {
+            fake.aborted = true;
+            rej(new Error("aborted"));
+          },
+          { once: true },
+        );
+      }),
   };
-  return child as unknown as import("../lib/background").BashChild & { killed: boolean };
+  return fake as unknown as import("@earendil-works/pi-coding-agent").BashOperations & { aborted: boolean };
 }
 
 describe("bashCommandHead", () => {
@@ -633,7 +808,9 @@ describe("bg with real bash commands", () => {
     const setStatus = vi.fn();
     const registry = createBackgroundRegistry({ sendUserMessage, notify, setStatus });
     const tool = createBgTool(registry, { defaultTimeoutMs: 30_000 });
-    const ctx = { sessionManager: { getSessionDir: () => sessionDir } };
+    const ctx = {
+      sessionManager: { getSessionDir: () => sessionDir, getSessionId: () => "real-test" },
+    };
     return { sendUserMessage, notify, setStatus, registry, tool, ctx };
   }
 
@@ -676,9 +853,9 @@ describe("bg with real bash commands", () => {
     expect(d.notify).toHaveBeenCalledWith(expect.stringContaining("exited 42"), "error");
   }, 15_000);
 
-  it("labels a self-terminated command as a signal kill", async () => {
+  it("reports a self-terminated command by its 128+signal exit code, like the bash tool", async () => {
     const { wake } = await runReal(realTool(), "kill -TERM $$");
-    expect(wake).toContain("killed (SIGTERM)");
+    expect(wake).toContain("exited 143");
   }, 15_000);
 
   it("runs pipelines and compound commands through bash -c", async () => {
@@ -707,15 +884,17 @@ describe("bg with real bash commands", () => {
     expect(wake).toContain("exited 0");
   }, 15_000);
 
-  it("rolls a real large output into the tail and stashes the overflow", async () => {
+  it("rolls a real large output into the tail and stashes the full output", async () => {
     const dir = mkdtempSync(join(tmpdir(), "bg-big-"));
     const d = realTool(dir);
     const { wake, details } = await runReal(d, "seq 1 5000");
     expect(wake).toContain("full output"); // stash pointer
     expect(wake.length).toBeLessThan(6_000); // capped inline body
-    const stashed = readFileSync(stashPath(dir, details.id), "utf8");
-    expect(stashed).toContain("4999\n5000"); // the end survives the roll
-    expect(stashed.startsWith("1\n")).toBe(false); // the start rolled out
+    await vi.waitFor(() => {
+      const stashed = readFileSync(outputLogPath(dir, details.id), "utf8");
+      expect(stashed).toContain("4999\n5000"); // the end survives the roll
+      expect(stashed.startsWith("1\n")).toBe(true); // the full output is stashed, start and all
+    });
   }, 15_000);
 
   it("trims whitespace-padded commands before naming and running them", async () => {

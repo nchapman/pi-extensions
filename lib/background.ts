@@ -19,15 +19,30 @@
  * - full replies over the wake cap are stashed beside the session at
  *   <sessionDir>/bg/<id>.txt with a pointer in the wake (the overflow pattern);
  *   with no session dir the text is hard-capped and says so
+ * - bg commands run through pi's own local bash operations (the same
+ *   createLocalBashOperations the built-in bash tool uses): identical shell
+ *   resolution (Unix /bin/bash → PATH → sh; Windows Git Bash), identical env
+ *   (pi's bin dir on PATH, this session's PI_* vars), identical process-tree
+ *   kill, identical #5303-safe wait on detached descendants, and the 128+signal
+ *   exit-code convention. bg-only deltas are deliberate: non-blocking + wake,
+ *   a bounded default timeout, a small wake cap, and the full command output
+ *   stashed beside the session at <sessionDir>/bg/<id>.log (or a temp file with
+ *   no session dir) instead of pi's temp file — it survives resume
  * - PI_BG_WAKE=0 disables wake messages; the terminal notification still fires
  */
 
-import { spawn as nodeSpawn } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { createWriteStream, existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { delimiter, join } from "node:path";
+import {
+  createLocalBashOperations,
+  truncateTail,
+  DEFAULT_MAX_LINES,
+  type BashOperations,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-/** Chars of a child's reply that ride inline in the wake message. */
+/** Budget (chars for replies, bytes for command output) that rides inline in the wake message. */
 export const WAKE_TEXT_CAP = 4_000;
 
 export interface BgTask {
@@ -224,23 +239,15 @@ export function createBackgroundRegistry(deps: BackgroundDeps = {}): BackgroundR
  * The bg tool: a shell command adopted into the same registry as subagents —
  * one footer count, one shutdown kill, the same wake channel. The tool returns
  * a task id immediately; the exit status and output tail arrive in the wake.
+ *
+ * Execution is delegated to pi's local bash operations (createLocalBashOperations
+ * — the public API pi exposes for exactly this), so a backgrounded command
+ * behaves identically to an inline bash tool call: same shell resolution,
+ * env, cwd validation, process-tree kill, wait semantics, and exit codes.
  */
 
 /** Rolling per-command output kept in memory so a chatty process can't grow the parent. */
 export const BASH_TAIL_CAP = 8_192;
-
-/** The child surface the tool depends on (Node's ChildProcess satisfies this). */
-export interface BashChild {
-  on(event: "close", cb: (code: number | null, signal: NodeJS.Signals | null) => void): unknown;
-  on(event: "error", cb: (error: Error) => void): unknown;
-  stdout: { on(event: "data", cb: (chunk: string | Buffer) => void): unknown } | null;
-  stderr: { on(event: "data", cb: (chunk: string | Buffer) => void): unknown } | null;
-  kill(signal?: NodeJS.Signals): unknown;
-  /** Process id — the process-group leader when spawned detached. */
-  readonly pid?: number | undefined;
-}
-
-export type BashSpawnFn = (command: string, cwd?: string) => BashChild;
 
 /** Node clamps out-of-range setTimeout delays to 1ms — an instant kill. Keep timeouts schedulable. */
 export const MAX_TIMEOUT_MS = 2_147_483_647;
@@ -251,15 +258,70 @@ export function clampTimeoutMs(value: number | undefined, fallback: number): num
   return Math.min(Math.floor(value), MAX_TIMEOUT_MS);
 }
 
-const defaultBashSpawn: BashSpawnFn = (command, cwd) =>
-  nodeSpawn("bash", ["-c", command], {
-    stdio: ["ignore", "pipe", "pipe"],
-    cwd,
-    // Detached on POSIX makes bash a process-group leader so kills take out
-    // grandchildren too — a surviving grandchild holds the pipe write-ends and
-    // blocks close (and the wake) indefinitely. Same approach as pi's bash tool.
-    detached: process.platform !== "win32",
-  });
+/** Full-output log for a backgrounded command, beside the session so it survives resume. */
+export function outputLogPath(sessionDir: string, id: string): string {
+  return join(sessionDir, "bg", `${id}.log`);
+}
+
+/** Temp-file fallback when the session has no dir — mirrors pi's pi-bash-*.log temp files. */
+export function tempOutputLogPath(id: string): string {
+  return join(tmpdir(), `pi-bg-${id}.log`);
+}
+
+/**
+ * The agent config directory (~/.pi/agent by default), the parent of the bin
+ * dir pi's bash tool prepends to PATH (fd, rg, …). Mirrors pi's getAgentDir.
+ */
+export function piAgentDir(env: Record<string, string | undefined> = process.env): string {
+  const dir = env.PI_CODING_AGENT_DIR?.trim();
+  if (dir) {
+    return dir === "~" || dir.startsWith("~/") ? join(homedir(), dir.slice(1)) : dir;
+  }
+  return join(homedir(), ".pi", "agent");
+}
+
+/**
+ * The environment a bg command sees — mirrors pi's built-in bash tool
+ * (resolveSpawnContext with exposeSessionEnvironment defaulting to true, on top
+ * of getShellEnv's bin-dir PATH prepend):
+ * - pi's bin dir is prepended to PATH when missing (case-insensitive key);
+ * - inherited PI_* session vars are stripped, then this session's are re-added,
+ *   so stale values from another context can't leak to the child.
+ */
+export function buildBashEnv(
+  base: NodeJS.ProcessEnv,
+  opts: {
+    agentDir?: string;
+    sessionId?: string;
+    sessionFile?: string;
+    provider?: string;
+    model?: string;
+    thinkingLevel?: string;
+  } = {},
+): NodeJS.ProcessEnv {
+  const env = { ...base };
+  if (opts.agentDir) {
+    const binDir = join(opts.agentDir, "bin");
+    const pathKey = Object.keys(env).find((key) => key.toLowerCase() === "path") ?? "PATH";
+    const current = env[pathKey] ?? "";
+    if (!current.split(delimiter).filter(Boolean).includes(binDir)) {
+      env[pathKey] = [binDir, current].filter(Boolean).join(delimiter);
+    }
+  }
+  delete env.PI_SESSION_ID;
+  delete env.PI_SESSION_FILE;
+  delete env.PI_PROVIDER;
+  delete env.PI_MODEL;
+  delete env.PI_REASONING_LEVEL;
+  if (opts.sessionId) env.PI_SESSION_ID = opts.sessionId;
+  if (opts.sessionFile) env.PI_SESSION_FILE = opts.sessionFile;
+  if (opts.provider && opts.model) {
+    env.PI_PROVIDER = opts.provider;
+    env.PI_MODEL = opts.model;
+  }
+  if (opts.thinkingLevel) env.PI_REASONING_LEVEL = opts.thinkingLevel;
+  return env;
+}
 
 /** One line identifying the command for wake headers and the registry's running list. */
 export function bashCommandHead(command: string): string {
@@ -268,18 +330,21 @@ export function bashCommandHead(command: string): string {
   return Array.from(command.replace(/\s+/g, " ").trim()).slice(0, 80).join("");
 }
 
-/** The wake message for a finished shell command: status, duration, capped tail. */
+/** The wake message for a finished shell command: status, duration, output tail. */
 export function formatBashWake(opts: {
   command: string;
   id: string;
   status: string;
   durationMs: number;
+  /** Output tail, already truncated to the wake budget by the tool. */
   output: string;
-  sessionDir: string | undefined;
+  /** Pointer/warning appended after the output (full-output path, or a stash failure). */
+  outputNote?: string;
 }): string {
-  const body = opts.output.trim()
-    ? `\n\n${capResultText(opts.output.trim(), opts.sessionDir, opts.id, WAKE_TEXT_CAP, "output").text}`
-    : ""; // quiet commands stay quiet
+  const body =
+    opts.output.trim() || opts.outputNote
+      ? `\n\n${[opts.output.trim(), opts.outputNote].filter(Boolean).join("\n")}`
+      : ""; // quiet commands stay quiet
   return `[background] bash (${opts.id}, ${formatDuration(opts.durationMs)}) ${opts.status} — ${bashCommandHead(
     opts.command,
   )}${body}`;
@@ -293,9 +358,9 @@ export interface BgToolResult {
 
 export function createBgTool(
   registry: BackgroundRegistry,
-  opts: { spawnFn?: BashSpawnFn; defaultTimeoutMs?: number; now?: () => number } = {},
+  opts: { operations?: BashOperations; defaultTimeoutMs?: number; now?: () => number } = {},
 ) {
-  const spawnFn = opts.spawnFn ?? defaultBashSpawn;
+  const operations = opts.operations ?? createLocalBashOperations();
   const now = opts.now ?? Date.now;
   return {
     name: "bg",
@@ -310,7 +375,7 @@ Use for long-running commands whose result you need later — builds, test suite
       "Background results are delivered to you automatically as your next message, even mid-run — keep working and they will reach you; never sleep or poll waiting for one.",
     ],
     parameters: Type.Object({
-      command: Type.String({ description: "Shell command, passed to bash -c" }),
+      command: Type.String({ description: "Shell command to execute" }),
       timeout_ms: Type.Optional(
         Type.Number({ description: "SIGKILL the command after this many milliseconds (default 10m)" }),
       ),
@@ -318,9 +383,20 @@ Use for long-running commands whose result you need later — builds, test suite
     async execute(
       _id: string,
       params: { command: string; timeout_ms?: number },
-      _signal: AbortSignal | undefined,
+      signal: AbortSignal | undefined,
       _onUpdate: undefined, // unused: bg never streams partials; loose type to satisfy bivariant method checks
-      ctx: { sessionManager?: { getSessionDir(): string | undefined }; cwd?: string } | undefined,
+      ctx:
+        | {
+            cwd?: string;
+            sessionManager?: {
+              getSessionDir(): string | undefined;
+              getSessionId(): string | undefined;
+              getSessionFile?(): string | undefined;
+            };
+            model?: { provider: string; id: string } | undefined;
+            thinkingLevel?: string | undefined;
+          }
+        | undefined,
     ): Promise<BgToolResult> {
       const command = params.command?.trim();
       if (!command) {
@@ -330,66 +406,111 @@ Use for long-running commands whose result you need later — builds, test suite
           isError: true,
         };
       }
-      let child: BashChild;
-      try {
-        child = spawnFn(command, ctx?.cwd);
-      } catch (error) {
+      const cwd = ctx?.cwd ?? process.cwd();
+      // pi's bash tool validates the working directory up front with a clear
+      // error; do the same before adopting so a bad cwd is an immediate tool
+      // error, not a stray "failed" wake for a task that never ran.
+      if (!existsSync(cwd)) {
         return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Failed to spawn: ${error instanceof Error ? error.message : String(error)}`,
-            },
-          ],
+          content: [{ type: "text" as const, text: `Working directory does not exist: ${cwd}` }],
           details: { kind: "bash" },
           isError: true,
         };
       }
       const sessionDir = ctx?.sessionManager?.getSessionDir();
       const startedAt = now();
+      const timeoutMs = clampTimeoutMs(params.timeout_ms, opts.defaultTimeoutMs ?? 10 * 60_000);
+      const env = buildBashEnv(process.env, {
+        agentDir: piAgentDir(),
+        sessionId: ctx?.sessionManager?.getSessionId?.(),
+        sessionFile: ctx?.sessionManager?.getSessionFile?.(),
+        provider: ctx?.model?.provider,
+        model: ctx?.model?.id,
+        thinkingLevel: ctx?.thinkingLevel,
+      });
+      // One controller per task: registry kills (kill_task, /tasks, shutdown)
+      // and the tool call's own abort both funnel into it. pi's local ops kill
+      // the whole process tree on abort, like the built-in bash tool.
+      const controller = new AbortController();
+      const onOuterAbort = () => controller.abort();
+      if (signal) {
+        if (signal.aborted) controller.abort();
+        else signal.addEventListener("abort", onOuterAbort, { once: true });
+      }
       // Rolling tail kept as bytes: a chunk can end mid-codepoint, and string
       // concatenation would bake U+FFFD into the tail at every boundary.
-      // Decoding once at finish also makes the cap a byte cap.
-      let tailBuf = Buffer.alloc(0);
-      let timedOut = false;
-      // Kill the process group when possible so grandchildren (the pipe-
-      // holders a spawned test suite leaves behind) die with bash; fall back
-      // to the child itself when the group is already gone or on Windows.
-      const killTree = () => {
-        if (child.pid !== undefined && process.platform !== "win32") {
-          try {
-            process.kill(-child.pid, "SIGKILL");
-            return;
-          } catch {
-            // group gone — the child may not be
-          }
-        }
-        child.kill("SIGKILL");
-      };
+      let tail = Buffer.alloc(0);
+      // Full output, streamed to a log once it will overflow the wake — pi's
+      // bash tool does the same with a temp file. rawChunks replay to the log
+      // when it opens late, so the log is complete from byte zero.
+      let rawChunks: Buffer[] = [];
+      let totalBytes = 0;
+      let logStream: import("node:fs").WriteStream | undefined;
+      let logPath: string | undefined;
+      let logFailed = false;
       const id = registry.adopt({
         name: bashCommandHead(command),
         kind: "bash",
-        kill: killTree,
+        kill: () => {
+          controller.abort();
+          // A killed task leaves no orphaned log: stop writes, remove the
+          // partial file (best effort — Windows may still hold it open).
+          logStream?.destroy();
+          logStream = undefined;
+          if (logPath) {
+            try {
+              unlinkSync(logPath);
+            } catch {
+              // best effort
+            }
+          }
+        },
       });
-      // Combined rolling tail, interleaved as received.
-      const append = (chunk: string | Buffer) => {
-        const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-        const next = Buffer.concat([tailBuf, bytes]);
-        tailBuf = next.subarray(next.length - BASH_TAIL_CAP);
+      const ensureLog = () => {
+        if (logStream || logFailed) return;
+        logPath = sessionDir ? outputLogPath(sessionDir, id) : tempOutputLogPath(id);
+        try {
+          if (sessionDir) mkdirSync(join(sessionDir, "bg"), { recursive: true });
+          logStream = createWriteStream(logPath);
+          logStream.on("error", () => {
+            logFailed = true;
+            logStream?.destroy();
+            logStream = undefined;
+          });
+          for (const chunk of rawChunks) logStream.write(chunk);
+          rawChunks = [];
+        } catch {
+          logFailed = true; // fail-open: the wake says the full output is lost
+        }
       };
-      child.stdout?.on("data", append);
-      child.stderr?.on("data", append);
-      const timeoutMs = clampTimeoutMs(params.timeout_ms, opts.defaultTimeoutMs ?? 10 * 60_000);
-      const timer = setTimeout(() => {
-        timedOut = true;
-        killTree();
-      }, timeoutMs);
-      timer.unref?.();
-      const finish = (status: string, ok: boolean) => {
-        clearTimeout(timer);
-        // A task killed by shutdown completes (and stashes) as a no-op — but
-        // guard before composing so a killed task leaves no orphaned stash.
+      const onData = (data: Buffer) => {
+        // A killed or settled task is done: ignore late chunks so a delayed
+        // pipe read can't resurrect the log (or grow the tail) after teardown.
         if (!registry.isRunning(id)) return;
+        totalBytes += data.length;
+        const next = Buffer.concat([tail, data]);
+        tail = next.subarray(next.length - BASH_TAIL_CAP);
+        if (totalBytes > WAKE_TEXT_CAP) {
+          ensureLog();
+          logStream?.write(data);
+        } else if (data.length > 0) {
+          rawChunks.push(data);
+        }
+      };
+      const settle = (status: string, ok: boolean) => {
+        signal?.removeEventListener("abort", onOuterAbort);
+        logStream?.end();
+        // A task killed by kill_task/shutdown completes (and would compose its
+        // wake) as a no-op — guard before composing so it leaves nothing behind.
+        if (!registry.isRunning(id)) return;
+        const output = tail.toString("utf8");
+        const display = truncateTail(output, { maxLines: DEFAULT_MAX_LINES, maxBytes: WAKE_TEXT_CAP });
+        const note =
+          display.truncated && logPath
+            ? logFailed
+              ? "[… truncated — could not save the full output …]"
+              : `[… truncated — full output: ${logPath} …]`
+            : undefined;
         registry.complete(id, {
           ok,
           text: formatBashWake({
@@ -397,25 +518,46 @@ Use for long-running commands whose result you need later — builds, test suite
             id,
             status,
             durationMs: now() - startedAt,
-            output: tailBuf.toString("utf8"),
-            sessionDir,
+            output: display.content,
+            outputNote: note,
           }),
         });
       };
-      child.on("close", (code, signal) => {
-        // Only a signal-less exit with no code is a timeout kill; a natural
-        // exit racing the deadline still reports its real code.
-        const timedOutKill = timedOut && code === null;
-        finish(
-          timedOutKill
-            ? `timed out after ${formatDuration(timeoutMs)}`
-            : code === null
-              ? `killed (${signal ?? "unknown signal"})`
-              : `exited ${code}`,
-          code === 0 && !timedOutKill,
-        );
-      });
-      child.on("error", (error) => finish(`failed: ${error.message}`, false));
+      let execPromise: Promise<{ exitCode: number | null }>;
+      try {
+        // pi's local ops take the timeout in seconds; the tree kill on
+        // timeout/abort and the #5303-safe wait live inside ops.exec.
+        execPromise = operations.exec(command, cwd, {
+          onData,
+          signal: controller.signal,
+          timeout: timeoutMs / 1000,
+          env,
+        });
+      } catch (error) {
+        settle(`failed: ${error instanceof Error ? error.message : String(error)}`, false);
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Failed to start command: ${error instanceof Error ? error.message : String(error)}`,
+            },
+          ],
+          details: { kind: "bash", id },
+          isError: true,
+        };
+      }
+      void execPromise.then(
+        ({ exitCode }) =>
+          // ops.exec already maps signal kills to 128 + signal number, so a
+          // plain "exited N" matches the built-in bash tool's convention.
+          settle(exitCode === null ? "terminated without an exit code" : `exited ${exitCode}`, exitCode === 0),
+        (error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error);
+          if (message === "aborted") settle("aborted", false);
+          else if (message.startsWith("timeout:")) settle(`timed out after ${formatDuration(timeoutMs)}`, false);
+          else settle(`failed: ${message}`, false);
+        },
+      );
       return {
         content: [
           {
