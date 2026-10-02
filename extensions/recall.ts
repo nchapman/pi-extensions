@@ -18,8 +18,9 @@
  *   back still surface. Lexical match is deliberate: recall returns verbatim
  *   text, the regime where models are strongest (NoLiMa), and every hit
  *   carries provenance.
- * - Hybrid: a local EmbeddingGemma (300M, ONNX) adds a semantic ranking over
- *   the same chunks, fused into BM25 by weighted reciprocal-rank fusion
+ * - Hybrid: a local jina-v5-text-nano (768-dim ONNX, q8) adds a semantic
+ *   ranking over the same chunks, fused into BM25 by weighted
+ *   reciprocal-rank fusion
  *   (`PI_RECALL_EMBED_WEIGHT`, default 0.15 — benchmarked optimum for the
  *   binary-quantized nano) so
  *   paraphrase queries surface discussions that share no terms. Embeddings
@@ -113,7 +114,7 @@ export interface RecallConfig {
   maxResults: number;
   readChars: number;
   projectMaxBytes: number;
-  /** Semantic side of hybrid search: local EmbeddingGemma embeddings, fused into lexical ranking by RRF. */
+  /** Semantic side of hybrid search: local jina-v5-text-nano embeddings, fused into lexical ranking by RRF. */
   embedEnabled: boolean;
   embedDtype: EmbedDtype;
   /** RRF weight of the semantic ranking (lexical is 1.0). 0 keeps ranking purely lexical. */

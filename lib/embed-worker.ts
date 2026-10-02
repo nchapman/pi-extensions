@@ -36,7 +36,7 @@
 /** The one embedding model — jina v5-text-nano (retrieval adapter), q8 ONNX (~212MB). */
 const MODEL_ID = "jinaai/jina-embeddings-v5-text-nano-retrieval";
 const MODEL_DIR = process.env.PI_RECALL_MODEL_DIR?.trim() || `${process.env.HOME ?? "~"}/.pi/agent/models`;
-/** dtype whitelist mirrors transformers.js' union, narrowed to the EmbeddingGemma builds worth using. */
+/** dtype whitelist mirrors transformers.js' union, narrowed to the quantized builds worth using. */
 type Dtype = "fp32" | "fp16" | "q8" | "q4" | "q4f16";
 const DTYPES = new Set<Dtype>(["fp32", "fp16", "q8", "q4", "q4f16"]);
 const rawDtype = process.env.PI_RECALL_EMBED_DTYPE?.trim() as Dtype | undefined;
