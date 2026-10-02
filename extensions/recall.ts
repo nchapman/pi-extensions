@@ -106,7 +106,7 @@ export interface RecallConfig {
   ownSummaries: boolean;
   /** Hard character budget for generated summaries (PI_RECALL_SUMMARY_CHARS). */
   summaryChars: number;
-  /** Thinking for the summarization call: "session" mirrors the session level; or a fixed ThinkingLevel / "off" (PI_RECALL_SUMMARY_THINKING). Defaults to "high": a one-shot hard task needs more reasoning than the interactive session level — measured on glm-5.3, mirroring a "low" session collapsed template adherence on long inputs. */
+  /** Thinking for the summarization call: "session" mirrors the session level; or a fixed ThinkingLevel / "off" (PI_RECALL_SUMMARY_THINKING). Defaults to "off": no thinking is requested so the provider applies its own default (glm-5.3 disables outright, deepseek keeps a light default), and the instruction-sandwich layout carries template adherence at literally 0 reasoning tokens — measured across the fleet — so the whole output cap stays available for summary text and no reasoning run can starve it. */
   summaryThinking: "session" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   chunkChars: number;
   snippetChars: number;
@@ -176,7 +176,7 @@ function summaryThinkingFromEnv(env: NodeJS.ProcessEnv): RecallConfig["summaryTh
   const valid = new Set(["session", "off", "minimal", "low", "medium", "high", "xhigh", "max"]);
   if (!valid.has(raw)) {
     console.error(
-      `recall: PI_RECALL_SUMMARY_THINKING=${raw} is invalid (session|off|minimal|low|medium|high|xhigh|max) — using session`,
+      `recall: PI_RECALL_SUMMARY_THINKING=${raw} is invalid (session|off|minimal|low|medium|high|xhigh|max) — using off`,
     );
     return DEFAULTS.summaryThinking;
   }
