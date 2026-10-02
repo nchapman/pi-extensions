@@ -37,7 +37,7 @@ npm run test:coverage  # vitest with V8 coverage report
 
 ## Design through-line
 
-**Keep the parent agent's context small; fail explicitly.** Extensions add capability without bloating the tool surface the main agent sees. Before adding a tool, message, or wake, justify its context cost. The design notes (`docs/design-notes.md`) record the reasoning behind each mechanism — read them before changing one, and update both the design note and the relevant extension's README section when behavior changes.
+**Keep the parent agent's context small; fail explicitly.** Extensions add capability without bloating the tool surface the main agent sees. Before adding a tool, message, or wake, justify its context cost. The file-header comments record the deliberate design cuts for each mechanism (see `lib/background.ts` for the pattern) — read them before changing one, and update both the header comments and the relevant extension's README section when behavior changes.
 
 ## Commit messages
 
