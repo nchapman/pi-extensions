@@ -12,16 +12,21 @@ import {
   lastGoalSnapshot,
   parseMaxContinuations,
   parseMaxTurnsPerRun,
+  parseVerifyTimeoutMs,
   renderContinuationPrompt,
   renderGoalCall,
   renderGoalResult,
   renderGoalReminder,
+  runVerify,
   scanGoalBranch,
   validateCriteria,
   validateObjective,
+  validateVerify,
   type Goal,
   type GoalDetails,
+  type VerifyResult,
   registerGoalTool,
+  VERIFY_TIMEOUT_MS_DEFAULT,
 } from "../extensions/goal";
 
 const THEME = { fg: (_k: string, s: string) => s, bold: (s: string) => s, dim: (s: string) => s } as never;
@@ -332,6 +337,185 @@ describe("scanGoalBranch / lastGoalSnapshot", () => {
       { type: "compaction" },
     ];
     expect(scanGoalBranch(staleCarrier).hiddenByCompaction).toBe(true);
+  });
+});
+
+describe("validateVerify", () => {
+  it("accepts a real command and trims it", () => {
+    const { verify, error } = validateVerify("  npm test  ");
+    expect(error).toBeUndefined();
+    expect(verify).toBe("npm test");
+  });
+  it("accepts a chained command", () => {
+    expect(validateVerify("npm run typecheck && npm test").verify).toBe("npm run typecheck && npm test");
+  });
+  it("returns empty when omitted", () => {
+    expect(validateVerify(undefined)).toEqual({});
+  });
+  it("rejects non-strings and empty/whitespace commands", () => {
+    expect(validateVerify(42).error).toContain("string");
+    expect(validateVerify("   ").error).toContain("non-empty");
+  });
+  it("rejects no-op commands that always pass", () => {
+    for (const bad of ["true", ":", "exit 0", "true ", "  :  "]) {
+      expect(validateVerify(bad).error).toContain("no-op");
+    }
+  });
+  it("rejects oversized commands", () => {
+    expect(validateVerify("x".repeat(501)).error).toContain("exceeds");
+  });
+  it("does not flag legitimate commands that merely contain the word 'true'", () => {
+    expect(validateVerify("echo true").error).toBeUndefined();
+    expect(validateVerify("npm test --if true").error).toBeUndefined();
+  });
+});
+
+describe("parseVerifyTimeoutMs", () => {
+  it("defaults on missing, empty, and invalid values", () => {
+    expect(parseVerifyTimeoutMs(undefined)).toBe(VERIFY_TIMEOUT_MS_DEFAULT);
+    expect(parseVerifyTimeoutMs("  ")).toBe(VERIFY_TIMEOUT_MS_DEFAULT);
+    expect(parseVerifyTimeoutMs("abc")).toBe(VERIFY_TIMEOUT_MS_DEFAULT);
+    expect(parseVerifyTimeoutMs("0")).toBe(VERIFY_TIMEOUT_MS_DEFAULT);
+    expect(parseVerifyTimeoutMs("-5")).toBe(VERIFY_TIMEOUT_MS_DEFAULT);
+  });
+  it("parses a valid millisecond value", () => {
+    expect(parseVerifyTimeoutMs("30000")).toBe(30000);
+  });
+  it("clamps absurd values to the default", () => {
+    expect(parseVerifyTimeoutMs("999999999999")).toBe(VERIFY_TIMEOUT_MS_DEFAULT);
+    expect(parseVerifyTimeoutMs("999")).toBe(VERIFY_TIMEOUT_MS_DEFAULT);
+  });
+});
+
+describe("runVerify", () => {
+  it("resolves ok on exit 0 with captured output", async () => {
+    const r = await runVerify("echo hello", { timeoutMs: 5000 });
+    expect(r.ok).toBe(true);
+    expect(r.exitCode).toBe(0);
+    expect(r.timedOut).toBe(false);
+    expect(r.output).toContain("hello");
+  });
+  it("resolves not ok on a non-zero exit with the exit code and output", async () => {
+    const r = await runVerify("echo boom; exit 3", { timeoutMs: 5000 });
+    expect(r.ok).toBe(false);
+    expect(r.exitCode).toBe(3);
+    expect(r.output).toContain("boom");
+  });
+  it("times out a long command and kills it", async () => {
+    const start = Date.now();
+    const r = await runVerify("sleep 30", { timeoutMs: 80 });
+    expect(r.ok).toBe(false);
+    expect(r.timedOut).toBe(true);
+    expect(Date.now() - start).toBeLessThan(5000);
+  });
+  it("caps very large output to a tail", async () => {
+    const r = await runVerify(`python3 -c "print('x' * 100000)" || node -e "console.log('x'.repeat(100000))"`, {
+      timeoutMs: 5000,
+    });
+    expect(r.ok).toBe(true);
+    expect(r.output.length).toBeLessThanOrEqual(4096 + 20);
+    expect(r.output).toContain("(truncated)");
+  });
+});
+
+describe("registerGoalTool — verify", () => {
+  const okVerify: VerifyResult = { ok: true, exitCode: 0, timedOut: false, output: "all green" };
+  const failVerify: VerifyResult = { ok: false, exitCode: 1, timedOut: false, output: "FAIL: expected 2 to be 3" };
+  const timedOutVerify: VerifyResult = { ok: false, exitCode: null, timedOut: true, output: "" };
+
+  it("rejects a no-op verify at set time", async () => {
+    const { pi, tools } = makePi();
+    registerGoalTool(pi);
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    const r = (await tool.execute("1", { action: "set", objective: "ship", verify: "true" })) as {
+      details: GoalDetails;
+      content: Array<{ type: string; text: string }>;
+    };
+    expect(r.details.goal).toBeNull();
+    expect(r.content[0].text).toContain("no-op");
+  });
+
+  it("stores the verify command and reports the failing baseline at set", async () => {
+    const { pi, tools } = makePi();
+    registerGoalTool(pi, { verifyRunner: async () => failVerify });
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    const r = (await tool.execute("1", { action: "set", objective: "ship", verify: "npm test" })) as {
+      details: GoalDetails;
+      content: Array<{ type: string; text: string }>;
+    };
+    expect(r.details.goal!.verify).toBe("npm test");
+    expect(r.content[0].text).toContain("exiting 0");
+    expect(r.content[0].text).toContain("currently fails");
+  });
+
+  it("warns when the verify already passes at set time", async () => {
+    const { pi, tools } = makePi();
+    registerGoalTool(pi, { verifyRunner: async () => okVerify });
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    const r = (await tool.execute("1", { action: "set", objective: "ship", verify: "npm test" })) as {
+      content: Array<{ type: string; text: string }>;
+    };
+    expect(r.content[0].text).toContain("already passes");
+  });
+
+  it("rejects complete when the verify fails, returning its output", async () => {
+    const { pi, tools } = makePi();
+    registerGoalTool(pi, { verifyRunner: async () => failVerify });
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    await tool.execute("1", { action: "set", objective: "fix", criteria: ["tests green"], verify: "npm test" });
+    const r = (await tool.execute("2", {
+      action: "complete",
+      goalId: 1,
+      summary: "fixed it",
+      evidence: ["green"],
+    })) as { details: GoalDetails; content: Array<{ type: string; text: string }> };
+    expect(r.details.goal!.status).toBe("active");
+    expect(r.details.error).toContain("verify exited 1");
+    expect(r.content[0].text).toContain("expected 2 to be 3");
+  });
+
+  it("completes when the verify passes", async () => {
+    const { pi, tools } = makePi();
+    registerGoalTool(pi, { verifyRunner: async () => okVerify });
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    await tool.execute("1", { action: "set", objective: "fix", criteria: ["tests green"], verify: "npm test" });
+    const r = (await tool.execute("2", {
+      action: "complete",
+      goalId: 1,
+      summary: "fixed it",
+      evidence: ["green"],
+    })) as {
+      details: GoalDetails;
+    };
+    expect(r.details.goal!.status).toBe("complete");
+  });
+
+  it("rejects complete when the verify times out", async () => {
+    const { pi, tools } = makePi();
+    registerGoalTool(pi, { verifyRunner: async () => timedOutVerify });
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    await tool.execute("1", { action: "set", objective: "fix", criteria: ["x"], verify: "npm test" });
+    const r = (await tool.execute("2", { action: "complete", goalId: 1, summary: "done", evidence: ["ok"] })) as {
+      details: GoalDetails;
+    };
+    expect(r.details.goal!.status).toBe("active");
+    expect(r.details.error).toContain("timed out");
+  });
+
+  it("completes a goal with no verify on the structural gate alone", async () => {
+    const { pi, tools } = makePi();
+    registerGoalTool(pi, { verifyRunner: async () => failVerify });
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    await tool.execute("1", { action: "set", objective: "fix", criteria: ["x"] });
+    const r = (await tool.execute("2", { action: "complete", goalId: 1, summary: "done", evidence: ["ok"] })) as {
+      details: GoalDetails;
+    };
+    expect(r.details.goal!.status).toBe("complete");
+  });
+
+  it("carries verify through the branch snapshot", () => {
+    const { goal: scanned } = scanGoalBranch([goalSnapshot(goal({ verify: "npm test" }))]);
+    expect(scanned!.verify).toBe("npm test");
   });
 });
 

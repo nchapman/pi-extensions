@@ -14,9 +14,12 @@
  * - completion is a structural gate, not a model self-assessment: the model
  *   must supply a `summary` plus `evidence` indexed to the goal's criteria
  *   (evidence[i] proves criteria[i]). A free-text "I'm done" is rejected when
- *   it names a failure, a criterion lacks proof, or the id is stale. A
- *   semantic second opinion (a Jev-style classifier) is a later pass behind
- *   the injectable GoalJudge seam; v1 ships no judge (fail-open floor)
+ *   it names a failure, a criterion lacks proof, or the id is stale. If the
+ *   goal carries a `verify` command, completion also requires it to exit 0 —
+ *   the extension runs it itself (bounded), so the model can't fake success and a
+ *   failed run is rejected with its output to fix the real cause. A semantic
+ *   second opinion (a Jev-style classifier) is a later pass behind the
+ *   injectable GoalJudge seam; v1 ships no judge (fail-open floor)
  * - an agent_settled continuation loop keeps the agent working toward the goal:
  *   on every settle, if the goal is still active it injects a followUp restating
  *   the objective + criteria, so the run proceeds turn after turn until the goal
@@ -40,6 +43,7 @@
  */
 
 import { matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { spawn } from "node:child_process";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
 
@@ -86,6 +90,91 @@ export function parseMaxTurnsPerRun(raw: string | undefined): number {
   return n;
 }
 
+/**
+ * Verification timeout + output cap for a goal's `verify` command. The command
+ * runs in a bounded shell (hard timeout, capped output) so a hanging or verbose
+ * verify can't stall the loop or blow up context.
+ */
+export const VERIFY_TIMEOUT_MS_DEFAULT = 120_000;
+const VERIFY_TIMEOUT_ENV = "PI_GOAL_VERIFY_TIMEOUT_MS";
+const MAX_VERIFY_OUTPUT = 4096;
+
+/** Parse PI_GOAL_VERIFY_TIMEOUT_MS (ms). Invalid values fall back to the default. */
+export function parseVerifyTimeoutMs(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return VERIFY_TIMEOUT_MS_DEFAULT;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1_000 || n > 3_600_000) return VERIFY_TIMEOUT_MS_DEFAULT;
+  return n;
+}
+
+/**
+ * Result of running a goal's verify command. `ok` is true only on a clean exit 0
+ * with no timeout/spawn error; `output` is a capped tail of combined output.
+ */
+export interface VerifyResult {
+  ok: boolean;
+  exitCode: number | null;
+  timedOut: boolean;
+  spawnError?: string;
+  output: string;
+}
+
+/** The verify boundary: execute a command, return its result. Injected in tests. */
+export type VerifyRunner = (command: string, opts: { timeoutMs?: number; cwd?: string }) => Promise<VerifyResult>;
+
+function capVerifyOutput(s: string, n = MAX_VERIFY_OUTPUT): string {
+  return s.length > n ? `…(truncated) ${s.slice(-n)}` : s;
+}
+
+/**
+ * Run a verify command in a bounded shell: hard timeout + capped output. This is
+ * the boundary the model cannot fake — the extension executes the command and
+ * reads the exit code, so completion reflects reality, not a claim.
+ */
+export function runVerify(command: string, opts: { timeoutMs?: number; cwd?: string } = {}): Promise<VerifyResult> {
+  const timeoutMs = opts.timeoutMs ?? VERIFY_TIMEOUT_MS_DEFAULT;
+  const cwd = opts.cwd ?? process.cwd();
+  return new Promise((resolve) => {
+    let out = "";
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (r: VerifyResult) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve(r);
+    };
+    const onData = (d: Buffer) => {
+      if (out.length < MAX_VERIFY_OUTPUT * 4) out += d.toString();
+    };
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(command, { shell: true, cwd });
+    } catch (e) {
+      finish({
+        ok: false,
+        exitCode: null,
+        timedOut: false,
+        spawnError: e instanceof Error ? e.message : String(e),
+        output: "",
+      });
+      return;
+    }
+    child.stdout?.on("data", onData);
+    child.stderr?.on("data", onData);
+    timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish({ ok: false, exitCode: null, timedOut: true, output: capVerifyOutput(out) });
+    }, timeoutMs);
+    child.on("error", (e) => {
+      finish({ ok: false, exitCode: null, timedOut: false, spawnError: e.message, output: capVerifyOutput(out) });
+    });
+    child.on("close", (code) => {
+      finish({ ok: code === 0, exitCode: code, timedOut: false, output: capVerifyOutput(out) });
+    });
+  });
+}
+
 export type GoalStatus = "active" | "paused" | "blocked" | "complete";
 
 export interface Goal {
@@ -96,6 +185,8 @@ export interface Goal {
   criteria: string[];
   status: GoalStatus;
   blockedReason?: string;
+  /** Optional shell command that must exit 0 for the goal to count as complete. */
+  verify?: string;
 }
 
 /** Snapshot carried by every goal tool result (see lastGoalSnapshot). */
@@ -119,6 +210,21 @@ export interface GoalJudge {
   evaluate(goal: Goal, evidence: string[], summary: string): GoalVerdict | undefined;
 }
 
+export interface RegisterGoalOptions {
+  /** Optional semantic judge (Jev-style). v1 leaves this unset; the structural gate is the floor. */
+  judge?: GoalJudge;
+  /** Per-session cap on auto-continuations for a still-active goal. Defaults to
+   *  PI_GOAL_MAX_CONTINUATIONS, then GOAL_MAX_CONTINUATIONS_DEFAULT. */
+  maxContinuations?: number;
+  /** Per-run turn bound before steering a settle. Defaults to
+   *  PI_GOAL_MAX_TURNS_PER_RUN, then GOAL_MAX_TURNS_PER_RUN_DEFAULT. */
+  maxTurnsPerRun?: number;
+  /** Verifier run on `complete` (and prefetched on `set`). Inject a fake in tests. */
+  verifyRunner?: VerifyRunner;
+  /** Timeout (ms) for a verify run. Defaults to PI_GOAL_VERIFY_TIMEOUT_MS, then VERIFY_TIMEOUT_MS_DEFAULT. */
+  verifyTimeoutMs?: number;
+}
+
 const GOAL_STATUSES = ["active", "paused", "blocked", "complete"] as const;
 
 const GoalSetParams = Type.Object({
@@ -131,6 +237,12 @@ const GoalSetParams = Type.Object({
       }),
       { description: "Optional list of success criteria. Omit for a single implicit criterion (the objective)." },
     ),
+  ),
+  verify: Type.Optional(
+    Type.String({
+      description:
+        "Optional shell command that must exit 0 for the goal to count as complete (e.g. `npm test`). The extension runs it on completion — it must genuinely pass, not just be claimed. A no-op that always passes is rejected.",
+    }),
   ),
 });
 
@@ -171,7 +283,8 @@ function isGoal(g: unknown): g is Goal {
     Array.isArray(goal.criteria) &&
     goal.criteria.every((c) => typeof c === "string") &&
     typeof goal.status === "string" &&
-    GOAL_STATUSES.includes(goal.status as GoalStatus)
+    GOAL_STATUSES.includes(goal.status as GoalStatus) &&
+    (goal.verify === undefined || typeof goal.verify === "string")
   );
 }
 
@@ -200,6 +313,22 @@ export function validateCriteria(raw: unknown): { criteria: string[]; error?: st
     criteria.push(c.trim());
   }
   return { criteria };
+}
+
+const MAX_VERIFY_CHARS = 500;
+/** Commands that always exit 0 regardless of code state — a model can't prove anything with them. */
+const NOOP_VERIFY = new Set(["true", ":", "exit 0"]);
+
+/** Validate the optional `verify` command. Empty, oversized, or always-pass commands are rejected. */
+export function validateVerify(raw: unknown): { verify?: string; error?: string } {
+  if (raw === undefined) return {};
+  if (typeof raw !== "string") return { error: "verify must be a string command" };
+  const v = raw.trim();
+  if (v === "") return { error: "verify must be a non-empty command" };
+  if (v.length > MAX_VERIFY_CHARS) return { error: `verify exceeds ${MAX_VERIFY_CHARS} chars` };
+  if (NOOP_VERIFY.has(v))
+    return { error: `verify "${v}" is a no-op that always passes; give a real check (e.g. \`npm test\`)` };
+  return { verify: v };
 }
 
 /**
@@ -474,6 +603,8 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
   const maxContinuations = options.maxContinuations ?? parseMaxContinuations(process.env[GOAL_MAX_CONTINUATIONS_ENV]);
   const maxTurnsPerRun = options.maxTurnsPerRun ?? parseMaxTurnsPerRun(process.env[GOAL_MAX_TURNS_PER_RUN_ENV]);
   const judge = options.judge;
+  const verifyTimeoutMs = options.verifyTimeoutMs ?? parseVerifyTimeoutMs(process.env[VERIFY_TIMEOUT_ENV]);
+  const verifyRunner: VerifyRunner = options.verifyRunner ?? runVerify;
 
   const activateTool = () => {
     const active = pi.getActiveTools();
@@ -500,9 +631,9 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     if (g && g.status !== "complete") activateTool();
   };
 
-  const setGoal = (objective: string, criteria: string[]): Goal => {
+  const setGoal = (objective: string, criteria: string[], verify?: string): Goal => {
     goalSeq += 1;
-    goal = { id: goalSeq, objective, criteria, status: "active" };
+    goal = { id: goalSeq, objective, criteria, status: "active", ...(verify ? { verify } : {}) };
     compactedSinceUpdate = false;
     // A model-set goal does NOT reset the continuation budget: re-setting the goal
     // must not farm fresh auto-continuations and defeat the cap. The budget
@@ -600,7 +731,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     name: GOAL_TOOL_NAME,
     label: "Goal",
     description:
-      'Track a single high-level objective that must be finished and verified. Use it to commit to a goal and to gate its completion: set a goal (optionally with checkable criteria), then work toward it, then call it again with action "complete" and per-criterion evidence (evidence[i] proves criteria[i]) — a free-text \'done\' without proof is rejected, as is a summary that names a failure. Call it with action "blocked" only for a true impasse. Do not use it to organize steps (that is the todo tool) or for work that finishes in a couple of tool calls.',
+      'Track a single high-level objective that must be finished and verified. Use it to commit to a goal and to gate its completion: set a goal (optionally with checkable criteria and a `verify` command, e.g. `npm test`, that must exit 0 for the goal to count as done — the extension runs it, so it must genuinely pass, not just be claimed), then work toward it, then call it again with action "complete" and per-criterion evidence (evidence[i] proves criteria[i]) — a free-text \'done\' without proof is rejected, as is a summary that names a failure. Call it with action "blocked" only for a true impasse. Do not use it to organize steps (that is the todo tool) or for work that finishes in a couple of tool calls.',
     parameters: GoalParams,
     defaultActive: false,
     executionMode: "sequential",
@@ -610,12 +741,27 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         if (o.error) return finish(null, `Error: ${o.error}`);
         const c = validateCriteria(params.criteria);
         if (c.error) return finish(null, `Error: ${c.error}`);
-        const g = setGoal(o.objective, c.criteria);
+        const v = validateVerify(params.verify);
+        if (v.error) return finish(null, `Error: ${v.error}`);
+        const g = setGoal(o.objective, c.criteria, v.verify);
         const criteriaLine =
           g.criteria.length > 0 ? ` Criteria: ${g.criteria.map((cr, i) => `${i + 1}. ${cr}`).join("; ")}.` : "";
+        if (!g.verify) {
+          return finish(
+            g,
+            `Goal #${g.id} set: ${g.objective}.${criteriaLine} Call goal with action "complete" and per-criterion evidence when done.`,
+          );
+        }
+        // Preflight: run the verify now to establish the baseline. A verify that
+        // already passes means the goal is likely already met or mis-specified,
+        // so surface it before the model starts (and before it can "complete" trivially).
+        const pre = await verifyRunner(g.verify, { timeoutMs: verifyTimeoutMs });
+        const baseline = pre.ok
+          ? ` NOTE: the verify command already passes — confirm the goal isn't already met or the check is too weak, and refine it if so.`
+          : ` It currently fails, as expected for an unmet goal; completion is gated on it passing.`;
         return finish(
           g,
-          `Goal #${g.id} set: ${g.objective}.${criteriaLine} Call goal with action "complete" and per-criterion evidence when done.`,
+          `Goal #${g.id} set: ${g.objective}.${criteriaLine} Completion is gated on the verify command \`${g.verify}\` exiting 0${baseline} Call goal with action "complete" when done.`,
         );
       }
 
@@ -632,6 +778,25 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
             `Goal #${goal.id} NOT completed: ${check.reason}\nObjective: ${goal.objective}`,
             check.reason,
           );
+        }
+        // Independent verification: run the goal's verify command and require a zero
+        // exit. The extension executes it (bounded) — the model cannot fake the result
+        // — which is what makes completion consistent and truthful. A failure is
+        // rejected with its output so the model fixes the real cause and retries.
+        if (goal.verify) {
+          const res = await verifyRunner(goal.verify, { timeoutMs: verifyTimeoutMs });
+          if (!res.ok) {
+            const detail = res.spawnError
+              ? `verify could not run: ${res.spawnError}`
+              : res.timedOut
+                ? `verify timed out after ${verifyTimeoutMs} ms`
+                : `verify exited ${res.exitCode ?? "?"}`;
+            return finish(
+              goal,
+              `Goal #${goal.id} NOT completed — ${detail}.\nOutput:\n${res.output}\nFix the failure, then call complete again with fresh evidence.`,
+              `verify failed: ${detail}`,
+            );
+          }
         }
         // Optional semantic second opinion (Jev-style). v1 ships no judge.
         const verdict = judge?.evaluate(goal, params.evidence, params.summary);

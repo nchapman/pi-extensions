@@ -18,6 +18,7 @@ pi list                           # verify
 | `subagents.ts`         | Delegate tasks to isolated headless pi runs. Slow runs background and wake the agent when done. Also replaces the built-in `bash` (inline/auto/background) with `task`/`task_kill`/`task_remind` and `/tasks` to manage them. |
 | `recall.ts`            | Search compacted-away session history (BM25 + local embeddings). Owns auto-compaction and summary generation.                      |
 | `todo.ts`              | Plan tracking that survives compaction, rewind, and resume. Progress in tool rows, full-screen `/todos`.                           |
+| `goal.ts`              | A session-scoped goal with a verifiable completion gate: the agent keeps working until it's met, blocked, or a safety cap trips. |
 | `overflow.ts`          | Caps oversized custom tool results; full output stashed beside the session.                                                         |
 | `openai-gateways.ts`   | Dynamic model discovery for OpenAI-compatible gateways, mirrored into native `models.json` for headless runs.                      |
 | `shortcuts.ts`         | Extra slash commands (`/exit`, `/comp`, `/info`, `/time`); edit `SHORTCUTS` to add your own.                                        |
@@ -54,6 +55,18 @@ Common knobs (invalid values fall back to defaults with a warning; the full list
 ### todo
 
 One `todo` tool: every call sends the full list (`content` + `status`: pending/in_progress/completed/cancelled, at most one in_progress) and replaces the old one. Invalid lists are rejected with the current state attached; updates that drop unfinished items are accepted with a note naming them. State rides in tool-result `details`, replayed on `session_start`/`session_tree`, so every branch, rewind, and resume restores the right list. Reminders re-inject the plan when it is unfinished and stale (4+ turns) or when compaction wiped it; mid-run compaction drafts chain a `todo.plan` message instead. `/todos` opens the full list.
+
+### goal
+
+A single session-scoped objective with a verifiable completion gate — the agent keeps working turn after turn until the goal is met, blocked, or a safety cap trips, with no user interaction. One tool, `goal`, with an `action` discriminator (`set` | `complete` | `blocked`); it registers inactive and is revealed on the first goal (after-first-goal visibility), so a fresh session adds zero tool surface.
+
+Completion is a structural gate, not a model self-assessment: to `complete`, the model must supply a `summary` plus `evidence` indexed to the goal's criteria (`evidence[i]` proves `criteria[i]`). A free-text "done" is rejected when it names a failure, a criterion lacks proof, or the id is stale. If the goal carries a `verify` command (e.g. `npm test`), completion additionally requires it to exit 0 — the extension runs it itself in a bounded shell (hard timeout, capped output tail), so the model can't fake success, and a failed run is rejected with its output so the real cause gets fixed. No-op verifies (`true`, `:`, `exit 0`) are rejected at `set` time, and a preflight run at `set` reports whether the check already passes. A semantic second opinion (Jev-style classifier) can slot in behind the injectable `GoalJudge` seam; v1 ships none (fail-open floor).
+
+A `agent_settled` continuation loop keeps it working: on every settle, an active goal gets a `followUp` restating the objective + criteria. Two model-untouchable circuit breakers bound a stuck run — a per-session cap on auto-continuations and a per-run turn bound that steers a long turn to settle so the cap can re-engage. The model's `set`/`complete`/`blocked` never reset either; both re-arm only on resume or a user `/goal` kickoff. A `before_agent_start` reminder re-injects the objective when a compaction hid it (summaries never carry the goal).
+
+State is model-owned and reconstructed from the branch (snapshots in the goal tool result's `details`, replayed on `session_start`/`session_tree`) — no filesystem, nothing desyncs on rewind or resume. `/goal` is a view + kickoff: it shows the goal, starts one (routed through the model so the goal tool creates and persists it), or stops the loop with `/goal stop`.
+
+Knobs: `PI_GOAL_MAX_CONTINUATIONS` (25, per-session settle cap), `PI_GOAL_MAX_TURNS_PER_RUN` (50, per-run turn bound), `PI_GOAL_VERIFY_TIMEOUT_MS` (120,000, verify command timeout).
 
 ### overflow
 
