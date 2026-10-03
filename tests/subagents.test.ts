@@ -279,10 +279,10 @@ describe("loadAgents", () => {
 
 describe("env parsing", () => {
   it("uses defaults for missing or invalid values", () => {
-    expect(parseTimeoutMs({})).toBe(600000);
-    expect(parseTimeoutMs({ PI_SUBAGENT_TIMEOUT_MS: "abc" })).toBe(600000);
-    expect(parseTimeoutMs({ PI_SUBAGENT_TIMEOUT_MS: "0" })).toBe(600000);
-    expect(parseTimeoutMs({ PI_SUBAGENT_TIMEOUT_MS: "-5" })).toBe(600000);
+    expect(parseTimeoutMs({})).toBe(1_200_000);
+    expect(parseTimeoutMs({ PI_SUBAGENT_TIMEOUT_MS: "abc" })).toBe(1_200_000);
+    expect(parseTimeoutMs({ PI_SUBAGENT_TIMEOUT_MS: "0" })).toBe(1_200_000);
+    expect(parseTimeoutMs({ PI_SUBAGENT_TIMEOUT_MS: "-5" })).toBe(1_200_000);
     expect(parseConcurrency({})).toBe(4);
     expect(parseConcurrency({ PI_SUBAGENT_CONCURRENCY: "x" })).toBe(4);
   });

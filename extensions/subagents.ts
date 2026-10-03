@@ -30,7 +30,7 @@ import {
 } from "../lib/superbash";
 
 export const BUILTIN_TOOLS = ["read", "write", "edit", "bash", "grep", "find", "ls"];
-const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000;
 const DEFAULT_CONCURRENCY = 4;
 const STDERR_TAIL_MAX = 8 * 1024;
 const STDOUT_BUF_MAX = 1024 * 1024;

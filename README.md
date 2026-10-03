@@ -31,7 +31,7 @@ Subagents block until they finish — waiting on a tool call costs the agent not
 
 The extension also replaces the built-in `bash` by name, one tool covering the whole CLI-task lifecycle: `wait: "inline"` (default) is the built-in bash verbatim (streaming, truncation, temp-file stashing, structured output) — blocking is the norm because waiting on a tool call costs the agent nothing, `wait: "auto"` blocks up to the ~2-minute window and then promotes to the background, and `wait: "background"` returns a task id immediately. Auto and background run through pi's own local bash operations, so shell resolution, environment, process-tree kill, and exit codes are identical to the built-in. The full output streams to `<sessionDir>/tasks/<id>.log` from byte zero — `task <id>` peeks at it while the command runs and it survives resume — and is removed on kill; the wake carries exit status, duration, and a 4KB output tail. `timeout` is in seconds with no default: 0 or omitted means no timeout. Task ids are `t-` + a base36 timecode, so ids from earlier sessions or parallel sessions never collide in a long-running context.
 
-Knobs: `PI_SUBAGENT_TIMEOUT_MS` (10m), `PI_SUBAGENT_CONCURRENCY` (4), `PI_SUBAGENT_BG_AFTER_MS` (off by default — set e.g. 120000 to restore the old auto-adoption window), `PI_BASH_BG_AFTER_MS` (2m, the bash auto-promote window for wait: "auto"), `PI_BG_WAKE=0` to suppress wake messages.
+Knobs: `PI_SUBAGENT_TIMEOUT_MS` (20m), `PI_SUBAGENT_CONCURRENCY` (4), `PI_SUBAGENT_BG_AFTER_MS` (off by default — set e.g. 120000 to restore the old auto-adoption window), `PI_BASH_BG_AFTER_MS` (2m, the bash auto-promote window for wait: "auto"), `PI_BG_WAKE=0` to suppress wake messages.
 
 ### recall
 
