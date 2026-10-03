@@ -349,9 +349,22 @@ export function defaultProgressJudge(_goal: Goal, verifyOutputs: string[]): Prog
 
 const GOAL_STATUSES = ["active", "paused", "blocked", "complete"] as const;
 
-const GoalSetParams = Type.Object({
-  action: Type.Literal("set"),
-  objective: Type.String({ description: "The goal, in one or a few sentences. Keep it under 4000 chars." }),
+/**
+ * One flat object schema, not a discriminated union. A top-level Type.Union
+ * serializes to a rootless anyOf with no `properties` for OpenAI-compatible
+ * providers to key arguments off — GLM via zai answered such a schema with
+ * empty arguments, and the tool silently fell through to "No goal." Every
+ * action-specific field is optional here and validated per-branch in execute.
+ */
+const GoalParams = Type.Object({
+  action: Type.Union([Type.Literal("set"), Type.Literal("complete"), Type.Literal("blocked")], {
+    description:
+      'Which operation: "set" starts a goal, "complete" finishes it with evidence, "blocked" reports an impasse.',
+  }),
+  // action: "set"
+  objective: Type.Optional(
+    Type.String({ description: "The goal, in one or a few sentences. Keep it under 4000 chars." }),
+  ),
   criteria: Type.Optional(
     Type.Array(
       Type.String({
@@ -366,27 +379,22 @@ const GoalSetParams = Type.Object({
         "Optional measurable check: a shell command that prints the measured state (e.g. `npm test`, a coverage report) and exits 0 only when the objective is met. The extension runs it at the end of every turn while the goal is active — it reads the output to see what is still missing and re-engages you to close the gaps, and it must genuinely exit 0 for the goal to count as complete. A no-op that always passes is rejected.",
     }),
   ),
-});
-
-const GoalCompleteParams = Type.Object({
-  action: Type.Literal("complete"),
-  goalId: Type.Number({ description: "The id of the goal being completed (from the last set result)." }),
-  summary: Type.String({ description: "A concise statement of what was done." }),
-  evidence: Type.Array(
-    Type.String({
-      description: "Concrete proof for the criterion at the same index (test name, file, command output).",
-    }),
-    { description: "evidence[i] is the proof for criteria[i]; one entry per criterion." },
+  // action: "complete"
+  goalId: Type.Optional(
+    Type.Number({ description: "The id of the goal being completed or blocked (from the last set result)." }),
   ),
+  summary: Type.Optional(Type.String({ description: "A concise statement of what was done." })),
+  evidence: Type.Optional(
+    Type.Array(
+      Type.String({
+        description: "Concrete proof for the criterion at the same index (test name, file, command output).",
+      }),
+      { description: "evidence[i] is the proof for criteria[i]; one entry per criterion." },
+    ),
+  ),
+  // action: "blocked"
+  reason: Type.Optional(Type.String({ description: "Why the goal cannot proceed." })),
 });
-
-const GoalBlockedParams = Type.Object({
-  action: Type.Literal("blocked"),
-  goalId: Type.Number({ description: "The id of the goal being blocked." }),
-  reason: Type.String({ description: "Why the goal cannot proceed." }),
-});
-
-const GoalParams = Type.Union([GoalSetParams, GoalCompleteParams, GoalBlockedParams]);
 
 /** The single checkable criterion when the model set none: the objective itself. */
 export function effectiveCriteria(goal: Goal): string[] {
@@ -1202,6 +1210,9 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
             check.reason,
           );
         }
+        // checkCompletion has validated these by now; re-narrow for the flat schema.
+        const summary = params.summary ?? "";
+        const evidence = params.evidence ?? [];
         // Independent verification: run the goal's verify command and require a zero
         // exit. The extension executes it (bounded) — the model cannot fake the result
         // — which is what makes completion consistent and truthful. A failure is
@@ -1228,7 +1239,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
           }
         }
         // Optional semantic second opinion (Jev-style). v1 ships no judge.
-        const verdict = judge?.evaluate(goal, params.evidence, params.summary);
+        const verdict = judge?.evaluate(goal, evidence, summary);
         if (verdict && !verdict.complete) {
           const judgeReason = `judge: ${verdict.reason ?? "insufficient evidence"}`;
           return finish(goal, `Goal #${goal.id} NOT completed: ${judgeReason}`, judgeReason);
@@ -1240,10 +1251,19 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         // otherwise fake `complete` to farm fresh auto-continuations. The budget
         // re-arms only on resume or a user /goal kickoff, keeping the cap a true
         // per-session circuit breaker.
-        return finish(goal, `Goal #${goal.id} complete: ${params.summary.trim()}`);
+        return finish(goal, `Goal #${goal.id} complete: ${summary.trim()}`);
       }
 
       // params.action === "blocked"
+      if (params.action !== "blocked") {
+        // A loud error, not a silent status readout: empty or malformed
+        // arguments used to fall through to "No goal." with no signal about
+        // what went wrong (observed with a rootless-union schema on zai).
+        return finish(
+          null,
+          `Error: action must be one of "set", "complete", or "blocked" (got ${JSON.stringify(params.action) ?? "nothing"}); resend the call with the full arguments object`,
+        );
+      }
       if (!goal) return finish(null, "Error: no goal to block");
       if (!Number.isInteger(params.goalId) || params.goalId !== goal.id) {
         const r = `stale goal id ${String(params.goalId)}; the current goal is #${goal.id}`;

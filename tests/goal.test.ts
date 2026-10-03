@@ -82,6 +82,7 @@ function makePi() {
     registerTool: (t: {
       name: string;
       description?: string;
+      parameters?: unknown;
       execute: (id: string, params: unknown, signal?: AbortSignal) => Promise<unknown>;
       renderCall?: (args: never, theme: never, context?: never) => unknown;
       renderResult?: (result: never, options: never, theme: never, context?: never) => unknown;
@@ -559,6 +560,28 @@ describe("runVerify", () => {
     expect(r.ok).toBe(true);
     expect(r.output.length).toBeLessThanOrEqual(4096 + 20);
     expect(r.output).toContain("(truncated)");
+  });
+});
+
+describe("registerGoalTool — schema", () => {
+  it("is a flat root object schema: OpenAI-compatible providers cannot key arguments off a rootless union", async () => {
+    const { pi, tools } = makePi();
+    registerGoalTool(pi);
+    const tool = tools.get(GOAL_TOOL_NAME)! as { parameters?: Record<string, unknown> };
+    // The observed failure: a top-level anyOf (from Type.Union) made GLM via
+    // zai emit empty arguments, which pi parsed to {} — silently.
+    expect(tool.parameters?.anyOf).toBeUndefined();
+    expect(tool.parameters?.type).toBe("object");
+    expect(tool.parameters?.properties).toHaveProperty("action");
+    expect(tool.parameters?.properties).toHaveProperty("objective");
+  });
+
+  it("errors loudly on a missing action instead of falling through to a status readout", async () => {
+    const { pi, tools } = makePi();
+    registerGoalTool(pi);
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    const r = (await tool.execute("1", {})) as { content: Array<{ type: string; text: string }> };
+    expect(r.content[0].text).toContain('action must be one of "set", "complete", or "blocked"');
   });
 });
 
