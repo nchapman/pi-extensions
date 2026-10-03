@@ -22,15 +22,23 @@
  *   injectable GoalJudge seam; v1 ships no judge (fail-open floor)
  * - an agent_before_settle continuation loop drives the goal turn by turn: at
  *   each settle, if the goal is active and carries a `verify` command, the
- *   extension runs it (bounded), reads the measured state, and queues a HIDDEN
- *   follow-up (a custom message with display:false, so no visible "keep going"
- *   line) — "close these measured gaps" when the check fails, "the check passed,
- *   summarize and call complete" when it passes. The check is graded, not
- *   boolean: it prints the measured state (coverage %, test summary) and exits 0
- *   only when the objective is met, so the agent measures, narrates the gap, and
- *   works until it closes. A footer status (objective + elapsed time) keeps the
- *   goal in view the whole time. A goal without a verify is user-driven (no
- *   auto-loop) — the check is what makes progress measurable. Two
+ *   extension runs it (bounded), reads the measured state, and queues a
+ *   follow-up (display:true with a compact registered message renderer, so the
+ *   user sees a one-line "goal check N/M · verify failed — continuing" heartbeat
+ *   instead of an invisible hand-off) — "close these measured gaps" when the
+ *   check fails, "the check passed, summarize and call complete" when it
+ *   passes. The check is graded, not boolean: it prints the measured state
+ *   (coverage %, test summary) and exits 0 only when the objective is met, so
+ *   the agent measures, narrates the gap, and works until it closes. While the
+ *   verify runs, an animated chat-area spinner widget shows the check in flight
+ *   (pi clears its own working spinner at agent_end, so the settle boundary
+ *   would otherwise render as a dead pause), and an expensive verify can be
+ *   throttled via PI_GOAL_CHECK_EVERY (every Nth continuation; the in-between
+ *   turns reuse the last measured state, marked stale in the prompt — keep
+ *   checkEvery ≤ maxContinuations − 1 so each judge window still holds ≥ 2
+ *   fresh outputs). A footer status (elapsed time) keeps the goal in view the
+ *   whole time. A goal without a verify is user-driven (no auto-loop) — the
+ *   check is what makes progress measurable. Two
  *   model-untouchable circuit breakers keep a stuck run bounded: a per-session
  *   cap (PI_GOAL_MAX_CONTINUATIONS) on auto-continuations, and a per-run turn
  *   bound (PI_GOAL_MAX_TURNS_PER_RUN) that steers a long turn to settle so the
@@ -72,6 +80,20 @@ export const GOAL_REMINDER_TYPE = "goal.reminder";
 
 /** customType of the hidden turn-end check prompt (the graded "close the gaps" / "summarize + complete" message). */
 export const GOAL_CHECK_TYPE = "goal.check";
+
+/** Structured summary of one turn-end check, carried in the goal.check custom
+ * message `details` (not sent to the model) so the transcript renderer can show
+ * a compact row without parsing the prompt. */
+export interface GoalCheckDetails {
+  continuation: number;
+  max: number;
+  ok: boolean;
+  exitCode: number | null;
+  timedOut: boolean;
+  spawnError?: string;
+  staleContinuations: number;
+  output: string;
+}
 
 /** Per-session cap on auto-continuations for a still-active goal (PI_GOAL_MAX_CONTINUATIONS). */
 export const GOAL_MAX_CONTINUATIONS_DEFAULT = 25;
@@ -122,6 +144,23 @@ export function parseMaxProgressResets(raw: string | undefined): number {
   if (raw === undefined || raw.trim() === "") return GOAL_MAX_PROGRESS_RESETS_DEFAULT;
   const n = Number(raw);
   if (!Number.isInteger(n) || n < 0 || n > 100_000) return GOAL_MAX_PROGRESS_RESETS_DEFAULT;
+  return n;
+}
+
+/**
+ * Run the verify check every Nth continuation (PI_GOAL_CHECK_EVERY), reusing the
+ * previous measured state in between. Default 1 (every turn — the graded loop
+ * as designed). An expensive verify (a full benchmark suite can take minutes)
+ * sets this higher so most turns re-engage instantly on the last measurement.
+ */
+export const GOAL_CHECK_EVERY_DEFAULT = 1;
+const GOAL_CHECK_EVERY_ENV = "PI_GOAL_CHECK_EVERY";
+
+/** Parse PI_GOAL_CHECK_EVERY. Invalid values fall back to the default — fail-open, no throw. */
+export function parseCheckEvery(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return GOAL_CHECK_EVERY_DEFAULT;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > 1_000) return GOAL_CHECK_EVERY_DEFAULT;
   return n;
 }
 
@@ -499,9 +538,53 @@ export function formatElapsed(ms: number): string {
   return `${sec}s`;
 }
 
-/** Footer status line: `🎯 #1: <objective> · <elapsed>`. */
+/** Footer status line: `goal · <elapsed>` — presence + time only, no emoji (the
+ * footer is plain text throughout). The objective lives in the /goal view and
+ * the turn-end prompt; the footer is an ambient indicator and stays short so
+ * other footer segments keep their room. */
 export function renderGoalFooter(goal: Goal, now: number): string {
-  return `🎯 #${goal.id}: ${clip(goal.objective, 80)} · ${formatElapsed(now - goal.startedAt)}`;
+  return `goal · ${formatElapsed(now - goal.startedAt)}`;
+}
+
+/** Widget key for the animated goal-check spinner shown above the editor. */
+const GOAL_CHECK_WIDGET_KEY = "goal-check";
+const CHECK_SPINNER_FRAMES = ["|", "/", "-", "\\"];
+const CHECK_SPINNER_INTERVAL_MS = 120;
+
+/**
+ * Animated "running goal check" row shown above the editor while the
+ * settle-boundary verify runs. pi clears its own working spinner on agent_end
+ * (before settle), so a slow verify would otherwise render as a dead pause —
+ * this widget keeps an explicit, self-animating indicator in the chat area for
+ * exactly the duration of the check.
+ */
+class CheckSpinnerComponent {
+  private frame = 0;
+  private timer: ReturnType<typeof setInterval>;
+
+  constructor(
+    private tui: { requestRender(): void },
+    private theme: Pick<Theme, "fg">,
+    private label: string,
+  ) {
+    this.timer = setInterval(() => {
+      this.frame = (this.frame + 1) % CHECK_SPINNER_FRAMES.length;
+      this.tui.requestRender();
+    }, CHECK_SPINNER_INTERVAL_MS);
+  }
+
+  dispose(): void {
+    clearInterval(this.timer);
+  }
+
+  invalidate(): void {
+    // Width-keyed rendering isn't cached; the timer drives frame changes.
+  }
+
+  render(width: number): string[] {
+    const frame = this.theme.fg("accent", CHECK_SPINNER_FRAMES[this.frame]!);
+    return [truncateToWidth(` ${frame} ${this.label}`, width)];
+  }
 }
 
 /** Plain reminder re-injected as a one-shot custom message when a compaction hid the goal. */
@@ -525,12 +608,22 @@ export function renderGoalReminder(goal: Goal): string {
  * This is what keeps the agent working turn after turn without a visible
  * "keep going" line.
  */
-export function renderCheckPrompt(goal: Goal, check: VerifyResult, continuations: number, max: number): string {
+export function renderCheckPrompt(
+  goal: Goal,
+  check: VerifyResult,
+  continuations: number,
+  max: number,
+  staleContinuations = 0,
+): string {
   const lines = [`GOAL #${goal.id} — turn-end check (continuation ${continuations}/${max}):`, goal.objective, ""];
   for (const c of effectiveCriteria(goal)) lines.push(`  • ${c}`);
+  // Staleness rides the outcome lines, not the measured-state block: a reused
+  // timeout has empty output, and "it timed out" presented as just-happened
+  // would send the model chasing a stale failure.
+  const stale = staleContinuations > 0 ? `, measured ${staleContinuations} continuation(s) ago` : "";
   const measured = check.output.trim() ? `\n\nMeasured state (verify output):\n${check.output.trim()}` : "";
   if (check.ok) {
-    lines.push("", `The verify command passed (exit 0).${measured}`, "");
+    lines.push("", `The verify command passed (exit 0).${stale}${measured}`, "");
     lines.push(
       'The measurable criterion is met. Summarize the final state — what was achieved, the key numbers, what changed — and call the goal tool with action "complete", citing per-criterion evidence from the real commands and their output.',
     );
@@ -540,12 +633,43 @@ export function renderCheckPrompt(goal: Goal, check: VerifyResult, continuations
       : check.timedOut
         ? "it timed out"
         : `it exited ${check.exitCode ?? "?"}`;
-    lines.push("", `The verify command did not pass yet (${why}).${measured}`, "");
+    lines.push("", `The verify command did not pass yet (${why}${stale}).${measured}`, "");
     lines.push(
       'Do not declare the goal done. Read the measured state above, identify the specific gaps it reveals, and make concrete progress closing them this turn — do not redo work already done. When you believe every criterion is met, re-run the check yourself; only if it genuinely passes, call the goal tool with action "complete" with per-criterion evidence. Call "blocked" only for a true, non-transient impasse.',
     );
   }
   return lines.join("\n");
+}
+
+/** Transcript row for a goal.check message: the loop's visible heartbeat —
+ * which continuation ran, what the verify said, what happens next. Registered
+ * via registerMessageRenderer so the model still receives the full prompt while
+ * the user sees one compact line. */
+export function renderCheckMessage(
+  details: GoalCheckDetails | undefined,
+  options: { expanded: boolean },
+  theme: Pick<Theme, "fg">,
+): string {
+  if (!details) return theme.fg("dim", "goal check");
+  const outcome = details.ok
+    ? theme.fg("success", "verify passed — agent will summarize and complete")
+    : theme.fg(
+        "accent",
+        `verify ${
+          details.timedOut
+            ? "timed out"
+            : details.spawnError
+              ? `could not run (${details.spawnError})`
+              : `failed (exit ${details.exitCode ?? "?"})`
+        } — continuing`,
+      );
+  const stale =
+    details.staleContinuations > 0 ? theme.fg("dim", ` · measured ${details.staleContinuations} turn(s) ago`) : "";
+  const head = `${theme.fg("dim", `goal check ${details.continuation}/${details.max} · `)}${outcome}${stale}`;
+  if (options.expanded && details.output.trim()) {
+    return `${head}\n${details.output.trim()}`;
+  }
+  return head;
 }
 
 const STATUS_COLORS: Record<GoalStatus, "accent" | "muted" | "error" | "success"> = {
@@ -710,6 +834,9 @@ export interface RegisterGoalOptions {
   /** Cap on judge-approved budget resets at the continuation cap. Defaults to
    *  PI_GOAL_MAX_PROGRESS_RESETS, then GOAL_MAX_PROGRESS_RESETS_DEFAULT. */
   maxProgressResets?: number;
+  /** Run the verify check every Nth continuation, reusing the last measured
+   *  state in between. Defaults to PI_GOAL_CHECK_EVERY, then 1 (every turn). */
+  checkEvery?: number;
   /** Per-session cap on auto-continuations for a still-active goal. Defaults to
    *  PI_GOAL_MAX_CONTINUATIONS, then GOAL_MAX_CONTINUATIONS_DEFAULT. */
   maxContinuations?: number;
@@ -745,17 +872,26 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
   // the evidence the progress judge reads at the cap. Cleared with the budget.
   let budgetOutputs: string[] = [];
   let resetsUsed = 0;
+  const checkEvery = options.checkEvery ?? parseCheckEvery(process.env[GOAL_CHECK_EVERY_ENV]);
+  // Last verify result + how many continuations ago it ran. With checkEvery > 1
+  // most turns reuse it instead of re-running an expensive verify.
+  let lastCheck: VerifyResult | undefined;
+  let lastCheckAge = 0;
 
   const activateTool = () => {
     const active = pi.getActiveTools();
     if (!active.includes(GOAL_TOOL_NAME)) pi.setActiveTools([...active, GOAL_TOOL_NAME]);
   };
 
-  // Footer status: `🎯 #N: <objective> · <elapsed>` while a goal is active, cleared on
+  // Footer status: `goal · <elapsed>` while a goal is active, cleared on
   // completion / block. Best-effort — a missing UI (print mode) is a no-op.
-  const updateFooter = () => {
-    if (goal && goal.status === "active") uiRef?.setStatus("goal", renderGoalFooter(goal, Date.now()));
-    else uiRef?.setStatus("goal", undefined);
+  // Re-asserted at every event below: pi clears extension statuses on
+  // rebind/reload (resetExtensionUI), so a status set once would vanish until
+  // the next turn_end — visible as the footer "coming and going".
+  const updateFooter = (checking = false) => {
+    if (goal && goal.status === "active") {
+      uiRef?.setStatus("goal", checking ? `goal · checking (${goal.verify})` : renderGoalFooter(goal, Date.now()));
+    } else uiRef?.setStatus("goal", undefined);
   };
   const clearFooter = () => uiRef?.setStatus("goal", undefined);
 
@@ -767,6 +903,8 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     stopped = false;
     budgetOutputs = [];
     resetsUsed = 0;
+    lastCheck = undefined; // a resumed goal re-establishes its measured state
+    lastCheckAge = 0;
   };
 
   const adoptBranchState = (ctx: ExtensionContext) => {
@@ -778,9 +916,13 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     continuations = 0;
     budgetOutputs = [];
     resetsUsed = 0;
-    // Re-arm the continuation loop for an active goal on resume; it never runs for
-    // a finished or blocked one.
-    stopped = !(g && g.status === "active");
+    lastCheck = undefined;
+    lastCheckAge = 0;
+    // Re-arm the continuation loop for an active goal on resume; a finished or
+    // blocked snapshot stays disarmed. A branch with NO goal (a fresh session)
+    // stays armed — disarming there would kill the loop for a goal the model
+    // sets later in the same session, since a model set never re-arms.
+    stopped = g ? g.status !== "active" : false;
     if (g && g.status !== "complete") activateTool();
     updateFooter();
   };
@@ -795,6 +937,8 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     // evidence (not continuations/resetsUsed) is strictly tightening — a fresh
     // window with <2 outputs fails closed to the stop.
     budgetOutputs = [];
+    lastCheck = undefined; // a new verify command invalidates the cached state
+    lastCheckAge = 0;
     // A model-set goal does NOT reset the continuation budget: re-setting the goal
     // must not farm fresh auto-continuations and defeat the cap. The budget
     // re-arms only at resume, a gated completion, or a user /goal kickoff.
@@ -828,6 +972,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
   });
 
   pi.on("before_agent_start", () => {
+    updateFooter(); // re-assert: pi clears extension statuses on rebind/reload
     // A between-turns compaction folds the goal out of context and there is no
     // in-progress turn to steer, so re-inject it at the start of the next turn.
     // (Mid-turn compactions are handled directly in the session_compact handler.)
@@ -875,6 +1020,13 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         resetsUsed += 1;
         continuations = 0;
         budgetOutputs = [];
+        // Drop the cached check too: a fresh window must open with a fresh
+        // baseline, else (with a high checkEvery) the window would hold a
+        // single fresh output and the judge would fail closed on "not enough
+        // measured states" — defeating the judge in exactly the configs the
+        // throttle exists for.
+        lastCheck = undefined;
+        lastCheckAge = 0;
         ctx.ui?.notify(
           `Goal #${goal.id} hit the continuation cap but is still progressing (${verdict.reason ?? "judge approved"}) — ` +
             `resetting the budget (reset ${resetsUsed}/${maxProgressResets}).`,
@@ -896,27 +1048,60 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     }
     continuations += 1;
     let check: VerifyResult;
-    try {
-      check = await verifyRunner(goal.verify, { timeoutMs: verifyTimeoutMs });
-    } catch (e) {
-      // The built-in runner never rejects; an injected one might. A throw must
-      // not escape the settle boundary — treat it as a failed check and
-      // re-engage with the error so the model can fix the check itself.
-      check = {
-        ok: false,
-        exitCode: null,
-        timedOut: false,
-        spawnError: e instanceof Error ? e.message : String(e),
-        output: "",
-      };
+    // Throttle: with checkEvery > 1 only every Nth continuation re-runs the
+    // verify; the others reuse the last measured state (aged) so the settle is
+    // instant instead of a silent multi-minute benchmark.
+    const due = continuations % checkEvery === 0 || !lastCheck;
+    const verifyCommand = goal.verify; // captured for the closure: narrowing of `goal` doesn't cross it
+    if (due) {
+      // Animated chat-area spinner while the (possibly minutes-long) verify
+      // runs — pi clears its own working spinner at agent_end, so without this
+      // the settle boundary renders as a dead pause.
+      uiRef?.setWidget(
+        GOAL_CHECK_WIDGET_KEY,
+        (tui: { requestRender(): void }, theme: Pick<Theme, "fg">) =>
+          new CheckSpinnerComponent(tui, theme, `running goal check: ${clip(verifyCommand, 60)}`),
+      );
+      try {
+        check = await verifyRunner(goal.verify, { timeoutMs: verifyTimeoutMs });
+      } catch (e) {
+        // The built-in runner never rejects; an injected one might. A throw must
+        // not escape the settle boundary — treat it as a failed check and
+        // re-engage with the error so the model can fix the check itself.
+        check = {
+          ok: false,
+          exitCode: null,
+          timedOut: false,
+          spawnError: e instanceof Error ? e.message : String(e),
+          output: "",
+        };
+      }
+      lastCheck = check;
+      lastCheckAge = 0;
+      uiRef?.setWidget(GOAL_CHECK_WIDGET_KEY, undefined); // spinner lives only for the check's duration
+    } else {
+      check = lastCheck!;
+      lastCheckAge += 1;
     }
     updateFooter();
-    recordBudgetOutput(budgetOutputs, check.output);
+    if (due) recordBudgetOutput(budgetOutputs, check.output);
     pi.sendMessage(
       {
         customType: GOAL_CHECK_TYPE,
-        content: renderCheckPrompt(goal, check, continuations, maxContinuations),
-        display: false,
+        content: renderCheckPrompt(goal, check, continuations, maxContinuations, lastCheckAge),
+        // Visible in the transcript via the compact renderer (registerMessageRenderer
+        // below) — the loop's heartbeat shouldn't be invisible to the user.
+        display: true,
+        details: {
+          continuation: continuations,
+          max: maxContinuations,
+          ok: check.ok,
+          exitCode: check.exitCode,
+          timedOut: check.timedOut,
+          ...(check.spawnError ? { spawnError: check.spawnError } : {}),
+          staleContinuations: lastCheckAge,
+          output: clip(check.output, 2000),
+        } satisfies GoalCheckDetails,
       },
       { deliverAs: "followUp" },
     );
@@ -930,6 +1115,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
   pi.on("agent_start", () => {
     perRunTurns = 0;
     perRunNudged = false;
+    updateFooter(); // re-assert: pi clears extension statuses on rebind/reload
   });
   pi.on("turn_end", () => {
     if (!goal || goal.status !== "active") return;
@@ -947,6 +1133,18 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         { deliverAs: "steer", triggerTurn: false },
       );
     }
+  });
+
+  // Compact transcript rendering for the visible goal.check messages — the
+  // model receives the full prompt; the user sees the one-line heartbeat
+  // (continuation count, verify outcome, stale age), with the measured state
+  // when the row is expanded.
+  pi.registerMessageRenderer?.(GOAL_CHECK_TYPE, (message, options, theme) => {
+    const text = new Text("", 0, 0);
+    text.setText(
+      renderCheckMessage(message.details as GoalCheckDetails | undefined, { expanded: options.expanded }, theme),
+    );
+    return text;
   });
 
   pi.registerTool({
@@ -1010,6 +1208,12 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         // rejected with its output so the model fixes the real cause and retries.
         if (goal.verify) {
           const res = await verifyRunner(goal.verify, { timeoutMs: verifyTimeoutMs });
+          // A failed complete-time verify is the freshest measurement — cache it
+          // so a throttled settle doesn't reuse (and over-age) an older result.
+          if (!res.ok) {
+            lastCheck = res;
+            lastCheckAge = 0;
+          }
           if (!res.ok) {
             const detail = res.spawnError
               ? `verify could not run: ${res.spawnError}`

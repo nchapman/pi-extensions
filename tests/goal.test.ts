@@ -5,6 +5,7 @@ import {
   checkEvidenceCoverage,
   defaultProgressJudge,
   effectiveCriteria,
+  GOAL_CHECK_EVERY_DEFAULT,
   GOAL_MAX_CONTINUATIONS_DEFAULT,
   GOAL_MAX_PROGRESS_RESETS_DEFAULT,
   GOAL_MAX_TURNS_PER_RUN_DEFAULT,
@@ -13,12 +14,14 @@ import {
   GOAL_TOOL_NAME,
   isContradictorySummary,
   lastGoalSnapshot,
+  parseCheckEvery,
   parseMaxContinuations,
   parseMaxProgressResets,
   parseMaxTurnsPerRun,
   recordBudgetOutput,
   parseVerifyTimeoutMs,
   renderCheckPrompt,
+  renderCheckMessage,
   renderGoalCall,
   renderGoalFooter,
   renderGoalResult,
@@ -29,6 +32,7 @@ import {
   validateObjective,
   validateVerify,
   type Goal,
+  type GoalCheckDetails,
   type GoalDetails,
   type ProgressJudge,
   type VerifyResult,
@@ -73,6 +77,7 @@ function makePi() {
   const activeTools: string[] = ["read", "bash"];
   const sent: Array<{ text: string; opts?: unknown }> = [];
   const sentCustom: Array<{ msg: unknown; opts?: unknown }> = [];
+  const messageRenderers = new Map<string, (message: never, options: never, theme: never) => unknown>();
   const pi = {
     registerTool: (t: {
       name: string;
@@ -101,8 +106,11 @@ function makePi() {
     sendMessage: (msg: unknown, opts?: unknown) => {
       sentCustom.push({ msg, opts });
     },
+    registerMessageRenderer: (type: string, renderer: (message: never, options: never, theme: never) => unknown) => {
+      messageRenderers.set(type, renderer);
+    },
   } as unknown as ExtensionAPI;
-  return { pi, tools, commands, events, activeTools, sent, sentCustom };
+  return { pi, tools, commands, events, activeTools, sent, sentCustom, messageRenderers };
 }
 
 /** Fire a captured event handler (an optional event body overrides the synthesized one). */
@@ -318,17 +326,33 @@ describe("formatElapsed", () => {
 });
 
 describe("renderGoalFooter", () => {
-  it("shows the objective, id, and elapsed time", () => {
+  it("shows presence and elapsed time, without the objective or emoji", () => {
     const g = goal({ id: 3, objective: "ship it", startedAt: 0 });
     const footer = renderGoalFooter(g, 252_000); // 4m 12s after start
-    expect(footer).toContain("🎯 #3");
-    expect(footer).toContain("ship it");
-    expect(footer).toContain("4m 12s");
+    expect(footer).toBe("goal · 4m 12s");
   });
+});
+
+describe("parseCheckEvery", () => {
+  it("defaults to every turn on missing, empty, and invalid values", () => {
+    expect(parseCheckEvery(undefined)).toBe(GOAL_CHECK_EVERY_DEFAULT);
+    expect(parseCheckEvery("")).toBe(1);
+    expect(parseCheckEvery("abc")).toBe(1);
+    expect(parseCheckEvery("0")).toBe(1);
+    expect(parseCheckEvery("1e6")).toBe(1);
+  });
+
+  it("accepts a valid interval", () => expect(parseCheckEvery("3")).toBe(3));
 });
 
 describe("renderCheckPrompt", () => {
   const g = goal({ id: 2, criteria: ["a", "b"] });
+  it("marks the measured state as stale when the check was not re-run", () => {
+    const p = renderCheckPrompt(goal(), failVerify, 4, 25, 2);
+    expect(p).toContain("2 continuation(s) ago");
+    expect(p).toContain("Measured state");
+  });
+
   it("on a failed check: the measured state, the gap directive, and the count", () => {
     const p = renderCheckPrompt(g, failVerify, 3, 10);
     expect(p).toContain("#2");
@@ -802,7 +826,7 @@ describe("registerGoalTool", () => {
 
   it("the turn-end check re-engages with the measured state and continues", async () => {
     const { pi, tools, events, sentCustom } = makePi();
-    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn() } } as unknown as ExtensionContext;
+    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
     let check = failVerify;
     registerGoalTool(pi, { maxContinuations: 10, verifyRunner: async () => check });
     const tool = tools.get(GOAL_TOOL_NAME)!;
@@ -821,7 +845,7 @@ describe("registerGoalTool", () => {
     expect(first.msg.content).toContain("ship it");
     expect(first.msg.content).toContain("did not pass");
     expect(first.msg.content).toContain("FAIL: expected 2 to be 3"); // the check's measured output
-    expect(first.msg.display).toBe(false);
+    expect(first.msg.display).toBe(true);
     expect(first.opts).toEqual({ deliverAs: "followUp" });
 
     // Once the check passes and the goal is completed, the loop stops.
@@ -833,7 +857,7 @@ describe("registerGoalTool", () => {
 
   it("a passing check prompts the agent to summarize and complete", async () => {
     const { pi, tools, events, sentCustom } = makePi();
-    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn() } } as unknown as ExtensionContext;
+    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
     registerGoalTool(pi, { maxContinuations: 10, verifyRunner: async () => okVerify });
     await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it", verify: "npm test" });
 
@@ -846,7 +870,7 @@ describe("registerGoalTool", () => {
 
   it("a goal with no verify does not auto-continue (user-driven)", async () => {
     const { pi, tools, events, sentCustom } = makePi();
-    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn() } } as unknown as ExtensionContext;
+    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
     registerGoalTool(pi, { verifyRunner: async () => failVerify });
     await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it" }); // no verify
 
@@ -857,7 +881,7 @@ describe("registerGoalTool", () => {
   it("a stuck model re-setting the goal cannot defeat the cap", async () => {
     const { pi, tools, events, sentCustom } = makePi();
     const notify = vi.fn();
-    const ctx = { ui: { notify, setStatus: vi.fn() } } as unknown as ExtensionContext;
+    const ctx = { ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
     registerGoalTool(pi, { maxContinuations: 2, verifyRunner: async () => failVerify });
     const tool = tools.get(GOAL_TOOL_NAME)!;
     await tool.execute("1", { action: "set", objective: "stuck goal", verify: "npm test" });
@@ -878,7 +902,7 @@ describe("registerGoalTool", () => {
   it("re-arms the continuation loop when an active goal is resumed", async () => {
     const { pi, tools, events, sentCustom } = makePi();
     const notify = vi.fn();
-    const ctx = { ui: { notify, setStatus: vi.fn() } } as unknown as ExtensionContext;
+    const ctx = { ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
     registerGoalTool(pi, { maxContinuations: 1, verifyRunner: async () => failVerify });
     const tool = tools.get(GOAL_TOOL_NAME)!;
     await tool.execute("1", { action: "set", objective: "resumable", verify: "npm test" });
@@ -929,7 +953,7 @@ describe("registerGoalTool", () => {
   it("stops auto-continuing at the cap and notifies", async () => {
     const { pi, tools, events, sentCustom } = makePi();
     const notify = vi.fn();
-    const ctx = { ui: { notify, setStatus: vi.fn() } } as unknown as ExtensionContext;
+    const ctx = { ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
     registerGoalTool(pi, { maxContinuations: 2, verifyRunner: async () => failVerify });
     const tool = tools.get(GOAL_TOOL_NAME)!;
     await tool.execute("1", { action: "set", objective: "stuck goal", verify: "npm test" });
@@ -949,7 +973,7 @@ describe("registerGoalTool", () => {
   it("resets the budget at the cap when the measured state is still progressing", async () => {
     const { pi, tools, events, sentCustom } = makePi();
     const notify = vi.fn();
-    const ctx = { ui: { notify, setStatus: vi.fn() } } as unknown as ExtensionContext;
+    const ctx = { ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
     // Each check reports a different measured state — the run is visibly moving.
     let calls = 0;
     const outputs = ["geomean 0.33", "geomean 0.47", "geomean 0.55", "geomean 0.62", "geomean 0.71"];
@@ -975,7 +999,7 @@ describe("registerGoalTool", () => {
   it("stops for good once the judge resets are exhausted", async () => {
     const { pi, tools, events } = makePi();
     const notify = vi.fn();
-    const ctx = { ui: { notify, setStatus: vi.fn() } } as unknown as ExtensionContext;
+    const ctx = { ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
     let calls = 0;
     registerGoalTool(pi, {
       maxContinuations: 2,
@@ -1000,7 +1024,7 @@ describe("registerGoalTool", () => {
   it("stops at the cap when the judge has no opinion (fail closed)", async () => {
     const { pi, tools, events, sentCustom } = makePi();
     const notify = vi.fn();
-    const ctx = { ui: { notify, setStatus: vi.fn() } } as unknown as ExtensionContext;
+    const ctx = { ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
     const noOpinion: ProgressJudge = { assess: () => undefined };
     registerGoalTool(pi, {
       maxContinuations: 2,
@@ -1019,7 +1043,7 @@ describe("registerGoalTool", () => {
   it("a throwing progress judge fails closed to the stop", async () => {
     const { pi, tools, events } = makePi();
     const notify = vi.fn();
-    const ctx = { ui: { notify, setStatus: vi.fn() } } as unknown as ExtensionContext;
+    const ctx = { ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
     registerGoalTool(pi, {
       maxContinuations: 1,
       progressJudge: {
@@ -1039,7 +1063,7 @@ describe("registerGoalTool", () => {
   it("an async (LLM-style) judge is awaited; its rejection fails closed to the stop", async () => {
     const { pi, tools, events } = makePi();
     const notify = vi.fn();
-    const ctx = { ui: { notify, setStatus: vi.fn() } } as unknown as ExtensionContext;
+    const ctx = { ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
     let mode: "ok" | "reject" = "ok";
     const asyncJudge: ProgressJudge = {
       assess: async (_g, outputs) => {
@@ -1070,7 +1094,7 @@ describe("registerGoalTool", () => {
   it("re-setting the goal mid-window cannot buy a reset with a differently-printing verify", async () => {
     const { pi, tools, events } = makePi();
     const notify = vi.fn();
-    const ctx = { ui: { notify, setStatus: vi.fn() } } as unknown as ExtensionContext;
+    const ctx = { ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
     // Goal A's verify prints one thing forever; goal B's prints another forever.
     let which = "A";
     registerGoalTool(pi, {
@@ -1092,7 +1116,7 @@ describe("registerGoalTool", () => {
   it("seeds the budget window with the set-time baseline, so a tiny cap still judges two states", async () => {
     const { pi, tools, events } = makePi();
     const notify = vi.fn();
-    const ctx = { ui: { notify, setStatus: vi.fn() } } as unknown as ExtensionContext;
+    const ctx = { ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
     let calls = 0;
     registerGoalTool(pi, {
       maxContinuations: 1,
@@ -1124,7 +1148,7 @@ describe("registerGoalTool", () => {
     const { pi, tools, events } = makePi();
     const notify = vi.fn();
     const setStatus = vi.fn();
-    const uiCtx = { ui: { notify, setStatus } } as unknown as ExtensionContext;
+    const uiCtx = { ui: { notify, setStatus, setWidget: vi.fn() } } as unknown as ExtensionContext;
     registerGoalTool(pi, { maxContinuations: 1, verifyRunner: async () => failVerify });
     await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "stuck goal", verify: "npm test" });
 
@@ -1135,12 +1159,217 @@ describe("registerGoalTool", () => {
 
     // The goal is still active after the cap, so turn_end keeps the timer ticking.
     fire(events, "turn_end");
-    expect(setStatus).toHaveBeenLastCalledWith("goal", expect.stringContaining("🎯 #1"));
+    expect(setStatus).toHaveBeenLastCalledWith("goal", expect.stringContaining("goal ·"));
+  });
+
+  it("checkEvery > 1 reuses the last measured state between fresh checks", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
+    const runs: string[] = [];
+    registerGoalTool(pi, {
+      maxContinuations: 10,
+      checkEvery: 3,
+      verifyRunner: async () => {
+        const out = `state ${runs.length}`;
+        runs.push(out);
+        return { ...failVerify, output: out };
+      },
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
+    const preflightRuns = runs.length; // the set-time baseline run
+
+    await fire(events, "agent_before_settle", ctx); // 1: fresh (also set preflight ran once)
+    await fire(events, "agent_before_settle", ctx); // 2: reused
+    await fire(events, "agent_before_settle", ctx); // 3: fresh
+    expect(runs.length).toBe(preflightRuns + 2);
+    // The reused prompt is marked stale with the measured state's age.
+    expect((sentCustom[1]!.msg as { content: string }).content).toContain("1 continuation(s) ago");
+    expect((sentCustom[2]!.msg as { content: string }).content).not.toContain("continuation(s) ago");
+  });
+
+  it("shows a chat spinner widget while the verify runs, then removes it", async () => {
+    const { pi, tools, events } = makePi();
+    const setStatus = vi.fn();
+    const setWidget = vi.fn();
+    const ctx = { ui: { notify: vi.fn(), setStatus, setWidget } } as unknown as ExtensionContext;
+    let calls = 0;
+    let release: (() => void) | undefined;
+    registerGoalTool(pi, {
+      // First call is the set-time preflight (resolves immediately); the settle
+      // check hangs until released so the spinner state is observable.
+      verifyRunner: () =>
+        new Promise<VerifyResult>((resolve) => {
+          calls += 1;
+          if (calls === 1) return resolve(failVerify);
+          release = () => resolve(failVerify);
+        }),
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
+
+    const settle = fire(events, "agent_before_settle", ctx);
+    await new Promise((r) => setTimeout(r, 0)); // let the handler reach the pending verify
+    expect(setWidget).toHaveBeenCalledWith("goal-check", expect.any(Function));
+    release!();
+    expect(await settle).toEqual({ continue: true });
+    expect(setWidget).toHaveBeenLastCalledWith("goal-check", undefined);
+    expect(setStatus.mock.calls.at(-1)![1]).toMatch(/^goal · /);
+  });
+
+  it("a reused (throttled) check never flashes the spinner", async () => {
+    const { pi, tools, events } = makePi();
+    const setWidget = vi.fn();
+    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget } } as unknown as ExtensionContext;
+    registerGoalTool(pi, { maxContinuations: 10, checkEvery: 3, verifyRunner: async () => failVerify });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
+    setWidget.mockClear();
+
+    await fire(events, "agent_before_settle", ctx); // fresh
+    await fire(events, "agent_before_settle", ctx); // reused
+    // Spinner shown and removed once (the fresh check); the reused settle touched it zero times.
+    expect(setWidget).toHaveBeenCalledTimes(2);
+  });
+
+  it("a throwing verify runner still removes the spinner and restores the footer", async () => {
+    const { pi, events } = makePi();
+    const setStatus = vi.fn();
+    const setWidget = vi.fn();
+    const ctx = { ui: { notify: vi.fn(), setStatus, setWidget } } as unknown as ExtensionContext;
+    registerGoalTool(pi, {
+      verifyRunner: async () => {
+        throw new Error("boom");
+      },
+    });
+    // Seed the goal via resume (bypasses the set-time preflight, which would
+    // surface the injected throw directly) — the house pattern.
+    fire(events, "session_start", sessionCtx([goalSnapshot(goal({ id: 1, objective: "x", verify: "npm test" }))]));
+
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    expect(setWidget).toHaveBeenCalledWith("goal-check", expect.any(Function));
+    expect(setWidget).toHaveBeenLastCalledWith("goal-check", undefined);
+    expect(setStatus.mock.calls.at(-1)![1]).toMatch(/^goal · /);
+  });
+
+  it("re-asserts the footer at run boundaries after pi clears extension statuses", async () => {
+    const { pi, tools, events } = makePi();
+    const setStatus = vi.fn();
+    const ctx = { ui: { notify: vi.fn(), setStatus, setWidget: vi.fn() } } as unknown as ExtensionContext;
+    registerGoalTool(pi, { verifyRunner: async () => failVerify });
+    // Prime uiRef from a session ctx (tool execute gets no ctx), as in a real session.
+    fire(events, "session_start", {
+      ui: { notify: vi.fn(), setStatus },
+      sessionManager: { getBranch: () => [] },
+    } as unknown as ExtensionContext);
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
+    expect(setStatus).toHaveBeenCalled();
+
+    setStatus.mockClear();
+    // Simulate pi's rebind clearing statuses (resetExtensionUI): nothing re-sets
+    // it until the next run boundary — where the extension re-asserts it.
+    fire(events, "agent_start", ctx);
+    fire(events, "before_agent_start", ctx);
+    expect(setStatus).toHaveBeenCalledTimes(2);
+    expect(setStatus.mock.calls[0]![1]).toMatch(/^goal · /);
+  });
+
+  it("a model-set goal continues the loop in a fresh (goalless) session", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
+    registerGoalTool(pi, { verifyRunner: async () => failVerify });
+    // A fresh session starts with no goal on the branch — this must NOT disarm
+    // the loop for a goal the model sets afterwards (a model set never re-arms).
+    fire(events, "session_start", sessionCtx([]));
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
+
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    expect(sentCustom).toHaveLength(1);
+  });
+
+  it("a re-set invalidates the cached check — goal 2 never sees goal 1's passing state", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
+    let passes = true;
+    registerGoalTool(pi, {
+      maxContinuations: 10,
+      checkEvery: 5, // the modulo would happily serve the stale cached check
+      verifyRunner: async () => (passes ? okVerify : failVerify),
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "A", verify: "npm test" });
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    expect((sentCustom[0]!.msg as { content: string }).content).toContain("passed");
+
+    // Re-set to a goal whose verify fails: the cache must be dropped, not reused.
+    passes = false;
+    await tools.get(GOAL_TOOL_NAME)!.execute("2", { action: "set", objective: "B", verify: "npm test" });
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    expect((sentCustom[1]!.msg as { content: string }).content).toContain("did not pass");
+  });
+
+  it("a judge-approved reset drops the cached check so window 2 opens with a fresh baseline", async () => {
+    const { pi, tools, events } = makePi();
+    const notify = vi.fn();
+    const ctx = { ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
+    let n = 0;
+    registerGoalTool(pi, {
+      maxContinuations: 3,
+      checkEvery: 3,
+      verifyRunner: async () => ({ ...failVerify, output: `state ${n++}` }),
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
+
+    // Window 1: fresh at 1 (no cache) and 3 (modulo), reused at 2. Cap hits on settle 4.
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // cap → judge reset
+    expect(notify).toHaveBeenCalledTimes(1); // reset granted
+    // Window 2 must run a FRESH check at its first continuation (cache dropped),
+    // not reuse window 1's last output — else the judge starves at the next cap.
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    expect(notify).toHaveBeenCalledTimes(1); // no stop
+  });
+
+  it("the turn-end check message is visible and carries structured details for the renderer", async () => {
+    const { pi, tools, events, sentCustom, messageRenderers } = makePi();
+    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
+    registerGoalTool(pi, { verifyRunner: async () => failVerify });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
+    await fire(events, "agent_before_settle", ctx);
+
+    const msg = sentCustom[0]!.msg as { display: boolean; details: GoalCheckDetails };
+    expect(msg.display).toBe(true);
+    expect(msg.details.continuation).toBe(1);
+    expect(msg.details.ok).toBe(false);
+    expect(msg.details.exitCode).toBe(1);
+    expect(messageRenderers.has(GOAL_CHECK_TYPE)).toBe(true);
+  });
+
+  it("renderCheckMessage: compact row collapsed, measured state expanded", () => {
+    const details: GoalCheckDetails = {
+      continuation: 15,
+      max: 25,
+      ok: false,
+      exitCode: 1,
+      timedOut: false,
+      staleContinuations: 2,
+      output: "geomean ratio: 0.553",
+    };
+    const collapsed = renderCheckMessage(details, { expanded: false }, THEME);
+    expect(collapsed).toContain("goal check 15/25");
+    expect(collapsed).toContain("verify failed (exit 1) — continuing");
+    expect(collapsed).toContain("measured 2 turn(s) ago");
+    expect(collapsed).not.toContain("geomean");
+    const expanded = renderCheckMessage(details, { expanded: true }, THEME);
+    expect(expanded).toContain("geomean ratio: 0.553");
+    // Passing checks read as summarize-and-complete; missing details degrade to a dim row.
+    expect(renderCheckMessage({ ...details, ok: true }, { expanded: false }, THEME)).toContain(
+      "verify passed — agent will summarize and complete",
+    );
+    expect(renderCheckMessage(undefined, { expanded: false }, THEME)).toContain("goal check");
   });
 
   it("does not auto-continue a non-active goal", async () => {
     const { pi, tools, events, sentCustom } = makePi();
-    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn() } } as unknown as ExtensionContext;
+    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
     registerGoalTool(pi, { verifyRunner: async () => okVerify });
     const tool = tools.get(GOAL_TOOL_NAME)!;
     await tool.execute("1", { action: "set", objective: "x", verify: "npm test" });
@@ -1151,7 +1380,7 @@ describe("registerGoalTool", () => {
 
   it("does not re-engage after an errored or aborted run", async () => {
     const { pi, tools, events, sentCustom } = makePi();
-    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn() } } as unknown as ExtensionContext;
+    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
     registerGoalTool(pi, { verifyRunner: async () => failVerify });
     await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
 
@@ -1166,7 +1395,7 @@ describe("registerGoalTool", () => {
 
   it("a throwing verify runner degrades to a failed check instead of rejecting the boundary", async () => {
     const { pi, events, sentCustom } = makePi();
-    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn() } } as unknown as ExtensionContext;
+    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
     registerGoalTool(pi, {
       verifyRunner: async () => {
         throw new Error("boom");
@@ -1186,7 +1415,7 @@ describe("registerGoalTool", () => {
     const { pi, tools, events } = makePi();
     const notify = vi.fn();
     const setStatus = vi.fn();
-    const uiCtx = { ui: { notify, setStatus } } as unknown as ExtensionContext;
+    const uiCtx = { ui: { notify, setStatus, setWidget: vi.fn() } } as unknown as ExtensionContext;
     registerGoalTool(pi, { verifyRunner: async () => okVerify });
 
     // Prime uiRef the way a real session does.
@@ -1196,13 +1425,13 @@ describe("registerGoalTool", () => {
     } as unknown as ExtensionContext);
 
     await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it", verify: "npm test" });
-    expect(setStatus).toHaveBeenLastCalledWith("goal", expect.stringContaining("🎯 #1: ship it"));
+    expect(setStatus).toHaveBeenLastCalledWith("goal", expect.stringContaining("goal ·"));
 
     // turn_end keeps the timer current during a long run; a settle refreshes it too.
     fire(events, "turn_end");
-    expect(setStatus).toHaveBeenLastCalledWith("goal", expect.stringContaining("🎯 #1: ship it"));
+    expect(setStatus).toHaveBeenLastCalledWith("goal", expect.stringContaining("goal ·"));
     await fire(events, "agent_before_settle", uiCtx);
-    expect(setStatus).toHaveBeenLastCalledWith("goal", expect.stringContaining("🎯 #1: ship it"));
+    expect(setStatus).toHaveBeenLastCalledWith("goal", expect.stringContaining("goal ·"));
 
     // Completion clears the footer.
     await tools.get(GOAL_TOOL_NAME)!.execute("2", { action: "complete", goalId: 1, summary: "done", evidence: ["ok"] });
@@ -1212,7 +1441,7 @@ describe("registerGoalTool", () => {
   it("clears the footer when the goal is blocked", async () => {
     const { pi, tools, events } = makePi();
     const setStatus = vi.fn();
-    const uiCtx = { ui: { notify: vi.fn(), setStatus } } as unknown as ExtensionContext;
+    const uiCtx = { ui: { notify: vi.fn(), setStatus, setWidget: vi.fn() } } as unknown as ExtensionContext;
     registerGoalTool(pi);
     fire(events, "session_start", {
       sessionManager: { getBranch: () => [] },
@@ -1220,7 +1449,7 @@ describe("registerGoalTool", () => {
     } as unknown as ExtensionContext);
 
     await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "migrate db" });
-    expect(setStatus).toHaveBeenLastCalledWith("goal", expect.stringContaining("🎯 #1: migrate db"));
+    expect(setStatus).toHaveBeenLastCalledWith("goal", expect.stringContaining("goal ·"));
 
     await tools.get(GOAL_TOOL_NAME)!.execute("2", { action: "blocked", goalId: 1, reason: "stuck" });
     expect(setStatus).toHaveBeenLastCalledWith("goal", undefined);
@@ -1296,7 +1525,7 @@ describe("registerGoalTool", () => {
     const notify = vi.fn();
     const setStatus = vi.fn();
     const cmdCtx = { mode: "headless", ui: { notify, setStatus } };
-    const settleCtx = { ui: { notify, setStatus } } as unknown as ExtensionContext;
+    const settleCtx = { ui: { notify, setStatus, setWidget: vi.fn() } } as unknown as ExtensionContext;
     registerGoalTool(pi, { maxContinuations: 10, verifyRunner: async () => failVerify });
 
     await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "stuck work", verify: "npm test" });
