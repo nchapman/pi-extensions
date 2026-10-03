@@ -365,6 +365,16 @@ describe("scanGoalBranch / lastGoalSnapshot", () => {
     ];
     expect(scanGoalBranch(branch).hiddenByCompaction).toBe(false);
   });
+  it("does not hide the goal when a turn-end check carrier follows the compaction", () => {
+    // A goal.check message after a compaction restates the objective too, so it
+    // is a carrier like the reminder — no redundant re-injection on resume.
+    const branch = [
+      goalSnapshot(goal({ id: 1 })),
+      { type: "compaction" },
+      { type: "custom_message", customType: GOAL_CHECK_TYPE, content: "GOAL CHECK" },
+    ];
+    expect(scanGoalBranch(branch).hiddenByCompaction).toBe(false);
+  });
   it("does not hide a non-active goal even after compaction", () => {
     const branch = [goalSnapshot(goal({ id: 1, status: "paused" })), { type: "compaction" }];
     expect(scanGoalBranch(branch).hiddenByCompaction).toBe(false);
@@ -880,6 +890,37 @@ describe("registerGoalTool", () => {
     // Stopped: no further continuations on more settles.
     expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
     expect(sentCustom).toHaveLength(2);
+  });
+
+  it("the cap path does not throw when the settle ctx has no ui (headless)", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const ctx = {} as unknown as ExtensionContext; // no ui, as in print mode
+    registerGoalTool(pi, { maxContinuations: 1, verifyRunner: async () => failVerify });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "stuck goal", verify: "npm test" });
+
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // continuation 1
+    // At the cap with no ui: the notify must be a no-op, not a throw at the settle boundary.
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined(); // still stopped
+    expect(sentCustom).toHaveLength(1);
+  });
+
+  it("keeps the footer's elapsed time current after the cap trips", async () => {
+    const { pi, tools, events } = makePi();
+    const notify = vi.fn();
+    const setStatus = vi.fn();
+    const uiCtx = { ui: { notify, setStatus } } as unknown as ExtensionContext;
+    registerGoalTool(pi, { maxContinuations: 1, verifyRunner: async () => failVerify });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "stuck goal", verify: "npm test" });
+
+    // Continuation 1 (also primes uiRef from the settle ctx), then the cap: the
+    // cap branch refreshes the footer.
+    expect(await fire(events, "agent_before_settle", uiCtx)).toEqual({ continue: true });
+    expect(await fire(events, "agent_before_settle", uiCtx)).toBeUndefined(); // at cap
+
+    // The goal is still active after the cap, so turn_end keeps the timer ticking.
+    fire(events, "turn_end");
+    expect(setStatus).toHaveBeenLastCalledWith("goal", expect.stringContaining("🎯 #1"));
   });
 
   it("does not auto-continue a non-active goal", async () => {

@@ -623,7 +623,11 @@ export function scanGoalBranch(branch: GoalBranchEntry[]): { goal: Goal | null; 
     lastCompactionIndex !== -1 &&
     !branch
       .slice(lastCompactionIndex + 1)
-      .some((entry) => entry.type === "custom_message" && entry.customType === GOAL_REMINDER_TYPE);
+      .some(
+        (entry) =>
+          entry.type === "custom_message" &&
+          (entry.customType === GOAL_REMINDER_TYPE || entry.customType === GOAL_CHECK_TYPE),
+      );
   return { goal, hiddenByCompaction };
 }
 
@@ -674,8 +678,8 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
   const clearFooter = () => uiRef?.setStatus("goal", undefined);
 
   // Reset the auto-continuation budget. Called only at genuine engagement
-  // boundaries (resume, a gated completion, a user /goal kickoff) — never on the
-  // model's set/blocked, which is how a stuck model would defeat the cap.
+  // boundaries (a resumed session or a user /goal kickoff) — never on the
+  // model's set/complete/blocked, which is how a stuck model would defeat the cap.
   const resetContinuationBudget = () => {
     continuations = 0;
     stopped = false;
@@ -765,10 +769,11 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     if (!goal.verify) return;
     if (continuations >= maxContinuations) {
       stopped = true;
-      ctx.ui.notify(
+      ctx.ui?.notify(
         `Goal #${goal.id} still active after ${maxContinuations} auto-continuations — stopping. ` +
           "Complete it via the goal tool, adjust it, or /goal stop.",
       );
+      updateFooter();
       return;
     }
     continuations += 1;
@@ -808,8 +813,9 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     perRunNudged = false;
   });
   pi.on("turn_end", () => {
-    if (!goal || goal.status !== "active" || stopped) return;
-    updateFooter(); // keep the footer's elapsed time current during a long run
+    if (!goal || goal.status !== "active") return;
+    updateFooter(); // keep the footer's elapsed time current during a long run (and after the cap trips)
+    if (stopped) return;
     perRunTurns += 1;
     if (!perRunNudged && perRunTurns >= maxTurnsPerRun) {
       perRunNudged = true;
