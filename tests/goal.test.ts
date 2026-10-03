@@ -5,11 +5,13 @@ import {
   checkEvidenceCoverage,
   effectiveCriteria,
   GOAL_MAX_CONTINUATIONS_DEFAULT,
+  GOAL_MAX_TURNS_PER_RUN_DEFAULT,
   GOAL_REMINDER_TYPE,
   GOAL_TOOL_NAME,
   isContradictorySummary,
   lastGoalSnapshot,
   parseMaxContinuations,
+  parseMaxTurnsPerRun,
   renderContinuationPrompt,
   renderGoalCall,
   renderGoalResult,
@@ -211,6 +213,17 @@ describe("parseMaxContinuations", () => {
     expect(parseMaxContinuations("999999")).toBe(GOAL_MAX_CONTINUATIONS_DEFAULT);
   });
   it("accepts a valid integer", () => expect(parseMaxContinuations("7")).toBe(7));
+});
+
+describe("parseMaxTurnsPerRun", () => {
+  it("defaults on missing, empty, and invalid values", () => {
+    expect(parseMaxTurnsPerRun(undefined)).toBe(GOAL_MAX_TURNS_PER_RUN_DEFAULT);
+    expect(parseMaxTurnsPerRun("  ")).toBe(GOAL_MAX_TURNS_PER_RUN_DEFAULT);
+    expect(parseMaxTurnsPerRun("abc")).toBe(GOAL_MAX_TURNS_PER_RUN_DEFAULT);
+    expect(parseMaxTurnsPerRun("0")).toBe(GOAL_MAX_TURNS_PER_RUN_DEFAULT);
+    expect(parseMaxTurnsPerRun("99999999")).toBe(GOAL_MAX_TURNS_PER_RUN_DEFAULT);
+  });
+  it("accepts a valid integer", () => expect(parseMaxTurnsPerRun("7")).toBe(7));
 });
 
 describe("renderContinuationPrompt", () => {
@@ -523,6 +536,80 @@ describe("registerGoalTool", () => {
 
     fire(events, "agent_settled", ctx); // still capped
     expect(sent).toHaveLength(2);
+  });
+
+  it("a fake completion cannot farm the continuation cap", async () => {
+    const { pi, tools, events, sent } = makePi();
+    const notify = vi.fn();
+    const ctx = { ui: { notify } } as unknown as ExtensionContext;
+    registerGoalTool(pi, { maxContinuations: 2 });
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    await tool.execute("1", { action: "set", objective: "farm" });
+
+    fire(events, "agent_settled", ctx); // continuation 1
+    fire(events, "agent_settled", ctx); // continuation 2
+    fire(events, "agent_settled", ctx); // at cap → stopped
+    expect(sent).toHaveLength(2);
+    expect(notify).toHaveBeenCalledTimes(1);
+
+    // The model "completes" (the structural gate passes on presence) and sets a
+    // new goal. Completion must NOT refund the budget, so the loop stays stopped.
+    await tool.execute("2", { action: "complete", goalId: 1, summary: "done", evidence: ["did it"] });
+    await tool.execute("3", { action: "set", objective: "farm again" });
+    fire(events, "agent_settled", ctx);
+    expect(sent).toHaveLength(2);
+    expect(notify).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-arms the continuation loop when an active goal is resumed", async () => {
+    const { pi, tools, events, sent } = makePi();
+    const notify = vi.fn();
+    const ctx = { ui: { notify } } as unknown as ExtensionContext;
+    registerGoalTool(pi, { maxContinuations: 1 });
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    await tool.execute("1", { action: "set", objective: "resumable" });
+
+    // Drive the loop to the cap so it is stopped.
+    fire(events, "agent_settled", ctx); // continuation 1
+    fire(events, "agent_settled", ctx); // at cap → stopped
+    expect(notify).toHaveBeenCalledTimes(1);
+
+    // Resume re-derives the (still active) goal and re-arms the loop.
+    const branch = [goalSnapshot(goal({ id: 1, objective: "resumable", status: "active" }))];
+    fire(events, "session_start", sessionCtx(branch));
+    fire(events, "agent_settled"); // re-engages with a fresh budget
+    expect(sent).toHaveLength(2);
+  });
+
+  it("bounds a within-run busy-loop by steering a settle once per run", async () => {
+    const { pi, tools, events } = makePi();
+    const sendMessage = vi.fn();
+    pi.sendMessage = sendMessage;
+    registerGoalTool(pi, { maxTurnsPerRun: 3 });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "spin" });
+
+    fire(events, "agent_start");
+    fire(events, "turn_end"); // 1
+    fire(events, "turn_end"); // 2
+    expect(sendMessage).not.toHaveBeenCalled();
+    fire(events, "turn_end"); // 3 → steer a settle
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    const [msg, opts] = sendMessage.mock.calls[0] as unknown as [
+      { content: string },
+      { deliverAs: string; triggerTurn: boolean },
+    ];
+    expect(msg.content).toContain("Summarize your progress");
+    expect(msg.content).toContain("re-engage you with the goal");
+    expect(opts).toEqual({ deliverAs: "steer", triggerTurn: false });
+    fire(events, "turn_end"); // 4 → no second steer this run
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+
+    // A new run re-arms the per-run bound.
+    fire(events, "agent_start");
+    fire(events, "turn_end");
+    fire(events, "turn_end");
+    fire(events, "turn_end"); // 3 → steer again
+    expect(sendMessage).toHaveBeenCalledTimes(2);
   });
 
   it("stops auto-continuing at the cap and notifies", async () => {

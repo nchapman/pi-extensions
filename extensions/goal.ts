@@ -20,12 +20,14 @@
  * - an agent_settled continuation loop keeps the agent working toward the goal:
  *   on every settle, if the goal is still active it injects a followUp restating
  *   the objective + criteria, so the run proceeds turn after turn until the goal
- *   is completed or blocked. A per-session cap (PI_GOAL_MAX_CONTINUATIONS) bounds
- *   a stuck loop, stopping it with a notice; /goal stop halts it session-scoped.
- *   The cap is a model-untouchable circuit breaker: the model's set/blocked
- *   actions never reset the budget (a stuck model can't farm fresh turns by
- *   re-setting the goal). It re-arms only at a genuine engagement boundary — a
- *   resumed session, a gated completion, or the user starting a goal via /goal
+ *   is completed or blocked. Two model-untouchable circuit breakers keep a stuck
+ *   run bounded: a per-session cap (PI_GOAL_MAX_CONTINUATIONS) on
+ *   auto-continuations, and a per-run turn bound (PI_GOAL_MAX_TURNS_PER_RUN) that
+ *   steers a long turn to settle so the cap can re-engage. The model's
+ *   set/complete/blocked actions never reset either (a stuck model can't farm
+ *   fresh turns by re-setting or faking a completion); both re-arm only on a
+ *   resumed session or when the user starts a goal via /goal, and /goal stop
+ *   halts the loop session-scoped
  * - a before_agent_start reminder re-injects the objective + criteria when a
  *   compaction hid it (summaries never carry the goal); a compaction mid-turn
  *   additionally re-injects immediately by steering the in-progress run (no new
@@ -61,6 +63,26 @@ export function parseMaxContinuations(raw: string | undefined): number {
   if (raw === undefined || raw.trim() === "") return GOAL_MAX_CONTINUATIONS_DEFAULT;
   const n = Number(raw);
   if (!Number.isInteger(n) || n < 1 || n > 100_000) return GOAL_MAX_CONTINUATIONS_DEFAULT;
+  return n;
+}
+
+/**
+ * Per-run turn bound (PI_GOAL_MAX_TURNS_PER_RUN): after this many turns in a
+ * single run, steer the model to settle. A stuck model can loop tool calls
+ * inside one run without ever settling, so the settle-cap alone can't catch it —
+ * this converts a runaway run into bounded runs the cap can then re-engage.
+ */
+export const GOAL_MAX_TURNS_PER_RUN_DEFAULT = 50;
+const GOAL_MAX_TURNS_PER_RUN_ENV = "PI_GOAL_MAX_TURNS_PER_RUN";
+
+/**
+ * Parse PI_GOAL_MAX_TURNS_PER_RUN. Invalid values (non-numeric, < 1, absurdly
+ * large) fall back to the default — fail-open, no throw.
+ */
+export function parseMaxTurnsPerRun(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return GOAL_MAX_TURNS_PER_RUN_DEFAULT;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > 1_000_000) return GOAL_MAX_TURNS_PER_RUN_DEFAULT;
   return n;
 }
 
@@ -252,7 +274,10 @@ export function renderGoalReminder(goal: Goal): string {
   const lines = [`GOAL REMINDER — active goal #${goal.id}:`, goal.objective, ""];
   for (const c of effectiveCriteria(goal)) lines.push(`  • ${c}`);
   lines.push(
-    'Work toward it; when every criterion is met, call the goal tool with action "complete" and per-criterion evidence.',
+    "Context may have been reset by compaction. Re-orient first: check git status/diff and review any plan/todo, note what is already done, and do NOT redo completed work.",
+  );
+  lines.push(
+    'Keep working toward it. When every criterion is met AND verified (run the real check — do not assert it from memory), call the goal tool with action "complete" and per-criterion evidence citing the actual command and its output.',
   );
   return lines.join("\n");
 }
@@ -270,7 +295,10 @@ export function renderContinuationPrompt(goal: Goal, continuations: number, max:
   ];
   for (const c of effectiveCriteria(goal)) lines.push(`  • ${c}`);
   lines.push(
-    'Continue working. When every criterion is met and verified, call the goal tool with action "complete" and per-criterion evidence. If you are truly stuck, call it with action "blocked" and a reason.',
+    "Do not stop or write a final summary until every criterion is met AND verified. Make progress this turn — if a step fails, diagnose it and continue; do not declare the goal blocked over a transient failure, and do not redo work already done.",
+  );
+  lines.push(
+    'Before calling complete, re-verify each criterion by actually running the check (read the file / run the test), and cite the real command and its output as evidence. Only call "complete" when every criterion genuinely passes; call "blocked" with a reason only for a true, non-transient impasse.',
   );
   return lines.join("\n");
 }
@@ -430,6 +458,9 @@ export interface RegisterGoalOptions {
   /** Per-session cap on auto-continuations for a still-active goal. Defaults to
    *  PI_GOAL_MAX_CONTINUATIONS, then GOAL_MAX_CONTINUATIONS_DEFAULT. */
   maxContinuations?: number;
+  /** Per-run turn bound before steering a settle. Defaults to
+   *  PI_GOAL_MAX_TURNS_PER_RUN, then GOAL_MAX_TURNS_PER_RUN_DEFAULT. */
+  maxTurnsPerRun?: number;
 }
 
 export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions = {}): void {
@@ -438,7 +469,10 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
   let compactedSinceUpdate = false;
   let continuations = 0;
   let stopped = false;
+  let perRunTurns = 0;
+  let perRunNudged = false;
   const maxContinuations = options.maxContinuations ?? parseMaxContinuations(process.env[GOAL_MAX_CONTINUATIONS_ENV]);
+  const maxTurnsPerRun = options.maxTurnsPerRun ?? parseMaxTurnsPerRun(process.env[GOAL_MAX_TURNS_PER_RUN_ENV]);
   const judge = options.judge;
 
   const activateTool = () => {
@@ -538,6 +572,30 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     pi.sendUserMessage(renderContinuationPrompt(goal, continuations, maxContinuations), { deliverAs: "followUp" });
   });
 
+  // Per-run busy-loop bound: a stuck model can loop tool calls inside a single
+  // run without ever settling, so the settle-cap never fires and the run burns
+  // unbounded cost. Count turns per run; past the bound, steer the model to
+  // settle once so the run is bounded and the settle-cap can re-engage.
+  pi.on("agent_start", () => {
+    perRunTurns = 0;
+    perRunNudged = false;
+  });
+  pi.on("turn_end", () => {
+    if (!goal || goal.status !== "active" || stopped) return;
+    perRunTurns += 1;
+    if (!perRunNudged && perRunTurns >= maxTurnsPerRun) {
+      perRunNudged = true;
+      pi.sendMessage(
+        {
+          customType: GOAL_REMINDER_TYPE,
+          content: `You have made ${perRunTurns} steps this run without settling. Summarize your progress and stop now; I will re-engage you with the goal.`,
+          display: false,
+        },
+        { deliverAs: "steer", triggerTurn: false },
+      );
+    }
+  });
+
   pi.registerTool({
     name: GOAL_TOOL_NAME,
     label: "Goal",
@@ -582,10 +640,11 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
           return finish(goal, `Goal #${goal.id} NOT completed: ${judgeReason}`, judgeReason);
         }
         goal = { ...goal, status: "complete" };
-        // A verified (gated) completion is a genuine end-of-engagement: the next
-        // goal gets a fresh auto-continuation budget. A stuck model can't reach
-        // here without passing the gate, so this can't be used to farm turns.
-        resetContinuationBudget();
+        // A completion does NOT re-arm the budget: the structural gate is
+        // presence-only (no judge in v1), so a self-certifying model could
+        // otherwise fake `complete` to farm fresh auto-continuations. The budget
+        // re-arms only on resume or a user /goal kickoff, keeping the cap a true
+        // per-session circuit breaker.
         return finish(goal, `Goal #${goal.id} complete: ${params.summary.trim()}`);
       }
 
@@ -677,7 +736,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
       // engagement, distinct from the model's autonomous set (which can't re-arm).
       resetContinuationBudget();
       pi.sendUserMessage(
-        `Set the goal "${trimmed}" using the goal tool (action "set"), then work toward it. When it is met, call the goal tool with action "complete" and per-criterion evidence.`,
+        `Set the goal "${trimmed}" using the goal tool (action "set"), then work toward it autonomously: keep making tool calls until every part is done and verified — do not stop or write a closing summary before then. When it is genuinely met, call the goal tool with action "complete" and per-criterion evidence that cites the real command and its output.`,
         { deliverAs: "followUp" },
       );
       ctx.ui.notify("Goal started; the agent will set it via the goal tool.");
