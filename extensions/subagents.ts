@@ -17,12 +17,15 @@ import {
   type BackgroundRegistry,
   capResultText,
   createBackgroundRegistry,
-  createBgTool,
-  createKillTaskTool,
+  createBashTool,
+  createTaskKillTool,
+  createTaskRemindTool,
+  createTaskTool,
   createTasksCommand,
   DEFAULT_BG_AFTER_MS,
   formatSubagentWake,
   parseBgAfterMs,
+  parseBashBgAfterMs,
   parseWakeEnabled,
 } from "../lib/background";
 
@@ -377,7 +380,7 @@ export function formatUsageLine(u: ChildUsage): string {
  * arrives on its own and that sleep-polling is pure waste (the wake would
  * land when the sleep returns; the sleep just burns its whole duration). */
 export function backgroundedNotice(agentName: string, id: string): string {
-  return `Subagent "${agentName}" is still running — moved to the background (${id}). When it completes, its result is delivered to you automatically as your next message — even mid-run, while you keep working — so continue other work; never sleep or poll to wait for it. The hard timeout still applies.`;
+  return `Subagent "${agentName}" is still running — moved to the background (${id}). When it completes, its result is delivered to you automatically as your next message — even mid-run, while you keep working — so continue other work; never sleep or poll to wait for it. Check on it with task ${id}; schedule a check-in with task_remind. The hard timeout still applies.`;
 }
 
 /** Adopt a still-running child into the registry and wire its wake. Returns the task id. */
@@ -395,6 +398,7 @@ export function adoptSubagentTask(
       const capped = capResultText(run.text, sessionDir, id);
       registry.complete(id, {
         ok: true,
+        status: "completed",
         text: formatSubagentWake(agentName, id, {
           ok: true,
           durationMs: Date.now() - startedAt,
@@ -406,6 +410,7 @@ export function adoptSubagentTask(
     (error: Error & { usage?: ChildUsage }) => {
       registry.complete(id, {
         ok: false,
+        status: "failed",
         text: formatSubagentWake(agentName, id, {
           ok: false,
           durationMs: Date.now() - startedAt,
@@ -1086,13 +1091,18 @@ export function registerSubagentsExtension(
     }
   });
   registerSubagentTools(pi, agentsDir, opts.spawnFn ?? defaultSpawn, agents, registry);
-  // bg shares the registry: one footer count, one shutdown kill, the same wake channel.
-  pi.registerTool(createBgTool(registry, { defaultTimeoutMs: DEFAULT_TIMEOUT_MS, operations: opts.bgOperations?.() }));
-  // Per-task control, agent side: kill by id; the terminal sees it happen.
+  // The unified bash tool replaces the built-in by name: wait: inline delegates
+  // to pi's own bash tool; auto/background promote to this registry like subagents.
+  // The wait window is read per call so PI_BASH_BG_AFTER_MS changes apply live.
   pi.registerTool(
-    createKillTaskTool(registry, { onKilled: (id) => ui?.notify(`Background task killed: ${id}`, "warning") }),
+    createBashTool(registry, { operations: opts.bgOperations?.(), waitMs: () => parseBashBgAfterMs(process.env) }),
   );
-  // Per-task control, user side: /tasks lists, /tasks <id> kills.
+  // Task management: peek (pull-based check-in), kill, and scheduled check-ins.
+  pi.registerTool(createTaskTool(registry));
+  pi.registerTool(
+    createTaskKillTool(registry, { onKilled: (id) => ui?.notify(`Background task killed: ${id}`, "warning") }),
+  );
+  pi.registerTool(createTaskRemindTool(registry));
   pi.registerCommand("tasks", createTasksCommand(registry));
   registerCommandsForAgents(pi, agents);
 }

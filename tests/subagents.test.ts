@@ -837,7 +837,7 @@ describe("adoptSubagentTask", () => {
     await new Promise((r) => setTimeout(r, 10));
     expect(sendUserMessage).toHaveBeenCalledTimes(2);
     const okWake = sendUserMessage.mock.calls[0][0] as string;
-    expect(okWake).toContain('[background] subagent "reviewer" (bg-1,');
+    expect(okWake).toContain('[background] subagent "reviewer" (t-');
     expect(okWake).toContain("completed");
     expect(okWake).toContain("all clear");
     const failWake = sendUserMessage.mock.calls[1][0] as string;
@@ -992,8 +992,8 @@ describe("registerSubagentTools with a registry", () => {
       details: { agent: string; backgrounded: boolean; id: string };
     };
     expect(result.details.backgrounded).toBe(true);
-    expect(result.details.id).toBe("bg-1");
-    expect(result.content[0].text).toContain("bg-1");
+    expect(result.details.id).toMatch(/^t-/);
+    expect(result.content[0].text).toContain(result.details.id);
     expect(result.content[0].text).toContain("even mid-run");
     expect(result.content[0].text).toContain("never sleep or poll");
     expect(registry.running()).toHaveLength(1);
@@ -1052,7 +1052,7 @@ describe("registerSubagentTools with a registry", () => {
     };
 
     expect(result.content[0].text).toContain("### reviewer\nfast ok");
-    expect(result.content[0].text).toContain("backgrounded as bg-1");
+    expect(result.content[0].text).toMatch(/backgrounded as t-[0-9a-z]+/);
     // The inline backgrounded section teaches the wake contract too.
     expect(result.content[0].text).toContain("even mid-run");
     expect(result.content[0].text).toContain("never sleep or poll");
@@ -1086,7 +1086,7 @@ describe("registerSubagentsExtension (full wiring)", () => {
     execute: (id: string, params: unknown, signal?: AbortSignal, onUpdate?: unknown, ctx?: unknown) => Promise<unknown>;
   }
 
-  /** Minimal bash operations fake: enough surface for the bg tool's wiring path. */
+  /** Minimal bash operations fake: enough surface for the bash tool's wiring path. */
   function wireBgOps() {
     let onData: ((chunk: Buffer) => void) | undefined;
     let resolve: ((r: { exitCode: number | null }) => void) | undefined;
@@ -1175,14 +1175,16 @@ describe("registerSubagentsExtension (full wiring)", () => {
     expect(options?.deliverAs).toBe("steer");
   });
 
-  it("delivers bg-tool wakes through the same steered channel as subagent wakes", async () => {
+  it("delivers bash-task wakes through the same steered channel as subagent wakes", async () => {
     const wired = wireUp();
-    await wired.tools.get("bg")!.execute("1", { command: "just check 2>&1" }, undefined, undefined, {
-      sessionManager: { getSessionDir: () => undefined },
-    });
+    await wired.tools
+      .get("bash")!
+      .execute("1", { command: "just check 2>&1", wait: "background" }, undefined, undefined, {
+        sessionManager: { getSessionDir: () => undefined },
+      });
 
     // The bash kind must ride the same steered wake channel — a split
-    // (bg queueing as followUp) would reintroduce the sleep-poll livelock
+    // (bash queueing as followUp) would reintroduce the sleep-poll livelock
     // for shell tasks only.
     wired.bgOps[0].emit("ok\n");
     wired.bgOps[0].exit(0);
@@ -1209,12 +1211,14 @@ describe("registerSubagentsExtension (full wiring)", () => {
     expect(wired.sendUserMessage).not.toHaveBeenCalled();
   });
 
-  it("registers the bg tool and kills its task on shutdown alongside subagents", async () => {
+  it("registers the bash tool and kills its task on shutdown alongside subagents", async () => {
     const wired = wireUp();
-    const result = (await wired.tools.get("bg")!.execute("1", { command: "sleep 60" }, undefined, undefined, {
-      sessionManager: { getSessionDir: () => undefined },
-    })) as { details: { id: string } };
-    expect(result.details.id).toBe("bg-1");
+    const result = (await wired.tools
+      .get("bash")!
+      .execute("1", { command: "sleep 60", wait: "background" }, undefined, undefined, {
+        sessionManager: { getSessionDir: () => undefined },
+      })) as { details: { id: string } };
+    expect(result.details.id).toMatch(/^t-/);
     expect(wired.bgOps[0].aborted).toBe(false);
 
     wired.handlers.get("session_shutdown")!({ reason: "fork" });
