@@ -1605,6 +1605,22 @@ describe("registerGoalTool", () => {
     expect(notify).toHaveBeenLastCalledWith("No paused goal to resume.");
   });
 
+  it("a paused goal steers every turn away from goal work until resumed", async () => {
+    const { pi, tools, commands, events } = makePi();
+    registerGoalTool(pi, { verifyRunner: async () => failVerify });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "stuck work", verify: "npm test" });
+    await commands.get("goal")!.handler("pause", { mode: "headless", ui: { notify: vi.fn(), setStatus: vi.fn() } });
+
+    // While paused: every agent start carries a do-not-work-on-it steer —
+    // the model's context still holds the original "work toward it" instruction.
+    const paused = fire(events, "before_agent_start") as { message: { content: string } };
+    expect(paused.message.content).toContain("Do NOT work toward it this turn");
+
+    // Once resumed, the steer is gone.
+    await commands.get("goal")!.handler("resume", { mode: "headless", ui: { notify: vi.fn(), setStatus: vi.fn() } });
+    expect(fire(events, "before_agent_start")).toBeUndefined();
+  });
+
   it("resume re-derives goal state from the branch and a view command does not corrupt it", async () => {
     const { pi, tools, commands, events } = makePi();
     registerGoalTool(pi);

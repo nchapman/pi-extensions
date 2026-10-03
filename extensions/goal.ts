@@ -984,6 +984,21 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
 
   pi.on("before_agent_start", () => {
     updateFooter(); // re-assert: pi clears extension statuses on rebind/reload
+    // A paused goal must not be worked on: the model's context still holds the
+    // original "work toward the goal" instruction, and without a per-prompt
+    // steer it would keep grinding criteria inside every conversational turn.
+    if (goal && goal.status === "paused") {
+      return {
+        message: {
+          customType: GOAL_REMINDER_TYPE,
+          content:
+            `GOAL PAUSED — goal #${goal.id} was paused by the user for a conversation. ` +
+            "Do NOT work toward it this turn and do not call the goal tool; just respond to the user's message. " +
+            "The user will resume it with /goal resume.",
+          display: false,
+        },
+      };
+    }
     // A between-turns compaction folds the goal out of context and there is no
     // in-progress turn to steer, so re-inject it at the start of the next turn.
     // (Mid-turn compactions are handled directly in the session_compact handler.)
