@@ -20,17 +20,24 @@
  *   failed run is rejected with its output to fix the real cause. A semantic
  *   second opinion (a Jev-style classifier) is a later pass behind the
  *   injectable GoalJudge seam; v1 ships no judge (fail-open floor)
- * - an agent_settled continuation loop keeps the agent working toward the goal:
- *   on every settle, if the goal is still active it injects a followUp restating
- *   the objective + criteria, so the run proceeds turn after turn until the goal
- *   is completed or blocked. Two model-untouchable circuit breakers keep a stuck
- *   run bounded: a per-session cap (PI_GOAL_MAX_CONTINUATIONS) on
- *   auto-continuations, and a per-run turn bound (PI_GOAL_MAX_TURNS_PER_RUN) that
- *   steers a long turn to settle so the cap can re-engage. The model's
- *   set/complete/blocked actions never reset either (a stuck model can't farm
- *   fresh turns by re-setting or faking a completion); both re-arm only on a
- *   resumed session or when the user starts a goal via /goal, and /goal stop
- *   halts the loop session-scoped
+ * - an agent_before_settle continuation loop drives the goal turn by turn: at
+ *   each settle, if the goal is active and carries a `verify` command, the
+ *   extension runs it (bounded), reads the measured state, and queues a HIDDEN
+ *   follow-up (a custom message with display:false, so no visible "keep going"
+ *   line) — "close these measured gaps" when the check fails, "the check passed,
+ *   summarize and call complete" when it passes. The check is graded, not
+ *   boolean: it prints the measured state (coverage %, test summary) and exits 0
+ *   only when the objective is met, so the agent measures, narrates the gap, and
+ *   works until it closes. A footer status (objective + elapsed time) keeps the
+ *   goal in view the whole time. A goal without a verify is user-driven (no
+ *   auto-loop) — the check is what makes progress measurable. Two
+ *   model-untouchable circuit breakers keep a stuck run bounded: a per-session
+ *   cap (PI_GOAL_MAX_CONTINUATIONS) on auto-continuations, and a per-run turn
+ *   bound (PI_GOAL_MAX_TURNS_PER_RUN) that steers a long turn to settle so the
+ *   cap can re-engage. The model's set/complete/blocked actions never reset
+ *   either (a stuck model can't farm fresh turns by re-setting or faking a
+ *   completion); both re-arm only on a resumed session or when the user starts a
+ *   goal via /goal, and /goal stop halts the loop session-scoped
  * - a before_agent_start reminder re-injects the objective + criteria when a
  *   compaction hid it (summaries never carry the goal); a compaction mid-turn
  *   additionally re-injects immediately by steering the in-progress run (no new
@@ -53,6 +60,9 @@ export const MAX_CRITERIA = 20;
 
 /** customType of this extension's one-shot goal reminder message. */
 export const GOAL_REMINDER_TYPE = "goal.reminder";
+
+/** customType of the hidden turn-end check prompt (the graded "close the gaps" / "summarize + complete" message). */
+export const GOAL_CHECK_TYPE = "goal.check";
 
 /** Per-session cap on auto-continuations for a still-active goal (PI_GOAL_MAX_CONTINUATIONS). */
 export const GOAL_MAX_CONTINUATIONS_DEFAULT = 25;
@@ -185,8 +195,16 @@ export interface Goal {
   criteria: string[];
   status: GoalStatus;
   blockedReason?: string;
-  /** Optional shell command that must exit 0 for the goal to count as complete. */
+  /**
+   * Optional measurable check: a shell command that prints the measured state
+   * (coverage %, test summary) and exits 0 only when the objective is met. The
+   * extension runs it at the end of every turn while the goal is active — its
+   * output is the graded signal the agent reads to see what's left, and it must
+   * genuinely exit 0 for the goal to count as complete.
+   */
   verify?: string;
+  /** Wall-clock ms at which the goal was set; the footer shows elapsed time from here. */
+  startedAt: number;
 }
 
 /** Snapshot carried by every goal tool result (see lastGoalSnapshot). */
@@ -241,7 +259,7 @@ const GoalSetParams = Type.Object({
   verify: Type.Optional(
     Type.String({
       description:
-        "Optional shell command that must exit 0 for the goal to count as complete (e.g. `npm test`). The extension runs it on completion — it must genuinely pass, not just be claimed. A no-op that always passes is rejected.",
+        "Optional measurable check: a shell command that prints the measured state (e.g. `npm test`, a coverage report) and exits 0 only when the objective is met. The extension runs it at the end of every turn while the goal is active — it reads the output to see what is still missing and re-engages you to close the gaps, and it must genuinely exit 0 for the goal to count as complete. A no-op that always passes is rejected.",
     }),
   ),
 });
@@ -284,7 +302,9 @@ function isGoal(g: unknown): g is Goal {
     goal.criteria.every((c) => typeof c === "string") &&
     typeof goal.status === "string" &&
     GOAL_STATUSES.includes(goal.status as GoalStatus) &&
-    (goal.verify === undefined || typeof goal.verify === "string")
+    (goal.verify === undefined || typeof goal.verify === "string") &&
+    typeof goal.startedAt === "number" &&
+    Number.isFinite(goal.startedAt)
   );
 }
 
@@ -398,6 +418,27 @@ function clip(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
+/**
+ * Human-friendly elapsed time for the footer. Seconds under a minute, minutes
+ * under an hour ("4m 12s"), hours beyond ("1h 5m"). Negative / non-finite input
+ * clamps to 0s — the footer must never show a negative or NaN timer.
+ */
+export function formatElapsed(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return "0s";
+  const totalSec = Math.floor(ms / 1000);
+  const sec = totalSec % 60;
+  const min = Math.floor(totalSec / 60) % 60;
+  const hr = Math.floor(totalSec / 3600);
+  if (hr > 0) return `${hr}h ${min}m`;
+  if (min > 0) return `${min}m ${sec}s`;
+  return `${sec}s`;
+}
+
+/** Footer status line: `🎯 #1: <objective> · <elapsed>`. */
+export function renderGoalFooter(goal: Goal, now: number): string {
+  return `🎯 #${goal.id}: ${clip(goal.objective, 80)} · ${formatElapsed(now - goal.startedAt)}`;
+}
+
 /** Plain reminder re-injected as a one-shot custom message when a compaction hid the goal. */
 export function renderGoalReminder(goal: Goal): string {
   const lines = [`GOAL REMINDER — active goal #${goal.id}:`, goal.objective, ""];
@@ -412,23 +453,33 @@ export function renderGoalReminder(goal: Goal): string {
 }
 
 /**
- * Continuation prompt injected as a followUp at the end of each turn while a goal
- * is still active — the mechanism that keeps the agent working (and re-states the
- * objective) turn after turn until the goal is completed or blocked.
+ * Turn-end check prompt, injected as a HIDDEN followUp at the end of each turn
+ * while a goal is active. It carries the graded result of the goal's verify
+ * command — the measured state — and either directs the agent to close the
+ * remaining gaps (check failed) or to summarize and complete (check passed).
+ * This is what keeps the agent working turn after turn without a visible
+ * "keep going" line.
  */
-export function renderContinuationPrompt(goal: Goal, continuations: number, max: number): string {
-  const lines = [
-    `GOAL #${goal.id} is not complete — keep working toward it (continuation ${continuations}/${max}):`,
-    goal.objective,
-    "",
-  ];
+export function renderCheckPrompt(goal: Goal, check: VerifyResult, continuations: number, max: number): string {
+  const lines = [`GOAL #${goal.id} — turn-end check (continuation ${continuations}/${max}):`, goal.objective, ""];
   for (const c of effectiveCriteria(goal)) lines.push(`  • ${c}`);
-  lines.push(
-    "Do not stop or write a final summary until every criterion is met AND verified. Make progress this turn — if a step fails, diagnose it and continue; do not declare the goal blocked over a transient failure, and do not redo work already done.",
-  );
-  lines.push(
-    'Before calling complete, re-verify each criterion by actually running the check (read the file / run the test), and cite the real command and its output as evidence. Only call "complete" when every criterion genuinely passes; call "blocked" with a reason only for a true, non-transient impasse.',
-  );
+  const measured = check.output.trim() ? `\n\nMeasured state (verify output):\n${check.output.trim()}` : "";
+  if (check.ok) {
+    lines.push("", `The verify command passed (exit 0).${measured}`, "");
+    lines.push(
+      'The measurable criterion is met. Summarize the final state — what was achieved, the key numbers, what changed — and call the goal tool with action "complete", citing per-criterion evidence from the real commands and their output.',
+    );
+  } else {
+    const why = check.spawnError
+      ? `it could not run (${check.spawnError})`
+      : check.timedOut
+        ? "it timed out"
+        : `it exited ${check.exitCode ?? "?"}`;
+    lines.push("", `The verify command did not pass yet (${why}).${measured}`, "");
+    lines.push(
+      'Do not declare the goal done. Read the measured state above, identify the specific gaps it reveals, and make concrete progress closing them this turn — do not redo work already done. When you believe every criterion is met, re-run the check yourself; only if it genuinely passes, call the goal tool with action "complete" with per-criterion evidence. Call "blocked" only for a true, non-transient impasse.',
+    );
+  }
   return lines.join("\n");
 }
 
@@ -600,6 +651,9 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
   let stopped = false;
   let perRunTurns = 0;
   let perRunNudged = false;
+  // Captured from the latest ctx (session_start / session_tree / agent_before_settle)
+  // so the goal tool handlers (which get no ctx) can still update the footer.
+  let uiRef: ExtensionContext["ui"] | undefined;
   const maxContinuations = options.maxContinuations ?? parseMaxContinuations(process.env[GOAL_MAX_CONTINUATIONS_ENV]);
   const maxTurnsPerRun = options.maxTurnsPerRun ?? parseMaxTurnsPerRun(process.env[GOAL_MAX_TURNS_PER_RUN_ENV]);
   const judge = options.judge;
@@ -611,6 +665,14 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     if (!active.includes(GOAL_TOOL_NAME)) pi.setActiveTools([...active, GOAL_TOOL_NAME]);
   };
 
+  // Footer status: `🎯 #N: <objective> · <elapsed>` while a goal is active, cleared on
+  // completion / block. Best-effort — a missing UI (print mode) is a no-op.
+  const updateFooter = () => {
+    if (goal && goal.status === "active") uiRef?.setStatus("goal", renderGoalFooter(goal, Date.now()));
+    else uiRef?.setStatus("goal", undefined);
+  };
+  const clearFooter = () => uiRef?.setStatus("goal", undefined);
+
   // Reset the auto-continuation budget. Called only at genuine engagement
   // boundaries (resume, a gated completion, a user /goal kickoff) — never on the
   // model's set/blocked, which is how a stuck model would defeat the cap.
@@ -620,6 +682,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
   };
 
   const adoptBranchState = (ctx: ExtensionContext) => {
+    if (ctx.ui) uiRef = ctx.ui;
     const { goal: g, hiddenByCompaction } = scanGoalBranch(ctx.sessionManager.getBranch() as GoalBranchEntry[]);
     goal = g;
     if (g) goalSeq = g.id;
@@ -629,16 +692,18 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     // a finished or blocked one.
     stopped = !(g && g.status === "active");
     if (g && g.status !== "complete") activateTool();
+    updateFooter();
   };
 
   const setGoal = (objective: string, criteria: string[], verify?: string): Goal => {
     goalSeq += 1;
-    goal = { id: goalSeq, objective, criteria, status: "active", ...(verify ? { verify } : {}) };
+    goal = { id: goalSeq, objective, criteria, status: "active", startedAt: Date.now(), ...(verify ? { verify } : {}) };
     compactedSinceUpdate = false;
     // A model-set goal does NOT reset the continuation budget: re-setting the goal
     // must not farm fresh auto-continuations and defeat the cap. The budget
     // re-arms only at resume, a gated completion, or a user /goal kickoff.
     activateTool();
+    updateFooter();
     return goal;
   };
 
@@ -683,24 +748,55 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     return undefined;
   });
 
-  // The continuation loop: on every settle, if the goal is still active and the
-  // loop is armed and under the cap, re-engage the model with a followUp restating
-  // the objective. This is what keeps the agent working turn after turn until the
-  // goal is completed or blocked. At the cap we stop and tell the user, so a stuck
-  // loop can't run away. (agent_settled fires only when the run is fully settled,
-  // so a followUp here starts a fresh turn rather than colliding with one.)
-  pi.on("agent_settled", (_event, ctx) => {
+  // The continuation loop — the "turn-end check" that drives the goal. At each
+  // settle (the point where the run is about to hand control back), if the goal is
+  // active and carries a measurable check, the extension runs the check (bounded),
+  // reads the graded result, and queues a HIDDEN follow-up (display:false — the user
+  // sees no "keep going" line) telling the agent the measured state and what to do
+  // next. Returning { continue: true } makes the session call agent.continue() with
+  // that queued message — a clean in-loop continuation, not a fresh prompt. At the
+  // cap we stop and tell the user, so a stuck loop can't run away.
+  pi.on("agent_before_settle", async (event, ctx) => {
+    if (ctx.ui) uiRef = ctx.ui;
+    // Only re-engage after a clean completion — not after an errored or aborted
+    // run, where re-engaging would just re-run the failure.
+    if (event.outcome === "error" || event.outcome === "aborted") return;
     if (!goal || goal.status !== "active" || stopped) return;
+    if (!goal.verify) return;
     if (continuations >= maxContinuations) {
       stopped = true;
       ctx.ui.notify(
         `Goal #${goal.id} still active after ${maxContinuations} auto-continuations — stopping. ` +
-          "Complete it via the goal tool, adjust it, or stop it.",
+          "Complete it via the goal tool, adjust it, or /goal stop.",
       );
       return;
     }
     continuations += 1;
-    pi.sendUserMessage(renderContinuationPrompt(goal, continuations, maxContinuations), { deliverAs: "followUp" });
+    let check: VerifyResult;
+    try {
+      check = await verifyRunner(goal.verify, { timeoutMs: verifyTimeoutMs });
+    } catch (e) {
+      // The built-in runner never rejects; an injected one might. A throw must
+      // not escape the settle boundary — treat it as a failed check and
+      // re-engage with the error so the model can fix the check itself.
+      check = {
+        ok: false,
+        exitCode: null,
+        timedOut: false,
+        spawnError: e instanceof Error ? e.message : String(e),
+        output: "",
+      };
+    }
+    updateFooter();
+    pi.sendMessage(
+      {
+        customType: GOAL_CHECK_TYPE,
+        content: renderCheckPrompt(goal, check, continuations, maxContinuations),
+        display: false,
+      },
+      { deliverAs: "followUp" },
+    );
+    return { continue: true };
   });
 
   // Per-run busy-loop bound: a stuck model can loop tool calls inside a single
@@ -713,6 +809,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
   });
   pi.on("turn_end", () => {
     if (!goal || goal.status !== "active" || stopped) return;
+    updateFooter(); // keep the footer's elapsed time current during a long run
     perRunTurns += 1;
     if (!perRunNudged && perRunTurns >= maxTurnsPerRun) {
       perRunNudged = true;
@@ -731,7 +828,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     name: GOAL_TOOL_NAME,
     label: "Goal",
     description:
-      'Track a single high-level objective that must be finished and verified. Use it to commit to a goal and to gate its completion: set a goal (optionally with checkable criteria and a `verify` command, e.g. `npm test`, that must exit 0 for the goal to count as done — the extension runs it, so it must genuinely pass, not just be claimed), then work toward it, then call it again with action "complete" and per-criterion evidence (evidence[i] proves criteria[i]) — a free-text \'done\' without proof is rejected, as is a summary that names a failure. Call it with action "blocked" only for a true impasse. Do not use it to organize steps (that is the todo tool) or for work that finishes in a couple of tool calls.',
+      'Track a single high-level objective that must be finished and verified. Use it to commit to a goal and to gate its completion: set a goal (optionally with checkable criteria and a `verify` check, e.g. `npm test` or a coverage report, that prints the measured state and exits 0 only when the objective is met — the extension runs it at the end of every turn, reads the output to see what is still missing, and re-engages you to close the gaps, so it must genuinely exit 0, not just be claimed), then work toward it, then call it again with action "complete" and per-criterion evidence (evidence[i] proves criteria[i]) — a free-text \'done\' without proof is rejected, as is a summary that names a failure. Call it with action "blocked" only for a true impasse. Do not use it to organize steps (that is the todo tool) or for work that finishes in a couple of tool calls.',
     parameters: GoalParams,
     defaultActive: false,
     executionMode: "sequential",
@@ -805,6 +902,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
           return finish(goal, `Goal #${goal.id} NOT completed: ${judgeReason}`, judgeReason);
         }
         goal = { ...goal, status: "complete" };
+        clearFooter();
         // A completion does NOT re-arm the budget: the structural gate is
         // presence-only (no judge in v1), so a self-certifying model could
         // otherwise fake `complete` to farm fresh auto-continuations. The budget
@@ -829,6 +927,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         return finish(goal, `Goal NOT blocked: ${r}`, r);
       }
       goal = { ...goal, status: "blocked", blockedReason: reason };
+      clearFooter();
       return finish(goal, `Goal #${goal.id} blocked: ${reason}`);
 
       function finish(state: Goal | null, text: string, error?: string) {
@@ -883,6 +982,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         // model-owned, so a reload re-adopts the last snapshot and can re-arm.
         stopped = true;
         goal = { ...goal, status: "blocked", blockedReason: "stopped by user" };
+        clearFooter();
         ctx.ui.notify(`Goal #${goal.id} stopped (auto-continuation paused for this session).`);
         return;
       }
@@ -901,7 +1001,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
       // engagement, distinct from the model's autonomous set (which can't re-arm).
       resetContinuationBudget();
       pi.sendUserMessage(
-        `Set the goal "${trimmed}" using the goal tool (action "set"), then work toward it autonomously: keep making tool calls until every part is done and verified — do not stop or write a closing summary before then. When it is genuinely met, call the goal tool with action "complete" and per-criterion evidence that cites the real command and its output.`,
+        `Set the goal "${trimmed}" using the goal tool (action "set"). If the objective is measurable, give it a verify command that prints the current state and exits 0 only when the objective is met — the extension re-runs it at the end of every turn and only lets you complete when it passes. Then work toward the goal, and when it is genuinely met, call the goal tool with action "complete" and per-criterion evidence that cites the real command and its output.`,
         { deliverAs: "followUp" },
       );
       ctx.ui.notify("Goal started; the agent will set it via the goal tool.");

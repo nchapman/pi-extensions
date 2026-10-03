@@ -13,8 +13,9 @@ import {
   parseMaxContinuations,
   parseMaxTurnsPerRun,
   parseVerifyTimeoutMs,
-  renderContinuationPrompt,
+  renderCheckPrompt,
   renderGoalCall,
+  renderGoalFooter,
   renderGoalResult,
   renderGoalReminder,
   runVerify,
@@ -26,6 +27,8 @@ import {
   type GoalDetails,
   type VerifyResult,
   registerGoalTool,
+  formatElapsed,
+  GOAL_CHECK_TYPE,
   VERIFY_TIMEOUT_MS_DEFAULT,
 } from "../extensions/goal";
 
@@ -40,8 +43,14 @@ const goal = (over: Partial<Goal> = {}): Goal => ({
   objective: "fix the failing test",
   criteria: [],
   status: "active",
+  startedAt: 0,
   ...over,
 });
+
+/** Shared fake verify results used across the loop and gate tests. */
+const okVerify: VerifyResult = { ok: true, exitCode: 0, timedOut: false, output: "all green" };
+const failVerify: VerifyResult = { ok: false, exitCode: 1, timedOut: false, output: "FAIL: expected 2 to be 3" };
+const timedOutVerify: VerifyResult = { ok: false, exitCode: null, timedOut: true, output: "" };
 
 function makePi() {
   const tools = new Map<
@@ -57,6 +66,7 @@ function makePi() {
   const events = new Map<string, (event?: unknown, ctx?: unknown) => unknown>();
   const activeTools: string[] = ["read", "bash"];
   const sent: Array<{ text: string; opts?: unknown }> = [];
+  const sentCustom: Array<{ msg: unknown; opts?: unknown }> = [];
   const pi = {
     registerTool: (t: {
       name: string;
@@ -82,8 +92,11 @@ function makePi() {
     sendUserMessage: (text: string, opts?: unknown) => {
       sent.push({ text, opts });
     },
+    sendMessage: (msg: unknown, opts?: unknown) => {
+      sentCustom.push({ msg, opts });
+    },
   } as unknown as ExtensionAPI;
-  return { pi, tools, commands, events, activeTools, sent };
+  return { pi, tools, commands, events, activeTools, sent, sentCustom };
 }
 
 /** Fire a captured event handler (an optional event body overrides the synthesized one). */
@@ -231,14 +244,57 @@ describe("parseMaxTurnsPerRun", () => {
   it("accepts a valid integer", () => expect(parseMaxTurnsPerRun("7")).toBe(7));
 });
 
-describe("renderContinuationPrompt", () => {
-  it("restates the objective, criteria, and the continuation count", () => {
-    const prompt = renderContinuationPrompt(goal({ id: 2, criteria: ["a", "b"] }), 3, 10);
-    expect(prompt).toContain("#2");
-    expect(prompt).toContain("fix the failing test");
-    expect(prompt).toContain("3/10");
-    expect(prompt).toContain("• a");
-    expect(prompt).toContain("• b");
+describe("formatElapsed", () => {
+  it("shows seconds under a minute", () => {
+    expect(formatElapsed(0)).toBe("0s");
+    expect(formatElapsed(45_000)).toBe("45s");
+  });
+  it("shows minutes and seconds under an hour", () => {
+    expect(formatElapsed(252_000)).toBe("4m 12s");
+    expect(formatElapsed(59 * 60_000 + 59_000)).toBe("59m 59s");
+  });
+  it("shows hours and minutes beyond an hour", () => {
+    expect(formatElapsed(3_600_000)).toBe("1h 0m");
+    expect(formatElapsed(3_600_000 + 5 * 60_000)).toBe("1h 5m");
+  });
+  it("clamps negative and non-finite input to 0s", () => {
+    expect(formatElapsed(-5)).toBe("0s");
+    expect(formatElapsed(Number.NaN)).toBe("0s");
+  });
+});
+
+describe("renderGoalFooter", () => {
+  it("shows the objective, id, and elapsed time", () => {
+    const g = goal({ id: 3, objective: "ship it", startedAt: 0 });
+    const footer = renderGoalFooter(g, 252_000); // 4m 12s after start
+    expect(footer).toContain("🎯 #3");
+    expect(footer).toContain("ship it");
+    expect(footer).toContain("4m 12s");
+  });
+});
+
+describe("renderCheckPrompt", () => {
+  const g = goal({ id: 2, criteria: ["a", "b"] });
+  it("on a failed check: the measured state, the gap directive, and the count", () => {
+    const p = renderCheckPrompt(g, failVerify, 3, 10);
+    expect(p).toContain("#2");
+    expect(p).toContain("3/10");
+    expect(p).toContain("FAIL: expected 2 to be 3");
+    expect(p).toContain("did not pass");
+    expect(p).toContain("Do not declare the goal done");
+    expect(p).toContain("• a");
+    expect(p).toContain("• b");
+  });
+  it("on a passing check: the measured state and the summarize+complete directive", () => {
+    const p = renderCheckPrompt(g, okVerify, 1, 10);
+    expect(p).toContain("all green");
+    expect(p).toContain("passed");
+    expect(p).toContain("Summarize the final state");
+    expect(p).toContain("complete");
+  });
+  it("reports a timeout on a failed check", () => {
+    const p = renderCheckPrompt(g, timedOutVerify, 1, 10);
+    expect(p).toContain("timed out");
   });
 });
 
@@ -419,10 +475,6 @@ describe("runVerify", () => {
 });
 
 describe("registerGoalTool — verify", () => {
-  const okVerify: VerifyResult = { ok: true, exitCode: 0, timedOut: false, output: "all green" };
-  const failVerify: VerifyResult = { ok: false, exitCode: 1, timedOut: false, output: "FAIL: expected 2 to be 3" };
-  const timedOutVerify: VerifyResult = { ok: false, exitCode: null, timedOut: true, output: "" };
-
   it("rejects a no-op verify at set time", async () => {
     const { pi, tools } = makePi();
     registerGoalTool(pi);
@@ -532,9 +584,13 @@ describe("registerGoalTool", () => {
     })) as { content: Array<{ type: string; text: string }>; details: GoalDetails };
 
     expect(result.content[0].text).toContain("Goal #1 set");
-    expect(result.details.goal).toEqual(
-      goal({ objective: "ship the smaller fix first", criteria: ["tests green", "lint clean"] }),
-    );
+    expect(result.details.goal).toMatchObject({
+      id: 1,
+      objective: "ship the smaller fix first",
+      criteria: ["tests green", "lint clean"],
+      status: "active",
+    });
+    expect(typeof result.details.goal!.startedAt).toBe("number");
     expect(activeTools).toContain(GOAL_TOOL_NAME);
   });
 
@@ -680,89 +736,99 @@ describe("registerGoalTool", () => {
     expect(result.details.goal?.status).toBe("complete");
   });
 
-  it("keeps the agent going: each settle re-engages the goal with an increasing count", async () => {
-    const { pi, tools, events, sent } = makePi();
-    registerGoalTool(pi, { maxContinuations: 10 });
+  it("the turn-end check re-engages with the measured state and continues", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn() } } as unknown as ExtensionContext;
+    let check = failVerify;
+    registerGoalTool(pi, { maxContinuations: 10, verifyRunner: async () => check });
     const tool = tools.get(GOAL_TOOL_NAME)!;
-    await tool.execute("1", { action: "set", objective: "ship it" });
+    await tool.execute("1", { action: "set", objective: "ship it", verify: "npm test" });
 
-    // Three settles → three re-engagements, numbered 1/10, 2/10, 3/10.
-    for (let i = 0; i < 3; i++) fire(events, "agent_settled");
-    expect(sent).toHaveLength(3);
-    expect(sent[0].text).toContain("1/10");
-    expect(sent[1].text).toContain("2/10");
-    expect(sent[2].text).toContain("3/10");
-    expect(sent[0].text).toContain("ship it");
-    expect(sent[0].opts).toEqual({ deliverAs: "followUp" });
+    // Three settles → three hidden re-engagements, numbered 1/10, 2/10, 3/10.
+    for (let i = 0; i < 3; i++) {
+      expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    }
+    expect(sentCustom).toHaveLength(3);
+    const first = sentCustom[0] as { msg: { customType: string; content: string; display: boolean }; opts: unknown };
+    expect(first.msg.customType).toBe(GOAL_CHECK_TYPE);
+    expect(first.msg.content).toContain("1/10");
+    expect((sentCustom[1] as { msg: { content: string } }).msg.content).toContain("2/10");
+    expect((sentCustom[2] as { msg: { content: string } }).msg.content).toContain("3/10");
+    expect(first.msg.content).toContain("ship it");
+    expect(first.msg.content).toContain("did not pass");
+    expect(first.msg.content).toContain("FAIL: expected 2 to be 3"); // the check's measured output
+    expect(first.msg.display).toBe(false);
+    expect(first.opts).toEqual({ deliverAs: "followUp" });
 
-    // Complete the goal; the loop stops.
+    // Once the check passes and the goal is completed, the loop stops.
+    check = okVerify;
     await tool.execute("2", { action: "complete", goalId: 1, summary: "done", evidence: ["ok"] });
-    fire(events, "agent_settled");
-    expect(sent).toHaveLength(3);
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(sentCustom).toHaveLength(3);
+  });
+
+  it("a passing check prompts the agent to summarize and complete", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn() } } as unknown as ExtensionContext;
+    registerGoalTool(pi, { maxContinuations: 10, verifyRunner: async () => okVerify });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it", verify: "npm test" });
+
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    const msg = sentCustom[0] as { msg: { content: string } };
+    expect(msg.msg.content).toContain("passed");
+    expect(msg.msg.content).toContain("Summarize the final state");
+    expect(msg.msg.content).toContain("all green"); // the check's measured output
+  });
+
+  it("a goal with no verify does not auto-continue (user-driven)", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn() } } as unknown as ExtensionContext;
+    registerGoalTool(pi, { verifyRunner: async () => failVerify });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it" }); // no verify
+
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(sentCustom).toHaveLength(0);
   });
 
   it("a stuck model re-setting the goal cannot defeat the cap", async () => {
-    const { pi, tools, events, sent } = makePi();
+    const { pi, tools, events, sentCustom } = makePi();
     const notify = vi.fn();
-    const ctx = { ui: { notify } } as unknown as ExtensionContext;
-    registerGoalTool(pi, { maxContinuations: 2 });
+    const ctx = { ui: { notify, setStatus: vi.fn() } } as unknown as ExtensionContext;
+    registerGoalTool(pi, { maxContinuations: 2, verifyRunner: async () => failVerify });
     const tool = tools.get(GOAL_TOOL_NAME)!;
-    await tool.execute("1", { action: "set", objective: "stuck goal" });
+    await tool.execute("1", { action: "set", objective: "stuck goal", verify: "npm test" });
 
-    fire(events, "agent_settled", ctx); // continuation 1
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // continuation 1
     // Re-setting the goal mid-loop must NOT reset the continuation budget.
-    await tool.execute("2", { action: "set", objective: "stuck goal" });
-    fire(events, "agent_settled", ctx); // continuation 2
-    fire(events, "agent_settled", ctx); // at cap → stop + notify
-    expect(sent).toHaveLength(2);
+    await tool.execute("2", { action: "set", objective: "stuck goal", verify: "npm test" });
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // continuation 2
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined(); // at cap → stop + notify
+    expect(sentCustom).toHaveLength(2);
     expect(notify).toHaveBeenCalledTimes(1);
     expect(notify.mock.calls[0]![0]).toContain("2");
 
-    fire(events, "agent_settled", ctx); // still capped
-    expect(sent).toHaveLength(2);
-  });
-
-  it("a fake completion cannot farm the continuation cap", async () => {
-    const { pi, tools, events, sent } = makePi();
-    const notify = vi.fn();
-    const ctx = { ui: { notify } } as unknown as ExtensionContext;
-    registerGoalTool(pi, { maxContinuations: 2 });
-    const tool = tools.get(GOAL_TOOL_NAME)!;
-    await tool.execute("1", { action: "set", objective: "farm" });
-
-    fire(events, "agent_settled", ctx); // continuation 1
-    fire(events, "agent_settled", ctx); // continuation 2
-    fire(events, "agent_settled", ctx); // at cap → stopped
-    expect(sent).toHaveLength(2);
-    expect(notify).toHaveBeenCalledTimes(1);
-
-    // The model "completes" (the structural gate passes on presence) and sets a
-    // new goal. Completion must NOT refund the budget, so the loop stays stopped.
-    await tool.execute("2", { action: "complete", goalId: 1, summary: "done", evidence: ["did it"] });
-    await tool.execute("3", { action: "set", objective: "farm again" });
-    fire(events, "agent_settled", ctx);
-    expect(sent).toHaveLength(2);
-    expect(notify).toHaveBeenCalledTimes(1);
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined(); // still capped
+    expect(sentCustom).toHaveLength(2);
   });
 
   it("re-arms the continuation loop when an active goal is resumed", async () => {
-    const { pi, tools, events, sent } = makePi();
+    const { pi, tools, events, sentCustom } = makePi();
     const notify = vi.fn();
-    const ctx = { ui: { notify } } as unknown as ExtensionContext;
-    registerGoalTool(pi, { maxContinuations: 1 });
+    const ctx = { ui: { notify, setStatus: vi.fn() } } as unknown as ExtensionContext;
+    registerGoalTool(pi, { maxContinuations: 1, verifyRunner: async () => failVerify });
     const tool = tools.get(GOAL_TOOL_NAME)!;
-    await tool.execute("1", { action: "set", objective: "resumable" });
+    await tool.execute("1", { action: "set", objective: "resumable", verify: "npm test" });
 
     // Drive the loop to the cap so it is stopped.
-    fire(events, "agent_settled", ctx); // continuation 1
-    fire(events, "agent_settled", ctx); // at cap → stopped
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // continuation 1
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined(); // at cap → stopped
     expect(notify).toHaveBeenCalledTimes(1);
 
     // Resume re-derives the (still active) goal and re-arms the loop.
-    const branch = [goalSnapshot(goal({ id: 1, objective: "resumable", status: "active" }))];
+    const branch = [goalSnapshot(goal({ id: 1, objective: "resumable", verify: "npm test", status: "active" }))];
     fire(events, "session_start", sessionCtx(branch));
-    fire(events, "agent_settled"); // re-engages with a fresh budget
-    expect(sent).toHaveLength(2);
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // re-engages with a fresh budget
+    expect(sentCustom).toHaveLength(2);
   });
 
   it("bounds a within-run busy-loop by steering a settle once per run", async () => {
@@ -797,32 +863,111 @@ describe("registerGoalTool", () => {
   });
 
   it("stops auto-continuing at the cap and notifies", async () => {
-    const { pi, tools, events, sent } = makePi();
+    const { pi, tools, events, sentCustom } = makePi();
     const notify = vi.fn();
-    const ctx = { ui: { notify } } as unknown as ExtensionContext;
-    registerGoalTool(pi, { maxContinuations: 2 });
+    const ctx = { ui: { notify, setStatus: vi.fn() } } as unknown as ExtensionContext;
+    registerGoalTool(pi, { maxContinuations: 2, verifyRunner: async () => failVerify });
     const tool = tools.get(GOAL_TOOL_NAME)!;
-    await tool.execute("1", { action: "set", objective: "stuck goal" });
+    await tool.execute("1", { action: "set", objective: "stuck goal", verify: "npm test" });
 
-    fire(events, "agent_settled", ctx); // continuation 1
-    fire(events, "agent_settled", ctx); // continuation 2
-    fire(events, "agent_settled", ctx); // at cap → stop + notify
-    expect(sent).toHaveLength(2);
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined(); // at cap → stop + notify
+    expect(sentCustom).toHaveLength(2);
     expect(notify).toHaveBeenCalledTimes(1);
     expect(notify.mock.calls[0]![0]).toContain("2");
 
     // Stopped: no further continuations on more settles.
-    fire(events, "agent_settled", ctx);
-    expect(sent).toHaveLength(2);
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(sentCustom).toHaveLength(2);
   });
 
   it("does not auto-continue a non-active goal", async () => {
-    const { pi, tools, events, sent } = makePi();
-    registerGoalTool(pi);
-    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x" });
+    const { pi, tools, events, sentCustom } = makePi();
+    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn() } } as unknown as ExtensionContext;
+    registerGoalTool(pi, { verifyRunner: async () => okVerify });
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    await tool.execute("1", { action: "set", objective: "x", verify: "npm test" });
+    await tool.execute("2", { action: "complete", goalId: 1, summary: "done", evidence: ["ok"] });
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(sentCustom).toHaveLength(0);
+  });
+
+  it("does not re-engage after an errored or aborted run", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn() } } as unknown as ExtensionContext;
+    registerGoalTool(pi, { verifyRunner: async () => failVerify });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
+
+    expect(
+      await fire(events, "agent_before_settle", ctx, { type: "agent_before_settle", outcome: "error" }),
+    ).toBeUndefined();
+    expect(
+      await fire(events, "agent_before_settle", ctx, { type: "agent_before_settle", outcome: "aborted" }),
+    ).toBeUndefined();
+    expect(sentCustom).toHaveLength(0);
+  });
+
+  it("a throwing verify runner degrades to a failed check instead of rejecting the boundary", async () => {
+    const { pi, events, sentCustom } = makePi();
+    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn() } } as unknown as ExtensionContext;
+    registerGoalTool(pi, {
+      verifyRunner: async () => {
+        throw new Error("boom");
+      },
+    });
+
+    // Seed the goal via resume (bypasses the set-time preflight).
+    fire(events, "session_start", sessionCtx([goalSnapshot(goal({ id: 1, objective: "x", verify: "npm test" }))]));
+
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    const msg = sentCustom[0] as { msg: { content: string } };
+    expect(msg.msg.content).toContain("could not run");
+    expect(msg.msg.content).toContain("boom");
+  });
+
+  it("shows the footer while active and clears it on completion or block", async () => {
+    const { pi, tools, events } = makePi();
+    const notify = vi.fn();
+    const setStatus = vi.fn();
+    const uiCtx = { ui: { notify, setStatus } } as unknown as ExtensionContext;
+    registerGoalTool(pi, { verifyRunner: async () => okVerify });
+
+    // Prime uiRef the way a real session does.
+    fire(events, "session_start", {
+      sessionManager: { getBranch: () => [] },
+      ui: { notify, setStatus },
+    } as unknown as ExtensionContext);
+
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it", verify: "npm test" });
+    expect(setStatus).toHaveBeenLastCalledWith("goal", expect.stringContaining("🎯 #1: ship it"));
+
+    // turn_end keeps the timer current during a long run; a settle refreshes it too.
+    fire(events, "turn_end");
+    expect(setStatus).toHaveBeenLastCalledWith("goal", expect.stringContaining("🎯 #1: ship it"));
+    await fire(events, "agent_before_settle", uiCtx);
+    expect(setStatus).toHaveBeenLastCalledWith("goal", expect.stringContaining("🎯 #1: ship it"));
+
+    // Completion clears the footer.
     await tools.get(GOAL_TOOL_NAME)!.execute("2", { action: "complete", goalId: 1, summary: "done", evidence: ["ok"] });
-    fire(events, "agent_settled");
-    expect(sent).toHaveLength(0);
+    expect(setStatus).toHaveBeenLastCalledWith("goal", undefined);
+  });
+
+  it("clears the footer when the goal is blocked", async () => {
+    const { pi, tools, events } = makePi();
+    const setStatus = vi.fn();
+    const uiCtx = { ui: { notify: vi.fn(), setStatus } } as unknown as ExtensionContext;
+    registerGoalTool(pi);
+    fire(events, "session_start", {
+      sessionManager: { getBranch: () => [] },
+      ui: uiCtx.ui,
+    } as unknown as ExtensionContext);
+
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "migrate db" });
+    expect(setStatus).toHaveBeenLastCalledWith("goal", expect.stringContaining("🎯 #1: migrate db"));
+
+    await tools.get(GOAL_TOOL_NAME)!.execute("2", { action: "blocked", goalId: 1, reason: "stuck" });
+    expect(setStatus).toHaveBeenLastCalledWith("goal", undefined);
   });
 
   it("stays quiet when there is no active goal", () => {
@@ -891,25 +1036,28 @@ describe("registerGoalTool", () => {
   });
 
   it("/goal stop halts the loop on an active goal and does nothing without one", async () => {
-    const { pi, tools, commands, events, sent } = makePi();
-    registerGoalTool(pi, { maxContinuations: 10 });
+    const { pi, tools, commands, events, sentCustom } = makePi();
     const notify = vi.fn();
-    const ctx = { mode: "headless", ui: { notify } };
+    const setStatus = vi.fn();
+    const cmdCtx = { mode: "headless", ui: { notify, setStatus } };
+    const settleCtx = { ui: { notify, setStatus } } as unknown as ExtensionContext;
+    registerGoalTool(pi, { maxContinuations: 10, verifyRunner: async () => failVerify });
 
-    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "stuck work" });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "stuck work", verify: "npm test" });
 
     // Without stop, settles keep re-engaging the goal.
-    fire(events, "agent_settled");
-    expect(sent).toHaveLength(1);
+    expect(await fire(events, "agent_before_settle", settleCtx)).toEqual({ continue: true });
+    expect(sentCustom).toHaveLength(1);
 
-    await commands.get("goal")!.handler("stop", ctx);
+    await commands.get("goal")!.handler("stop", cmdCtx);
     expect(notify).toHaveBeenLastCalledWith(expect.stringContaining("stopped"));
-    // The stop marks the goal blocked session-scoped; the loop halts.
-    fire(events, "agent_settled");
-    expect(sent).toHaveLength(1);
+    // The stop marks the goal blocked session-scoped, clears the footer, and halts the loop.
+    expect(setStatus).toHaveBeenLastCalledWith("goal", undefined);
+    expect(await fire(events, "agent_before_settle", settleCtx)).toBeUndefined();
+    expect(sentCustom).toHaveLength(1);
 
     // Stopping with no active goal is a no-op.
-    await commands.get("goal")!.handler("stop", ctx);
+    await commands.get("goal")!.handler("stop", cmdCtx);
     expect(notify).toHaveBeenLastCalledWith("No active goal to stop.");
   });
 
