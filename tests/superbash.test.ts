@@ -195,12 +195,29 @@ describe("formatReminderWake", () => {
 
   it("reports the task, elapsed time, and note", () => {
     expect(formatReminderWake(task, 252_000, "check the build")).toBe(
-      "[reminder] t-1134z8v (bash, 4m12s) still running — check the build",
+      "[reminder] t-1134z8v (bash, 4m12s) still running — check the build" +
+        "\nNothing here needs action: end your turn unless you'd act differently at a later check-in. A long elapsed time alone is not a reason to kill or restart — the completion wake is automatic; kill only if the result is no longer wanted.",
     );
   });
 
   it("omits the note when none was given", () => {
-    expect(formatReminderWake(task, 30_000)).toBe("[reminder] t-1134z8v (bash, 30s) still running");
+    expect(formatReminderWake(task, 30_000)).toBe(
+      "[reminder] t-1134z8v (bash, 30s) still running\nNothing here needs action: end your turn unless you'd act differently at a later check-in. A long elapsed time alone is not a reason to kill or restart — the completion wake is automatic; kill only if the result is no longer wanted.",
+    );
+  });
+
+  it("includes the task's progress line when it has one", () => {
+    const withProgress = { ...task, progress: () => "new output since the last look (10B):\nhi" };
+    expect(formatReminderWake(withProgress, 30_000)).toContain(
+      "still running\nnew output since the last look (10B):\nhi\nNothing here needs action",
+    );
+  });
+
+  it("falls back to the subagent signal note when there is no progress to report", () => {
+    const subagentTask = { ...task, kind: "subagent" } as const;
+    expect(formatReminderWake(subagentTask, 30_000)).toContain(
+      "subagents stream no output, so elapsed time is the only signal",
+    );
   });
 });
 
@@ -393,7 +410,10 @@ describe("createTaskRegistry", () => {
       d.registry.remind(id, 300_000, "check the build");
       d.timers[0].fn();
       expect(d.sendUserMessage).toHaveBeenCalledTimes(1);
-      expect(d.sendUserMessage).toHaveBeenCalledWith(`[reminder] ${id} (bash, 0s) still running — check the build`);
+      expect(d.sendUserMessage).toHaveBeenCalledWith(
+        `[reminder] ${id} (bash, 0s) still running — check the build` +
+          "\nNothing here needs action: end your turn unless you'd act differently at a later check-in. A long elapsed time alone is not a reason to kill or restart — the completion wake is automatic; kill only if the result is no longer wanted.",
+      );
       d.timers[0].fn(); // fire-once: the second fire is a no-op
       expect(d.sendUserMessage).toHaveBeenCalledTimes(1);
     });
@@ -497,8 +517,10 @@ describe("createBashTool", () => {
     expect(tool.description).toContain('"background" returns a task id immediately');
     expect(tool.description).toContain("even mid-run");
     expect(tool.description).toContain("never sleep or poll");
+    expect(tool.description).toContain("end your turn");
     expect(tool.description).toContain("no default");
-    expect(tool.promptGuidelines.join("\n")).toContain("never sleep or poll");
+    expect(tool.promptGuidelines.join("\n")).toMatch(/never sleep or poll/i);
+    expect(tool.promptGuidelines.join("\n")).toContain("end your turn");
   });
 
   it("returns a task id immediately and adopts the still-running command (background)", async () => {
@@ -517,6 +539,9 @@ describe("createBashTool", () => {
     expect(textOf(result)).toContain("delivered to you automatically");
     expect(textOf(result)).toContain("even mid-run");
     expect(textOf(result)).toContain("Never sleep or poll");
+    expect(textOf(result)).toContain("end your turn");
+    // The notice must not suggest arming a check-in — task_remind scoped to its own tool only.
+    expect(textOf(result)).not.toContain("task_remind");
     expect(result.structuredContent).toEqual({ backgrounded: true, task_id: id });
   });
 
@@ -1122,7 +1147,7 @@ describe("createTaskTool", () => {
     const subId = d.registry.adopt({ name: "reviewer", kind: "subagent", kill: () => undefined });
     const result = await d.tool.execute("1", { id: subId }, undefined, undefined, d.ctx);
     expect(textOf(result)).toContain("subagent, running");
-    expect(textOf(result)).toContain("no streaming output");
+    expect(textOf(result)).toContain("stream no output");
   });
 
   it("reports a settled bash task with its status and full-output path", async () => {
@@ -1192,15 +1217,18 @@ describe("createTaskRemindTool", () => {
       undefined,
     );
     expect(textOf(result)).toContain(`Check-in set for ${id} in 5m — check the build`);
+    expect(textOf(result)).toContain("not a way to wait");
     expect(result.details).toMatchObject({ kind: "task_remind", in_ms: 300_000 });
     expect(d.registry.reminderFor(id)).toEqual({ ms: 300_000, note: "check the build" });
   });
 
-  it("re-arming replaces the pending check-in", async () => {
+  it("re-arming replaces the pending check-in and says so", async () => {
     const d = remindDeps();
     const id = d.registry.adopt({ name: "a", kind: "bash", kill: () => undefined });
-    await d.tool.execute("1", { id, in_ms: 1000 }, undefined, undefined, undefined);
-    await d.tool.execute("2", { id, in_ms: 2000 }, undefined, undefined, undefined);
+    const first = await d.tool.execute("1", { id, in_ms: 1000 }, undefined, undefined, undefined);
+    expect(textOf(first)).not.toContain("replacing");
+    const second = await d.tool.execute("2", { id, in_ms: 2000 }, undefined, undefined, undefined);
+    expect(textOf(second)).toContain("replacing the earlier check-in, was in 1s");
     expect(d.timers[0].cancelled).toBe(true);
     expect(d.registry.reminderFor(id)).toEqual({ ms: 2000, note: undefined });
   });
@@ -1258,7 +1286,10 @@ describe("createTaskRemindTool", () => {
     await d.tool.execute("1", { id, in_ms: 300_000, note: "check the build" }, undefined, undefined, undefined);
     d.timers[0].fn();
     expect(d.sendUserMessage).toHaveBeenCalledTimes(1);
-    expect(d.sendUserMessage).toHaveBeenCalledWith(`[reminder] ${id} (bash, 0s) still running — check the build`);
+    expect(d.sendUserMessage).toHaveBeenCalledWith(
+      `[reminder] ${id} (bash, 0s) still running — check the build` +
+        "\nNothing here needs action: end your turn unless you'd act differently at a later check-in. A long elapsed time alone is not a reason to kill or restart — the completion wake is automatic; kill only if the result is no longer wanted.",
+    );
   });
 
   it("drops the check-in when the task settled first", async () => {

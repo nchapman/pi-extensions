@@ -382,7 +382,7 @@ export function formatUsageLine(u: ChildUsage): string {
  * arrives on its own and that sleep-polling is pure waste (the wake would
  * land when the sleep returns; the sleep just burns its whole duration). */
 export function backgroundedNotice(agentName: string, id: string): string {
-  return `Subagent "${agentName}" is still running — moved to the background (${id}). When it completes, its result is delivered to you automatically as your next message — even mid-run, while you keep working — so continue other work; never sleep or poll to wait for it. Check on it with task ${id}; schedule a check-in with task_remind. The hard timeout still applies.`;
+  return `Subagent "${agentName}" is still running — moved to the background (${id}). When it completes, its result is delivered to you automatically as your next message — even mid-run. If you have nothing else to do, end your turn: the wake re-engages you, so waiting is never your job. Never sleep or poll to wait, and don't arm a check-in just to wait — the result arrives on its own. Peek with task ${id}; stop it with task_kill ${id} if the result is no longer wanted. The hard timeout still applies.`;
 }
 
 /** Adopt a still-running child into the registry and wire its wake. Returns the task id. */
@@ -763,7 +763,7 @@ const modelField = Type.Optional(
 const backgroundField = Type.Optional(
   Type.Boolean({
     description:
-      "Run in the background: return immediately with a task id; the result is delivered to you automatically as your next message, even mid-run.",
+      "Run in the background: return immediately with a task id, then end your turn if you have nothing else to do — the result is delivered to you automatically as your next message, even mid-run.",
   }),
 );
 const taskItem = Type.Object({
@@ -804,12 +804,12 @@ Available agents:
 ${agentList}
 Alternatively pass agent_md: a full agent definition in markdown (frontmatter + system prompt) for an ad-hoc specialist. With neither, a generic read-only investigator runs.
 The subagent runs to completion and returns its final response. Use for reviews, research, and any work that benefits from an isolated context.
-Subagents block until they finish by default — waiting on a tool call costs nothing. Pass background: true for known-long work: the tool returns immediately and the result is delivered to you automatically as your next message — even mid-run, while you keep working; never sleep or poll waiting for it.`,
+By default the call blocks until the subagent finishes — waiting on a tool call costs nothing. Pass background: true for long work you have other work to do alongside: the tool returns a task id immediately and the result is delivered to you automatically as your next message, even mid-run — if you have nothing else to do, end your turn; the wake re-engages you. Never sleep or poll to wait.`,
     promptSnippet: "Delegate a task to a focused subagent (isolated pi session)",
     promptGuidelines: [
       "Use subagent for self-contained work (reviews, research, audits); the subagent only sees the task text you pass, so include all needed context.",
       "For a bespoke specialist, pass agent_md with the exact instructions and tool restrictions instead of forcing a named agent to fit.",
-      "Subagent calls block until they finish by default; background: true opts a run into the background — the result is delivered to you automatically as your next message, even mid-run — continue other work and never sleep or poll.",
+      "Subagents block until they finish — waiting costs nothing. Pass background: true only when you have other work to do alongside; the backgrounded result arrives as your next message, even mid-run — end your turn if you have nothing else to do. Never sleep or poll to wait.",
     ],
     parameters: taskItem,
     renderCall(args, theme, context) {
@@ -878,11 +878,11 @@ Subagents block until they finish by default — waiting on a tool call costs no
 Available agents:
 ${agentList}
 Each task may instead include agent_md (an inline agent definition) or omit both to use the generic read-only investigator.
-Tasks block until they finish by default. Pass background: true per task for known-long work — that task backgrounds immediately and its result is then delivered to you automatically as your next message, even mid-run; never sleep or poll waiting for one.`,
+By default the call blocks until every subagent finishes — waiting on a tool call costs nothing. Pass background: true per task for long work you have other work to do alongside: that task returns a task id immediately and its result is delivered to you automatically as your next message, even mid-run — if you have nothing else to do, end your turn; the wake re-engages you. Never sleep or poll to wait.`,
     promptSnippet: "Run several subagent tasks in parallel",
     promptGuidelines: [
       "Use subagents for independent, self-contained tasks that benefit from parallel isolated sessions; each subagent only sees its own task text, so include all needed context.",
-      "Subagent tasks block until they finish by default; background: true per task opts into the background — the result is delivered to you automatically as your next message, even mid-run — continue other work and never sleep or poll.",
+      "Subagents block until they finish — waiting costs nothing. Pass background: true per task only when you have other work to do alongside; backgrounded results arrive as your next message, even mid-run — end your turn if you have nothing else to do. Never sleep or poll to wait.",
     ],
     parameters: Type.Object({
       tasks: Type.Array(taskItem, { minItems: 1, description: "Tasks to run in parallel" }),
@@ -938,7 +938,7 @@ Tasks block until they finish by default. Pass background: true per task for kno
           r.status === "rejected"
             ? `ERROR: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`
             : "adopted" in r.value
-              ? `Still running — backgrounded as ${r.value.id}; when it completes, the result is delivered to you automatically as your next message, even mid-run — never sleep or poll.`
+              ? `Still running — backgrounded as ${r.value.id}.`
               : r.value.text;
         return `### ${label}\n${body}`;
       });
@@ -956,8 +956,14 @@ Tasks block until they finish by default. Pass background: true per task for kno
         ),
       );
       const backgroundedCount = results.filter((r) => r.status === "fulfilled" && "adopted" in r.value).length;
+      // One shared footer, not a paragraph per task: N repetitions of the
+      // same contract trains skimming, and the batch is where several long
+      // runs land at once.
+      const bgFooter = backgroundedCount
+        ? `\n\n${backgroundedCount} task${backgroundedCount > 1 ? "s" : ""} still running — if you have nothing else to do, end your turn; the wakes re-engage you. Never sleep or poll to wait, and don't arm check-ins just to wait — results arrive on their own.`
+        : "";
       return {
-        content: [{ type: "text", text: sections.join("\n\n---\n\n") }],
+        content: [{ type: "text", text: sections.join("\n\n---\n\n") + bgFooter }],
         details: { count: params.tasks.length, ...(backgroundedCount ? { backgrounded: backgroundedCount } : {}) },
         ...(usage ? { usage } : {}),
       };

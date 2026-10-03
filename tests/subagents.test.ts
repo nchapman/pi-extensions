@@ -918,7 +918,10 @@ describe("formatUsageLine / backgroundedNotice", () => {
     // forbids sleep-polling (which can only waste time, never help).
     expect(notice).toContain("delivered to you automatically");
     expect(notice).toContain("even mid-run");
-    expect(notice).toContain("never sleep or poll");
+    expect(notice).toMatch(/[Nn]ever sleep or poll/);
+    expect(notice).toContain("end your turn");
+    // No check-in suggestions in the notice — task_remind is scoped to its own tool.
+    expect(notice).not.toContain("task_remind");
   });
 });
 
@@ -1003,7 +1006,8 @@ describe("registerSubagentTools with a registry", () => {
     expect(result.details.id).toMatch(/^t-/);
     expect(result.content[0].text).toContain(result.details.id);
     expect(result.content[0].text).toContain("even mid-run");
-    expect(result.content[0].text).toContain("never sleep or poll");
+    expect(result.content[0].text).toMatch(/[Nn]ever sleep or poll/);
+    expect(result.content[0].text).toContain("end your turn");
     expect(registry.running()).toHaveLength(1);
 
     children[0].stdoutEmit(jsonLine("late but worth it"));
@@ -1061,9 +1065,11 @@ describe("registerSubagentTools with a registry", () => {
 
     expect(result.content[0].text).toContain("### reviewer\nfast ok");
     expect(result.content[0].text).toMatch(/backgrounded as t-[0-9a-z]+/);
-    // The inline backgrounded section teaches the wake contract too.
-    expect(result.content[0].text).toContain("even mid-run");
-    expect(result.content[0].text).toContain("never sleep or poll");
+    // The wake contract rides in one shared footer, not per-task paragraphs.
+    expect(result.content[0].text).toContain("Still running — backgrounded as");
+    expect(result.content[0].text).toContain("still running — if you have nothing else to do, end your turn");
+    expect(result.content[0].text).toMatch(/[Nn]ever sleep or poll/);
+    expect(result.content[0].text).toContain("don't arm check-ins just to wait");
     expect(result.details).toMatchObject({ count: 2, backgrounded: 1 });
     // Only the fast child's usage rides inline; the slow one's comes in its wake.
     expect(result.usage).toEqual(USAGE());

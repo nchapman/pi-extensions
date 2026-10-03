@@ -10,9 +10,9 @@
  *   session (the existing PI_SUBAGENT_TIMEOUT_MS hard kill still applies while
  *   running in the background)
  * - one tool for every CLI task, named `bash` so it replaces the built-in by
- *   name: wait: "inline" delegates to pi's own bash tool (identical streaming,
- *   truncation, temp-file stashing, structured output); wait: "auto"
- *   (default) blocks for up to a ~2m window and then promotes to the
+ *   name: wait: "inline" (default) delegates to pi's own bash tool (identical
+ *   streaming, truncation, temp-file stashing, structured output); wait: "auto"
+ *   blocks for up to a ~2m window and then promotes to the
  *   background exactly like subagents do; wait: "background" returns the task
  *   id immediately. No default timeout — the agent decides; 0 or omitted
  *   means no timeout
@@ -85,6 +85,10 @@ export interface BgTask {
   endedAt?: number;
   /** Short terminal status line ("exited 0", "completed", …) recorded on complete. */
   status?: string;
+  /** Live progress line for check-in wakes; undefined when the kind has nothing to report.
+   *  Consuming: calling it advances the reminder channel's read offset — the
+   *  delta it reports is one-shot, so call it exactly once per wake. */
+  progress?: () => string | undefined;
 }
 
 /** The handle runChild hands over at adoption: the child's eventual outcome, plus a kill switch. */
@@ -113,7 +117,12 @@ export interface TaskDeps {
 
 export interface TaskRegistry {
   /** Register a running task; returns its id (t-<base36 time>, e.g. t-1134z8v). */
-  adopt(record: { name: string; kind: "subagent" | "bash"; kill: () => void }): string;
+  adopt(record: {
+    name: string;
+    kind: "subagent" | "bash";
+    kill: () => void;
+    progress?: () => string | undefined;
+  }): string;
   /**
    * Record the outcome and deliver the wake exactly once; a no-op for unknown
    * or non-running tasks. wake: false records without messaging — the tool
@@ -229,7 +238,14 @@ export function formatSubagentWake(
 /** The wake message for a scheduled check-in on a task that is still running. */
 export function formatReminderWake(task: BgTask, elapsedMs: number, note?: string): string {
   const notePart = note ? ` — ${note}` : "";
-  return `[reminder] ${task.id} (${task.kind}, ${formatDuration(elapsedMs)}) still running${notePart}`;
+  // The wake must be content-bearing: a bare elapsed time is the only salient
+  // number otherwise, and it reads as pressure — the observed 3m→1m check-in
+  // escalation ended in killing a healthy run ~90s early.
+  const progress =
+    task.progress?.() ??
+    (task.kind === "subagent" ? "subagents stream no output, so elapsed time is the only signal" : undefined);
+  const progressPart = progress ? `\n${progress}` : "";
+  return `[reminder] ${task.id} (${task.kind}, ${formatDuration(elapsedMs)}) still running${notePart}${progressPart}\nNothing here needs action: end your turn unless you'd act differently at a later check-in. A long elapsed time alone is not a reason to kill or restart — the completion wake is automatic; kill only if the result is no longer wanted.`;
 }
 
 /** The "Check-ins:" block appended to task listings (task tool and /tasks). */
@@ -311,6 +327,7 @@ export function createTaskRegistry(deps: TaskDeps = {}): TaskRegistry {
         state: "running",
         startedAt: now(),
         kill: record.kill,
+        progress: record.progress,
       });
       refreshStatus();
       return id;
@@ -379,6 +396,9 @@ export function createTaskRegistry(deps: TaskDeps = {}): TaskRegistry {
 
 /** Rolling per-command output kept in memory so a chatty process can't grow the parent. */
 export const BASH_TAIL_CAP = 8_192;
+
+/** Tail cap for a check-in wake's progress line — a nudge, not a dump. */
+export const REMINDER_TAIL_CAP = 500;
 
 /** Node clamps out-of-range setTimeout delays to 1ms — an instant kill. Keep timeouts schedulable. */
 export const MAX_TIMEOUT_MS = 2_147_483_647;
@@ -519,9 +539,9 @@ const UPDATE_THROTTLE_MS = 100;
 /**
  * The unified bash tool — replaces the built-in by name and covers the whole
  * range of "run a CLI task":
- * - wait: "inline" — delegates to pi's own bash tool (same streaming,
+ * - wait: "inline" (default) — delegates to pi's own bash tool (same streaming,
  *   truncation, temp-file stashing, structured output); no task is registered
- * - wait: "auto" (default) — blocks up to the window, streaming live output to
+ * - wait: "auto" — blocks up to the window, streaming live output to
  *   the TUI; a command that finishes in time returns a built-in-style result
  *   inline, one that doesn't is promoted to the background and the tool
  *   returns its task id, with the wake delivering the result later
@@ -564,13 +584,13 @@ export function createBashTool(
     name: "bash",
     label: "bash",
     description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first); when truncated, the full output is saved to a file whose path the result includes.
-wait: "inline" (default) blocks until the command finishes and returns its output — waiting on a tool call costs nothing, so this is the normal choice; pass a timeout to bound a command you're unsure about. wait: "auto" blocks while the command runs, up to ~${formatDuration(descWindowMs)} — a command that finishes in time returns its output inline, one that doesn't move to the background and return a task id (t-xxxxx). "background" returns a task id immediately. A backgrounded command's result (exit status, duration, output tail) is delivered to you automatically as your next message, even mid-run — never sleep or poll waiting for it. Check on a running task with task <id>; schedule a one-shot check-in with task_remind; stop it with task_kill.
+wait: "inline" (default) blocks until the command finishes and returns its output — waiting on a tool call costs nothing, so this is the normal choice; pass a timeout to bound a command you're unsure about. wait: "auto" blocks up to ~${formatDuration(descWindowMs)} — a command that finishes in time returns its output inline, one that doesn't move to the background and return a task id (t-xxxxx). "background" returns a task id immediately — for work you'll do other things while it runs. A backgrounded command's result (exit status, duration, output tail) is delivered to you automatically as your next message, even mid-run — if you have nothing else to do, end your turn and the wake re-engages you; never sleep or poll to wait. Peek at a running task with task <id> only when its new output would change what you do; stop it with task_kill.
 Timeout is in seconds, optional, no default — a command without a timeout runs until it finishes or is killed (0 also means no timeout).`,
     promptSnippet: "Execute bash commands (ls, grep, find, etc.)",
     promptGuidelines: [
-      "Default to plain blocking (inline) — waiting on a tool call costs nothing; pass a timeout to bound commands you're unsure about. Use wait: auto only when you want a bounded block before backgrounding; wait: background for long-running work (builds, test suites, migrations) whose result you need later.",
-      "Background results are delivered to you automatically as your next message, even mid-run — continue other work; never sleep or poll waiting for them.",
-      "Peek at a running task with task <id>; schedule a one-shot check-in with task_remind; stop a task with task_kill.",
+      "Default to plain blocking (inline): waiting on a tool call costs nothing. Use wait: background for long-running work (builds, test suites, migrations) you have other work to do alongside; wait: auto only when you want a bounded block before backgrounding.",
+      "Background results are delivered to you automatically as your next message, even mid-run — if you have nothing else to do, end your turn; the wake re-engages you. Never sleep or poll to wait.",
+      "Peek at a running task with task <id> only when new output would change what you do; otherwise end your turn and let the completion wake re-engage you. Stop a task with task_kill.",
       "You can inspect PI_* environment variables for current model and session details.",
     ],
     parameters: Type.Object({
@@ -662,6 +682,9 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
       let logStream: import("node:fs").WriteStream | undefined;
       let logPath: string | undefined;
       let logFailed = false;
+      // Read offset for check-in wake progress lines (independent of the task
+      // tool's peek offsets, which live in that tool's closure).
+      let remindReadOffset = 0;
       const ensureLog = () => {
         if (logStream || logFailed) return;
         logPath = sessionDir ? outputLogPath(sessionDir, id) : tempOutputLogPath(id);
@@ -725,6 +748,20 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
       const id = registry.adopt({
         name: bashCommandHead(command),
         kind: "bash",
+        // Check-in wakes read the log from their own offset, so each wake
+        // carries the output that appeared since the last look — the wake is
+        // content-bearing, never just an elapsed-time nag.
+        progress: () => {
+          if (!logPath || !existsSync(logPath)) return "(no output yet)";
+          const size = statSync(logPath).size;
+          if (size <= remindReadOffset) return "no new output since the last look";
+          // Show the tail of the delta, like a first peek does — the head of a
+          // large delta (build banners) is the least informative slice.
+          const chunk = readLogChunk(logPath, Math.max(remindReadOffset, size - REMINDER_TAIL_CAP), REMINDER_TAIL_CAP);
+          if (!chunk) return "(no output yet)";
+          remindReadOffset = size;
+          return `new output since the last look (${formatSize(chunk.bytes)}):\n${chunk.text}`;
+        },
         kill: () => {
           controller.abort();
           // A killed task leaves no orphaned log: stop writes, remove the
@@ -817,7 +854,7 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
           {
             type: "text",
             text: `Backgrounded (${id}): ${bashCommandHead(command)}
-The command keeps running in the background. When it exits, the exit status, duration, and output tail are delivered to you automatically as your next message — even mid-run, while you keep working. Check on it with task ${id}; schedule a one-shot check-in with task_remind ${id} <in_ms>. Never sleep or poll waiting for it.`,
+The command keeps running in the background. When it exits, the exit status, duration, and output tail are delivered to you automatically as your next message — even mid-run. If you have nothing else to do, end your turn: the wake re-engages you, so waiting is never your job. Never sleep or poll to wait, and don't arm a check-in just to wait — the result arrives on its own. Peek at it with task ${id}; stop it with task_kill ${id}. Any timeout you passed still applies.`,
           },
         ],
         details: { kind: "bash", mode, id },
@@ -995,7 +1032,7 @@ export function createTaskTool(registry: TaskRegistry, opts: { now?: () => numbe
 Task ids come from bash (wait: background or auto), backgrounded subagents, or background wake messages.`,
     promptSnippet: "Check on a background task",
     promptGuidelines: [
-      "Use task <id> to peek at a running task instead of waiting or polling; it returns only the output since your last check.",
+      "Use task <id> to peek at a running task only when its new output would change what you do; otherwise end your turn and let the completion wake re-engage you — it returns only the output since your last check.",
     ],
     parameters: Type.Object({
       id: Type.Optional(Type.String({ description: "Task id to check, e.g. t-1134z8v. Omit to list running tasks." })),
@@ -1050,7 +1087,7 @@ Task ids come from bash (wait: background or auto), backgrounded subagents, or b
           content: [
             {
               type: "text",
-              text: `${task.id} (subagent, running, ${elapsed}) ${task.name} — still running; subagent tasks have no streaming output, the result arrives in its wake.`,
+              text: `${task.id} (subagent, running, ${elapsed}) ${task.name} — still running; subagents stream no output, so there is nothing to learn by waiting: if you have nothing else to do, end your turn — the wake re-engages you.`,
             },
           ],
           details: { kind: "task", id: task.id },
@@ -1063,14 +1100,24 @@ Task ids come from bash (wait: background or auto), backgrounded subagents, or b
       const chunk = readLogChunk(logPath, peekOffsets.get(task.id), WAKE_TEXT_CAP);
       if (chunk === undefined) {
         return {
-          content: [{ type: "text", text: `${task.id} (bash, running, ${elapsed}) ${task.name} — (no output yet)` }],
+          content: [
+            {
+              type: "text",
+              text: `${task.id} (bash, running, ${elapsed}) ${task.name} — (no output yet) If there's nothing to act on, end your turn — the completion wake re-engages you.`,
+            },
+          ],
           details: { kind: "task", id: task.id },
         };
       }
       peekOffsets.set(task.id, chunk.next);
       const body = chunk.text ? `\nNew output (${formatSize(chunk.bytes)}):\n${chunk.text}` : "\n(no output yet)";
       return {
-        content: [{ type: "text", text: `${task.id} (bash, running, ${elapsed}) ${task.name}${body}` }],
+        content: [
+          {
+            type: "text",
+            text: `${task.id} (bash, running, ${elapsed}) ${task.name}${body}\nIf the new output doesn't change what you do, end your turn — the completion wake re-engages you.`,
+          },
+        ],
         details: { kind: "task", id: task.id },
       };
     },
@@ -1090,7 +1137,7 @@ export function createTaskKillTool(
 The task stops immediately and its result never arrives. Ids come from bash (wait: background or auto), a backgrounded subagent's notice, or a background wake message.`,
     promptSnippet: "Kill a background task by id",
     promptGuidelines: [
-      "Reach for task_kill when a backgrounded command or subagent is no longer wanted — stopped tasks are gone for good, so re-launch if the work is still needed.",
+      "Reach for task_kill when a backgrounded command or subagent is no longer wanted — stopped tasks are gone for good, so re-launch if the work is still needed. Never kill a task just because you're idle or unsure how long it will take — the completion wake arrives on its own; kill only when the result is no longer wanted.",
     ],
     parameters: Type.Object({
       id: Type.String({ description: "Task id to kill, e.g. t-1134z8v" }),
@@ -1141,10 +1188,10 @@ export function createTaskRemindTool(registry: TaskRegistry, opts: { now?: () =>
     name: "task_remind",
     label: "Schedule task check-in",
     description: `Schedule a one-shot check-in on a running background task (t-xxxxx): after in_ms, a wake message reports that it is still running, with elapsed time and your note. If the task settles first, the check-in is dropped — the completion wake already carries the result. Re-arming replaces the pending check-in for that task; omit in_ms to cancel it.
-Use this instead of sleep-looping to check on long builds, servers, or watchers.`,
+Use this only for long, uncertain runs where a status ping would change what you do — never to wait for a result you'll receive anyway (for that, end your turn; the completion wake is automatic). The fit is work with a go/no-go point: watchers, dev servers, migrations past a deadline you'd abandon.`,
     promptSnippet: "Schedule a check-in on a background task",
     promptGuidelines: [
-      "Use task_remind to check on a long-running task later instead of sleeping or polling; the wake arrives automatically and says whether the task is still running.",
+      "Use task_remind only when a status ping would change what you do on a long, uncertain run — not as a way to wait; for that, end your turn and let the completion wake re-engage you.",
     ],
     parameters: Type.Object({
       id: Type.String({ description: "Task id to check in on, e.g. t-1134z8v" }),
@@ -1153,7 +1200,12 @@ Use this instead of sleep-looping to check on long builds, servers, or watchers.
           description: "Delay in milliseconds. Omit to cancel the pending check-in for this task.",
         }),
       ),
-      note: Type.Optional(Type.String({ description: "What to check when the reminder fires." })),
+      note: Type.Optional(
+        Type.String({
+          description:
+            "What you'd act on at this check-in (echoed back in the wake), e.g. 'if not done by then, proceed without it'.",
+        }),
+      ),
     }),
     async execute(
       _id: string,
@@ -1202,6 +1254,7 @@ Use this instead of sleep-looping to check on long builds, servers, or watchers.
       }
       const ms = params.in_ms;
       const note = params.note?.trim() || undefined;
+      const prev = registry.reminderFor(id); // shown below: silent re-arming hides cadence escalation
       if (!registry.remind(id, ms, note)) {
         return {
           content: [
@@ -1221,7 +1274,7 @@ Use this instead of sleep-looping to check on long builds, servers, or watchers.
         content: [
           {
             type: "text",
-            text: `Check-in set for ${id} in ${formatDuration(ms)}${note ? ` — ${note}` : ""}; you'll be woken with its status if it is still running.`,
+            text: `Check-in set for ${id} in ${formatDuration(ms)}${prev ? ` (replacing the earlier check-in, was in ${formatDuration(prev.ms)})` : ""}${note ? ` — ${note}` : ""}; you'll be woken with its status if it is still running. This is not a way to wait: if you have nothing else to do, end your turn — the completion or check-in wake re-engages you either way.`,
           },
         ],
         details: { kind: "task_remind", id: id ?? "", in_ms: ms },
