@@ -1059,6 +1059,24 @@ describe("createTaskTool", () => {
     expect(textOf(result)).toContain(`${d.id} (bash,`);
   });
 
+  it("reports a settled task's duration as its run time, not the time since launch", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "task-peek-"));
+    const ctx = { sessionManager: { getSessionDir: () => dir } } as never;
+    // Start at t=5s, settle at t=5.5s; the agent checks in 20 minutes later —
+    // the reported duration must stay 1s (rounded), not 20m.
+    let now = 5_000;
+    const registry = createBackgroundRegistry({ now: () => now });
+    const id = registry.adopt({ name: "long build", kind: "bash", kill: () => undefined });
+    now = 5_500;
+    registry.complete(id, { ok: true, text: "ok" });
+    now = 1_205_000;
+    const tool = createTaskTool(registry, { now: () => now });
+    const result = await tool.execute("1", { id }, undefined, undefined, ctx);
+    const text = textOf(result);
+    expect(text).toContain(", 1s)");
+    expect(text).not.toContain("20m");
+  });
+
   it("says no output yet for a running task whose log is empty", async () => {
     const d = setup();
     const result = await d.tool.execute("1", { id: d.id }, undefined, undefined, d.ctx);
@@ -1096,7 +1114,7 @@ describe("createTaskTool", () => {
     d.registry.complete(d.id, { ok: true, text: "done", status: "exited 0", wake: false });
     const result = await d.tool.execute("1", { id: d.id }, undefined, undefined, d.ctx);
     const text = textOf(result);
-    expect(text).toContain(`${d.id} (bash, done, exited 0, 2s) long build`);
+    expect(text).toContain(`${d.id} (bash, done, exited 0, 0s) long build`);
     expect(text).toContain(`Full output: ${d.log}`);
   });
 
@@ -1104,7 +1122,7 @@ describe("createTaskTool", () => {
     const d = setup();
     d.registry.complete(d.id, { ok: false, text: "boom", status: "failed: x", wake: false });
     const result = await d.tool.execute("1", { id: d.id }, undefined, undefined, d.ctx);
-    expect(textOf(result)).toContain(`${d.id} (bash, failed, failed: x, 2s) long build`);
+    expect(textOf(result)).toContain(`${d.id} (bash, failed, failed: x, 0s) long build`);
     expect(textOf(result)).toContain("the completion wake carried its output");
   });
 
@@ -1112,7 +1130,7 @@ describe("createTaskTool", () => {
     const d = setup();
     d.registry.kill(d.id);
     const result = await d.tool.execute("1", { id: d.id }, undefined, undefined, d.ctx);
-    expect(textOf(result)).toContain(`${d.id} (bash, killed, 2s) long build`);
+    expect(textOf(result)).toContain(`${d.id} (bash, killed, 0s) long build`);
     expect(textOf(result)).toContain("output was discarded");
   });
 

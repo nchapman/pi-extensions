@@ -1019,7 +1019,9 @@ Task ids come from bash (wait: background or auto), backgrounded subagents, or b
           isError: true,
         };
       }
-      const elapsed = formatDuration(now() - task.startedAt);
+      // A settled task's duration is its run time (endedAt - startedAt); now()
+      // would grow forever after completion.
+      const elapsed = formatDuration((task.endedAt ?? now()) - task.startedAt);
       if (task.state !== "running") {
         const statusLine = task.status ? `, ${task.status}` : "";
         let text = `${task.id} (${task.kind}, ${task.state}${statusLine}, ${elapsed}) ${task.name}`;
