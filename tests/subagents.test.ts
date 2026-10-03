@@ -739,6 +739,14 @@ describe("adoption (runChild)", () => {
     await expect(promise).rejects.toThrow(/timed out/); // hard timeout, no adoption
   });
 
+  it("blocks to completion by default: no adoptAfterMs means never adopt, even with onAdopted", async () => {
+    const child = fakeChild();
+    const onAdopted = vi.fn(() => "bg-1");
+    const promise = runChild(AGENT, "task", undefined, { timeoutMs: 30, onAdopted }, () => child);
+    await expect(promise).rejects.toThrow(/timed out/); // the hard timeout, not adoption, ends it
+    expect(onAdopted).not.toHaveBeenCalled();
+  });
+
   it("kills the child when the signal was already aborted at registration", async () => {
     const child = fakeChild();
     const controller = new AbortController();

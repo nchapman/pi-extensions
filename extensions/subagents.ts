@@ -22,7 +22,7 @@ import {
   createTaskRemindTool,
   createTaskTool,
   createTasksCommand,
-  DEFAULT_BG_AFTER_MS,
+  NEVER_ADOPT_MS,
   formatSubagentWake,
   parseBgAfterMs,
   parseBashBgAfterMs,
@@ -247,7 +247,9 @@ export interface RunChildOptions {
   timeoutMs?: number;
   onUpdate?: (partial: AgentToolResult) => void;
   signal?: AbortSignal;
-  /** Soft threshold in ms: hand the still-running child to onAdopted instead of waiting. */
+  /** Soft threshold in ms: hand the still-running child to onAdopted instead of waiting.
+   * Undefined (default) blocks to completion — the anti-churn default; only
+   * background: true or PI_SUBAGENT_BG_AFTER_MS opts into adoption. */
   adoptAfterMs?: number;
   onAdopted?: OnAdopted;
 }
@@ -555,29 +557,33 @@ export function runChild(
     // immediately. The abort listener detaches — a backgrounded child survives
     // turn aborts — while stdout parsing and the hard timeout continue. A
     // throwing onAdopted falls back to the foreground failure contract.
-    const adoptTimer = options.onAdopted
-      ? setTimeout(() => {
-          if (settled) return;
-          signal?.removeEventListener("abort", onAbort);
-          const completion = new Promise<ChildRun>((resolveCompletion, rejectCompletion) => {
-            completionResolve = resolveCompletion;
-            completionReject = rejectCompletion;
-          });
-          let id: string;
-          try {
-            id = options.onAdopted!({ completion, kill: () => child.kill("SIGKILL"), startedAt });
-          } catch (error) {
-            // Fence later events out of the completion path, kill the child,
-            // and fail the call — adoption never happened.
-            completionSettled = true;
-            child.kill("SIGKILL");
-            settle(() => reject(error instanceof Error ? error : new Error(String(error))));
-            return;
-          }
-          adopted = true;
-          settle(() => resolve({ adopted: true, id }));
-        }, options.adoptAfterMs ?? DEFAULT_BG_AFTER_MS)
-      : undefined;
+    const adoptAfterMs = options.adoptAfterMs ?? NEVER_ADOPT_MS;
+    // Infinity (the default) must never reach setTimeout — Node clamps it to
+    // 1ms, which would adopt instantly instead of blocking to completion.
+    const adoptTimer =
+      options.onAdopted && Number.isFinite(adoptAfterMs)
+        ? setTimeout(() => {
+            if (settled) return;
+            signal?.removeEventListener("abort", onAbort);
+            const completion = new Promise<ChildRun>((resolveCompletion, rejectCompletion) => {
+              completionResolve = resolveCompletion;
+              completionReject = rejectCompletion;
+            });
+            let id: string;
+            try {
+              id = options.onAdopted!({ completion, kill: () => child.kill("SIGKILL"), startedAt });
+            } catch (error) {
+              // Fence later events out of the completion path, kill the child,
+              // and fail the call — adoption never happened.
+              completionSettled = true;
+              child.kill("SIGKILL");
+              settle(() => reject(error instanceof Error ? error : new Error(String(error))));
+              return;
+            }
+            adopted = true;
+            settle(() => resolve({ adopted: true, id }));
+          }, adoptAfterMs)
+        : undefined;
     adoptTimer?.unref?.();
 
     const cleanup = () => {
@@ -757,7 +763,7 @@ const modelField = Type.Optional(
 const backgroundField = Type.Optional(
   Type.Boolean({
     description:
-      "Run in the background: return immediately with a task id; the result is delivered to you automatically as your next message, even mid-run (long runs also background automatically).",
+      "Run in the background: return immediately with a task id; the result is delivered to you automatically as your next message, even mid-run.",
   }),
 );
 const taskItem = Type.Object({
@@ -798,12 +804,12 @@ Available agents:
 ${agentList}
 Alternatively pass agent_md: a full agent definition in markdown (frontmatter + system prompt) for an ad-hoc specialist. With neither, a generic read-only investigator runs.
 The subagent runs to completion and returns its final response. Use for reviews, research, and any work that benefits from an isolated context.
-Subagents still running after ~2 minutes move to the background: the tool returns immediately, and the result is delivered to you automatically as your next message — even mid-run, while you keep working. Pass background: true for known-long work; never sleep or poll waiting for it.`,
+Subagents block until they finish by default — waiting on a tool call costs nothing. Pass background: true for known-long work: the tool returns immediately and the result is delivered to you automatically as your next message — even mid-run, while you keep working; never sleep or poll waiting for it.`,
     promptSnippet: "Delegate a task to a focused subagent (isolated pi session)",
     promptGuidelines: [
       "Use subagent for self-contained work (reviews, research, audits); the subagent only sees the task text you pass, so include all needed context.",
       "For a bespoke specialist, pass agent_md with the exact instructions and tool restrictions instead of forcing a named agent to fit.",
-      "Long subagent runs background automatically; results are delivered to you automatically as your next message, even mid-run — continue other work and never sleep or poll.",
+      "Subagent calls block until they finish by default; background: true opts a run into the background — the result is delivered to you automatically as your next message, even mid-run — continue other work and never sleep or poll.",
     ],
     parameters: taskItem,
     renderCall(args, theme, context) {
@@ -872,11 +878,11 @@ Subagents still running after ~2 minutes move to the background: the tool return
 Available agents:
 ${agentList}
 Each task may instead include agent_md (an inline agent definition) or omit both to use the generic read-only investigator.
-Slow tasks background individually after ~2 minutes; each result is then delivered to you automatically as your next message, even mid-run. Pass background: true per task for known-long work; never sleep or poll waiting for one.`,
+Tasks block until they finish by default. Pass background: true per task for known-long work — that task backgrounds immediately and its result is then delivered to you automatically as your next message, even mid-run; never sleep or poll waiting for one.`,
     promptSnippet: "Run several subagent tasks in parallel",
     promptGuidelines: [
       "Use subagents for independent, self-contained tasks that benefit from parallel isolated sessions; each subagent only sees its own task text, so include all needed context.",
-      "Slow tasks background individually; each result is delivered to you automatically as your next message, even mid-run — continue other work and never sleep or poll.",
+      "Subagent tasks block until they finish by default; background: true per task opts into the background — the result is delivered to you automatically as your next message, even mid-run — continue other work and never sleep or poll.",
     ],
     parameters: Type.Object({
       tasks: Type.Array(taskItem, { minItems: 1, description: "Tasks to run in parallel" }),

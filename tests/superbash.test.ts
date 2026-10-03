@@ -17,7 +17,7 @@ import {
   createTaskTool,
   createTasksCommand,
   DEFAULT_BASH_BG_AFTER_MS,
-  DEFAULT_BG_AFTER_MS,
+  NEVER_ADOPT_MS,
   describeReminders,
   formatDuration,
   formatReminderWake,
@@ -40,12 +40,13 @@ const textOf = (r: { content: readonly unknown[] }): string => (r.content[0] as 
 const idOf = (r: { details: unknown }): string => (r.details as { id: string }).id;
 
 describe("env parsing", () => {
-  it("defaults the adoption threshold and rejects invalid values", () => {
-    expect(parseBgAfterMs({})).toBe(DEFAULT_BG_AFTER_MS);
-    expect(parseBgAfterMs({ PI_SUBAGENT_BG_AFTER_MS: "abc" })).toBe(DEFAULT_BG_AFTER_MS);
-    expect(parseBgAfterMs({ PI_SUBAGENT_BG_AFTER_MS: "-5" })).toBe(DEFAULT_BG_AFTER_MS);
-    expect(parseBgAfterMs({ PI_SUBAGENT_BG_AFTER_MS: "" })).toBe(DEFAULT_BG_AFTER_MS); // Number("") is 0
-    expect(parseBgAfterMs({ PI_SUBAGENT_BG_AFTER_MS: "  " })).toBe(DEFAULT_BG_AFTER_MS);
+  it("defaults to never adopting and rejects invalid values", () => {
+    // Blocking is the norm: adoption only happens when the env knob opts in.
+    expect(parseBgAfterMs({})).toBe(NEVER_ADOPT_MS);
+    expect(parseBgAfterMs({ PI_SUBAGENT_BG_AFTER_MS: "abc" })).toBe(NEVER_ADOPT_MS);
+    expect(parseBgAfterMs({ PI_SUBAGENT_BG_AFTER_MS: "-5" })).toBe(NEVER_ADOPT_MS);
+    expect(parseBgAfterMs({ PI_SUBAGENT_BG_AFTER_MS: "" })).toBe(NEVER_ADOPT_MS); // Number("") is 0
+    expect(parseBgAfterMs({ PI_SUBAGENT_BG_AFTER_MS: "  " })).toBe(NEVER_ADOPT_MS);
   });
 
   it("accepts valid thresholds including zero", () => {
@@ -492,7 +493,7 @@ describe("createBashTool", () => {
     const d = toolDeps();
     const tool = createBashTool(d.registry, { operations: fakeBashOps() });
     expect(tool.name).toBe("bash");
-    expect(tool.description).toContain('wait: "auto" (default)');
+    expect(tool.description).toContain('wait: "inline" (default)');
     expect(tool.description).toContain('"background" returns a task id immediately');
     expect(tool.description).toContain("even mid-run");
     expect(tool.description).toContain("never sleep or poll");
@@ -859,17 +860,34 @@ describe("createBashTool", () => {
       expect(sc.output.length).toBe(1_048_576); // the head cap, not the 2MB file
     });
 
-    it("auto is the default wait mode", async () => {
+    it("inline is the default wait mode: a still-running default call never promotes", async () => {
       const d = toolDeps();
       const ops = fakeBashOps();
-      const tool = createBashTool(d.registry, { operations: ops, waitMs: 20 });
-      const p = tool.execute("1", { command: "sleep 30" }, undefined, undefined, CTX); // no wait → auto
-      const result = await p; // the window (20ms) elapses before the fake exits
-      const id = idOf(result);
-      expect(textOf(result)).toContain(`Backgrounded (${id})`);
-      expect(d.registry.running()).toHaveLength(1);
-      await ops.exit(0);
-      expect(d.sendUserMessage).toHaveBeenCalledTimes(1);
+      // A gate that holds the inline delegation open past the promote window,
+      // so the test observes the call while it is still legitimately running.
+      let releaseInline!: () => void;
+      const gate = new Promise<void>((res) => {
+        releaseInline = res;
+      });
+      const inline = vi.fn(async (_id: string, _params: { command: string; timeout?: number }) => {
+        await gate;
+        return {
+          content: [{ type: "text" as const, text: "done" }],
+          details: { fullOutputPath: "/tmp/full.log" },
+          structuredContent: { output: "done", truncated: false, exit_code: 0, wall_time_seconds: 0.1 },
+        };
+      });
+      const tool = createBashTool(d.registry, { operations: ops, waitMs: 20, inline });
+      const p = tool.execute("1", { command: "sleep 30" }, undefined, undefined, CTX); // no wait → inline
+      await new Promise((r) => setTimeout(r, 40)); // the window (20ms) elapses while still inline
+      // Blocking is the norm: nothing is adopted, no wake fires — the call
+      // stays a pending tool result, not a background task.
+      expect(d.registry.running()).toHaveLength(0);
+      expect(d.sendUserMessage).not.toHaveBeenCalled();
+      releaseInline();
+      const result = await p;
+      expect(inline).toHaveBeenCalledTimes(1); // the delegation actually ran
+      expect(result.details).toMatchObject({ mode: "inline" });
     });
 
     it("promotes to the background when the window elapses, then wakes on exit", async () => {
@@ -1414,7 +1432,13 @@ describe("bash tool with real commands", () => {
     const registry = createTaskRegistry({ sendUserMessage, notify, setStatus });
     const tool = createBashTool(registry, waitMs !== undefined ? { waitMs } : {});
     const ctx = {
-      sessionManager: { getSessionDir: () => sessionDir, getSessionId: () => "real-test" },
+      // getSessionFile is required by the inline delegation to pi's built-in
+      // bash tool (temp-file stashing on truncation) — the default wait mode.
+      sessionManager: {
+        getSessionDir: () => sessionDir,
+        getSessionId: () => "real-test",
+        getSessionFile: () => join(tmpdir(), "pi-test-session.jsonl"),
+      },
     };
     return { sendUserMessage, notify, setStatus, registry, tool, ctx };
   }
@@ -1431,14 +1455,15 @@ describe("bash tool with real commands", () => {
     };
   }
 
-  it("auto (default): a fast command returns inline without a wake", async () => {
+  it("inline (default): a fast command returns inline without a wake", async () => {
     const d = realTool(undefined, 10_000);
     const result = await d.tool.execute("1", { command: "echo real-hi" }, undefined, undefined, d.ctx);
     expect(textOf(result)).toContain("real-hi");
     expect(result.isError).toBeUndefined();
     expect(d.sendUserMessage).not.toHaveBeenCalled();
-    const id = idOf(result);
-    expect(d.registry.get(id)).toMatchObject({ state: "done", status: "exited 0" });
+    // The inline delegation bypasses the registry: nothing was adopted, so
+    // there is no task record and no wake to deliver.
+    expect(d.registry.running()).toHaveLength(0);
   }, 15_000);
 
   it("background: wakes with the output", async () => {
@@ -1521,12 +1546,12 @@ describe("bash tool with real commands", () => {
     });
   }, 15_000);
 
-  it("auto (default): a slow command promotes and wakes with the full output logged", async () => {
+  it("auto: a slow command promotes and wakes with the full output logged", async () => {
     const dir = mkdtempSync(join(tmpdir(), "bash-big-auto-"));
     const d = realTool(dir, 200);
     const result = await d.tool.execute(
       "1",
-      { command: "sleep 0.3 && echo promoted-out" },
+      { command: "sleep 0.3 && echo promoted-out", wait: "auto" },
       undefined,
       undefined,
       d.ctx,

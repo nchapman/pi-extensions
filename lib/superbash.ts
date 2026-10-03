@@ -140,8 +140,13 @@ export interface TaskRegistry {
   reminders(): { id: string; ms: number; note?: string }[];
 }
 
-/** Millis before a subagent child is adopted into the background. */
-export const DEFAULT_BG_AFTER_MS = 120_000;
+/**
+ * Subagents block to completion by default — adoption never fires unless
+ * background: true or PI_SUBAGENT_BG_AFTER_MS opts in. Node clamps Infinity
+ * setTimeout delays to 1ms (an instant adopt), so callers must guard with
+ * Number.isFinite before scheduling.
+ */
+export const NEVER_ADOPT_MS = Number.POSITIVE_INFINITY;
 
 /** Millis bash (wait: auto) blocks before promoting to the background. */
 export const DEFAULT_BASH_BG_AFTER_MS = 120_000;
@@ -154,7 +159,9 @@ function parseAfterMs(env: Record<string, string | undefined>, key: string, fall
 }
 
 export function parseBgAfterMs(env: Record<string, string | undefined>): number {
-  return parseAfterMs(env, "PI_SUBAGENT_BG_AFTER_MS", DEFAULT_BG_AFTER_MS);
+  // Default: never adopt — blocking is the norm; the env knob opts into the
+  // old auto-adoption window.
+  return parseAfterMs(env, "PI_SUBAGENT_BG_AFTER_MS", NEVER_ADOPT_MS);
 }
 
 export function parseBashBgAfterMs(env: Record<string, string | undefined>): number {
@@ -557,11 +564,11 @@ export function createBashTool(
     name: "bash",
     label: "bash",
     description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first); when truncated, the full output is saved to a file whose path the result includes.
-wait: "auto" (default) blocks while the command runs, up to ~${formatDuration(descWindowMs)} — a command that finishes in time returns its output inline, one that doesn't move to the background and return a task id (t-xxxxx). "inline" always blocks. "background" returns a task id immediately. A backgrounded command's result (exit status, duration, output tail) is delivered to you automatically as your next message, even mid-run — never sleep or poll waiting for it. Check on a running task with task <id>; schedule a one-shot check-in with task_remind; stop it with task_kill.
+wait: "inline" (default) blocks until the command finishes and returns its output — waiting on a tool call costs nothing, so this is the normal choice; pass a timeout to bound a command you're unsure about. wait: "auto" blocks while the command runs, up to ~${formatDuration(descWindowMs)} — a command that finishes in time returns its output inline, one that doesn't move to the background and return a task id (t-xxxxx). "background" returns a task id immediately. A backgrounded command's result (exit status, duration, output tail) is delivered to you automatically as your next message, even mid-run — never sleep or poll waiting for it. Check on a running task with task <id>; schedule a one-shot check-in with task_remind; stop it with task_kill.
 Timeout is in seconds, optional, no default — a command without a timeout runs until it finishes or is killed (0 also means no timeout).`,
     promptSnippet: "Execute bash commands (ls, grep, find, etc.)",
     promptGuidelines: [
-      "Use wait: auto (default) when you don't know how long a command takes; wait: background for known long-running work (builds, test suites, migrations) whose result you need later; wait: inline for quick commands you need to proceed with.",
+      "Default to plain blocking (inline) — waiting on a tool call costs nothing; pass a timeout to bound commands you're unsure about. Use wait: auto only when you want a bounded block before backgrounding; wait: background for long-running work (builds, test suites, migrations) whose result you need later.",
       "Background results are delivered to you automatically as your next message, even mid-run — continue other work; never sleep or poll waiting for them.",
       "Peek at a running task with task <id>; schedule a one-shot check-in with task_remind; stop a task with task_kill.",
       "You can inspect PI_* environment variables for current model and session details.",
@@ -575,7 +582,7 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
       ),
       wait: Type.Optional(
         Type.Union([Type.Literal("inline"), Type.Literal("auto"), Type.Literal("background")], {
-          description: `inline: block and return output. auto (default): block up to ~${formatDuration(descWindowMs)}, then move to the background. background: return a task id immediately.`,
+          description: `inline (default): block and return output. auto: block up to ~${formatDuration(descWindowMs)}, then move to the background. background: return a task id immediately.`,
         }),
       ),
     }),
@@ -586,7 +593,7 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
       onUpdate: BashOnUpdate | undefined,
       ctx: ToolCtx | undefined,
     ): Promise<BashToolResult> {
-      const mode: BashWaitMode = params.wait ?? "auto";
+      const mode: BashWaitMode = params.wait ?? "inline";
       const error = (text: string): BashToolResult => ({
         content: [{ type: "text", text }],
         details: { kind: "bash", mode },
