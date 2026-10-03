@@ -1569,6 +1569,42 @@ describe("registerGoalTool", () => {
     expect(notify).toHaveBeenLastCalledWith("No active goal to stop.");
   });
 
+  it("/goal pause halts the loop, shows a paused footer, and /goal resume re-engages", async () => {
+    const { pi, tools, commands, events, sentCustom } = makePi();
+    const notify = vi.fn();
+    const setStatus = vi.fn();
+    const cmdCtx = { mode: "headless", ui: { notify, setStatus } };
+    const settleCtx = { ui: { notify, setStatus, setWidget: vi.fn() } } as unknown as ExtensionContext;
+    registerGoalTool(pi, { maxContinuations: 10, verifyRunner: async () => failVerify });
+
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "stuck work", verify: "npm test" });
+
+    // One settle binds the UI (uiRef) and shows the loop is live.
+    expect(await fire(events, "agent_before_settle", settleCtx)).toEqual({ continue: true });
+    expect(sentCustom).toHaveLength(1);
+
+    // Pause: no further continuations, and the footer says paused (not cleared).
+    await commands.get("goal")!.handler("pause", cmdCtx);
+    expect(notify).toHaveBeenLastCalledWith(expect.stringContaining("paused"));
+    expect(setStatus).toHaveBeenLastCalledWith("goal", expect.stringMatching(/goal · .* · paused/));
+    expect(await fire(events, "agent_before_settle", settleCtx)).toBeUndefined();
+    expect(sentCustom).toHaveLength(1);
+
+    // Pausing with no active goal is a no-op.
+    await commands.get("goal")!.handler("pause", cmdCtx);
+    expect(notify).toHaveBeenLastCalledWith("No active goal to pause.");
+
+    // Resume: the loop runs again and the model is re-engaged with a followUp.
+    await commands.get("goal")!.handler("resume", cmdCtx);
+    expect(notify).toHaveBeenLastCalledWith(expect.stringContaining("resumed"));
+    expect(await fire(events, "agent_before_settle", settleCtx)).toEqual({ continue: true });
+    expect(sentCustom).toHaveLength(2);
+
+    // Resuming with no paused goal is a no-op.
+    await commands.get("goal")!.handler("resume", cmdCtx);
+    expect(notify).toHaveBeenLastCalledWith("No paused goal to resume.");
+  });
+
   it("resume re-derives goal state from the branch and a view command does not corrupt it", async () => {
     const { pi, tools, commands, events } = makePi();
     registerGoalTool(pi);

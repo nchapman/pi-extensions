@@ -891,14 +891,17 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     if (!active.includes(GOAL_TOOL_NAME)) pi.setActiveTools([...active, GOAL_TOOL_NAME]);
   };
 
-  // Footer status: `goal · <elapsed>` while a goal is active, cleared on
-  // completion / block. Best-effort — a missing UI (print mode) is a no-op.
+  // Footer status: `goal · <elapsed>` while a goal is active, `goal · <elapsed> · paused`
+  // while paused (so a parked goal stays visible), cleared on completion /
+  // block. Best-effort — a missing UI (print mode) is a no-op.
   // Re-asserted at every event below: pi clears extension statuses on
   // rebind/reload (resetExtensionUI), so a status set once would vanish until
   // the next turn_end — visible as the footer "coming and going".
   const updateFooter = (checking = false) => {
     if (goal && goal.status === "active") {
       uiRef?.setStatus("goal", checking ? `goal · checking (${goal.verify})` : renderGoalFooter(goal, Date.now()));
+    } else if (goal && goal.status === "paused") {
+      uiRef?.setStatus("goal", `${renderGoalFooter(goal, Date.now())} · paused`);
     } else uiRef?.setStatus("goal", undefined);
   };
   const clearFooter = () => uiRef?.setStatus("goal", undefined);
@@ -1311,7 +1314,8 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
   };
 
   pi.registerCommand("goal", {
-    description: "Show the active goal, start one with /goal <objective>, or stop the loop with /goal stop",
+    description:
+      "Show the active goal, start one with /goal <objective>, pause/resume with /goal pause|resume, or stop the loop with /goal stop",
     handler: async (args, ctx: ExtensionCommandContext) => {
       const trimmed = args.trim();
 
@@ -1321,6 +1325,40 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
           return;
         }
         await ctx.ui.custom<void>((_tui, theme, _kb, done) => new GoalStatusComponent(goal, theme, () => done()));
+        return;
+      }
+
+      if (trimmed === "pause") {
+        if (!goal || goal.status !== "active") {
+          ctx.ui.notify("No active goal to pause.");
+          return;
+        }
+        // Session-scoped, like stop: the loop halts and the goal shows paused,
+        // but nothing is persisted to the branch — a reload re-adopts the last
+        // snapshot. Unlike stop, the goal stays pursuing (not blocked) and all
+        // progress is retained for /goal resume.
+        stopped = true;
+        goal = { ...goal, status: "paused" };
+        updateFooter();
+        ctx.ui.notify(`Goal #${goal.id} paused — talk freely; /goal resume when ready to continue.`);
+        return;
+      }
+
+      if (trimmed === "resume") {
+        if (!goal || goal.status !== "paused") {
+          ctx.ui.notify("No paused goal to resume.");
+          return;
+        }
+        // A user resuming is a deliberate engagement: re-arm the continuation
+        // budget, exactly like a user (re)starting a goal.
+        goal = { ...goal, status: "active" };
+        stopped = false;
+        resetContinuationBudget();
+        ctx.ui.notify(`Goal #${goal.id} resumed.`);
+        pi.sendUserMessage(
+          `The user paused goal #${goal.id} to have a conversation; that conversation is over and the goal is active again. Continue working toward it — the goal is: ${goal.objective}`,
+          { deliverAs: "followUp" },
+        );
         return;
       }
 
@@ -1341,8 +1379,9 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
 
       // Start a goal by routing it through the model: the goal is created by the
       // goal tool (which persists a branch snapshot), so the branch stays the
-      // single source of truth. State-changing verbs (pause/resume/clear) are
-      // deliberately absent in v1 — goal state is owned by the model.
+      // single source of truth. Pause/resume are the deliberate user-control
+      // exceptions: they only steer the session loop (the model still owns the
+      // branch snapshot).
       const o = validateObjective(trimmed);
       if (o.error) {
         ctx.ui.notify(o.error, "error");
