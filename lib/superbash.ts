@@ -1,7 +1,7 @@
 /**
- * Background task core — the shared registry behind non-blocking subagents
- * and the unified `bash` tool, plus the task management tools (task,
- * task_kill, task_remind).
+ * superbash — the background-task core: the shared registry behind
+ * non-blocking subagents and the unified `bash` tool, plus the task
+ * management tools (task, task_kill, task_remind).
  *
  * Design (the deliberate cut of a larger plan):
  * - the registry is in-memory and session-scoped: pi reloads and exits run

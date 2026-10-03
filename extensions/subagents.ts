@@ -27,7 +27,7 @@ import {
   parseBgAfterMs,
   parseBashBgAfterMs,
   parseWakeEnabled,
-} from "../lib/background";
+} from "../lib/superbash";
 
 export const BUILTIN_TOOLS = ["read", "write", "edit", "bash", "grep", "find", "ls"];
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;

@@ -31,7 +31,7 @@ import {
   stashPath,
   tempOutputLogPath,
   WAKE_TEXT_CAP,
-} from "../lib/background";
+} from "../lib/superbash";
 
 /** First content block of these tools' results is always text. */
 const textOf = (r: { content: readonly unknown[] }): string => (r.content[0] as { text: string }).text;
