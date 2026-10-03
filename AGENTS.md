@@ -18,7 +18,7 @@ npm run test:coverage  # vitest with V8 coverage report
 ## Layout
 
 - `extensions/*.ts` — one file per extension; every file here is auto-registered via `pi.extensions` in `package.json` (cross-extension imports exist — e.g. `recall.ts` imports plan rendering from `todo.ts`, so vendoring one file can pull in another)
-- `lib/` — shared core modules (e.g. the background-task registry) imported by extensions and tests alike
+- `lib/` — shared core modules (e.g. the task registry) imported by extensions and tests alike
 - `tests/*.test.ts` — one vitest suite per module/extension; keep new tests in the matching file
 
 ## Code conventions

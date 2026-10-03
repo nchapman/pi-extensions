@@ -38,7 +38,7 @@ import {
   type ChildUsage,
   type SpawnFn,
 } from "../extensions/subagents";
-import { createBackgroundRegistry, type AdoptedHandle } from "../lib/superbash";
+import { createTaskRegistry, type AdoptedHandle } from "../lib/superbash";
 
 /** Identity theme: strips styling so assertions see plain text. */
 const THEME = { fg: (_k: string, s: string) => s, bold: (s: string) => s } as never;
@@ -808,7 +808,7 @@ describe("adoption (runChild)", () => {
 describe("adoptSubagentTask", () => {
   it("wires completion and failure wakes through the registry", async () => {
     const sendUserMessage = vi.fn();
-    const registry = createBackgroundRegistry({ sendUserMessage });
+    const registry = createTaskRegistry({ sendUserMessage });
     const okChild = fakeChild();
     const failChild = fakeChild();
 
@@ -847,7 +847,7 @@ describe("adoptSubagentTask", () => {
 
   it("sends no wake when the child completes after killAll", async () => {
     const sendUserMessage = vi.fn();
-    const registry = createBackgroundRegistry({ sendUserMessage });
+    const registry = createTaskRegistry({ sendUserMessage });
     const child = fakeChild();
     const promise = runChild(
       AGENT,
@@ -867,7 +867,7 @@ describe("adoptSubagentTask", () => {
   it("includes the usage line and stashes over-cap replies", async () => {
     const sessionDir = mkdtempSync(join(tmpdir(), "bg-adopt-"));
     const sendUserMessage = vi.fn();
-    const registry = createBackgroundRegistry({ sendUserMessage });
+    const registry = createTaskRegistry({ sendUserMessage });
     const child = fakeChild();
     const long = `${"r".repeat(4500)}`;
     const promise = runChild(
@@ -981,7 +981,7 @@ describe("registerSubagentTools with a registry", () => {
   it("backgrounds a background:true task immediately and wakes on completion", async () => {
     const children: FakeChild[] = [];
     const sendUserMessage = vi.fn();
-    const registry = createBackgroundRegistry({ sendUserMessage });
+    const registry = createTaskRegistry({ sendUserMessage });
     const { pi, tools } = makePi();
     registerSubagentTools(pi, mkdtempSync(join(tmpdir(), "agents-")), silentSpawn(children), undefined, registry);
 
@@ -1009,7 +1009,7 @@ describe("registerSubagentTools with a registry", () => {
   it("returns partial results when only some batch tasks background", async () => {
     const children: FakeChild[] = [];
     const sendUserMessage = vi.fn();
-    const registry = createBackgroundRegistry({ sendUserMessage });
+    const registry = createTaskRegistry({ sendUserMessage });
     const dir = mkdtempSync(join(tmpdir(), "agents-"));
     writeFileSync(join(dir, "reviewer.md"), "---\nname: reviewer\ndescription: d\n---\nBody.");
     let call = 0;

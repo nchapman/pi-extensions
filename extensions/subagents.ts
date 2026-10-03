@@ -14,9 +14,9 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import {
   type AdoptedHandle,
-  type BackgroundRegistry,
+  type TaskRegistry,
   capResultText,
-  createBackgroundRegistry,
+  createTaskRegistry,
   createBashTool,
   createTaskKillTool,
   createTaskRemindTool,
@@ -385,7 +385,7 @@ export function backgroundedNotice(agentName: string, id: string): string {
 
 /** Adopt a still-running child into the registry and wire its wake. Returns the task id. */
 export function adoptSubagentTask(
-  registry: BackgroundRegistry,
+  registry: TaskRegistry,
   agentName: string,
   handle: AdoptedHandle<ChildRun>,
   sessionDir: string | undefined,
@@ -780,7 +780,7 @@ export function registerSubagentTools(
   agentsDir: string = AGENTS_DIR,
   spawnFn: SpawnFn = defaultSpawn,
   preloadedAgents?: AgentDef[],
-  registry?: BackgroundRegistry,
+  registry?: TaskRegistry,
 ): void {
   const agents = preloadedAgents ?? loadAgents(agentsDir);
   // The description's agent list is fixed at registration, but execute
@@ -1067,7 +1067,7 @@ export function registerSubagentsExtension(
   // model gets the result as its next message, and a sleep-polling model gets
   // it the moment its sleep returns — the livelock is impossible by mechanism,
   // not by instruction.
-  const registry = createBackgroundRegistry({
+  const registry = createTaskRegistry({
     sendUserMessage: (text) => pi.sendUserMessage(text, { deliverAs: "steer" }),
     notify: (message, level) => ui?.notify(message, level),
     setStatus: (key, text) => ui?.setStatus(key, text),

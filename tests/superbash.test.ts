@@ -10,7 +10,7 @@ import {
   buildBashEnv,
   capResultText,
   clampTimeoutMs,
-  createBackgroundRegistry,
+  createTaskRegistry,
   createBashTool,
   createTaskKillTool,
   createTaskRemindTool,
@@ -216,13 +216,13 @@ describe("describeReminders", () => {
   });
 });
 
-describe("createBackgroundRegistry", () => {
+describe("createTaskRegistry", () => {
   function makeDeps() {
     const sendUserMessage = vi.fn();
     const notify = vi.fn();
     const setStatus = vi.fn();
     let tick = 1000;
-    const registry = createBackgroundRegistry({
+    const registry = createTaskRegistry({
       sendUserMessage,
       notify,
       setStatus,
@@ -232,7 +232,7 @@ describe("createBackgroundRegistry", () => {
   }
 
   it("swallows a throwing wake channel instead of surfacing an unhandled rejection", () => {
-    const registry = createBackgroundRegistry({
+    const registry = createTaskRegistry({
       sendUserMessage: () => {
         throw new Error("channel down");
       },
@@ -248,7 +248,7 @@ describe("createBackgroundRegistry", () => {
   it("adopts with time-based ids, unique even for same-millisecond tasks", () => {
     const t0 = 1_750_000_000_000;
     let tick = t0;
-    const registry = createBackgroundRegistry({ now: () => tick });
+    const registry = createTaskRegistry({ now: () => tick });
     const a = registry.adopt({ name: "a", kind: "subagent", kill: () => undefined });
     const b = registry.adopt({ name: "b", kind: "subagent", kill: () => undefined });
     // "t-" + base36 ms; same-millisecond adopts advance the clock by 1ms.
@@ -260,7 +260,7 @@ describe("createBackgroundRegistry", () => {
   });
 
   it("lists running tasks oldest first", () => {
-    const registry = createBackgroundRegistry({ now: () => 5_000 });
+    const registry = createTaskRegistry({ now: () => 5_000 });
     const a = registry.adopt({ name: "a", kind: "subagent", kill: () => undefined });
     const b = registry.adopt({ name: "b", kind: "subagent", kill: () => undefined });
     // Same start tick: insertion order is preserved (stable sort).
@@ -311,7 +311,7 @@ describe("createBackgroundRegistry", () => {
   it("suppresses the wake but keeps the notification when wakes are disabled", () => {
     const sendUserMessage = vi.fn();
     const notify = vi.fn();
-    const registry = createBackgroundRegistry({ sendUserMessage, notify, wakeEnabled: false });
+    const registry = createTaskRegistry({ sendUserMessage, notify, wakeEnabled: false });
     const id = registry.adopt({ name: "a", kind: "subagent", kill: () => undefined });
     registry.complete(id, { ok: true, text: "wake" });
     expect(sendUserMessage).not.toHaveBeenCalled();
@@ -349,7 +349,7 @@ describe("createBackgroundRegistry", () => {
       const timers: Array<{ fn: () => void; ms: number; cancelled: boolean }> = [];
       const sendUserMessage = vi.fn();
       const notify = vi.fn();
-      const registry = createBackgroundRegistry({
+      const registry = createTaskRegistry({
         sendUserMessage,
         notify,
         now: () => 1000,
@@ -481,7 +481,7 @@ describe("createBashTool", () => {
   function toolDeps() {
     const sendUserMessage = vi.fn();
     const notify = vi.fn();
-    const registry = createBackgroundRegistry({ sendUserMessage, notify, setStatus: vi.fn() });
+    const registry = createTaskRegistry({ sendUserMessage, notify, setStatus: vi.fn() });
     return { sendUserMessage, notify, registry };
   }
 
@@ -1026,7 +1026,7 @@ describe("createTaskTool", () => {
   function setup() {
     const dir = mkdtempSync(join(tmpdir(), "task-peek-"));
     const ctx = { sessionManager: { getSessionDir: () => dir } } as never;
-    const registry = createBackgroundRegistry({ now: () => 5_000 });
+    const registry = createTaskRegistry({ now: () => 5_000 });
     const id = registry.adopt({ name: "long build", kind: "bash", kill: () => undefined });
     const log = outputLogPath(dir, id);
     const tool = createTaskTool(registry, { now: () => 7_000 });
@@ -1044,7 +1044,7 @@ describe("createTaskTool", () => {
   });
 
   it("lists an empty registry as such", async () => {
-    const registry = createBackgroundRegistry();
+    const registry = createTaskRegistry();
     const tool = createTaskTool(registry);
     const ctx = { sessionManager: { getSessionDir: () => undefined } } as never;
     const result = await tool.execute("1", {}, undefined, undefined, ctx);
@@ -1065,7 +1065,7 @@ describe("createTaskTool", () => {
     // Start at t=5s, settle at t=5.5s; the agent checks in 20 minutes later —
     // the reported duration must stay 1s (rounded), not 20m.
     let now = 5_000;
-    const registry = createBackgroundRegistry({ now: () => now });
+    const registry = createTaskRegistry({ now: () => now });
     const id = registry.adopt({ name: "long build", kind: "bash", kill: () => undefined });
     now = 5_500;
     registry.complete(id, { ok: true, text: "ok" });
@@ -1146,7 +1146,7 @@ describe("createTaskRemindTool", () => {
   function remindDeps() {
     const timers: Array<{ fn: () => void; ms: number; cancelled: boolean }> = [];
     const sendUserMessage = vi.fn();
-    const registry = createBackgroundRegistry({
+    const registry = createTaskRegistry({
       sendUserMessage,
       notify: vi.fn(),
       now: () => 1000,
@@ -1257,7 +1257,7 @@ describe("kill and control surfaces", () => {
   function controlDeps() {
     const sendUserMessage = vi.fn();
     const notify = vi.fn();
-    const registry = createBackgroundRegistry({ sendUserMessage, notify, setStatus: vi.fn(), now: () => 1_000 });
+    const registry = createTaskRegistry({ sendUserMessage, notify, setStatus: vi.fn(), now: () => 1_000 });
     return { sendUserMessage, notify, registry };
   }
 
@@ -1411,7 +1411,7 @@ describe("bash tool with real commands", () => {
     const sendUserMessage = vi.fn();
     const notify = vi.fn();
     const setStatus = vi.fn();
-    const registry = createBackgroundRegistry({ sendUserMessage, notify, setStatus });
+    const registry = createTaskRegistry({ sendUserMessage, notify, setStatus });
     const tool = createBashTool(registry, waitMs !== undefined ? { waitMs } : {});
     const ctx = {
       sessionManager: { getSessionDir: () => sessionDir, getSessionId: () => "real-test" },

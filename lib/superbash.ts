@@ -95,7 +95,7 @@ export interface AdoptedHandle<T = { text: string; usage?: unknown }> {
   startedAt: number;
 }
 
-export interface BackgroundDeps {
+export interface TaskDeps {
   /** Wake channel — receives the steered user message text. */
   sendUserMessage?: (text: string) => void;
   /** Terminal notification channel (ctx.ui.notify); optional for headless modes. */
@@ -111,7 +111,7 @@ export interface BackgroundDeps {
   unschedule?: (handle: unknown) => void;
 }
 
-export interface BackgroundRegistry {
+export interface TaskRegistry {
   /** Register a running task; returns its id (t-<base36 time>, e.g. t-1134z8v). */
   adopt(record: { name: string; kind: "subagent" | "bash"; kill: () => void }): string;
   /**
@@ -234,7 +234,7 @@ export function describeReminders(reminders: { id: string; ms: number; note?: st
 }
 
 /** Create a session-scoped registry. Pure over its injected channels. */
-export function createBackgroundRegistry(deps: BackgroundDeps = {}): BackgroundRegistry {
+export function createTaskRegistry(deps: TaskDeps = {}): TaskRegistry {
   const now = deps.now ?? Date.now;
   const schedule = deps.schedule ?? ((fn: () => void, ms: number) => setTimeout(fn, ms));
   const unschedule = deps.unschedule ?? ((handle: unknown) => clearTimeout(handle as ReturnType<typeof setTimeout>));
@@ -524,7 +524,7 @@ const UPDATE_THROTTLE_MS = 100;
  * resume.
  */
 export function createBashTool(
-  registry: BackgroundRegistry,
+  registry: TaskRegistry,
   opts: {
     operations?: BashOperations;
     /** Inline executor; defaults to pi's own bash tool. */
@@ -978,7 +978,7 @@ function readLogChunk(
  * byte offsets live in this tool's closure: session-scoped, and a fresh
  * session starts at the tail again, which is the useful default after resume.
  */
-export function createTaskTool(registry: BackgroundRegistry, opts: { now?: () => number } = {}) {
+export function createTaskTool(registry: TaskRegistry, opts: { now?: () => number } = {}) {
   const now = opts.now ?? Date.now;
   const peekOffsets = new Map<string, number>();
   return {
@@ -1072,7 +1072,7 @@ Task ids come from bash (wait: background or auto), backgrounded subagents, or b
 
 /** The agent-side lever: kill one background task by id, whatever spawned it. */
 export function createTaskKillTool(
-  registry: BackgroundRegistry,
+  registry: TaskRegistry,
   opts: { now?: () => number; onKilled?: (id: string) => void } = {},
 ) {
   const now = opts.now ?? Date.now;
@@ -1128,7 +1128,7 @@ The task stops immediately and its result never arrives. Ids come from bash (wai
  * settled — the completion wake already delivered the result, so a reminder
  * could only burn a turn on stale news.
  */
-export function createTaskRemindTool(registry: BackgroundRegistry, opts: { now?: () => number } = {}) {
+export function createTaskRemindTool(registry: TaskRegistry, opts: { now?: () => number } = {}) {
   const now = opts.now ?? Date.now;
   return {
     name: "task_remind",
@@ -1224,7 +1224,7 @@ Use this instead of sleep-looping to check on long builds, servers, or watchers.
 }
 
 /** The user-side lever: /tasks lists running tasks and check-ins; /tasks kill <id|all> stops one or all. */
-export function createTasksCommand(registry: BackgroundRegistry, opts: { now?: () => number } = {}) {
+export function createTasksCommand(registry: TaskRegistry, opts: { now?: () => number } = {}) {
   const now = opts.now ?? Date.now;
   const listing = () => `${describeRunningTasks(registry.running(), now())}${describeReminders(registry.reminders())}`;
   const usage = () => `Usage: /tasks — list running tasks; /tasks kill <t-xxxxx | all>\n\n${listing()}`;
