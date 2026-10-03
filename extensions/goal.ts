@@ -78,6 +78,13 @@ export const MAX_CRITERIA = 20;
 /** customType of this extension's one-shot goal reminder message. */
 export const GOAL_REMINDER_TYPE = "goal.reminder";
 
+/** Distinct from GOAL_REMINDER_TYPE: the paused steer says the OPPOSITE of a
+ * reminder, and scanGoalBranch treats any post-compaction goal.reminder as
+ * proof the goal is still in context — a shared type would mask compaction
+ * and let a reload re-adopt a paused goal as active with "do NOT work"
+ * instructions still in context. */
+export const GOAL_PAUSED_STEER_TYPE = "goal.paused";
+
 /** customType of the hidden turn-end check prompt (the graded "close the gaps" / "summarize + complete" message). */
 export const GOAL_CHECK_TYPE = "goal.check";
 
@@ -901,7 +908,9 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     if (goal && goal.status === "active") {
       uiRef?.setStatus("goal", checking ? `goal · checking (${goal.verify})` : renderGoalFooter(goal, Date.now()));
     } else if (goal && goal.status === "paused") {
-      uiRef?.setStatus("goal", `${renderGoalFooter(goal, Date.now())} · paused`);
+      // No elapsed while paused: startedAt never freezes, so a ticking clock
+      // would read as active work time during a long conversation.
+      uiRef?.setStatus("goal", "goal · paused");
     } else uiRef?.setStatus("goal", undefined);
   };
   const clearFooter = () => uiRef?.setStatus("goal", undefined);
@@ -990,7 +999,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     if (goal && goal.status === "paused") {
       return {
         message: {
-          customType: GOAL_REMINDER_TYPE,
+          customType: GOAL_PAUSED_STEER_TYPE,
           content:
             `GOAL PAUSED — goal #${goal.id} was paused by the user for a conversation. ` +
             "Do NOT work toward it this turn and do not call the goal tool; just respond to the user's message. " +
@@ -1183,6 +1192,17 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     executionMode: "sequential",
     async execute(_id, params) {
       if (params.action === "set") {
+        // A user-paused goal must not be replaced: set is the one action that
+        // persists a new snapshot, so an unguarded call would discard the
+        // pause AND wedge /goal resume (stopped stays true, status goes
+        // active). The steer says don't call the tool; this is the backstop.
+        if (goal?.status === "paused") {
+          return finish(
+            goal,
+            `Error: goal #${goal.id} is paused by the user; wait for /goal resume before starting or changing goals`,
+            "goal is paused",
+          );
+        }
         const o = validateObjective(params.objective);
         if (o.error) return finish(null, `Error: ${o.error}`);
         const c = validateCriteria(params.criteria);
@@ -1280,6 +1300,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         return finish(
           null,
           `Error: action must be one of "set", "complete", or "blocked" (got ${JSON.stringify(params.action) ?? "nothing"}); resend the call with the full arguments object`,
+          "invalid action",
         );
       }
       if (!goal) return finish(null, "Error: no goal to block");
@@ -1355,7 +1376,9 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         stopped = true;
         goal = { ...goal, status: "paused" };
         updateFooter();
-        ctx.ui.notify(`Goal #${goal.id} paused — talk freely; /goal resume when ready to continue.`);
+        ctx.ui.notify(
+          `Goal #${goal.id} paused — talk freely; /goal resume when ready. Session-scoped: reloading the session resumes it.`,
+        );
         return;
       }
 
@@ -1378,8 +1401,8 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
       }
 
       if (trimmed === "stop") {
-        if (!goal || goal.status !== "active") {
-          ctx.ui.notify("No active goal to stop.");
+        if (!goal || (goal.status !== "active" && goal.status !== "paused")) {
+          ctx.ui.notify("No active or paused goal to stop.");
           return;
         }
         // Session-scoped kill switch: pause auto-continuation and mark the goal

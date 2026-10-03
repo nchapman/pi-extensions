@@ -1566,7 +1566,7 @@ describe("registerGoalTool", () => {
 
     // Stopping with no active goal is a no-op.
     await commands.get("goal")!.handler("stop", cmdCtx);
-    expect(notify).toHaveBeenLastCalledWith("No active goal to stop.");
+    expect(notify).toHaveBeenLastCalledWith("No active or paused goal to stop.");
   });
 
   it("/goal pause halts the loop, shows a paused footer, and /goal resume re-engages", async () => {
@@ -1586,7 +1586,7 @@ describe("registerGoalTool", () => {
     // Pause: no further continuations, and the footer says paused (not cleared).
     await commands.get("goal")!.handler("pause", cmdCtx);
     expect(notify).toHaveBeenLastCalledWith(expect.stringContaining("paused"));
-    expect(setStatus).toHaveBeenLastCalledWith("goal", expect.stringMatching(/goal · .* · paused/));
+    expect(setStatus).toHaveBeenLastCalledWith("goal", "goal · paused");
     expect(await fire(events, "agent_before_settle", settleCtx)).toBeUndefined();
     expect(sentCustom).toHaveLength(1);
 
@@ -1605,6 +1605,57 @@ describe("registerGoalTool", () => {
     expect(notify).toHaveBeenLastCalledWith("No paused goal to resume.");
   });
 
+  it("the model cannot set, stop, or work a paused goal away from the user", async () => {
+    const { pi, tools, commands } = makePi();
+    const ui = { notify: vi.fn(), setStatus: vi.fn() };
+    registerGoalTool(pi, { verifyRunner: async () => failVerify });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "mine", verify: "npm test" });
+    await commands.get("goal")!.handler("pause", { mode: "headless", ui });
+
+    // set is gated like complete/blocked: an unguarded call would replace the
+    // paused goal, persist a new snapshot, and wedge /goal resume.
+    const r = (await tools.get(GOAL_TOOL_NAME)!.execute("2", { action: "set", objective: "sneaky" })) as {
+      content: Array<{ type: string; text: string }>;
+    };
+    expect(r.content[0].text).toContain("paused by the user");
+
+    // /goal stop accepts a paused goal (strictly stronger than pause).
+    await commands.get("goal")!.handler("stop", { mode: "headless", ui });
+    expect(ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("stopped"));
+  });
+
+  it("resume re-arms the continuation budget", async () => {
+    const { pi, tools, commands, events } = makePi();
+    const notify = vi.fn();
+    const setStatus = vi.fn();
+    const cmdCtx = { mode: "headless", ui: { notify, setStatus } };
+    const settleCtx = { ui: { notify, setStatus, setWidget: vi.fn() } } as unknown as ExtensionContext;
+    registerGoalTool(pi, { maxContinuations: 1, verifyRunner: async () => failVerify });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "stuck work", verify: "npm test" });
+
+    // The first settle continues (budget 1/1); the second trips the cap.
+    expect(await fire(events, "agent_before_settle", settleCtx)).toEqual({ continue: true });
+    expect(await fire(events, "agent_before_settle", settleCtx)).toBeUndefined();
+    expect(notify).toHaveBeenLastCalledWith(expect.stringContaining("still active after"));
+
+    // Pause, then resume: the budget was re-armed, so the loop continues.
+    await commands.get("goal")!.handler("pause", cmdCtx);
+    await commands.get("goal")!.handler("resume", cmdCtx);
+    expect(await fire(events, "agent_before_settle", settleCtx)).toEqual({ continue: true });
+  });
+
+  it("errors loudly on an unrecognized action string", async () => {
+    const { pi, tools } = makePi();
+    registerGoalTool(pi);
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    const r = (await tool.execute("1", { action: "pause" })) as {
+      content: Array<{ type: string; text: string }>;
+      details: { error?: string };
+    };
+    expect(r.content[0].text).toContain('got "pause"');
+    expect(r.details.error).toBe("invalid action");
+  });
+
   it("a paused goal steers every turn away from goal work until resumed", async () => {
     const { pi, tools, commands, events } = makePi();
     registerGoalTool(pi, { verifyRunner: async () => failVerify });
@@ -1613,7 +1664,11 @@ describe("registerGoalTool", () => {
 
     // While paused: every agent start carries a do-not-work-on-it steer —
     // the model's context still holds the original "work toward it" instruction.
-    const paused = fire(events, "before_agent_start") as { message: { content: string } };
+    const paused = fire(events, "before_agent_start") as { message: { customType: string; content: string } };
+    // Its own type, not goal.reminder: scanGoalBranch treats post-compaction
+    // goal.reminder messages as proof the goal is in context, and a paused
+    // steer masquerading as one would mask compaction of the real reminder.
+    expect(paused.message.customType).toBe("goal.paused");
     expect(paused.message.content).toContain("Do NOT work toward it this turn");
 
     // Once resumed, the steer is gone.
