@@ -34,7 +34,16 @@
  *   model-untouchable circuit breakers keep a stuck run bounded: a per-session
  *   cap (PI_GOAL_MAX_CONTINUATIONS) on auto-continuations, and a per-run turn
  *   bound (PI_GOAL_MAX_TURNS_PER_RUN) that steers a long turn to settle so the
- *   cap can re-engage. The model's set/complete/blocked actions never reset
+ *   cap can re-engage. At the cap, an injectable ProgressJudge seam decides
+ *   between "still progressing → reset the budget and continue" and "plateaued
+ *   → stop": the default judge is deterministic (the verify output changed
+ *   across the budget window ⇒ progressing), a semantic judge can slot in
+ *   later, and a no-opinion or throwing judge fails closed to the stop. The
+ *   seam is awaitable so an async (LLM) judge needs no adapter; judge resets are
+ *   themselves capped (PI_GOAL_MAX_PROGRESS_RESETS) so the breaker stays a
+ *   breaker — the worst case any strategy achieves is
+ *   maxContinuations × (maxProgressResets + 1). The
+ *   model's set/complete/blocked actions never reset
  *   either (a stuck model can't farm fresh turns by re-setting or faking a
  *   completion); both re-arm only on a resumed session or when the user starts a
  *   goal via /goal, and /goal stop halts the loop session-scoped
@@ -97,6 +106,22 @@ export function parseMaxTurnsPerRun(raw: string | undefined): number {
   if (raw === undefined || raw.trim() === "") return GOAL_MAX_TURNS_PER_RUN_DEFAULT;
   const n = Number(raw);
   if (!Number.isInteger(n) || n < 1 || n > 1_000_000) return GOAL_MAX_TURNS_PER_RUN_DEFAULT;
+  return n;
+}
+
+/**
+ * Cap on judge-approved budget resets at the continuation cap
+ * (PI_GOAL_MAX_PROGRESS_RESETS). Each reset re-arms the continuation budget;
+ * without this the progress judge would defeat the circuit breaker entirely.
+ */
+export const GOAL_MAX_PROGRESS_RESETS_DEFAULT = 3;
+const GOAL_MAX_PROGRESS_RESETS_ENV = "PI_GOAL_MAX_PROGRESS_RESETS";
+
+/** Parse PI_GOAL_MAX_PROGRESS_RESETS. Invalid values fall back to the default — fail-open, no throw. */
+export function parseMaxProgressResets(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return GOAL_MAX_PROGRESS_RESETS_DEFAULT;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0 || n > 100_000) return GOAL_MAX_PROGRESS_RESETS_DEFAULT;
   return n;
 }
 
@@ -228,19 +253,59 @@ export interface GoalJudge {
   evaluate(goal: Goal, evidence: string[], summary: string): GoalVerdict | undefined;
 }
 
-export interface RegisterGoalOptions {
-  /** Optional semantic judge (Jev-style). v1 leaves this unset; the structural gate is the floor. */
-  judge?: GoalJudge;
-  /** Per-session cap on auto-continuations for a still-active goal. Defaults to
-   *  PI_GOAL_MAX_CONTINUATIONS, then GOAL_MAX_CONTINUATIONS_DEFAULT. */
-  maxContinuations?: number;
-  /** Per-run turn bound before steering a settle. Defaults to
-   *  PI_GOAL_MAX_TURNS_PER_RUN, then GOAL_MAX_TURNS_PER_RUN_DEFAULT. */
-  maxTurnsPerRun?: number;
-  /** Verifier run on `complete` (and prefetched on `set`). Inject a fake in tests. */
-  verifyRunner?: VerifyRunner;
-  /** Timeout (ms) for a verify run. Defaults to PI_GOAL_VERIFY_TIMEOUT_MS, then VERIFY_TIMEOUT_MS_DEFAULT. */
-  verifyTimeoutMs?: number;
+/** A typed second opinion on continuing past the continuation cap. */
+export interface ProgressVerdict {
+  continueRun: boolean;
+  reason?: string;
+}
+
+/**
+ * Decides, at the continuation cap, whether the run is still making progress
+ * (reset the budget and continue) or has plateaued (stop). Receives the verify
+ * outputs observed during the current budget window, oldest first. May return
+ * a Promise (an LLM judge is async; the seam awaits it). `undefined`
+ * = no opinion, which fails closed to the stop — the circuit breaker is the
+ * floor, so an absent or ambiguous judge may not extend the run.
+ */
+export interface ProgressJudge {
+  assess(goal: Goal, verifyOutputs: string[]): ProgressVerdict | undefined | Promise<ProgressVerdict | undefined>;
+}
+
+/** Max verify outputs retained per budget window (~4KB each — bounded retention). */
+export const MAX_BUDGET_OUTPUTS = 32;
+
+/**
+ * Append a verify output to the budget window, bounding retention: keep the
+ * oldest (the window's baseline), drop second-oldest beyond the cap. The
+ * default judge only needs first vs last; a semantic judge gets the baseline
+ * plus the most recent tail — enough signal without unbounded memory.
+ */
+export function recordBudgetOutput(outputs: string[], output: string): string[] {
+  outputs.push(output);
+  if (outputs.length > MAX_BUDGET_OUTPUTS) outputs.splice(1, 1);
+  return outputs;
+}
+
+/**
+ * The default deterministic progress judge: the measured state changed across
+ * the budget window ⇒ progressing. A verify that prints live numbers (coverage,
+ * benchmarks) moves whenever real work lands; a stuck run reproduces the same
+ * output turn after turn. This is a proxy, not a regression test — it can't
+ * tell improvement from drift — and any verify whose output carries timestamps
+ * or timings reads as "changed" every turn, so its resets are effectively
+ * always granted up to the cap; that is why the resets are themselves capped.
+ * The window is scoped to the current goal (cleared on set) so a reset always
+ * certifies measured movement of that goal, never a re-set trick.
+ */
+export function defaultProgressJudge(_goal: Goal, verifyOutputs: string[]): ProgressVerdict {
+  const outputs = verifyOutputs.map((o) => o.trim()).filter((o) => o !== "");
+  if (outputs.length < 2) {
+    return { continueRun: false, reason: "not enough measured states to show progress" };
+  }
+  const changed = outputs[0] !== outputs[outputs.length - 1];
+  return changed
+    ? { continueRun: true, reason: "measured state changed across the budget window" }
+    : { continueRun: false, reason: "measured state is unchanged since the budget started (plateau)" };
 }
 
 const GOAL_STATUSES = ["active", "paused", "blocked", "complete"] as const;
@@ -639,12 +704,22 @@ export function lastGoalSnapshot(branch: GoalBranchEntry[]): Goal | null {
 export interface RegisterGoalOptions {
   /** Optional semantic judge (Jev-style). v1 leaves this unset; the structural gate is the floor. */
   judge?: GoalJudge;
+  /** Optional progress judge consulted at the continuation cap. Defaults to the
+   *  deterministic defaultProgressJudge (verify output changed ⇒ progressing). */
+  progressJudge?: ProgressJudge;
+  /** Cap on judge-approved budget resets at the continuation cap. Defaults to
+   *  PI_GOAL_MAX_PROGRESS_RESETS, then GOAL_MAX_PROGRESS_RESETS_DEFAULT. */
+  maxProgressResets?: number;
   /** Per-session cap on auto-continuations for a still-active goal. Defaults to
    *  PI_GOAL_MAX_CONTINUATIONS, then GOAL_MAX_CONTINUATIONS_DEFAULT. */
   maxContinuations?: number;
   /** Per-run turn bound before steering a settle. Defaults to
    *  PI_GOAL_MAX_TURNS_PER_RUN, then GOAL_MAX_TURNS_PER_RUN_DEFAULT. */
   maxTurnsPerRun?: number;
+  /** Verifier run on `complete` (and prefetched on `set`). Inject a fake in tests. */
+  verifyRunner?: VerifyRunner;
+  /** Timeout (ms) for a verify run. Defaults to PI_GOAL_VERIFY_TIMEOUT_MS, then VERIFY_TIMEOUT_MS_DEFAULT. */
+  verifyTimeoutMs?: number;
 }
 
 export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions = {}): void {
@@ -660,9 +735,16 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
   let uiRef: ExtensionContext["ui"] | undefined;
   const maxContinuations = options.maxContinuations ?? parseMaxContinuations(process.env[GOAL_MAX_CONTINUATIONS_ENV]);
   const maxTurnsPerRun = options.maxTurnsPerRun ?? parseMaxTurnsPerRun(process.env[GOAL_MAX_TURNS_PER_RUN_ENV]);
+  const maxProgressResets =
+    options.maxProgressResets ?? parseMaxProgressResets(process.env[GOAL_MAX_PROGRESS_RESETS_ENV]);
+  const progressJudge: ProgressJudge = options.progressJudge ?? { assess: defaultProgressJudge };
   const judge = options.judge;
   const verifyTimeoutMs = options.verifyTimeoutMs ?? parseVerifyTimeoutMs(process.env[VERIFY_TIMEOUT_ENV]);
   const verifyRunner: VerifyRunner = options.verifyRunner ?? runVerify;
+  // Verify outputs observed during the current budget window (oldest first) —
+  // the evidence the progress judge reads at the cap. Cleared with the budget.
+  let budgetOutputs: string[] = [];
+  let resetsUsed = 0;
 
   const activateTool = () => {
     const active = pi.getActiveTools();
@@ -683,6 +765,8 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
   const resetContinuationBudget = () => {
     continuations = 0;
     stopped = false;
+    budgetOutputs = [];
+    resetsUsed = 0;
   };
 
   const adoptBranchState = (ctx: ExtensionContext) => {
@@ -692,6 +776,8 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     if (g) goalSeq = g.id;
     compactedSinceUpdate = hiddenByCompaction;
     continuations = 0;
+    budgetOutputs = [];
+    resetsUsed = 0;
     // Re-arm the continuation loop for an active goal on resume; it never runs for
     // a finished or blocked one.
     stopped = !(g && g.status === "active");
@@ -703,6 +789,12 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     goalSeq += 1;
     goal = { id: goalSeq, objective, criteria, status: "active", startedAt: Date.now(), ...(verify ? { verify } : {}) };
     compactedSinceUpdate = false;
+    // Scope the judge's evidence to THIS goal: a window mixing goal A's outputs
+    // with goal B's would let a re-set with any differently-printing verify buy
+    // a "progressing" reset without moving the current goal. Clearing only the
+    // evidence (not continuations/resetsUsed) is strictly tightening — a fresh
+    // window with <2 outputs fails closed to the stop.
+    budgetOutputs = [];
     // A model-set goal does NOT reset the continuation budget: re-setting the goal
     // must not farm fresh auto-continuations and defeat the cap. The budget
     // re-arms only at resume, a gated completion, or a user /goal kickoff.
@@ -768,13 +860,39 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     if (!goal || goal.status !== "active" || stopped) return;
     if (!goal.verify) return;
     if (continuations >= maxContinuations) {
-      stopped = true;
-      ctx.ui?.notify(
-        `Goal #${goal.id} still active after ${maxContinuations} auto-continuations — stopping. ` +
-          "Complete it via the goal tool, adjust it, or /goal stop.",
-      );
-      updateFooter();
-      return;
+      // At the cap, a progress judge decides: still moving → reset the budget
+      // and continue (itself capped, so the judge can't defeat the breaker);
+      // plateaued or no opinion → stop. Fail-closed on ambiguity.
+      let verdict: ProgressVerdict | undefined;
+      try {
+        // Awaited so an async (LLM) judge needs no adapter; its rejection lands
+        // in this catch and fails closed.
+        verdict = await progressJudge.assess(goal, budgetOutputs);
+      } catch {
+        verdict = undefined; // a throwing judge must not extend the run
+      }
+      if (verdict?.continueRun && resetsUsed < maxProgressResets) {
+        resetsUsed += 1;
+        continuations = 0;
+        budgetOutputs = [];
+        ctx.ui?.notify(
+          `Goal #${goal.id} hit the continuation cap but is still progressing (${verdict.reason ?? "judge approved"}) — ` +
+            `resetting the budget (reset ${resetsUsed}/${maxProgressResets}).`,
+        );
+      } else {
+        stopped = true;
+        const why = verdict?.continueRun
+          ? `progress-judge resets exhausted (${resetsUsed}/${maxProgressResets})`
+          : verdict
+            ? (verdict.reason ?? "no progress signal")
+            : "progress judge unavailable — failing closed";
+        ctx.ui?.notify(
+          `Goal #${goal.id} still active after ${maxContinuations} auto-continuations — stopping (${why}). ` +
+            "Complete it via the goal tool, adjust it, or /goal stop.",
+        );
+        updateFooter();
+        return;
+      }
     }
     continuations += 1;
     let check: VerifyResult;
@@ -793,6 +911,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
       };
     }
     updateFooter();
+    recordBudgetOutput(budgetOutputs, check.output);
     pi.sendMessage(
       {
         customType: GOAL_CHECK_TYPE,
@@ -859,6 +978,9 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         // already passes means the goal is likely already met or mis-specified,
         // so surface it before the model starts (and before it can "complete" trivially).
         const pre = await verifyRunner(g.verify, { timeoutMs: verifyTimeoutMs });
+        // Seed the budget window with the baseline so the judge has a first
+        // measured state even for tiny caps (PI_GOAL_MAX_CONTINUATIONS=1).
+        recordBudgetOutput(budgetOutputs, pre.output);
         const baseline = pre.ok
           ? ` NOTE: the verify command already passes — confirm the goal isn't already met or the check is too weak, and refine it if so.`
           : ` It currently fails, as expected for an unmet goal; completion is gated on it passing.`;

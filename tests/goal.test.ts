@@ -3,15 +3,20 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import {
   checkCompletion,
   checkEvidenceCoverage,
+  defaultProgressJudge,
   effectiveCriteria,
   GOAL_MAX_CONTINUATIONS_DEFAULT,
+  GOAL_MAX_PROGRESS_RESETS_DEFAULT,
   GOAL_MAX_TURNS_PER_RUN_DEFAULT,
+  MAX_BUDGET_OUTPUTS,
   GOAL_REMINDER_TYPE,
   GOAL_TOOL_NAME,
   isContradictorySummary,
   lastGoalSnapshot,
   parseMaxContinuations,
+  parseMaxProgressResets,
   parseMaxTurnsPerRun,
+  recordBudgetOutput,
   parseVerifyTimeoutMs,
   renderCheckPrompt,
   renderGoalCall,
@@ -25,6 +30,7 @@ import {
   validateVerify,
   type Goal,
   type GoalDetails,
+  type ProgressJudge,
   type VerifyResult,
   registerGoalTool,
   formatElapsed,
@@ -242,6 +248,54 @@ describe("parseMaxTurnsPerRun", () => {
     expect(parseMaxTurnsPerRun("99999999")).toBe(GOAL_MAX_TURNS_PER_RUN_DEFAULT);
   });
   it("accepts a valid integer", () => expect(parseMaxTurnsPerRun("7")).toBe(7));
+});
+
+describe("parseMaxProgressResets", () => {
+  it("defaults on missing, empty, and invalid values", () => {
+    expect(parseMaxProgressResets(undefined)).toBe(GOAL_MAX_PROGRESS_RESETS_DEFAULT);
+    expect(parseMaxProgressResets("")).toBe(GOAL_MAX_PROGRESS_RESETS_DEFAULT);
+    expect(parseMaxProgressResets("abc")).toBe(GOAL_MAX_PROGRESS_RESETS_DEFAULT);
+    expect(parseMaxProgressResets("-1")).toBe(GOAL_MAX_PROGRESS_RESETS_DEFAULT);
+    expect(parseMaxProgressResets("1e9")).toBe(GOAL_MAX_PROGRESS_RESETS_DEFAULT);
+  });
+
+  it("accepts a valid integer, including zero (judge resets disabled)", () => {
+    expect(parseMaxProgressResets("5")).toBe(5);
+    expect(parseMaxProgressResets("0")).toBe(0);
+  });
+});
+
+describe("recordBudgetOutput", () => {
+  it("keeps the oldest entry as the baseline and bounds the window", () => {
+    const outputs = ["baseline"];
+    for (let i = 0; i < MAX_BUDGET_OUTPUTS + 10; i++) recordBudgetOutput(outputs, `state ${i}`);
+    expect(outputs).toHaveLength(MAX_BUDGET_OUTPUTS);
+    expect(outputs[0]).toBe("baseline"); // baseline survives
+    expect(outputs.at(-1)).toBe(`state ${MAX_BUDGET_OUTPUTS + 9}`); // newest survives
+  });
+});
+
+describe("defaultProgressJudge", () => {
+  it("continues when the measured state changed across the window", () => {
+    const v = defaultProgressJudge(goal(), ["coverage 41%", "coverage 41%", "coverage 55%"]);
+    expect(v.continueRun).toBe(true);
+  });
+
+  it("stops on an unchanged measured state (plateau)", () => {
+    const same = "FAIL: expected 2 to be 3";
+    const v = defaultProgressJudge(goal(), [same, same, same]);
+    expect(v.continueRun).toBe(false);
+  });
+
+  it("stops without at least two measured states", () => {
+    expect(defaultProgressJudge(goal(), ["coverage 41%"]).continueRun).toBe(false);
+    expect(defaultProgressJudge(goal(), []).continueRun).toBe(false);
+  });
+
+  it("ignores whitespace-only differences and empty outputs", () => {
+    const v = defaultProgressJudge(goal(), ["  coverage 41%\n", "", " \tcoverage 41% \n"]);
+    expect(v.continueRun).toBe(false);
+  });
 });
 
 describe("formatElapsed", () => {
@@ -890,6 +944,167 @@ describe("registerGoalTool", () => {
     // Stopped: no further continuations on more settles.
     expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
     expect(sentCustom).toHaveLength(2);
+  });
+
+  it("resets the budget at the cap when the measured state is still progressing", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const notify = vi.fn();
+    const ctx = { ui: { notify, setStatus: vi.fn() } } as unknown as ExtensionContext;
+    // Each check reports a different measured state — the run is visibly moving.
+    let calls = 0;
+    const outputs = ["geomean 0.33", "geomean 0.47", "geomean 0.55", "geomean 0.62", "geomean 0.71"];
+    registerGoalTool(pi, {
+      maxContinuations: 2,
+      verifyRunner: async () => ({ ...failVerify, output: outputs[Math.min(calls++, outputs.length - 1)] }),
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "bench goal", verify: "npm test" });
+
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 1/2
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 2/2
+    // At the cap the judge sees a changed measured state → reset, not stop.
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 1/2 (reset)
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify.mock.calls[0]![0]).toContain("still progressing");
+    expect(notify.mock.calls[0]![0]).toContain("1/3");
+    expect(sentCustom).toHaveLength(3);
+    // The reset prompt's counter restarts from the new budget.
+    const last = sentCustom.at(-1)!.msg as { content: string };
+    expect(last.content).toContain("continuation 1/2");
+  });
+
+  it("stops for good once the judge resets are exhausted", async () => {
+    const { pi, tools, events } = makePi();
+    const notify = vi.fn();
+    const ctx = { ui: { notify, setStatus: vi.fn() } } as unknown as ExtensionContext;
+    let calls = 0;
+    registerGoalTool(pi, {
+      maxContinuations: 2,
+      maxProgressResets: 1,
+      verifyRunner: async () => ({ ...failVerify, output: `coverage ${40 + calls++}%` }),
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
+
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 1/2
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 2/2
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // judge reset 1/1
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 2/2 again
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined(); // resets exhausted → stop
+    expect(notify).toHaveBeenCalledTimes(2);
+    expect(notify.mock.calls[1]![0]).toContain("resets exhausted");
+    // Stopped stays stopped even though the measured state keeps changing.
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(notify).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops at the cap when the judge has no opinion (fail closed)", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const notify = vi.fn();
+    const ctx = { ui: { notify, setStatus: vi.fn() } } as unknown as ExtensionContext;
+    const noOpinion: ProgressJudge = { assess: () => undefined };
+    registerGoalTool(pi, {
+      maxContinuations: 2,
+      progressJudge: noOpinion,
+      verifyRunner: async () => ({ ...failVerify, output: `coverage ${Date.now()}%` }),
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
+
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined(); // no opinion → stop
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(sentCustom).toHaveLength(2);
+  });
+
+  it("a throwing progress judge fails closed to the stop", async () => {
+    const { pi, tools, events } = makePi();
+    const notify = vi.fn();
+    const ctx = { ui: { notify, setStatus: vi.fn() } } as unknown as ExtensionContext;
+    registerGoalTool(pi, {
+      maxContinuations: 1,
+      progressJudge: {
+        assess: () => {
+          throw new Error("judge offline");
+        },
+      },
+      verifyRunner: async () => ({ ...failVerify, output: `coverage ${Date.now()}%` }),
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
+
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined(); // throw → stop, not crash
+    expect(notify).toHaveBeenCalledTimes(1);
+  });
+
+  it("an async (LLM-style) judge is awaited; its rejection fails closed to the stop", async () => {
+    const { pi, tools, events } = makePi();
+    const notify = vi.fn();
+    const ctx = { ui: { notify, setStatus: vi.fn() } } as unknown as ExtensionContext;
+    let mode: "ok" | "reject" = "ok";
+    const asyncJudge: ProgressJudge = {
+      assess: async (_g, outputs) => {
+        if (mode === "reject") throw new Error("llm down");
+        return outputs.length >= 2 ? { continueRun: true, reason: "async ok" } : { continueRun: false };
+      },
+    };
+    registerGoalTool(pi, {
+      maxContinuations: 2,
+      progressJudge: asyncJudge,
+      verifyRunner: async () => failVerify,
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
+
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    // Async judge approved → the budget resets and the run continues.
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    expect(notify.mock.calls[0]![0]).toContain("async ok");
+
+    // A rejecting async judge must fail closed (stop), not crash or dangle a rejection.
+    mode = "reject";
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(notify.mock.calls.at(-1)![0]).toContain("progress judge unavailable");
+  });
+
+  it("re-setting the goal mid-window cannot buy a reset with a differently-printing verify", async () => {
+    const { pi, tools, events } = makePi();
+    const notify = vi.fn();
+    const ctx = { ui: { notify, setStatus: vi.fn() } } as unknown as ExtensionContext;
+    // Goal A's verify prints one thing forever; goal B's prints another forever.
+    let which = "A";
+    registerGoalTool(pi, {
+      maxContinuations: 2,
+      verifyRunner: async () => ({ ...failVerify, output: which === "A" ? "state A" : "state B" }),
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "A", verify: "npm test" });
+
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 1/2
+    // Re-set to goal B: the window is re-scoped to B's baseline, so B's static
+    // verify reads as a plateau — no free reset from the A/B output difference.
+    which = "B";
+    await tools.get(GOAL_TOOL_NAME)!.execute("2", { action: "set", objective: "B", verify: "npm test" });
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 2/2 (cap not raised)
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined(); // plateau → stop
+    expect(notify).toHaveBeenCalledTimes(1);
+  });
+
+  it("seeds the budget window with the set-time baseline, so a tiny cap still judges two states", async () => {
+    const { pi, tools, events } = makePi();
+    const notify = vi.fn();
+    const ctx = { ui: { notify, setStatus: vi.fn() } } as unknown as ExtensionContext;
+    let calls = 0;
+    registerGoalTool(pi, {
+      maxContinuations: 1,
+      verifyRunner: async () => ({ ...failVerify, output: `coverage ${40 + calls++}%` }),
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
+
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 1/1
+    // Baseline (set preflight) + one continuation ⇒ the judge sees movement.
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // reset, continue
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify.mock.calls[0]![0]).toContain("still progressing");
   });
 
   it("the cap path does not throw when the settle ctx has no ui (headless)", async () => {

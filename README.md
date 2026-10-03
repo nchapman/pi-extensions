@@ -13,15 +13,15 @@ pi list                           # verify
 
 ## Extensions
 
-| Extension              | What it does                                                                                                                        |
-| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `subagents.ts`         | Delegate tasks to isolated headless pi runs. Slow runs background and wake the agent when done. Also replaces the built-in `bash` (inline/auto/background) with `task`/`task_kill`/`task_remind` and `/tasks` to manage them. |
-| `recall.ts`            | Search compacted-away session history (BM25 + local embeddings). Owns auto-compaction and summary generation.                      |
-| `todo.ts`              | Plan tracking that survives compaction, rewind, and resume. Progress in tool rows, full-screen `/todos`.                           |
-| `goal.ts`              | A session-scoped goal with a verifiable completion gate: a turn-end check keeps the agent working until it's met, blocked, or a safety cap trips, with a footer showing the objective and elapsed time. |
-| `overflow.ts`          | Caps oversized custom tool results; full output stashed beside the session.                                                         |
-| `openai-gateways.ts`   | Dynamic model discovery for OpenAI-compatible gateways, mirrored into native `models.json` for headless runs.                      |
-| `shortcuts.ts`         | Extra slash commands (`/exit`, `/comp`, `/info`, `/time`); edit `SHORTCUTS` to add your own.                                        |
+| Extension            | What it does                                                                                                                                                                                                                  |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `subagents.ts`       | Delegate tasks to isolated headless pi runs. Slow runs background and wake the agent when done. Also replaces the built-in `bash` (inline/auto/background) with `task`/`task_kill`/`task_remind` and `/tasks` to manage them. |
+| `recall.ts`          | Search compacted-away session history (BM25 + local embeddings). Owns auto-compaction and summary generation.                                                                                                                 |
+| `todo.ts`            | Plan tracking that survives compaction, rewind, and resume. Progress in tool rows, full-screen `/todos`.                                                                                                                      |
+| `goal.ts`            | A session-scoped goal with a verifiable completion gate: a turn-end check keeps the agent working until it's met, blocked, or a safety cap trips, with a footer showing the objective and elapsed time.                       |
+| `overflow.ts`        | Caps oversized custom tool results; full output stashed beside the session.                                                                                                                                                   |
+| `openai-gateways.ts` | Dynamic model discovery for OpenAI-compatible gateways, mirrored into native `models.json` for headless runs.                                                                                                                 |
+| `shortcuts.ts`       | Extra slash commands (`/exit`, `/comp`, `/info`, `/time`); edit `SHORTCUTS` to add your own.                                                                                                                                  |
 
 ### subagents
 
@@ -43,14 +43,14 @@ recall also owns auto-compaction: it fires when projected context exceeds min(25
 
 Common knobs (invalid values fall back to defaults with a warning; the full list is in `parseConfig` in `extensions/recall.ts`):
 
-| Knob                       | Default | Notes                                              |
-| -------------------------- | ------- | -------------------------------------------------- |
-| `PI_RECALL_SCOPE`          | `session` | `project` also searches sibling session files    |
-| `PI_RECALL_EMBED`          | on      | `0` disables the semantic side                     |
-| `PI_RECALL_COMPACT_TARGET` | 256,000 | Token cap for auto-compaction (`0` disables)       |
-| `PI_RECALL_COMPACT_RATIO`  | 0.7     | Also bound the target to this fraction of the window |
-| `PI_RECALL_SUMMARY_CHARS`  | 5,000   | Hard budget for generated summaries                |
-| `PI_RECALL_HALF_LIFE_HOURS`| 4       | Recency decay half-life                            |
+| Knob                        | Default   | Notes                                                |
+| --------------------------- | --------- | ---------------------------------------------------- |
+| `PI_RECALL_SCOPE`           | `session` | `project` also searches sibling session files        |
+| `PI_RECALL_EMBED`           | on        | `0` disables the semantic side                       |
+| `PI_RECALL_COMPACT_TARGET`  | 256,000   | Token cap for auto-compaction (`0` disables)         |
+| `PI_RECALL_COMPACT_RATIO`   | 0.7       | Also bound the target to this fraction of the window |
+| `PI_RECALL_SUMMARY_CHARS`   | 5,000     | Hard budget for generated summaries                  |
+| `PI_RECALL_HALF_LIFE_HOURS` | 4         | Recency decay half-life                              |
 
 ### todo
 
@@ -62,7 +62,7 @@ A single session-scoped objective with a verifiable completion gate — the agen
 
 A `verify` command (optional) makes progress measurable: it prints the current state (e.g. a coverage report, a test summary) and exits 0 only when the objective is met. The extension runs it itself in a bounded shell (hard timeout, capped output tail), so the model can't fake success — at completion a failing run is rejected with its output so the real cause gets fixed. No-op verifies (`true`, `:`, `exit 0`) are rejected at `set` time, and a preflight run at `set` reports whether the check already passes. Completion is also a structural gate, not a model self-assessment: to `complete`, the model must supply a `summary` plus `evidence` indexed to the goal's criteria (`evidence[i]` proves `criteria[i]`); a free-text "done" is rejected when it names a failure, a criterion lacks proof, or the id is stale. A semantic second opinion (Jev-style classifier) can slot in behind the injectable `GoalJudge` seam; v1 ships none (fail-open floor).
 
-A `agent_before_settle` loop keeps it working — the "turn-end check": at each settle, an active goal with a `verify` has the check re-run, and the extension queues a hidden follow-up (a `display:false` custom message, so the user sees no "keep going" line) carrying the graded result — the measured state plus either "close these gaps" (check failed) or "summarize and call `complete`" (check passed). Goals without a `verify` are user-driven: the tool tracks the objective and gates completion but does not auto-continue. Two model-untouchable circuit breakers bound a stuck run — a per-session cap on auto-continuations and a per-run turn bound that steers a long turn to settle so the cap can re-engage. The model's `set`/`complete`/`blocked` never reset either; both re-arm only on resume or a user `/goal` kickoff. A footer status (`🎯 #N: objective · elapsed`) shows the goal and its running time while active and clears on completion or block. A `before_agent_start` reminder re-injects the objective when a compaction hid it (summaries never carry the goal).
+A `agent_before_settle` loop keeps it working — the "turn-end check": at each settle, an active goal with a `verify` has the check re-run, and the extension queues a hidden follow-up (a `display:false` custom message, so the user sees no "keep going" line) carrying the graded result — the measured state plus either "close these gaps" (check failed) or "summarize and call `complete`" (check passed). Goals without a `verify` are user-driven: the tool tracks the objective and gates completion but does not auto-continue. Two model-untouchable circuit breakers bound a stuck run — a per-session cap on auto-continuations (`PI_GOAL_MAX_CONTINUATIONS`, default 25) and a per-run turn bound (`PI_GOAL_MAX_TURNS_PER_RUN`, default 50) that steers a long turn to settle so the cap can re-engage. At the continuation cap an injectable `ProgressJudge` seam decides whether to keep going: the default judge is deterministic — the verify output changed across the budget window ⇒ still progressing ⇒ the budget resets and the run continues; unchanged ⇒ plateau ⇒ stop — and a no-opinion or throwing judge fails closed to the stop, so the breaker stays the floor. Judge resets are themselves capped (`PI_GOAL_MAX_PROGRESS_RESETS`, default 3) so the judge can't defeat the breaker — the effective worst case any strategy achieves is `PI_GOAL_MAX_CONTINUATIONS × (PI_GOAL_MAX_PROGRESS_RESETS + 1)` continuations, and a verify whose output carries timestamps/timings will read as "progressing" every window, so noisy checks effectively get the full multiple. The judge's evidence is scoped to the current goal (a mid-window re-set clears it) and seeded with the `set`-time baseline; a semantic async (LLM) judge can slot in behind the same awaited seam later. The model's `set`/`complete`/`blocked` never reset any of these; they re-arm only on resume (session start or branch switch — a rewind also re-arms, including after a stop) or a user `/goal` kickoff. A footer status (`🎯 #N: objective · elapsed`) shows the goal and its running time while active and clears on completion or block. A `before_agent_start` reminder re-injects the objective when a compaction hid it (summaries never carry the goal).
 
 State is model-owned and reconstructed from the branch (snapshots in the goal tool result's `details`, replayed on `session_start`/`session_tree`) — no filesystem, nothing desyncs on rewind or resume. `/goal` is a view + kickoff: it shows the goal, starts one (routed through the model so the goal tool creates and persists it), or stops the loop with `/goal stop`.
 
