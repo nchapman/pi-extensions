@@ -1,93 +1,90 @@
 # pi-extensions
 
-Personal [pi](https://pi.dev) coding agent extensions. Loads in-place as a local pi package — edit a file, then `/reload` in a pi session.
-
-Design through-line: keep the parent agent's context small, and fail explicitly.
+A personal collection of [pi](https://pi.dev) coding-agent extensions. The common idea is to give an agent useful long-running capabilities while keeping its everyday context and tool surface small: work can be recovered, checked, or delegated without silently losing state.
 
 ## Install
 
+Install the package once, then reload pi after editing the files:
+
 ```sh
-pi install ~/Code/pi-extensions   # one-time
-pi list                           # verify
+pi install ~/Code/pi-extensions
+pi list                       # verify the package is installed
 ```
 
-## Extensions
+Pi loads the TypeScript in this directory directly; there is no build step. The package registers the `extensions/` directory, so pi loads all included extension files. `recall` imports plan-rendering code from `todo`, so keep both if packaging extensions selectively.
 
-| Extension            | What it does                                                                                                                                                                                                                  |
-| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `subagents.ts`       | Delegate tasks to isolated headless pi runs. Calls block until done; `background: true` opts a run into the background with a wake on completion. Also replaces the built-in `bash` (inline default, auto/background opt-in) with `task`/`task_kill`/`task_remind` and `/tasks` to manage them. |
-| `recall.ts`          | Search compacted-away session history (BM25 + local embeddings). Owns auto-compaction and summary generation.                                                                                                                 |
-| `todo.ts`            | Plan tracking that survives compaction, rewind, and resume. Progress in tool rows, full-screen `/todos`.                                                                                                                      |
-| `goal.ts`            | A session-scoped goal with a verifiable completion gate: a turn-end check keeps the agent working until it's met, blocked, or a safety cap trips, with a footer showing the objective and elapsed time.                       |
-| `overflow.ts`        | Caps oversized custom tool results; full output stashed beside the session.                                                                                                                                                   |
-| `openai-gateways.ts` | Dynamic model discovery for OpenAI-compatible gateways, mirrored into native `models.json` for headless runs.                                                                                                                 |
-| `shortcuts.ts`       | Extra slash commands (`/exit`, `/comp`, `/info`, `/time`); edit `SHORTCUTS` to add your own.                                                                                                                                  |
+## Extensions at a glance
 
-### subagents
+| Extension                                          | Adds                                                                               | Useful for                                                                                                                                                                                                                              |
+| -------------------------------------------------- | ---------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`subagents`](extensions/subagents.ts)             | `subagent`, `subagents`, background-task tools, `/tasks`, and named agent commands | Delegating work or running shell commands without losing track of them. Blocking is the default; opt into background work when it helps. It also replaces pi's `bash` tool with a compatible inline mode and optional background modes. |
+| [`recall`](extensions/recall.ts)                   | `recall`                                                                           | Finding details from earlier in the session after compaction. Searches archived turns with lexical ranking and optional local semantic search; also manages context compaction and summaries.                                           |
+| [`todo`](extensions/todo.ts)                       | `todo`, `/todos`                                                                   | Keeping a multi-step plan visible and recoverable across compaction, rewind, and resume. The agent replaces the complete list on each update.                                                                                           |
+| [`goal`](extensions/goal.ts)                       | `goal`, `/goal`                                                                    | Pursuing one high-level objective with per-criterion evidence required at completion. An optional verification command can drive an automatic work/check loop, bounded by continuation and turn limits.                                 |
+| [`overflow`](extensions/overflow.ts)               | —                                                                                  | Preventing large custom-tool results from crowding out useful context. Oversized text is capped and the full result is saved beside the session for recovery.                                                                           |
+| [`openai-gateways`](extensions/openai-gateways.ts) | OpenAI-compatible providers                                                        | Discovering models from local gateways and proxies such as Ollama, vLLM, or LM Studio, including for headless subagent runs.                                                                                                            |
+| [`shortcuts`](extensions/shortcuts.ts)             | `/exit`, `/bye`, `/q`, `/close`, `/comp`, `/summarize`, `/info`, `/time`           | Common command aliases and quick session information.                                                                                                                                                                                   |
 
-Agents are markdown files in `~/.pi/agent/agents/` (frontmatter: `description`, `tools` as string/array/per-tool map, optional `model`/`thinking`). `subagent` runs one task; `subagents` runs a batch in parallel; each agent also gets a `/name` slash command. Children are headless pi runs (`pi -p --mode json --no-extensions`) with restricted tools — unknown tool names are dropped, never a silent widening. Model precedence: the tool call's `model` param, then the agent's `model`, then the parent chat's current model.
+## Plans, goals, and memory
 
-Subagents block until they finish — waiting on a tool call costs the agent nothing, so that is the default. Runs opt into the background per task (`background: true`) rather than being auto-adopted mid-run: the tool returns a task id and exactly one wake message delivers the result when it settles (over-cap replies stashed at `<sessionDir>/tasks/<id>.txt`); set `PI_SUBAGENT_BG_AFTER_MS` to restore the old auto-adoption window. Manage with `/tasks`, `/tasks kill <id>`, `/tasks kill all`, or the `task_kill` tool; peek at a running task with `task <id>` (new output since the last check) or schedule a one-shot check-in with `task_remind` — a single timer that fires once and is dropped if the task already settled, so no turn is burned on silence. `session_shutdown` kills running children.
+These three extensions solve different problems:
 
-The extension also replaces the built-in `bash` by name, one tool covering the whole CLI-task lifecycle: `wait: "inline"` (default) is the built-in bash verbatim (streaming, truncation, temp-file stashing, structured output) — blocking is the norm because waiting on a tool call costs the agent nothing, `wait: "auto"` blocks up to the ~2-minute window and then promotes to the background, and `wait: "background"` returns a task id immediately. Auto and background run through pi's own local bash operations, so shell resolution, environment, process-tree kill, and exit codes are identical to the built-in. The full output streams to `<sessionDir>/tasks/<id>.log` from byte zero — `task <id>` peeks at it while the command runs and it survives resume — and is removed on kill; the wake carries exit status, duration, and a 4KB output tail. `timeout` is in seconds with no default: 0 or omitted means no timeout. Task ids are `t-` + a base36 timecode, so ids from earlier sessions or parallel sessions never collide in a long-running context.
+- **`todo` is a plan.** Use it to track steps, status, and progress. Its state follows the active session branch, and `/todos` opens the full list.
+- **`goal` is a commitment.** Use it for a larger objective. Add a `verify` command that reports the measured state and exits successfully only when the goal is met; the extension runs it, requires it to pass before completion, and continues the agent while it fails. Passing the check does not complete the goal automatically: the agent must still call `complete`. Completion also requires a summary and evidence text for every criterion, but that text is not independently validated (no semantic judge ships). Without `verify`, the goal is user-driven and does not auto-continue. `/goal <objective>` starts one, `/goal` shows status, `/goal pause` and `/goal resume` suspend and continue the pursuit, and `/goal stop` halts the loop. Pause and stop are session-scoped, not saved to the branch; reloading can re-adopt the last saved active goal.
+- **`recall` is searchable history.** Ask it to find earlier decisions or details that compaction removed from the active context. Search is on demand, so old material is not automatically injected into every turn. By default it uses session history; project-wide search can include sibling sessions.
 
-Knobs: `PI_SUBAGENT_TIMEOUT_MS` (20m), `PI_SUBAGENT_CONCURRENCY` (4), `PI_SUBAGENT_BG_AFTER_MS` (off by default — set e.g. 120000 to restore the old auto-adoption window), `PI_BASH_BG_AFTER_MS` (2m, the bash auto-promote window for wait: "auto"), `PI_BG_WAKE=0` to suppress wake messages.
+`recall` uses BM25 search and, by default, a local embedding model for semantic matches. If embeddings are unavailable or disabled, lexical search still works. Its automatic compaction uses concise summaries as a working map; the original entries remain available to `recall`.
 
-### recall
+## Delegation and background work
 
-Compaction keeps only a summary in context, but pi stores every raw entry forever — `recall` makes that archive searchable. One tool, two query shapes: `description` (natural language → embedding model, BM25 as fallback) and `queries` (short exact-term strings → BM25 only). `scope: "project"` also searches sibling session files (labeled, down-ranked); `mode: "read"` pages a full entry by ref.
+`subagents` reads agent definitions from `~/.pi/agent/agents/`. Each Markdown file can provide YAML frontmatter such as:
 
-Ranking is BM25 over ~3k-char chunks, multiplied by a recency decay (halves every 4h from the archive frontier, floored at 0.25), fused with the semantic side by weighted RRF. The semantic side uses a local jina-v5-text-nano ONNX model in a disposable worker process; vectors are sign-quantized in a flat cache file per session dir (`recall-vectors.bin`) — a derived cache, so any failure degrades to lexical-only.
+```yaml
+---
+description: Review code for correctness and security
+tools: [read, grep]
+---
+Review the requested change. Report actionable findings with file and line references.
+```
 
-recall also owns auto-compaction: it fires when projected context exceeds min(256k tokens, 70% of the model window), from mid-run `turn_end` drafts and idle `agent_settled`, with pi's near-limit threshold as backstop. Every compaction (including manual `/compact`) is summarized with recall's own prompt — a short map, not an archive, since detail stays re-fetchable. Deterministic failures fall back to pi's default summarizer; compaction failures log to `~/.pi/agent/recall-compaction-errors.log`.
+Frontmatter can also set `model` and `thinking`. Available tools can be restricted with a list or per-tool map. One task runs with `subagent`; a batch runs in parallel with `subagents`. Each defined agent also gets a slash command named after it. Child runs are isolated and headless. The default is to wait for a result; `background: true` opts a task into the background.
 
-Common knobs (invalid values fall back to defaults with a warning; the full list is in `parseConfig` in `extensions/recall.ts`):
+Background shell and agent tasks can be inspected and managed with `task`, `task_kill`, `task_remind`, and `/tasks`. With wake messages enabled, a completed background task delivers its result automatically as the parent's next message; `task <id>` can peek at a running task, and `task_remind` sets an optional one-shot check-in. The extension's replacement `bash` keeps pi's normal behavior for `wait: "inline"` (the default). `wait: "auto"` waits up to its configured window before promoting a still-running command; `wait: "background"` starts it in the background immediately. Background work is session-scoped and is stopped when the session shuts down.
 
-| Knob                        | Default   | Notes                                                |
-| --------------------------- | --------- | ---------------------------------------------------- |
-| `PI_RECALL_SCOPE`           | `session` | `project` also searches sibling session files        |
-| `PI_RECALL_EMBED`           | on        | `0` disables the semantic side                       |
-| `PI_RECALL_COMPACT_TARGET`  | 256,000   | Token cap for auto-compaction (`0` disables)         |
-| `PI_RECALL_COMPACT_RATIO`   | 0.7       | Also bound the target to this fraction of the window |
-| `PI_RECALL_SUMMARY_CHARS`   | 5,000     | Hard budget for generated summaries                  |
-| `PI_RECALL_HALF_LIFE_HOURS` | 4         | Recency decay half-life                              |
+## OpenAI-compatible gateways
 
-### todo
+Create `~/.pi/agent/openai-gateways.json` to configure gateways. The top-level keys become provider names; each entry needs a `baseUrl` and may include `apiKey`, `contextWindow`, `maxTokens`, and a seed `models` list:
 
-One `todo` tool: every call sends the full list (`content` + `status`: pending/in_progress/completed/cancelled, at most one in_progress) and replaces the old one. Invalid lists are rejected with the current state attached; updates that drop unfinished items are accepted with a note naming them. State rides in tool-result `details`, replayed on `session_start`/`session_tree`, so every branch, rewind, and resume restores the right list. Reminders re-inject the plan when it is unfinished and stale (4+ turns) or when compaction wiped it; mid-run compaction drafts chain a `todo.plan` message instead. `/todos` opens the full list.
+```json
+{
+  "ollama": {
+    "baseUrl": "http://localhost:11434/v1",
+    "models": [{ "id": "qwen3" }]
+  }
+}
+```
 
-### goal
+The extension discovers models from `<baseUrl>/models` and mirrors its catalog into pi's `~/.pi/agent/models.json`. This lets headless runs resolve the same models. Gateway config owns its provider name in that file (a same-named entry is replaced); other providers and settings are preserved.
 
-A single session-scoped objective with a verifiable completion gate — the agent keeps working turn after turn until the goal is met, blocked, or a safety cap trips, with no user interaction. One tool, `goal`, with an `action` discriminator (`set` | `complete` | `blocked`); it registers inactive and is revealed on the first goal (after-first-goal visibility), so a fresh session adds zero tool surface.
+## Configuration
 
-A `verify` command (optional) makes progress measurable: it prints the current state (e.g. a coverage report, a test summary) and exits 0 only when the objective is met. The extension runs it itself in a bounded shell (hard timeout, capped output tail), so the model can't fake success — at completion a failing run is rejected with its output so the real cause gets fixed. No-op verifies (`true`, `:`, `exit 0`) are rejected at `set` time, and a preflight run at `set` reports whether the check already passes. Completion is also a structural gate, not a model self-assessment: to `complete`, the model must supply a `summary` plus `evidence` indexed to the goal's criteria (`evidence[i]` proves `criteria[i]`); a free-text "done" is rejected when it names a failure, a criterion lacks proof, or the id is stale. A semantic second opinion (Jev-style classifier) can slot in behind the injectable `GoalJudge` seam; v1 ships none (fail-open floor).
+Configuration is mostly through environment variables. Invalid values generally fall back to safe defaults; the extension source has the full list and parsing rules.
 
-A `agent_before_settle` loop keeps it working — the "turn-end check": at each settle, an active goal with a `verify` has the check re-run, and the extension queues a follow-up that is _visible_ in the transcript as a compact one-line heartbeat (`goal check 15/25 · verify failed (exit 1) — continuing`, via a registered message renderer; expanding the row shows the measured state) carrying the graded result — the measured state plus either "close these gaps" (check failed) or "summarize and call `complete`" (check passed). While the verify runs, an animated spinner widget shows the check in flight above the editor (pi clears its own working spinner at agent_end, so a slow verify would otherwise look like a dead pause). Goals without a `verify` are user-driven: the tool tracks the objective and gates completion but does not auto-continue. Two model-untouchable circuit breakers bound a stuck run — a per-session cap on auto-continuations (`PI_GOAL_MAX_CONTINUATIONS`, default 25) and a per-run turn bound (`PI_GOAL_MAX_TURNS_PER_RUN`, default 50) that steers a long turn to settle so the cap can re-engage. At the continuation cap an injectable `ProgressJudge` seam decides whether to keep going: the default judge is deterministic — the verify output changed across the budget window ⇒ still progressing ⇒ the budget resets and the run continues; unchanged ⇒ plateau ⇒ stop — and a no-opinion or throwing judge fails closed to the stop, so the breaker stays the floor. Judge resets are themselves capped (`PI_GOAL_MAX_PROGRESS_RESETS`, default 3) so the judge can't defeat the breaker — the effective worst case any strategy achieves is `PI_GOAL_MAX_CONTINUATIONS × (PI_GOAL_MAX_PROGRESS_RESETS + 1)` continuations, and a verify whose output carries timestamps/timings will read as "progressing" every window, so noisy checks effectively get the full multiple. The judge's evidence is scoped to the current goal (a mid-window re-set clears it) and seeded with the `set`-time baseline; a semantic async (LLM) judge can slot in behind the same awaited seam later. The model's `set`/`complete`/`blocked` never reset any of these; they re-arm only on resume (session start or branch switch — a rewind also re-arms, including after a stop) or a user `/goal` kickoff. A footer status (`goal · elapsed`, plus a transient `goal · checking (<verify>)` while the turn-end check runs, so a slow verify never looks like an unexplained pause; re-asserted at run boundaries because pi clears extension statuses on rebind/reload) shows the goal's presence and running time while active and clears on completion or block. An expensive verify can be throttled with `PI_GOAL_CHECK_EVERY` (run the check every Nth continuation, reusing — and marking stale — the last measured state in between; default 1, every turn; keep it ≤ `PI_GOAL_MAX_CONTINUATIONS − 1` so each judge window still holds ≥ 2 fresh outputs). A `before_agent_start` reminder re-injects the objective when a compaction hid it (summaries never carry the goal).
-
-State is model-owned and reconstructed from the branch (snapshots in the goal tool result's `details`, replayed on `session_start`/`session_tree`) — no filesystem, nothing desyncs on rewind or resume. `/goal` is a view + kickoff: it shows the goal, starts one (routed through the model so the goal tool creates and persists it), or stops the loop with `/goal stop`.
-
-Knobs: `PI_GOAL_MAX_CONTINUATIONS` (25, per-session settle cap), `PI_GOAL_MAX_TURNS_PER_RUN` (50, per-run turn bound), `PI_GOAL_VERIFY_TIMEOUT_MS` (120,000, verify command timeout).
-
-### overflow
-
-pi caps its built-in tools, but custom tool results enter context uncapped — a `tool_result` handler replaces text over `PI_OVERFLOW_MAX_CHARS` (default 10,000, floor 1,000, `0` disables) with a banner + head (80%) + tail (20%), stashing the full output at `<sessionDir>/overflow/<callId>.txt`. Images, `details`, `isError`, and `usage` pass through; built-in tools are skipped. Fail-open: a failed stash write leaves the original result intact — the cap never discards output without a recoverable pointer. Keep `PI_OVERFLOW_MAX_CHARS` above `PI_RECALL_READ_CHARS` if you raise the latter.
-
-### openai-gateways
-
-Registers OpenAI-compatible gateways (Ollama, vLLM, LM Studio, llamswap, proxies…) with live model discovery from `GET /v1/models`. Config: `~/.pi/agent/openai-gateways.json` — per gateway, `baseUrl` (required), `apiKey` (default `"local"`), `contextWindow`/`maxTokens` overrides (262144/65536), and an optional `models` seed list. Each gateway is mirrored into native `~/.pi/agent/models.json` so extension-less headless runs (subagent children) can resolve its models. Fail-soft: blips fall back to the last persisted catalog, then seeds; a missing file registers nothing; unparseable JSON fails loudly at load.
-
-### shortcuts
-
-A quit family (`/exit`, `/bye`, `/q`, `/close` → `ctx.shutdown()`), a compact family (`/comp`, `/summarize`), plus `/info` (session name, dir, context usage) and `/time`. Edit the `SHORTCUTS` array to add your own.
+| Extension   | Common settings                                                                                                                                                                                                                      |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `subagents` | `PI_SUBAGENT_TIMEOUT_MS` (20-minute default), `PI_SUBAGENT_CONCURRENCY` (4), `PI_SUBAGENT_BG_AFTER_MS` (background adoption off by default), `PI_BASH_BG_AFTER_MS` (2-minute `auto` window), `PI_BG_WAKE=0` (suppress wake messages) |
+| `recall`    | `PI_RECALL_SCOPE=session` (`project` includes sibling sessions), `PI_RECALL_EMBED=0` (disable embeddings), `PI_RECALL_COMPACT_TARGET=256000` (token cap; `0` disables), `PI_RECALL_COMPACT_RATIO=0.7` (fraction of the model window) |
+| `goal`      | `PI_GOAL_MAX_CONTINUATIONS=25`, `PI_GOAL_MAX_TURNS_PER_RUN=50`, `PI_GOAL_VERIFY_TIMEOUT_MS=120000`; `PI_GOAL_CHECK_EVERY` throttles verification                                                                                     |
+| `overflow`  | `PI_OVERFLOW_MAX_CHARS=10000`; `0` disables capping                                                                                                                                                                                  |
 
 ## Development
 
 ```sh
-npm run check         # typecheck (lint-grade strict) + full test suite — the gate before every commit
-npm test              # vitest only
-npm run bench:recall  # retrieval benchmark over a real session dir (spawns the embed worker)
+npm run check         # TypeScript check and full test suite
+npm run check:format  # check formatting
+npm test              # tests only
+npm run format        # format source and tests
+npm run bench:recall  # retrieval benchmark (uses a real session directory)
 ```
 
-Pure logic is exported separately and covered by `tests/` — boundaries are injected as fakes, no `vi.mock`, no network, no pi launches. pi loads the TypeScript directly; the dev dependency on `@earendil-works/pi-coding-agent` (pinned to the installed pi version) provides types at edit time.
-
-MCP: use pi's built-in (`builtin:mcp`, since 0.99.0) — the old `mcp.ts` was removed. Per-server `exposure` in `~/.pi/agent/mcp.json` (`direct` / `deferred` / `codemode`) covers the old `pin` concept; manage servers with `/mcp`.
+Tests exercise exported logic and use fakes for process, filesystem, and network boundaries; they do not launch pi or contact the network. The pi package dependency is pinned in `devDependencies` to provide the extension API types used during development.
