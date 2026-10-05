@@ -516,10 +516,10 @@ describe("validateVerify", () => {
 });
 
 describe("parseVerifyTimeoutMs", () => {
-  it("defaults to ten minutes — verify scripts run build+test suites", () => {
+  it("defaults to fifteen minutes — verify scripts run build+test suites", () => {
     // Pinned: two minutes killed real verifies and made every long check read
     // as a failure. Raise/lower deliberately, with this test in the diff.
-    expect(VERIFY_TIMEOUT_MS_DEFAULT).toBe(600_000);
+    expect(VERIFY_TIMEOUT_MS_DEFAULT).toBe(900_000);
   });
   it("defaults on missing, empty, and invalid values", () => {
     expect(parseVerifyTimeoutMs(undefined)).toBe(VERIFY_TIMEOUT_MS_DEFAULT);

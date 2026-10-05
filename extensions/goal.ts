@@ -180,7 +180,7 @@ export function parseCheckEvery(raw: string | undefined): number {
  * boundary adversarial — every long verify "fails" and the model gets re-engaged
  * to fix a timeout that was never a real failure.
  */
-export const VERIFY_TIMEOUT_MS_DEFAULT = 600_000;
+export const VERIFY_TIMEOUT_MS_DEFAULT = 900_000;
 const VERIFY_TIMEOUT_ENV = "PI_GOAL_VERIFY_TIMEOUT_MS";
 const MAX_VERIFY_OUTPUT = 4096;
 

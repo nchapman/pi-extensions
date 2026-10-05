@@ -74,7 +74,7 @@ Configuration is mostly through environment variables. Invalid values generally 
 | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `subagents` | `PI_SUBAGENT_TIMEOUT_MS` (20-minute default), `PI_SUBAGENT_CONCURRENCY` (4), `PI_SUBAGENT_BG_AFTER_MS` (background adoption off by default), `PI_BASH_BG_AFTER_MS` (2-minute `auto` window), `PI_BG_WAKE=0` (suppress wake messages) |
 | `recall`    | `PI_RECALL_SCOPE=session` (`project` includes sibling sessions), `PI_RECALL_EMBED=0` (disable embeddings), `PI_RECALL_COMPACT_TARGET=256000` (token cap; `0` disables), `PI_RECALL_COMPACT_RATIO=0.7` (fraction of the model window) |
-| `goal`      | `PI_GOAL_MAX_CONTINUATIONS=25`, `PI_GOAL_MAX_TURNS_PER_RUN=50`, `PI_GOAL_VERIFY_TIMEOUT_MS=600000`; `PI_GOAL_CHECK_EVERY` throttles verification                                                                                     |
+| `goal`      | `PI_GOAL_MAX_CONTINUATIONS=25`, `PI_GOAL_MAX_TURNS_PER_RUN=50`, `PI_GOAL_VERIFY_TIMEOUT_MS=900000`; `PI_GOAL_CHECK_EVERY` throttles verification                                                                                     |
 | `overflow`  | `PI_OVERFLOW_MAX_CHARS=10000`; `0` disables capping                                                                                                                                                                                  |
 
 ## Development
