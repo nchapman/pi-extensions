@@ -22,6 +22,8 @@ import {
   formatDuration,
   formatReminderWake,
   formatSubagentWake,
+  formatBashWake,
+  isWakeMessage,
   MAX_TIMEOUT_MS,
   outputLogPath,
   parseBashBgAfterMs,
@@ -218,6 +220,35 @@ describe("formatReminderWake", () => {
     expect(formatReminderWake(subagentTask, 30_000)).toContain(
       "subagents stream no output, so elapsed time is the only signal",
     );
+  });
+});
+
+describe("isWakeMessage", () => {
+  it("recognizes every wake this package writes", () => {
+    // Pins all three formatters to the predicate: a new wake shape must
+    // update isWakeMessage too, or wake-driven starts regress to counting
+    // as agent turns (the todo churn bug).
+    expect(
+      isWakeMessage(
+        formatBashWake({ command: "npm test", id: "t-1134z8v", status: "exited 0", durationMs: 1, output: "" }),
+      ),
+    ).toBe(true);
+    expect(isWakeMessage(formatSubagentWake("reviewer", "t-1134z8v", { ok: true, durationMs: 1, text: "" }))).toBe(
+      true,
+    );
+    expect(
+      isWakeMessage(
+        formatReminderWake({ id: "t-1134z8v", name: "npm test", kind: "bash", state: "running", startedAt: 0 }, 1),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects agent- or user-written text", () => {
+    expect(isWakeMessage("[background] subagent (t-1, 5s) completed:")).toBe(false); // malformed header
+    expect(isWakeMessage("[reminder] not-a-task still running")).toBe(false);
+    expect(isWakeMessage("continue waiting")).toBe(false);
+    expect(isWakeMessage("")).toBe(false);
+    expect(isWakeMessage(undefined)).toBe(false);
   });
 });
 

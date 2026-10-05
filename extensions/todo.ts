@@ -15,10 +15,14 @@
  * - One-shot reminders on before_agent_start when the plan is unfinished and
  *   stale (or compaction wiped it — summaries never carry the plan: recall
  *   re-injects it as a tail message after mid-run drafts, and this reminder
- *   covers every other compaction)
+ *   covers every other compaction). Wake-driven starts (background task
+ *   completions and check-ins from superbash) don't count toward staleness:
+ *   the plan is blocked on the very task the wake reports, and counting them
+ *   churned reminders during long waits
  * - /todos renders the list full-screen in the TUI
  */
 
+import { isWakeMessage } from "../lib/superbash";
 import { matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
@@ -428,8 +432,13 @@ export function registerTodoTool(pi: ExtensionAPI): void {
     compactedSinceUpdate = true;
   });
 
-  pi.on("before_agent_start", () => {
-    turnsSinceUpdate++;
+  pi.on("before_agent_start", (event) => {
+    // Wake-driven runs are machine starts, not agent work: the plan is
+    // typically blocked on the very task the wake reports. Freezing (not
+    // resetting) the counter keeps genuine neglect detectable on the next
+    // agent-driven turn, while a compaction below still reminds on a wake —
+    // the plan vanished there and the model needs it back to act on the wake.
+    if (!isWakeMessage(event.prompt)) turnsSinceUpdate++;
     const p = summarizeTodos(todos);
     if (!shouldRemind({ unfinished: p.resolved < p.total, turnsSinceUpdate, compactedSinceUpdate })) return;
     // Consume the trigger so the reminder fires once, not every turn.

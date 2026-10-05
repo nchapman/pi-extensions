@@ -17,6 +17,7 @@ import {
   droppedUnfinishedItems,
   lastTodoSnapshot,
 } from "../extensions/todo";
+import { formatBashWake, formatReminderWake, formatSubagentWake } from "../lib/superbash";
 
 const THEME = { fg: (_k: string, s: string) => s, bold: (s: string) => s } as never;
 
@@ -573,6 +574,52 @@ describe("registerTodoTool", () => {
       expect(fire(events, "before_agent_start")).toBeUndefined();
     }
     expect(fire(events, "before_agent_start")).toBeDefined();
+  });
+
+  it("wake-driven agent starts do not count toward staleness", async () => {
+    const { pi, tools, events } = makePi();
+    registerTodoTool(pi);
+
+    await tools.get(TODO_TOOL_NAME)!.execute("1", { todos: [item("a", "in_progress")] });
+
+    // Two real turns first: under freeze the wakes below must preserve that
+    // progress (counter stays 2); under a reset-to-zero implementation the
+    // final assertion would need two extra turns and fail.
+    for (let i = 0; i < 2; i++) {
+      expect(
+        fire(events, "before_agent_start", undefined, { type: "before_agent_start", prompt: "continue" }),
+      ).toBeUndefined();
+    }
+
+    // A backgrounded task re-engages the agent with machine-written wakes
+    // (check-ins and completions) while the plan is blocked on that task —
+    // those starts are not neglect and must not accumulate toward a reminder.
+    const wakes = [
+      formatReminderWake({ id: "t-1134z8v", name: "build", kind: "bash", state: "running", startedAt: 0 }, 300_000),
+      formatBashWake({ command: "npm test", id: "t-1134z8v", status: "exited 0", durationMs: 300_000, output: "ok" }),
+      formatSubagentWake("reviewer", "t-1134z8v", { ok: true, durationMs: 300_000, text: "done" }),
+    ];
+    for (let i = 0; i < REMINDER_MIN_TURNS * 3; i++) {
+      const wake = wakes[i % wakes.length];
+      expect(
+        fire(events, "before_agent_start", undefined, { type: "before_agent_start", prompt: wake }),
+      ).toBeUndefined();
+    }
+
+    // With the two pre-wake turns preserved, one quiet turn remains before
+    // the threshold; the turn after that must remind.
+    for (let i = 0; i < REMINDER_MIN_TURNS - 2 - 1; i++) {
+      expect(
+        fire(events, "before_agent_start", undefined, { type: "before_agent_start", prompt: "continue" }),
+      ).toBeUndefined();
+    }
+    const reminder = fire(events, "before_agent_start", undefined, {
+      type: "before_agent_start",
+      prompt: "continue",
+    }) as {
+      message: { content: string };
+    };
+    expect(reminder.message.content).toContain("[>] a");
   });
 
   it("reminds on the next turn after compaction", async () => {

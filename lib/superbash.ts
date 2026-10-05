@@ -501,6 +501,20 @@ export function formatBashWake(opts: {
   )}${body}`;
 }
 
+/** The fixed prefixes of this package's three machine-written wake messages. */
+const WAKE_PREFIXES = ['[background] subagent "', "[background] bash (t-", "[reminder] t-"];
+
+/**
+ * True when text is one of this package's machine-written wake messages (a
+ * background completion or a check-in). Consumers that classify agent starts
+ * — todo's staleness counter, say — use this to tell a wake-driven start from
+ * an agent- or user-driven one: the prefixes are fixed by the formatters
+ * above, and the tests pin all three outputs to this predicate.
+ */
+export function isWakeMessage(text: string | undefined): boolean {
+  return text !== undefined && WAKE_PREFIXES.some((p) => text.trimStart().startsWith(p));
+}
+
 /** Live output updates streamed to the TUI while an auto-mode call is still blocking. */
 type BashOnUpdate = AgentToolUpdateCallback;
 
