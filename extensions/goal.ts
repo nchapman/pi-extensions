@@ -174,9 +174,13 @@ export function parseCheckEvery(raw: string | undefined): number {
 /**
  * Verification timeout + output cap for a goal's `verify` command. The command
  * runs in a bounded shell (hard timeout, capped output) so a hanging or verbose
- * verify can't stall the loop or blow up context.
+ * verify can't stall the loop or blow up context. The timeout is a hang bound,
+ * not an expected runtime: real verify scripts run build+test suites that
+ * routinely exceed two minutes, and a default that kills them makes the settle
+ * boundary adversarial — every long verify "fails" and the model gets re-engaged
+ * to fix a timeout that was never a real failure.
  */
-export const VERIFY_TIMEOUT_MS_DEFAULT = 120_000;
+export const VERIFY_TIMEOUT_MS_DEFAULT = 600_000;
 const VERIFY_TIMEOUT_ENV = "PI_GOAL_VERIFY_TIMEOUT_MS";
 const MAX_VERIFY_OUTPUT = 4096;
 
