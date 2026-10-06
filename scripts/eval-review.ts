@@ -11,6 +11,7 @@
  *   EVAL_JUDGE_MODEL  judge model override — default: the finders' model;
  *                     overriding avoids same-model self-agreement bias
  *   EVAL_FROM=KEY     start from a fixture key (skips earlier PRs; must match)
+ *   EVAL_CONCURRENCY=1  PRs reviewed concurrently (default 1; 2-3 for speed)
  *   EVAL_REJUDGE=path re-judge an existing run JSONL with the current judge
  *                     (no finder re-spend; writes <path>-rejudged.jsonl) —
  *                     judge changes iterate against frozen findings
@@ -65,6 +66,9 @@ const JUDGE = String(env.EVAL_JUDGE ?? "1") !== "0";
 const FROM = env.EVAL_FROM ?? "";
 const JUDGE_MODEL = env.EVAL_JUDGE_MODEL?.trim() || undefined;
 const REJUDGE = env.EVAL_REJUDGE?.trim() || "";
+/** PRs reviewed concurrently (1 = today's serial default; 2 halves wall time
+ * at flat token cost — bounded to 3 so a stuck provider can't fan out wildly). */
+const CONCURRENCY = Math.max(1, Math.min(3, Number(env.EVAL_CONCURRENCY ?? 1) || 1));
 
 /** Judge a PR's findings against its golden issues: LLM pass, then a leftovers
  * pass (unmatched issues × unmatched findings) to recover pairs the first pass
@@ -181,7 +185,7 @@ describe("eval: review pipeline on code-review-bench", () => {
       const emptyRoot = await mkdtemp(path.join(os.tmpdir(), "review-eval-"));
       const results: PrResult[] = [];
 
-      for (const fixture of selected) {
+      const reviewFixture = async (fixture: (typeof selected)[number]): Promise<PrResult> => {
         const startedAt = Date.now();
         const deps: ReviewDeps = {
           git: async () => ({ code: 1, stdout: "", stderr: "eval: no git" }),
@@ -243,7 +247,25 @@ describe("eval: review pipeline on code-review-bench", () => {
             })),
           }) + "\n",
         );
-      }
+        return result;
+      };
+
+      // PR-level pool: independent PRs run concurrently up to EVAL_CONCURRENCY
+      // (default 1). Wall time drops ~linearly while tokens stay flat; logs and
+      // JSONL flushes stay per-PR (appendFileSync is atomic per line, and each
+      // PR's console lines carry its key).
+      let next = 0;
+      const workers = Array.from({ length: Math.min(CONCURRENCY, selected.length) }, async () => {
+        while (next < selected.length) {
+          const fixture = selected[next++];
+          await reviewFixture(fixture);
+        }
+      });
+      await Promise.all(workers);
+      // Preserve sample order in reports regardless of completion order.
+      results.sort(
+        (a, b) => selected.findIndex((f) => f.prUrl === a.prUrl) - selected.findIndex((f) => f.prUrl === b.prUrl),
+      );
 
       const metrics = computeMetrics(results);
       // Fail-open is right for the pipeline, but an eval where every child died
