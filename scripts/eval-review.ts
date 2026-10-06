@@ -185,6 +185,14 @@ describe("eval: review pipeline on code-review-bench", () => {
     }
 
     const metrics = computeMetrics(results);
+    // Fail-open is right for the pipeline, but an eval where every child died
+    // (bad model name, dead credentials) is an infrastructure failure, not a
+    // score — refuse to record it as one.
+    if (results.every((r) => r.findings.length === 0 && r.totalTokens === undefined)) {
+      throw new Error(
+        "every PR produced zero findings and zero usage — children failed to run (check PI_REVIEW_MODEL / credentials)",
+      );
+    }
     console.log("\n=== /review eval — code-review-bench offline ===");
     console.log(renderSummary(metrics));
     console.log("\n(context: the dataset's online split carries published P/R for 15 hosted");
