@@ -7,6 +7,7 @@ import {
   computeMetrics,
   heuristicMatches,
   judgeTask,
+  leftovers,
   matchScore,
   parseJudge,
   prKeyFromUrl,
@@ -106,11 +107,11 @@ describe("matching", () => {
     expect(heuristicMatches([], issues).size).toBe(0);
   });
 
-  it("judge task numbers findings and issues; parser accepts empty matches and rejects garbage", () => {
+  it("judge task labels each list distinctly; parser accepts empty matches and rejects garbage", () => {
     const task = judgeTask([finding()], [issue()]);
     expect(task).toContain("## Golden issues");
-    expect(task).toContain("1. [Critical]");
-    expect(task).toContain("1. [critical] src/api.py:12");
+    expect(task).toContain("ISSUE 1 [Critical]");
+    expect(task).toContain("FINDING 1 [critical] src/api.py:12");
     expect(parseJudge('```json\n{"matches": [{"issue": 1, "finding": 1}]}\n```')).toEqual([{ issue: 1, finding: 1 }]);
     expect(parseJudge('```json\n{"matches": []}\n```')).toEqual([]);
     expect(parseJudge("no json here")).toBeNull();
@@ -132,6 +133,21 @@ describe("computeMetrics + renderSummary", () => {
     cost: 0.1,
     durationMs: 1_000,
     ...over,
+  });
+
+  it("leftovers pairs unmatched issues with unused findings and maps positions back", () => {
+    const issues = [issue({ issue_index: 0 }), issue({ issue_index: 1 }), issue({ issue_index: 2, comment: "other" })];
+    const findings = [finding(), finding({ title: "Second" }), finding({ title: "Third" })];
+    const rest = leftovers(new Map([[0, 1]]), findings, issues);
+    // issue 0 caught by finding 1 → leftovers are issues 1,2 and findings 0,2
+    expect(rest.issues.map((i) => i.issue_index)).toEqual([1, 2]);
+    expect(rest.findings.map((f) => f.title)).toEqual(["Unawaited async operations in forEach", "Third"]);
+    expect(rest.issueOf).toEqual([1, 2]);
+    expect(rest.findingOf).toEqual([0, 2]);
+    // a judge match of leftover ISSUE 2 → leftover FINDING 1 lifts to originals 2→0
+    expect(rest.issueOf[2 - 1]).toBe(2);
+    expect(rest.findingOf[1 - 1]).toBe(0);
+    expect(leftovers(new Map(), [], [])).toMatchObject({ issues: [], findings: [], issueOf: [], findingOf: [] });
   });
 
   it("computes recall, severity split, noise proxy, and lens attribution", () => {
