@@ -747,6 +747,30 @@ describe("runReview", () => {
     expect(result.report).toContain("Verification skipped (PI_REVIEW_VERIFY=0)");
   });
 
+  it("bails out on an abort signal instead of failing open", async () => {
+    const spawn = fakeSpawn(() => "```json\n[]\n```");
+    const git = gitFor([
+      { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: "/repo\n", stderr: "" } },
+      {
+        match: (a) => a[0] === "diff" && a[a.length - 1] === "HEAD",
+        result: { code: 0, stdout: SAMPLE_DIFF, stderr: "" },
+      },
+    ]);
+    const controller = new AbortController();
+    controller.abort(); // Esc before the finders even start
+    await expect(
+      runReview({
+        cwd: "/repo",
+        config: CONFIG(),
+        target: { kind: "default" },
+        deps: emptyDeps({ git, spawnFn: spawn }) as never,
+        signal: controller.signal,
+      }),
+    ).rejects.toThrow("review aborted");
+    // children never spawned: cancellation must not burn tokens
+    expect(spawn.tasks).toHaveLength(0);
+  });
+
   it("runs find → verify → report over the default target and persists state", async () => {
     const written: Array<[string, string]> = [];
     const spawn = fakeSpawn((task) => {

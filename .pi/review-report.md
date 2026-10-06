@@ -1,0 +1,50 @@
+# Code review — HEAD~1..HEAD
+
+> ⚠️ Verification skipped (PI_REVIEW_VERIFY=0) — findings below are **unverified**.
+
+## 🟠 Important
+
+### Default review model silently redirects repo content to a hardcoded third-party provider
+**`extensions/review.ts:120`** — found by security, robustness
+parseReviewConfig now falls back to DEFAULT_REVIEW_MODEL ("opencode-go/deepseek-v4.1-flash", line 79) instead of leaving `model` undefined (previously `env.PI_REVIEW_MODEL?.trim() || undefined`). resolveInvocation returns config.model, runReview passes it to resolveChildModel for every finder and the verifier, and buildChildArgs emits `--model <value>`, so session-model inheritance (deps.sessionModel = ctx.model) is now dead by default: the pipeline always spawns children on opencode-go/deepseek-v4.1-flash. The task text shipped to those children is the target diff plus the untracked-file section, which reads any untracked, non-ignored file under the repo (untrackedSection, line 887; EXCLUDED at line ~222 has no .env/credential patterns) up to PI_REVIEW_UNTRACKED_MAX_BYTES. This matters more with this diff because the new `review` tool (line ~1480) lets the model invoke the pipeline itself, and the README/AGENTS.md guidance now tells agents to run it on their own work — so on a repo where the session model is local/self-hosted, or where the user never chose opencode-go, code (and any untracked config/credential files) is uploaded to a provider the user did not select, without a per-invocation human decision. The README change documents the behavior, but documentation is not an access control for egress.
+
+**Fix**: Keep inheriting the session model when PI_REVIEW_MODEL is unset (leave `model: undefined`), or make the benchmark model an explicit opt-in; if a hardcoded default is required, emit a one-time notice (and for the agent-invocable tool, surface the destination model in the tool result) before the first send, and add credential-shaped patterns (.env*, *.pem, id_*, secrets*) to the untracked-file exclusion list.
+
+### New agent-facing `review` tool has no tests; its failure paths are unverified
+**`extensions/review.ts:1482`** — found by tests
+The diff adds a whole new tool surface: pi.registerTool({ name: "review", ... }) with an execute() that has two new error branches (parseReviewArgs error -> isError text; runReview throwing -> `Review failed: ...` isError) plus a report-write side effect (mkdir + writeFile of `.pi/review-report.md`). Nothing exercises any of it: `grep -r registerReview tests/` matches only the `summarizeForTool` import, and no test registers the extension against a fake `pi` or invokes the tool. Sibling extensions in this same repo do test exactly this: tests/shortcuts.test.ts has a `describe("error handling in handlers")` that drives the registered handler with a throwing run fn and asserts the error is reported not thrown; tests/subagents.test.ts, tests/recall.test.ts, tests/goal.test.ts and tests/todo.test.ts each capture `registerTool` and call `execute`. So the tool's contract (parse-error target returns isError; a pipeline throw returns isError rather than rejecting; the report lands on disk while the returned text is the compact summary) is entirely unprotected — a regression in the catch branch or a mistake in the report path would ship silently.
+
+**Fix**: Add a test that builds a fake `pi` capturing `registerTool` (as the sibling extensions do), calls `registerReview(pi, { ...deps })`, then invokes the captured `review` tool's `execute`: one case with a bad `target` asserting the `isError`/`review: ...` text, one case where `runReview` throws asserting the `Review failed: ...` isError result, and one happy-path case asserting the report is written to `<cwd>/.pi/review-report.md` and the returned text is the summarizeForTool output.
+
+### Tool result points at a fixed report path that concurrent review invocations overwrite
+**`extensions/review.ts:1526`** — found by correctness, robustness
+The new `review` tool writes every invocation's full report to the same repo-scoped file, `<cwd>/.pi/review-report.md` (line 1526), and then hands the caller a summary whose only pointer to the details is that path (`summarizeForTool` appends `Full report: ${reportPath}`, line 1529/1434). pi runs multiple tool calls from one assistant message concurrently by default — `toolExecution` defaults to "parallel" (node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-agent-core/dist/agent.js:145, harness/runtime/harness.js:46, and no mode overrides it in core/agent-session.js). Two `review` calls in the same turn (e.g. `staged` and the default target, or two ranges) therefore both write this file; because tool results are delivered only after the batch settles, the agent reads one file for both summaries. It can then act on findings from the other invocation's diff while believing they belong to its own target, and the first invocation's report is destroyed. Nothing in the pipeline detects or discloses this: the report path is not part of `result`, so the summary can never tell which report it describes.
+
+**Fix**: Make the report path per-invocation (e.g. include a timestamp/random id, or the target hash) and print that unique path in the summary. Note that `executionMode: "sequential"` alone does not fix it, since both results arrive before the model reads any file; if a stable path is desired, also return the findings (or a content hash) in `details` so the caller can detect a stale/foreign report.
+
+## 🟡 Suggestion
+
+### New review tool ignores its abort signal, leaving the pipeline running after cancellation
+**`extensions/review.ts:1499`** — found by robustness
+The registered tool's execute signature is `(_id, params, _signal, _onUpdate, ctx)` and `_signal` (the tool call's AbortSignal, per ToolDefinition.execute in the pi types) is discarded; neither the tool nor runReview threads a signal into runChild (extensions/review.ts:1268-1276 and 1316-1322 pass only `{ timeoutMs: config.timeoutMs }`), even though runChild fully supports `options.signal` (it kills the child and rejects on abort, extensions/subagents.ts:545-554). Children are only reaped by the per-child timeout or the session_shutdown `killAll()` (review.ts:1443-1446). So when an agent turn that invoked `review` is cancelled, up to `maxChildren` (default 8) finder processes keep running for as long as the 20-minute default child timeout, consuming tokens with nobody consuming the result — the exact leak the tracked-spawn comment says it exists to prevent.
+
+**Fix**: Thread the tool's signal into the deps/runReview → runChild calls (or register an abort listener that calls the tracked-spawn killAll) so cancelling the tool call kills its children.
+
+### Eval section still claims children run pi's global default model, which this change made false
+**`README.md:71`** — found by correctness
+Line 71 states "Children run pi's global default model unless `PI_REVIEW_MODEL`/`PI_REVIEW_VERIFY_MODEL` are set". With `model: env.PI_REVIEW_MODEL?.trim() || DEFAULT_REVIEW_MODEL` (extensions/review.ts:120), the eval's `parseReviewConfig({ ...env, PI_REVIEW_STATE: "0" })` now always yields a model, so children are spawned with `--model opencode-go/deepseek-v4.1-flash` even when the knob is unset. The diff updated the two other README mentions (lines 63 and 99) but left this one contradicting both the code and the new default; the `resolveInvocation` doc comment (extensions/review.ts:155-157, "when both are unset the model stays undefined and children inherit (session model, else pi's global default)") is stale for the same reason, since no production path can now produce an undefined model.
+
+**Fix**: Update README line 71 and the `resolveInvocation` comment to say the default finder model is `DEFAULT_REVIEW_MODEL` (pi's global default / session model applies only when the caller passes an explicit override through a path that leaves `model` undefined).
+
+### summarizeForTool test is filed under parseReviewConfig, uses an untyped ad-hoc result, and skips two new branches
+**`tests/review.test.ts:134`** — found by tests
+The new test for summarizeForTool is nested inside `describe("parseReviewConfig")` even though it tests a different function. Its `full` fixture is an untyped object literal (not annotated `ReviewResult`), so TypeScript will not flag drift if ReviewResult's shape changes — the test would keep passing against a stale shape while the real tool breaks. It also only exercises the case where a report path is supplied and every finding has a line number: the new `if (reportPath)` branch (pointer line omitted) and the `${f.line ? `:${f.line}` : ""}` branch (finding with no/zero line) are both untouched, despite being added in this diff.
+
+**Fix**: Move the test into its own `describe("summarizeForTool")`, annotate the fixture `const full: ReviewResult = {...}` (import the type) so the compiler enforces the contract, and add assertions for a call with no reportPath (no `Full report:` line) and a finding without a line number (renders `[sev] file — title`).
+
+---
+
+**Scope reviewed**:
+- Files: README.md, extensions/review.ts, scripts/eval-review.ts, tests/review.test.ts
+
+_Reviewed 4 file(s) in 267s, 5032.2k tokens ($0.092). Next: address findings, then re-run /review — still-valid findings repeat verbatim, resolved ones stay gone._

@@ -1144,8 +1144,12 @@ export async function runReview(opts: {
   deps: ReviewDeps;
   /** Skip git entirely and review these pre-assembled sections (eval harness). */
   provided?: ProvidedReview;
+  /** Cancellation (Esc during a tool call): kills in-flight children and bails
+   * out — abort never rides the fail-open path, which would complete a
+   * cancelled review instead of stopping it. */
+  signal?: AbortSignal;
 }): Promise<ReviewResult> {
-  const { config, deps } = opts;
+  const { config, deps, signal } = opts;
   const now = deps.now ?? Date.now;
   const startedAt = now();
 
@@ -1243,6 +1247,8 @@ export async function runReview(opts: {
   const lensIds = FINDER_LENSES.map((l) => l.id);
   const lenses = new Map(FINDER_LENSES.map((l) => [l.id, l]));
   const runs = planFinderRuns(chunks.length, lensIds, config.maxChildren);
+  // Pre-flight abort check: an already-cancelled review spawns nothing.
+  if (signal?.aborted) throw new Error("review aborted");
   deps.notify(
     `Reviewing ${files.length} file(s) in ${chunks.length} chunk(s) with ${runs.length} finder run(s)…`,
     "info",
@@ -1270,6 +1276,7 @@ export async function runReview(opts: {
         resolveChildModel(config.model, agent.model, deps.sessionModel),
         {
           timeoutMs: config.timeoutMs,
+          signal,
         },
         deps.spawnFn,
       );
@@ -1282,6 +1289,7 @@ export async function runReview(opts: {
   // Coverage comes from outcomes, not the plan: a crashed finder never covered
   // its chunk, whatever the plan said.
   const lensCoverage = new Map<number, string[]>();
+  if (signal?.aborted) throw new Error("review aborted");
   findResults.forEach((r, i) => {
     if (r.status === "rejected") {
       errors.push(
@@ -1320,7 +1328,7 @@ export async function runReview(opts: {
         vAgent,
         vTask,
         resolveChildModel(config.verifyModel ?? config.model, vAgent.model, deps.sessionModel),
-        { timeoutMs: config.timeoutMs },
+        { timeoutMs: config.timeoutMs, signal },
         deps.spawnFn,
       );
       if ("adopted" in run) throw new Error("verifier backgrounded unexpectedly");
@@ -1329,6 +1337,7 @@ export async function runReview(opts: {
       usageParts.push(run.usage);
     } catch (err) {
       const e = err as Error & { usage?: ChildUsage };
+      if (signal?.aborted) throw new Error("review aborted");
       errors.push(`verification failed: ${e.message}`);
       if (e.usage) usageParts.push(e.usage);
       bundle = { findings: candidates, rejected: [], unverified: true };
@@ -1495,7 +1504,7 @@ export function registerReview(pi: ExtensionAPI, deps?: Partial<ReviewDeps>): vo
         }),
       ),
     }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
+    async execute(id, params, signal, _onUpdate, ctx) {
       const cwd = ctx.cwd ?? process.cwd();
       const parsed = parseReviewArgs(params.target ?? "");
       if (parsed.error) {
@@ -1519,11 +1528,14 @@ export function registerReview(pi: ExtensionAPI, deps?: Partial<ReviewDeps>): vo
           config: { ...config, model, verifyModel },
           target: parsed.target,
           deps: full,
+          signal,
         });
         // Full report to disk (recoverable, readable on demand); gist to context.
-        const reportDir = path.join(cwd, ".pi");
+        // Unique per call: concurrent reviews or successive iterations must not
+        // overwrite each other — .pi/review/<callId>.md accumulates, diffable.
+        const reportDir = path.join(cwd, ".pi", "review");
         await mkdir(reportDir, { recursive: true });
-        const reportPath = path.join(reportDir, "review-report.md");
+        const reportPath = path.join(reportDir, `${id}.md`);
         await writeFile(reportPath, result.report, "utf8");
         return {
           content: [{ type: "text" as const, text: summarizeForTool(result, reportPath) }],
