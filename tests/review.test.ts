@@ -5,7 +5,6 @@ import {
   applyVerdicts,
   chunkDiffFiles,
   collectGuidelines,
-  EFFORT_LENSES,
   extractReviewGuidelines,
   type Finding,
   finderAgent,
@@ -69,7 +68,6 @@ const finding = (over: Partial<Finding> = {}): Finding => ({
 });
 
 const CONFIG = (over: Partial<ReviewConfig> = {}): ReviewConfig => ({
-  effort: "balanced",
   chunkChars: 96_000,
   maxChildren: 8,
   timeoutMs: 60_000,
@@ -132,9 +130,9 @@ const emptyDeps = (over: Record<string, unknown> = {}) => ({
 });
 
 describe("parseReviewConfig", () => {
-  it("defaults without env", () => {
+  it("defaults without env (verification off, the measured config)", () => {
     const c = parseReviewConfig({});
-    expect(c.effort).toBe("balanced");
+    expect(c.verify).toBe(false);
     expect(c.chunkChars).toBe(96_000);
     expect(c.maxChildren).toBe(8);
     expect(c.model).toBeUndefined();
@@ -144,7 +142,7 @@ describe("parseReviewConfig", () => {
 
   it("accepts valid overrides and clamps invalid ones", () => {
     const c = parseReviewConfig({
-      PI_REVIEW_EFFORT: "deep",
+      PI_REVIEW_VERIFY: "1",
       PI_REVIEW_CHUNK_CHARS: "1",
       PI_REVIEW_MAX_CHILDREN: "999",
       PI_REVIEW_TIMEOUT_MS: "5",
@@ -152,7 +150,7 @@ describe("parseReviewConfig", () => {
       PI_REVIEW_CHECK_CMD: "npm run check",
       PI_REVIEW_STATE: "0",
     });
-    expect(c.effort).toBe("deep");
+    expect(c.verify).toBe(true);
     expect(c.chunkChars).toBe(8_000); // clamped to min
     expect(c.maxChildren).toBe(32); // clamped to max
     expect(c.timeoutMs).toBe(10_000); // clamped to min
@@ -162,8 +160,8 @@ describe("parseReviewConfig", () => {
   });
 
   it("falls back on garbage", () => {
-    const c = parseReviewConfig({ PI_REVIEW_EFFORT: "maximum", PI_REVIEW_CHUNK_CHARS: "banana" });
-    expect(c.effort).toBe("balanced");
+    const c = parseReviewConfig({ PI_REVIEW_VERIFY: "banana", PI_REVIEW_CHUNK_CHARS: "banana" });
+    expect(c.verify).toBe(false);
     expect(c.chunkChars).toBe(96_000);
   });
 
@@ -175,14 +173,9 @@ describe("parseReviewConfig", () => {
 });
 
 describe("parseReviewArgs", () => {
-  it("empty means default target and no effort override", () => {
-    expect(parseReviewArgs("")).toEqual({ target: { kind: "default" }, effort: undefined });
-    expect(parseReviewArgs("   ")).toEqual({ target: { kind: "default" }, effort: undefined });
-  });
-
-  it("parses effort words anywhere", () => {
-    expect(parseReviewArgs("deep").effort).toBe("deep");
-    expect(parseReviewArgs("main lite").effort).toBe("lite");
+  it("empty means default target", () => {
+    expect(parseReviewArgs("")).toEqual({ target: { kind: "default" } });
+    expect(parseReviewArgs("   ")).toEqual({ target: { kind: "default" } });
   });
 
   it("maps staged/cached and tree synonyms", () => {
@@ -200,8 +193,7 @@ describe("parseReviewArgs", () => {
 
   it("parses --model and --verify-model in space and equals form, anywhere", () => {
     expect(parseReviewArgs("--model glm-5.3")).toMatchObject({ model: "glm-5.3" });
-    expect(parseReviewArgs("deep --verify-model=ollama/qwen3 staged")).toMatchObject({
-      effort: "deep",
+    expect(parseReviewArgs("--verify-model=ollama/qwen3 staged")).toMatchObject({
       verifyModel: "ollama/qwen3",
       target: { kind: "staged" },
     });
@@ -223,19 +215,13 @@ describe("parseReviewArgs", () => {
   });
 
   it("resolves invocation models flag > env knob > inherit", () => {
-    const envCfg = { effort: "balanced" as const, model: "env-model" };
-    expect(resolveInvocation(parseReviewArgs(""), envCfg)).toEqual({
-      effort: "balanced",
-      model: "env-model",
-      verifyModel: undefined,
-    });
-    expect(resolveInvocation(parseReviewArgs("deep --model flag-model"), envCfg)).toEqual({
-      effort: "deep",
+    const envCfg = { model: "env-model" };
+    expect(resolveInvocation(parseReviewArgs(""), envCfg)).toEqual({ model: "env-model", verifyModel: undefined });
+    expect(resolveInvocation(parseReviewArgs("--model flag-model"), envCfg)).toEqual({
       model: "flag-model",
       verifyModel: undefined,
     });
-    expect(resolveInvocation(parseReviewArgs("--model a --verify-model b"), { effort: "lite" })).toEqual({
-      effort: "lite",
+    expect(resolveInvocation(parseReviewArgs("--model a --verify-model b"), {})).toEqual({
       model: "a",
       verifyModel: "b",
     });
@@ -489,7 +475,7 @@ describe("planFinderRuns", () => {
   });
 
   it("sheds lenses (correctness first) when the cap binds", () => {
-    const runs = planFinderRuns(2, EFFORT_LENSES.balanced, 3);
+    const runs = planFinderRuns(2, ["correctness", "security", "robustness", "tests"], 3);
     expect(runs).toEqual([
       { lens: "correctness", chunk: 0 },
       { lens: "correctness", chunk: 1 },
@@ -498,7 +484,7 @@ describe("planFinderRuns", () => {
   });
 
   it("falls back to correctness-only when even one lens per chunk does not fit", () => {
-    const runs = planFinderRuns(3, EFFORT_LENSES.balanced, 2);
+    const runs = planFinderRuns(3, ["correctness", "security", "robustness", "tests"], 2);
     expect(runs).toEqual([
       { lens: "correctness", chunk: 0 },
       { lens: "correctness", chunk: 1 },
@@ -548,7 +534,6 @@ describe("prompts", () => {
 describe("renderReport", () => {
   const base = {
     targetLabel: "uncommitted changes",
-    effort: "balanced" as const,
     reviewedFiles: ["src/a.ts"],
     uncoveredFiles: [],
     skippedFiles: [],
@@ -569,7 +554,7 @@ describe("renderReport", () => {
         unverified: false,
       },
     });
-    expect(report).toContain("# Code review — uncommitted changes (balanced effort)");
+    expect(report).toContain("# Code review — uncommitted changes");
     expect(report).toContain("## 🔴 Critical");
     expect(report).toContain("## 🟠 Important");
     expect(report).toContain("`src/a.ts:2`");
@@ -687,11 +672,13 @@ describe("runReview", () => {
     async (args: string[]) =>
       responses.find((r) => r.match(args))?.result ?? { code: 1, stdout: "", stderr: `unexpected: ${args.join(" ")}` };
 
-  it("parses the verify on/off knob with fail-safe default", () => {
-    expect(parseReviewConfig({}).verify).toBe(true);
+  it("parses the verify opt-in knob (off by default)", () => {
+    expect(parseReviewConfig({}).verify).toBe(false);
+    expect(parseReviewConfig({ PI_REVIEW_VERIFY: "1" }).verify).toBe(true);
+    expect(parseReviewConfig({ PI_REVIEW_VERIFY: "true" }).verify).toBe(true);
     expect(parseReviewConfig({ PI_REVIEW_VERIFY: "0" }).verify).toBe(false);
-    expect(parseReviewConfig({ PI_REVIEW_VERIFY: "" }).verify).toBe(true);
-    expect(parseReviewConfig({ PI_REVIEW_VERIFY: "garbage" }).verify).toBe(true);
+    expect(parseReviewConfig({ PI_REVIEW_VERIFY: "" }).verify).toBe(false);
+    expect(parseReviewConfig({ PI_REVIEW_VERIFY: "garbage" }).verify).toBe(false);
   });
 
   it("skips verification when the knob is off and discloses it in the report", async () => {
@@ -710,7 +697,7 @@ describe("runReview", () => {
     ]);
     const result = await runReview({
       cwd: "/repo",
-      config: CONFIG({ effort: "balanced", verify: false }),
+      config: CONFIG({ verify: false }),
       target: { kind: "default" },
       deps: emptyDeps({ git, spawnFn: spawn }) as never,
     });
@@ -754,8 +741,8 @@ describe("runReview", () => {
         writeFile: async (p: string, d: string) => void written.push([p, d]),
       }) as never,
     });
-    // 3 finders + 1 verify
-    expect(spawn.tasks).toHaveLength(4);
+    // 4 finders + 1 verify (this fixture opts into verification)
+    expect(spawn.tasks).toHaveLength(5);
     expect(spawn.tasks.filter((t) => t.startsWith("# Verify"))).toHaveLength(1);
     // security + correctness merge into one finding (the id-2 downgrade verdict is
     // out of range for 0-based ids, so critical stands — worst-severity-wins)
@@ -798,7 +785,7 @@ describe("runReview", () => {
     ]);
     const result = await runReview({
       cwd: "/repo",
-      config: CONFIG({ effort: "lite", maxFindings: 2 }),
+      config: CONFIG({ maxFindings: 2 }),
       target: { kind: "default" },
       deps: emptyDeps({ git, spawnFn: spawn }) as never,
     });
@@ -836,13 +823,7 @@ describe("runReview", () => {
     expect(result.report).toContain("**No actionable findings.**");
   });
 
-  it("skips verify at lite effort and fails open when the verifier dies", async () => {
-    const spawn = fakeSpawn((task) => {
-      if (task.includes("Correctness and logic")) {
-        return '```json\n[{"file":"src/a.ts","line":2,"severity":"critical","title":"Bug","detail":"D"}]\n```';
-      }
-      return "[]";
-    });
+  it("fails open when the verifier dies (verify opted in)", async () => {
     const git = gitFor([
       { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: "/repo\n", stderr: "" } },
       {
@@ -851,15 +832,6 @@ describe("runReview", () => {
       },
       { match: (a) => a[0] === "ls-files", result: { code: 0, stdout: "", stderr: "" } },
     ]);
-    const lite = await runReview({
-      cwd: "/repo",
-      config: CONFIG({ effort: "lite" }),
-      target: { kind: "uncommitted" },
-      deps: emptyDeps({ git, spawnFn: spawn }) as never,
-    });
-    expect(spawn.tasks).toHaveLength(1); // correctness finder only, no verifier
-    expect(lite.findingCount).toBe(1);
-
     const failing = fakeSpawn(
       (task) =>
         task.includes("Correctness and logic")
@@ -869,7 +841,7 @@ describe("runReview", () => {
     );
     const openResult = await runReview({
       cwd: "/repo",
-      config: CONFIG({ effort: "balanced" }),
+      config: CONFIG({ verify: true }),
       target: { kind: "uncommitted" },
       deps: emptyDeps({ git, spawnFn: failing }) as never,
     });
@@ -985,7 +957,7 @@ describe("runReview", () => {
     );
     const result = await runReview({
       cwd: "/repo",
-      config: CONFIG({ effort: "lite" }),
+      config: CONFIG(),
       target: { kind: "default" },
       deps: emptyDeps({
         git: async (args: string[]) => {

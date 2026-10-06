@@ -71,10 +71,7 @@ import {
 // Config
 // ---------------------------------------------------------------------------
 
-export type Effort = "lite" | "balanced" | "deep";
-
 export interface ReviewConfig {
-  effort: Effort;
   /** Characters of diff per finder chunk (file-boundary aligned). */
   chunkChars: number;
   /** Cap on total finder children per review. */
@@ -87,8 +84,7 @@ export interface ReviewConfig {
   verifyModel?: string;
   /** Read-only command whose output feeds verification ("" disables). */
   checkCmd: string;
-  /** Verification stage on/off (PI_REVIEW_VERIFY=0 skips it — fast mode:
-   * findings ship unverified, disclosed like a failed verification). */
+  /** Verification stage on/off (PI_REVIEW_VERIFY=1 opts in; off by default). */
   verify: boolean;
   /** Maximum findings in the final report. */
   maxFindings: number;
@@ -100,8 +96,6 @@ export interface ReviewConfig {
   untrackedMaxBytes: number;
 }
 
-const EFFORTS: Effort[] = ["lite", "balanced", "deep"];
-
 function clampInt(raw: unknown, fallback: number, min: number, max: number): number {
   // Blank strings mean "unset" (sibling parse* helpers agree), not 0.
   if (raw === undefined || raw === null || String(raw).trim() === "") return fallback;
@@ -112,16 +106,16 @@ function clampInt(raw: unknown, fallback: number, min: number, max: number): num
 
 /** Parse PI_REVIEW_* knobs; invalid values fall back to documented defaults. */
 export function parseReviewConfig(env: NodeJS.ProcessEnv): ReviewConfig {
-  const effortRaw = String(env.PI_REVIEW_EFFORT ?? "").toLowerCase();
   return {
-    effort: EFFORTS.includes(effortRaw as Effort) ? (effortRaw as Effort) : "balanced",
     chunkChars: clampInt(env.PI_REVIEW_CHUNK_CHARS, 96_000, 8_000, 512_000),
     maxChildren: clampInt(env.PI_REVIEW_MAX_CHILDREN, 8, 1, 32),
     timeoutMs: clampInt(env.PI_REVIEW_TIMEOUT_MS, 20 * 60_000, 10_000, 6 * 60 * 60_000),
     model: env.PI_REVIEW_MODEL?.trim() || undefined,
     verifyModel: env.PI_REVIEW_VERIFY_MODEL?.trim() || undefined,
     checkCmd: env.PI_REVIEW_CHECK_CMD?.trim() ?? "",
-    verify: String(env.PI_REVIEW_VERIFY ?? "1") !== "0",
+    // Verification off by default: the A/B on 20 PRs showed it costs ~half the
+    // wall time and buys no recall; opt back in with PI_REVIEW_VERIFY=1.
+    verify: ["1", "true", "on"].includes(String(env.PI_REVIEW_VERIFY ?? "").toLowerCase()),
     maxFindings: clampInt(env.PI_REVIEW_MAX_FINDINGS, 25, 1, 100),
     priorChars: clampInt(env.PI_REVIEW_PRIOR_CHARS, 8_000, 0, 32_000),
     persist: String(env.PI_REVIEW_STATE ?? "1") !== "0",
@@ -142,7 +136,6 @@ export type TargetSpec =
 
 export interface ParsedArgs {
   target: TargetSpec;
-  effort?: Effort;
   /** Child model overrides for this invocation (--model / --verify-model). */
   model?: string;
   verifyModel?: string;
@@ -150,26 +143,24 @@ export interface ParsedArgs {
   error?: string;
 }
 
-const EFFORT_WORDS = new Set(EFFORTS);
 const UNCOMMITTED_WORDS = new Set(["tree", "local", "uncommitted", "working"]);
 
-/** Effective models/effort for one invocation: command-line flag over env
+/** Effective models for one invocation: command-line flag over env
  * knob; when both are unset the model stays undefined and children inherit
  * (session model, else pi's global default). Pure so tests can pin precedence. */
 export function resolveInvocation(
   parsed: ParsedArgs,
-  config: Pick<ReviewConfig, "effort" | "model" | "verifyModel">,
-): { effort: Effort; model?: string; verifyModel?: string } {
+  config: Pick<ReviewConfig, "model" | "verifyModel">,
+): { model?: string; verifyModel?: string } {
   return {
-    effort: parsed.effort ?? config.effort,
     model: parsed.model ?? config.model,
     verifyModel: parsed.verifyModel ?? config.verifyModel,
   };
 }
 
 /**
- * Parse `/review [target] [effort] [--model <m>] [--verify-model <m>]` tokens,
- * order-insensitively: an effort word; staged/cached; tree/local/uncommitted/
+ * Parse `/review [target] [--model <m>] [--verify-model <m>]` tokens,
+
  * working; a `a..b`/`a...b` range; `--model=<m>`/`--model <m>` and
  * `--verify-model` overrides (flag form because refs and model names both
  * contain slashes — `origin/main` is a ref, `anthropic/claude-...` a model);
@@ -177,7 +168,6 @@ export function resolveInvocation(
  */
 export function parseReviewArgs(args: string): ParsedArgs {
   const tokens = args.split(/\s+/).filter(Boolean);
-  let effort: Effort | undefined;
   let target: TargetSpec | undefined;
   let model: string | undefined;
   let verifyModel: string | undefined;
@@ -195,10 +185,6 @@ export function parseReviewArgs(args: string): ParsedArgs {
       else verifyModel = value;
       continue;
     }
-    if (EFFORT_WORDS.has(token as Effort)) {
-      effort = token as Effort;
-      continue;
-    }
     if (UNCOMMITTED_WORDS.has(token)) {
       target ??= { kind: "uncommitted" };
       continue;
@@ -214,7 +200,7 @@ export function parseReviewArgs(args: string): ParsedArgs {
     }
     target ??= { kind: "ref", ref: token };
   }
-  return { target: target ?? { kind: "default" }, effort, model, verifyModel, ...(error ? { error } : {}) };
+  return { target: target ?? { kind: "default" }, model, verifyModel, ...(error ? { error } : {}) };
 }
 
 // ---------------------------------------------------------------------------
@@ -592,7 +578,7 @@ export const FINDER_LENSES: Lens[] = [
     id: "correctness",
     name: "Correctness and logic",
     focus:
-      "incorrect results, broken invariants, wrong conditions and off-by-ones, type errors, data corruption and data-loss paths, race conditions and ordering bugs",
+      "incorrect results, broken invariants, wrong conditions and off-by-ones, type errors, data corruption and data-loss paths, race conditions and ordering bugs, calls to library or standard-library APIs that do not exist or take different arguments than used, value-normalization asymmetries where only one side of a comparison or lookup is transformed (lowercased, trimmed, parsed)",
   },
   {
     id: "security",
@@ -604,7 +590,7 @@ export const FINDER_LENSES: Lens[] = [
     id: "robustness",
     name: "Robustness and error handling",
     focus:
-      "unhandled failures (network, IO, parse), missing timeouts and bounds, edge cases (empty, huge, concurrent, malformed input), resource lifecycle and leaks, broken public contracts for existing callers",
+      "unhandled failures (network, IO, parse), missing timeouts and bounds, edge cases (empty, huge, concurrent, malformed input), resource lifecycle and leaks, broken public contracts for existing callers, timing-fragile tests (fixed sleeps instead of waiting on a condition, waits that silently no-op under mocks or monkeypatches), over-broad exception handling that swallows unrelated failures",
   },
   {
     id: "tests",
@@ -612,19 +598,7 @@ export const FINDER_LENSES: Lens[] = [
     focus:
       "changed behavior with no test protection, tests that do not exercise this change's failure paths, weakened or deleted tests, tests asserting implementation details",
   },
-  {
-    id: "conventions",
-    name: "Conventions and maintainability",
-    focus:
-      "violations of the repo's own stated conventions (see any review guidelines provided), misleading names, abstractions that complicate safe future changes; skip formatter-level concerns",
-  },
 ];
-
-export const EFFORT_LENSES: Record<Effort, string[]> = {
-  lite: ["correctness"],
-  balanced: ["correctness", "security", "robustness"],
-  deep: ["correctness", "security", "robustness", "tests", "conventions"],
-};
 
 /** The reviewer's workflow — GitHub's transplant: ask, narrow, read, decide. */
 const WORKFLOW_RULES = `## Workflow: ask, narrow, read, decide
@@ -804,6 +778,10 @@ export interface ReviewResult {
   report: string;
   /** The final (capped) findings behind the report — data, not just display. */
   findings: Finding[];
+  /** Per-finder failures and lens coverage gaps, disclosed in the report and
+   * exposed here so evals can record *why* a lens went quiet (timeouts reaping
+   * slow finders look identical to "found nothing" in findings alone). */
+  coverage: { errors: string[]; uncoveredFiles: string[]; lensCoverage: Record<number, string[]> };
   usage?: ChildUsage;
   findingCount: number;
 }
@@ -935,8 +913,7 @@ export function planFinderRuns(
 /** Render the final markdown report. */
 export function renderReport(opts: {
   targetLabel: string;
-  effort: Effort;
-  /** Verification deliberately off (PI_REVIEW_VERIFY=0) — disclosed, not silent. */
+  /** Verification deliberately off (default) — disclosed, not silent. */
   verifySkipped?: boolean;
   reviewedFiles: string[];
   /** Files in chunks no finder covered (child cap or failures) — disclosed, never listed as reviewed. */
@@ -944,7 +921,7 @@ export function renderReport(opts: {
   skippedFiles: string[];
   lensCoverage: Map<number, string[]>;
   chunkCount: number;
-  /** Lenses the effort level planned per chunk — coverage below this is partial. */
+  /** Lenses planned per chunk — coverage below this is partial. */
   plannedLensCount: number;
   bundle: VerifiedBundle;
   usage?: ChildUsage;
@@ -954,7 +931,7 @@ export function renderReport(opts: {
   const { bundle } = opts;
   const lines: string[] = [];
   const sev = (s: Severity) => ({ critical: "🔴 Critical", important: "🟠 Important", suggestion: "🟡 Suggestion" })[s];
-  lines.push(`# Code review — ${opts.targetLabel} (${opts.effort} effort)`);
+  lines.push(`# Code review — ${opts.targetLabel}`);
   if (bundle.findings.length === 0) {
     const rejectedNote = bundle.rejected.length
       ? ` ${bundle.rejected.length} candidate(s) were rejected by verification.`
@@ -1151,7 +1128,6 @@ export async function runReview(opts: {
   const { config, deps } = opts;
   const now = deps.now ?? Date.now;
   const startedAt = now();
-  const effort = config.effort;
 
   // Stage 0a: diff sections.
   let sections: DiffSection[];
@@ -1179,7 +1155,12 @@ export async function runReview(opts: {
   if (sections.length === 0) {
     const emptyNote =
       opts.target.kind === "default" ? " (nothing ahead of upstream, uncommitted, or untracked)" : " for this target";
-    return { report: `# Code review\n\nNo changes to review${emptyNote}.`, findings: [], findingCount: 0 };
+    return {
+      report: `# Code review\n\nNo changes to review${emptyNote}.`,
+      findings: [],
+      coverage: { errors: [], uncoveredFiles: [], lensCoverage: {} },
+      findingCount: 0,
+    };
   }
 
   // Stage 0b: parse and exclude.
@@ -1196,6 +1177,7 @@ export async function runReview(opts: {
     return {
       report: `# Code review\n\nAll changed files are excluded from review (lockfiles, logs, generated, or binary):\n${list}`,
       findings: [],
+      coverage: { errors: [], uncoveredFiles: [], lensCoverage: {} },
       findingCount: 0,
     };
   }
@@ -1235,7 +1217,10 @@ export async function runReview(opts: {
   const chunks = chunkDiffFiles(files, Math.max(8_000, config.chunkChars - contextChars));
 
   // Stage 1: finders.
-  const lensIds = EFFORT_LENSES[effort];
+  // One configuration — every lens, every review. Tiers are gone: the eval
+  // showed the four-lens set is the quality floor worth paying for, and finders
+  // run in parallel so the marginal lens costs tokens, not wall time.
+  const lensIds = FINDER_LENSES.map((l) => l.id);
   const lenses = new Map(FINDER_LENSES.map((l) => [l.id, l]));
   const runs = planFinderRuns(chunks.length, lensIds, config.maxChildren);
   deps.notify(
@@ -1296,7 +1281,7 @@ export async function runReview(opts: {
 
   // Stage 2: verify.
   let bundle: VerifiedBundle = { findings: candidates, rejected: [], unverified: false };
-  if (candidates.length > 0 && config.verify && effort !== "lite") {
+  if (candidates.length > 0 && config.verify) {
     deps.notify(`Verifying ${candidates.length} candidate finding(s)…`, "info");
     const vAgent = verifyAgent();
     const { task: vTask } = fitTask(
@@ -1339,8 +1324,7 @@ export async function runReview(opts: {
   const reviewedFiles = chunks.map((chunk, i) => (coveredChunks.has(i) ? chunk.files.map((f) => f.path) : [])).flat();
   const report = renderReport({
     targetLabel: label,
-    effort,
-    verifySkipped: !config.verify && effort !== "lite",
+    verifySkipped: !config.verify,
     reviewedFiles,
     uncoveredFiles,
     skippedFiles: skipped,
@@ -1363,7 +1347,17 @@ export async function runReview(opts: {
       // Persistence is best-effort; the review stands without it.
     }
   }
-  return { report: report + pipelineNotes, findings: capped, usage, findingCount: capped.length };
+  return {
+    report: report + pipelineNotes,
+    findings: capped,
+    coverage: {
+      errors,
+      uncoveredFiles,
+      lensCoverage: Object.fromEntries([...lensCoverage.entries()].map(([c, ls]) => [c, [...ls]])),
+    },
+    usage,
+    findingCount: capped.length,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1408,7 +1402,7 @@ export function registerReview(pi: ExtensionAPI, deps?: Partial<ReviewDeps>): vo
         ctx.ui.notify(`/review: ${parsed.error}`, "error");
         return;
       }
-      const { effort, model, verifyModel } = resolveInvocation(parsed, config);
+      const { model, verifyModel } = resolveInvocation(parsed, config);
       const full = reviewDeps(ctx.cwd, {
         notify: (message, level) => ctx.ui.notify(message, level),
         sessionModel: ctx.model,
@@ -1422,7 +1416,7 @@ export function registerReview(pi: ExtensionAPI, deps?: Partial<ReviewDeps>): vo
       try {
         const result = await runReview({
           cwd: ctx.cwd,
-          config: { ...config, effort, model, verifyModel },
+          config: { ...config, model, verifyModel },
           target: parsed.target,
           deps: full,
         });

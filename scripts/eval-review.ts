@@ -6,11 +6,12 @@
  * Usage: npm run eval:review
  *   EVAL_PRS=10       PRs to review (default 10; 50 for the full benchmark)
  *   EVAL_SEED=42      deterministic sample seed
- *   EVAL_EFFORT=balanced  pipeline effort (lite/balanced/deep)
  *   EVAL_JUDGE=1      LLM judge for finding↔issue matching (0 = heuristic only)
  *   EVAL_JUDGE_MODEL  judge model override — default: the finders' model;
  *                     overriding avoids same-model self-agreement bias
  *   EVAL_FROM=KEY     start from a fixture key (skips earlier PRs; must match)
+ *   EVAL_ONLY=k1,k2   review exactly these fixtures (miss-retest tool; keys are
+ *                     owner--repo--number, order follows the dataset)
  *   EVAL_CONCURRENCY=1  PRs reviewed concurrently (default 1; 2-3 for speed)
  *   EVAL_REJUDGE=path re-judge an existing run JSONL with the current judge
  *                     (no finder re-spend; writes <path>-rejudged.jsonl) —
@@ -61,9 +62,13 @@ const RESULTS_DIR = path.join(HERE, "eval", "results");
 const env = process.env;
 const PRS = Math.max(1, Number(env.EVAL_PRS ?? 10) || 10);
 const SEED = Number(env.EVAL_SEED ?? 42) || 42;
-const EFFORT = env.EVAL_EFFORT ?? "balanced";
 const JUDGE = String(env.EVAL_JUDGE ?? "1") !== "0";
 const FROM = env.EVAL_FROM ?? "";
+const ONLY = env.EVAL_ONLY?.trim()
+  ? env.EVAL_ONLY.split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+  : [];
 const JUDGE_MODEL = env.EVAL_JUDGE_MODEL?.trim() || undefined;
 const REJUDGE = env.EVAL_REJUDGE?.trim() || "";
 /** PRs reviewed concurrently (1 = today's serial default; 2 halves wall time
@@ -187,15 +192,22 @@ describe("eval: review pipeline on code-review-bench", () => {
     "reviews the sampled PRs and scores against golden issues",
     { timeout: 24 * 60 * 60_000 },
     async () => {
-      const config: ReviewConfig = parseReviewConfig({ ...env, PI_REVIEW_EFFORT: EFFORT, PI_REVIEW_STATE: "0" });
-      const fixtures = sampleFixtures(loadBench(DATA_DIR), PRS, SEED);
+      const config: ReviewConfig = parseReviewConfig({ ...env, PI_REVIEW_STATE: "0" });
+      const all = loadBench(DATA_DIR);
+      // EVAL_ONLY bypasses sampling entirely (retests don't care about seeds).
+      let fixtures = ONLY.length ? all.filter((f) => ONLY.includes(f.key)) : sampleFixtures(all, PRS, SEED);
+      if (ONLY.length) {
+        const found = new Set(fixtures.map((f) => f.key));
+        const missing = ONLY.filter((k) => !found.has(k));
+        if (missing.length) throw new Error(`EVAL_ONLY: unknown fixture key(s): ${missing.join(", ")}`);
+      }
       const start = FROM ? fixtures.findIndex((f) => f.key === FROM) : 0;
       if (FROM && start < 0) throw new Error(`EVAL_FROM: no fixture "${FROM}" in the seed-${SEED} sample of ${PRS}`);
       const selected = fixtures.slice(start);
       const judgeModel = JUDGE_MODEL ?? config.model; // default: the finders' model
       const model = effectiveModel();
       console.log(
-        `eval: ${selected.length} PRs, effort=${config.effort}, judge=${JUDGE ? "on" : "off"}, seed=${SEED}, model=${model}, judge model=${judgeModel ?? "(pi global default)"}`,
+        `eval: ${selected.length} PRs, judge=${JUDGE ? "on" : "off"}, seed=${SEED}, model=${model}, judge model=${judgeModel ?? "(pi global default)"}`,
       );
 
       mkdirSync(RESULTS_DIR, { recursive: true });
@@ -316,7 +328,6 @@ describe("eval: review pipeline on code-review-bench", () => {
             meta: {
               prs: results.length,
               seed: SEED,
-              effort: config.effort,
               judge: JUDGE,
               model,
               judgeModel: judgeModel ?? "(pi global default)",
