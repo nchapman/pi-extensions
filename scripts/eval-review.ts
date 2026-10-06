@@ -32,6 +32,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { defaultSpawn, runChild } from "../extensions/subagents";
 import {
+  DEFAULT_REVIEW_MODEL,
   fitTask,
   parseReviewConfig,
   runReview,
@@ -170,21 +171,11 @@ async function judgeFindings(
   }
 }
 
-/** The model the eval children effectively run on: explicit override, else
- * pi's global default (what a `pi -p` child with no --model resolves to).
- * Recorded into results so scores are attributable to a model, not just a date. */
+/** The model the eval children effectively run on. Same resolution order as
+ * parseReviewConfig (env knob, else the in-code default) so recorded
+ * attribution matches what the children actually spawned with. */
 function effectiveModel(): string {
-  if (env.PI_REVIEW_MODEL) return env.PI_REVIEW_MODEL;
-  try {
-    const settings = JSON.parse(readFileSync(path.join(os.homedir(), ".pi", "agent", "settings.json"), "utf8"));
-    const model = settings.defaultModel;
-    if (typeof model === "string") {
-      return typeof settings.defaultProvider === "string" ? `${settings.defaultProvider}/${model}` : model;
-    }
-  } catch {
-    // settings are optional; report the fallback name
-  }
-  return "(pi global default)";
+  return env.PI_REVIEW_MODEL?.trim() || DEFAULT_REVIEW_MODEL;
 }
 
 describe("eval: review pipeline on code-review-bench", () => {

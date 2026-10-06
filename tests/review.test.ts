@@ -15,6 +15,7 @@ import {
   parseFindings,
   parseReviewArgs,
   resolveInvocation,
+  summarizeForTool,
   parseReviewConfig,
   parseVerdicts,
   planFinderRuns,
@@ -130,12 +131,38 @@ const emptyDeps = (over: Record<string, unknown> = {}) => ({
 });
 
 describe("parseReviewConfig", () => {
+  it("summarizes a review compactly for the agent-facing tool", () => {
+    const full = {
+      report: "# big report",
+      findings: [
+        finding({ severity: "critical", title: "Bug one" }),
+        finding({ file: "src/b.ts", line: 9, severity: "suggestion", title: "Nit" }),
+      ],
+      coverage: { errors: [], uncoveredFiles: [], lensCoverage: {} },
+      findingCount: 2,
+    };
+    const text = summarizeForTool(full, "/repo/.pi/review-report.md");
+    expect(text).toContain("2 finding(s): 1 critical, 1 suggestion.");
+    expect(text).toContain("[critical] src/a.ts:2 — Bug one");
+    expect(text).toContain("[suggestion] src/b.ts:9 — Nit");
+    expect(text).toContain("Full report: /repo/.pi/review-report.md");
+    expect(text).not.toContain("big report"); // details stay on disk
+    const gaps = summarizeForTool({
+      ...full,
+      findings: [],
+      findingCount: 0,
+      coverage: { errors: ["finder died"], uncoveredFiles: ["src/x.ts"], lensCoverage: {} },
+    });
+    expect(gaps).toContain("No actionable findings.");
+    expect(gaps).toContain("Coverage gaps: 1 file(s) unreviewed, 1 finder error(s).");
+  });
+
   it("defaults without env (verification off, the measured config)", () => {
     const c = parseReviewConfig({});
     expect(c.verify).toBe(false);
     expect(c.chunkChars).toBe(96_000);
     expect(c.maxChildren).toBe(8);
-    expect(c.model).toBeUndefined();
+    expect(c.model).toBe("opencode-go/deepseek-v4.1-flash");
     expect(c.checkCmd).toBe("");
     expect(c.persist).toBe(true);
   });

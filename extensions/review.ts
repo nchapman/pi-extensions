@@ -55,6 +55,7 @@
 import { execFile } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import {
   defaultSpawn,
@@ -70,6 +71,12 @@ import {
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
+
+/** Default finder model — the benchmarked configuration: 85.7% recall / 90.5%
+ * Crit-High on code-review-bench at ~1/10 the cost of heavier models. Env knob
+ * PI_REVIEW_MODEL and --model still override; note this default means reviews
+ * no longer inherit the session model unless --model says so. */
+export const DEFAULT_REVIEW_MODEL = "opencode-go/deepseek-v4.1-flash";
 
 export interface ReviewConfig {
   /** Characters of diff per finder chunk (file-boundary aligned). */
@@ -110,7 +117,7 @@ export function parseReviewConfig(env: NodeJS.ProcessEnv): ReviewConfig {
     chunkChars: clampInt(env.PI_REVIEW_CHUNK_CHARS, 96_000, 8_000, 512_000),
     maxChildren: clampInt(env.PI_REVIEW_MAX_CHILDREN, 8, 1, 32),
     timeoutMs: clampInt(env.PI_REVIEW_TIMEOUT_MS, 20 * 60_000, 10_000, 6 * 60 * 60_000),
-    model: env.PI_REVIEW_MODEL?.trim() || undefined,
+    model: env.PI_REVIEW_MODEL?.trim() || DEFAULT_REVIEW_MODEL,
     verifyModel: env.PI_REVIEW_VERIFY_MODEL?.trim() || undefined,
     checkCmd: env.PI_REVIEW_CHECK_CMD?.trim() ?? "",
     // Verification off by default: the A/B on 20 PRs showed it costs ~half the
@@ -1399,6 +1406,35 @@ export function reviewDeps(cwd: string, overrides?: Partial<ReviewDeps>): Review
   };
 }
 
+/** Compact agent-facing summary of a review: one line per finding plus coverage
+ * gaps and a pointer to the full report. The parent agent gets the gist for a
+ * few hundred tokens and reads the report file only when it needs detail —
+ * the context-cost discipline the eval header commits to. */
+export function summarizeForTool(result: ReviewResult, reportPath?: string): string {
+  const lines: string[] = [];
+  const bySev = { critical: 0, important: 0, suggestion: 0 };
+  for (const f of result.findings) bySev[f.severity]++;
+  const counts = [
+    bySev.critical ? `${bySev.critical} critical` : "",
+    bySev.important ? `${bySev.important} important` : "",
+    bySev.suggestion ? `${bySev.suggestion} suggestion` : "",
+  ]
+    .filter(Boolean)
+    .join(", ");
+  lines.push(
+    result.findings.length === 0 ? "No actionable findings." : `${result.findings.length} finding(s): ${counts}.`,
+  );
+  for (const f of result.findings) {
+    lines.push(`[${f.severity}] ${f.file}${f.line ? `:${f.line}` : ""} — ${f.title}`);
+  }
+  const gaps = result.coverage.uncoveredFiles;
+  if (gaps.length > 0 || result.coverage.errors.length > 0) {
+    lines.push(`Coverage gaps: ${gaps.length} file(s) unreviewed, ${result.coverage.errors.length} finder error(s).`);
+  }
+  if (reportPath) lines.push(`Full report: ${reportPath}`);
+  return lines.join("\n");
+}
+
 export function registerReview(pi: ExtensionAPI, deps?: Partial<ReviewDeps>): void {
   // Children are tracked so shutdown kills the whole pipeline — an orphaned
   // finder burns tokens with nobody consuming the result (the superbash invariant).
@@ -1437,6 +1473,70 @@ export function registerReview(pi: ExtensionAPI, deps?: Partial<ReviewDeps>): vo
         ctx.ui.notify(`Review complete: ${result.findingCount} finding(s)`, "info");
       } catch (err) {
         ctx.ui.notify(`Review failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+      }
+    },
+  });
+
+  // The agent-facing surface: same pipeline, compact output. The parent agent
+  // can review its own diff before committing — the discipline the global
+  // AGENTS.md asks for — without the multi-KB report landing in its context.
+  pi.registerTool({
+    name: "review",
+    label: "Review",
+    description:
+      "Run the multi-lens code-review pipeline (correctness, security, robustness, tests finders over a diff, then a deterministic merge) on local changes. Use it to review your own work before committing or when asked to review changes. target defaults to commits ahead of upstream plus uncommitted and untracked work; 'staged', 'tree' (uncommitted only), a ref like 'main', or a range like 'HEAD~3..HEAD' override. Returns one line per finding (severity, location, title); the full report with details and recommendations is written to .pi/review-report.md — read it for any finding you act on.",
+    promptSnippet:
+      "review — run the multi-lens review pipeline on a diff (default: ahead of upstream + working tree; or 'staged', 'tree', a ref, 'a..b'); returns compact findings, full report on disk",
+    parameters: Type.Object({
+      target: Type.Optional(
+        Type.String({
+          description:
+            "What to review: 'staged', 'tree' (uncommitted only), a ref like 'main' (commits ahead of it), or a range like 'HEAD~3..HEAD'. Default: ahead of upstream plus working tree",
+        }),
+      ),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const cwd = ctx.cwd ?? process.cwd();
+      const parsed = parseReviewArgs(params.target ?? "");
+      if (parsed.error) {
+        return {
+          content: [{ type: "text" as const, text: `review: ${parsed.error}` }],
+          details: { findingCount: 0 },
+          isError: true,
+        };
+      }
+      const config = parseReviewConfig(process.env);
+      const { model, verifyModel } = resolveInvocation(parsed, config);
+      const full = reviewDeps(cwd, {
+        notify: () => {}, // progress chatter is for humans; the tool result carries what matters
+        sessionModel: ctx.model,
+        ...deps,
+        spawnFn: tracked.spawnFn,
+      });
+      try {
+        const result = await runReview({
+          cwd,
+          config: { ...config, model, verifyModel },
+          target: parsed.target,
+          deps: full,
+        });
+        // Full report to disk (recoverable, readable on demand); gist to context.
+        const reportDir = path.join(cwd, ".pi");
+        await mkdir(reportDir, { recursive: true });
+        const reportPath = path.join(reportDir, "review-report.md");
+        await writeFile(reportPath, result.report, "utf8");
+        return {
+          content: [{ type: "text" as const, text: summarizeForTool(result, reportPath) }],
+          details: { findingCount: result.findingCount },
+        };
+      } catch (err) {
+        return {
+          content: [
+            { type: "text" as const, text: `Review failed: ${err instanceof Error ? err.message : String(err)}` },
+          ],
+          details: { findingCount: 0 },
+          isError: true,
+        };
       }
     },
   });
