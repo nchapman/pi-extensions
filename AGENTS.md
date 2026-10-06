@@ -26,7 +26,7 @@ npm run test:coverage  # vitest with V8 coverage report
 - TypeScript with lint-grade strictness beyond `strict: true` (`noUnusedLocals`, `noUnusedParameters`, `noImplicitReturns`, `noFallthroughCasesInSwitch`, `verbatimModuleSyntax`, and more). No unused anything; type-only imports use `import type`.
 - Prettier enforced: double quotes, semicolons, 2-space indent, 120-col width, trailing commas. Run `npm run format` before committing.
 - Comment the *why* — file headers explain the deliberate design cut (see `lib/superbash.ts` for the pattern), not a narration of the code.
-- Configuration is environment knobs (`PI_*`) parsed through small pure `parse*` helpers; invalid values fall back to documented defaults (range-clamped), never throw. Read timing varies — at registration (overflow, recall) or per-call (subagents) — match the surrounding code.
+- Configuration is environment knobs (`PI_*`) parsed through small pure `parse*` helpers; invalid values fall back to documented defaults (range-clamped), never throw. Read timing varies — at registration (recall) or per-call (subagents) — match the surrounding code.
 - Every network fetch and child process is bounded (timeout, capped buffers). Errors must carry enough detail to act on; choose fail-open vs fail-closed deliberately and say which in a comment.
 
 ## Testing conventions

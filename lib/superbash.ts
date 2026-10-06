@@ -31,7 +31,7 @@
  *   completion wake already delivered the result, so a heartbeat could only
  *   burn turns on silence
  * - full replies over the wake cap are stashed beside the session at
- *   <sessionDir>/tasks/<id>.txt with a pointer in the wake (the overflow pattern);
+ *   <sessionDir>/tasks/<id>.txt with a pointer in the wake (stash-and-pointer, recoverable after compaction);
  *   with no session dir the text is hard-capped and says so
  * - backgrounded bash commands run through pi's own local bash operations
  *   (the same createLocalBashOperations the built-in bash tool uses): identical
