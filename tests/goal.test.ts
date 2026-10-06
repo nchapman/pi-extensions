@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { createTaskRegistry, getSharedTaskRegistry, publishSharedTaskRegistry, type BgTask } from "../lib/superbash";
 import {
   checkCompletion,
   checkEvidenceCoverage,
@@ -16,6 +17,7 @@ import {
   GOAL_TOOL_NAME,
   isContradictorySummary,
   lastGoalSnapshot,
+  listenForTerminalInput,
   parseCheckEvery,
   parseMaxContinuations,
   parseMaxProgressResets,
@@ -643,6 +645,39 @@ describe("runVerify", () => {
   });
 });
 
+describe("listenForTerminalInput", () => {
+  it("forwards every key without consuming it, and detaching stops delivery", () => {
+    const handlers = new Set<(data: string) => unknown>();
+    const ui = {
+      onTerminalInput: (h: (data: string) => unknown) => {
+        handlers.add(h);
+        return () => handlers.delete(h);
+      },
+    };
+    const seen: string[] = [];
+    const detach = listenForTerminalInput(ui as never, (data) => seen.push(data));
+    expect(handlers).toHaveLength(1);
+    // Capture what the wrapped handler RETURNS: pi-tui dispatches extension
+    // input listeners before the focused component, so a non-undefined result
+    // (consume/rewrite) would eat the key pi's own handling expects to see.
+    const results = [...handlers].map((h) => h("\x1b"));
+    expect(seen).toEqual(["\x1b"]);
+    expect(results).toEqual([undefined]); // observe-only — pi still sees the key
+    detach();
+    expect(handlers).toHaveLength(0);
+    [...handlers].map((h) => h("a"));
+    expect(seen).toEqual(["\x1b"]); // detached — nothing delivered
+  });
+
+  it("is a no-op without an interactive UI", () => {
+    const fire = () => {
+      throw new Error("must not fire");
+    };
+    listenForTerminalInput(undefined, fire)();
+    listenForTerminalInput({} as never, fire)(); // no onTerminalInput method
+  });
+});
+
 describe("registerGoalTool — schema", () => {
   it("is a flat root object schema: OpenAI-compatible providers cannot key arguments off a rootless union", async () => {
     const { pi, tools } = makePi();
@@ -1076,6 +1111,129 @@ describe("registerGoalTool", () => {
     expect(sentCustom).toHaveLength(3);
   });
 
+  it("defers the settle check while background tasks run, then checks at the first calm settle", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const setStatus = vi.fn();
+    const notify = vi.fn();
+    const ctx = { ui: { notify, setStatus, setWidget: vi.fn() } } as unknown as ExtensionContext;
+    const gpu: BgTask = { id: "t-1", name: "needle 9B", kind: "bash", state: "running", startedAt: 0 };
+    const agent: BgTask = { id: "t-2", name: "reviewer", kind: "subagent", state: "running", startedAt: 1 };
+    let running: BgTask[] = [gpu, agent];
+    let calls = 0;
+    registerGoalTool(pi, {
+      maxContinuations: 10,
+      runningTasks: () => running,
+      verifyRunner: async () => {
+        calls += 1;
+        return failVerify;
+      },
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it", verify: "npm test" });
+    expect(calls).toBe(1); // the set-time preflight still runs — tasks defer only the settle check
+
+    // Settles while tasks run: the turn is only temporarily done (each
+    // completion wake re-engages the agent), so no check, no continuation,
+    // no follow-up — just a footer saying why, announced once per park.
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("check held"));
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(notify).toHaveBeenCalledTimes(1); // once per park, not per settle
+    expect(calls).toBe(1);
+    expect(sentCustom).toHaveLength(0);
+    expect(setStatus).toHaveBeenCalledWith("goal", "goal · holding check — 2 background tasks running");
+
+    // One task left: singular footer.
+    running = [gpu];
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(setStatus).toHaveBeenCalledWith("goal", "goal · holding check — 1 background task running");
+
+    // Last wake re-engaged the agent; its settle is calm — the check runs,
+    // and the deferrals burned no budget (numbered 1/10, not 4/10).
+    running = [];
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    expect(calls).toBe(2);
+    expect(sentCustom).toHaveLength(1);
+    expect((sentCustom[0] as { msg: { content: string } }).msg.content).toContain("1/10");
+
+    // A fresh park (a check ran in between) announces again.
+    running = [gpu];
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(notify).toHaveBeenCalledTimes(2);
+
+    // A model-set goal while still parked re-announces too: setGoal must
+    // clear the flag, or goal #2's whole park would ride goal #1's notice.
+    running = [gpu, agent];
+    await tools.get(GOAL_TOOL_NAME)!.execute("2", { action: "set", objective: "ship v2", verify: "npm test" });
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(notify).toHaveBeenCalledTimes(3);
+  });
+
+  it("a deferral at the continuation cap defers too — no budget burned, no judge consulted", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
+    const gpu: BgTask = { id: "t-1", name: "gate", kind: "bash", state: "running", startedAt: 0 };
+    let running: BgTask[] = [];
+    const assess = vi.fn(() => undefined);
+    registerGoalTool(pi, {
+      maxContinuations: 1,
+      progressJudge: { assess },
+      runningTasks: () => running,
+      verifyRunner: async () => failVerify,
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it", verify: "npm test" });
+
+    // Calm settle: continuation 1/1 — the budget is now spent.
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    expect(sentCustom).toHaveLength(1);
+
+    // At the cap, but a task is running: defer (the cap decision belongs to a
+    // calm settle — the judge would read a half-finished state otherwise).
+    running = [gpu];
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(assess).not.toHaveBeenCalled();
+    expect(sentCustom).toHaveLength(1);
+
+    // Calm again: the judge decides now (no opinion → fail closed to the stop).
+    running = [];
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(assess).toHaveBeenCalledTimes(1);
+    expect(ctx.ui!.notify).toHaveBeenCalledWith(expect.stringContaining("stopping"));
+  });
+
+  it("reads the real shared superbash registry through the default seam", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
+    // No runningTasks injected: the default resolution must find the registry
+    // the subagents extension publishes — the production wiring.
+    publishSharedTaskRegistry(createTaskRegistry());
+    try {
+      registerGoalTool(pi, { maxContinuations: 10, verifyRunner: async () => failVerify });
+      await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it", verify: "npm test" });
+
+      const id = getSharedTaskRegistry()!.adopt({ name: "gpu battery", kind: "bash", kill: () => {} });
+      expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined(); // deferred via the real registry
+      expect(sentCustom).toHaveLength(0);
+
+      getSharedTaskRegistry()!.complete(id, { ok: true, text: "exited 0" }); // the wake re-engages the agent
+      expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // check runs
+      expect(sentCustom).toHaveLength(1);
+
+      // The default seam reads the registry per event, not at registration:
+      // a re-published registry (reload) must gate the very next settle.
+      publishSharedTaskRegistry(createTaskRegistry());
+      const fresh = getSharedTaskRegistry()!;
+      const freshId = fresh.adopt({ name: "reviewer", kind: "subagent", kill: () => {} });
+      expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined(); // deferred on the fresh registry
+      fresh.complete(freshId, { ok: true, text: "done" });
+      expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+      expect(sentCustom).toHaveLength(2);
+    } finally {
+      // Reset for later tests in this file that use the default seam.
+      publishSharedTaskRegistry(createTaskRegistry());
+    }
+  });
+
   it("resolves (does not reject) when the runner throws at set or complete", async () => {
     const { pi, tools } = makePi();
     registerGoalTool(pi, {
@@ -1102,22 +1260,121 @@ describe("registerGoalTool", () => {
     expect(done.content[0].text).toContain("could not run: boom");
   });
 
-  it("forwards the run's abort signal to the settle check and unwedges on Esc", async () => {
+  it("the kill key (alt+x) aborts the settle check; Esc and editing keys do not", async () => {
     const { pi, tools, events, sentCustom } = makePi();
-    const ctrl = new AbortController();
+    // Production shape: no ctx.signal at this boundary — only the raw-input hook.
+    const handlers = new Set<(data: string) => unknown>();
     const ctx = {
-      ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() },
-      signal: ctrl.signal,
+      ui: {
+        notify: vi.fn(),
+        setStatus: vi.fn(),
+        setWidget: vi.fn(),
+        onTerminalInput: (h: (data: string) => unknown) => {
+          handlers.add(h);
+          return () => handlers.delete(h);
+        },
+      },
     } as unknown as ExtensionContext;
+    const press = (data: string) => {
+      for (const h of [...handlers]) h(data);
+    };
     let settleSignal: AbortSignal | undefined;
+    let started!: () => void;
+    const checkStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
     let call = 0;
     registerGoalTool(pi, {
       maxContinuations: 10,
       verifyRunner: (_cmd, opts) => {
-        if (call++ === 0) return Promise.resolve(failVerify); // set preflight
-        // Honor the signal like the real runner does — resolve as aborted on Esc.
-        return new Promise<VerifyResult>((resolve) => {
+        call += 1;
+        if (call === 1) return Promise.resolve(failVerify); // set preflight
+        if (call === 2) {
+          // Honor the signal like the real runner does — resolve as aborted on kill.
           settleSignal = opts?.signal;
+          started();
+          return new Promise<VerifyResult>((resolve) => {
+            opts?.signal?.addEventListener(
+              "abort",
+              () => resolve({ ok: false, exitCode: null, timedOut: false, aborted: true, output: "" }),
+              { once: true },
+            );
+          });
+        }
+        return Promise.resolve(okVerify);
+      },
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it", verify: "npm test" });
+
+    const settled = fire(events, "agent_before_settle", ctx);
+    await checkStarted; // listener is attached before the runner is called
+    expect(handlers).toHaveLength(1);
+    // The spinner advertises the escape hatch.
+    const setWidget = (ctx.ui as unknown as { setWidget: ReturnType<typeof vi.fn> }).setWidget;
+    const factory = setWidget.mock.calls[0]![1] as (
+      tui: { requestRender(): void },
+      theme: unknown,
+    ) => { render(width: number): string[] };
+    expect(
+      factory({ requestRender: () => {} }, THEME)
+        .render(80)
+        .join("\n"),
+    ).toContain("alt+x aborts");
+    // None of the polluted gestures may kill: an arrow key (an escape
+    // SEQUENCE), typing, and bare Esc presses — pi's own interrupt and its
+    // double-Esc action both live there, and popup dismissals emit Esc too.
+    press("\x1b[A");
+    press("a");
+    press("\x1b");
+    press("\x1b"); // pi's double-escape gesture — not ours to interpret
+    expect(settleSignal?.aborted).toBe(false);
+    press("\x1bx"); // alt+x — the dedicated kill key
+    // A deliberate kill re-engages with a notice instead of parking the turn
+    // (a real pi-side abort drops the continuation queue anyway).
+    expect(await settled).toEqual({ continue: true });
+    expect(sentCustom).toHaveLength(1);
+    const notice = sentCustom[0] as { msg: { content: string; details: GoalCheckDetails } };
+    expect(notice.msg.content).toContain("aborted before it finished");
+    expect(notice.msg.details.aborted).toBe(true);
+    expect(notice.msg.details.ok).toBe(false);
+    expect(notice.msg.details.exitCode).toBeNull();
+    expect(handlers).toHaveLength(0); // detached once the check ends
+
+    // The aborted check burned no budget: the next calm settle runs 1/10.
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    expect((sentCustom[1] as { msg: { content: string } }).msg.content).toContain("1/10");
+  });
+
+  it("a live run signal, when pi wires one, still cuts the settle check short", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const ctrl = new AbortController();
+    const handlers = new Set<(data: string) => unknown>();
+    const ctx = {
+      ui: {
+        notify: vi.fn(),
+        setStatus: vi.fn(),
+        setWidget: vi.fn(),
+        onTerminalInput: (h: (data: string) => unknown) => {
+          handlers.add(h);
+          return () => handlers.delete(h);
+        },
+      },
+      signal: ctrl.signal,
+    } as unknown as ExtensionContext;
+    let settleSignal: AbortSignal | undefined;
+    let started!: () => void;
+    const checkStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    let call = 0;
+    registerGoalTool(pi, {
+      maxContinuations: 10,
+      verifyRunner: (_cmd, opts) => {
+        call += 1;
+        if (call === 1) return Promise.resolve(failVerify); // set preflight
+        settleSignal = opts?.signal;
+        started();
+        return new Promise<VerifyResult>((resolve) => {
           opts?.signal?.addEventListener(
             "abort",
             () => resolve({ ok: false, exitCode: null, timedOut: false, aborted: true, output: "" }),
@@ -1128,10 +1385,13 @@ describe("registerGoalTool", () => {
     });
     await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it", verify: "npm test" });
 
-    setTimeout(() => ctrl.abort(), 30); // Esc mid-check
-    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
-    expect(settleSignal).toBe(ctrl.signal); // the wiring itself, not just the outcome
-    expect(sentCustom).toHaveLength(0);
+    const settled = fire(events, "agent_before_settle", ctx);
+    await checkStarted;
+    expect(settleSignal).toBeDefined();
+    ctrl.abort(); // pi-side abort, no terminal Esc pressed
+    expect(await settled).toEqual({ continue: true }); // notice queued; pi drops it on the real abort
+    expect((sentCustom[0] as { msg: { content: string } }).msg.content).toContain("aborted before it finished");
+    expect(handlers).toHaveLength(0);
   });
 
   it("session_shutdown aborts a running verify as an abort, not a fabricated failure", async () => {
@@ -1163,12 +1423,13 @@ describe("registerGoalTool", () => {
     });
     await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it", verify: "npm test" }); // preflight: call 1
 
-    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined(); // settle 1: fresh (call 2), aborted
+    // Settle 1: fresh (call 2), aborted — re-engages with a cut-short notice.
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
     check = failVerify;
     expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // settle 2
     expect(calls).toBe(3); // re-measured — a cached aborted result would leave this at 2
-    expect(sentCustom).toHaveLength(1);
-    expect((sentCustom[0] as { msg: { content: string } }).msg.content).toContain("1/10"); // no budget burned
+    expect(sentCustom).toHaveLength(2);
+    expect((sentCustom[1] as { msg: { content: string } }).msg.content).toContain("1/10"); // no budget burned
   });
 
   it("/goal stop kills an in-flight verify (the settle-boundary escape hatch)", async () => {
@@ -1191,6 +1452,115 @@ describe("registerGoalTool", () => {
     await commands.get("goal")!.handler("pause", { ui: { notify: vi.fn() }, mode: "tui" });
     const r = await p;
     expect(r.aborted).toBe(true);
+  });
+
+  it("/goal stop and /goal pause during a settle check halt the loop — no continuation, no notice", async () => {
+    const { pi, tools, events, commands, sentCustom } = makePi();
+    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
+    // Re-armed per pending check: the settle fires it, the test then issues
+    // the halt and resolves the runner as aborted (what the liveVerifyAborts
+    // drain does to a real runVerify).
+    let release!: (r: VerifyResult) => void;
+    let started!: () => void;
+    let checkStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    let hangNext = false;
+    registerGoalTool(pi, {
+      maxContinuations: 10,
+      verifyRunner: (_cmd, opts) => {
+        if (!hangNext) return Promise.resolve(failVerify); // set preflight etc.
+        hangNext = false;
+        started();
+        return new Promise<VerifyResult>((res) => {
+          release = res;
+          opts?.signal?.addEventListener(
+            "abort",
+            () => res({ ok: false, exitCode: null, timedOut: false, aborted: true, output: "" }),
+            { once: true },
+          );
+        });
+      },
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it", verify: "npm test" });
+
+    // /goal pause while the settle check is pending: the settle must respect
+    // the halt — the pre-fix re-engage here would burn one more model turn
+    // (carrying a notice that is false while paused) after the user paused.
+    hangNext = true;
+    let settled = fire(events, "agent_before_settle", ctx);
+    await checkStarted;
+    await commands.get("goal")!.handler("pause", { ui: { notify: vi.fn() }, mode: "tui" });
+    release({ ok: false, exitCode: null, timedOut: false, aborted: true, output: "" });
+    expect(await settled).toBeUndefined();
+    expect(sentCustom).toHaveLength(0);
+
+    // Same for /goal stop, after resuming (stop then blocks the goal; resume
+    // re-arms the loop, so stop gets a clean armed state to halt).
+    await commands.get("goal")!.handler("resume", { ui: { notify: vi.fn() }, mode: "tui" });
+    checkStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    hangNext = true;
+    settled = fire(events, "agent_before_settle", ctx);
+    await checkStarted;
+    await commands.get("goal")!.handler("stop", { ui: { notify: vi.fn() }, mode: "tui" });
+    release({ ok: false, exitCode: null, timedOut: false, aborted: true, output: "" });
+    expect(await settled).toBeUndefined();
+    expect(sentCustom).toHaveLength(0);
+  });
+
+  it("session_shutdown during a settle check resolves silently — no continuation outlives the teardown", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
+    let release!: (r: VerifyResult) => void;
+    let started!: () => void;
+    const checkStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    let hangNext = false;
+    registerGoalTool(pi, {
+      maxContinuations: 10,
+      verifyRunner: (_cmd, opts) => {
+        if (!hangNext) return Promise.resolve(failVerify); // set preflight
+        hangNext = false;
+        started();
+        return new Promise<VerifyResult>((res) => {
+          release = res;
+          opts?.signal?.addEventListener(
+            "abort",
+            () => res({ ok: false, exitCode: null, timedOut: false, aborted: true, output: "" }),
+            { once: true },
+          );
+        });
+      },
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it", verify: "npm test" });
+
+    // Reload/quit emit session_shutdown without session.abort(), so pi would
+    // honor a queued continue — the shutdown drain must suppress it.
+    hangNext = true;
+    const settled = fire(events, "agent_before_settle", ctx);
+    await checkStarted;
+    fire(events, "session_shutdown"); // reload mid-check
+    release({ ok: false, exitCode: null, timedOut: false, aborted: true, output: "" });
+    expect(await settled).toBeUndefined();
+    expect(sentCustom).toHaveLength(0);
+
+    // The latch must not outlive the teardown: extension closures survive
+    // session replacement (new/resume/fork re-run session_start), so an
+    // aborted check in the NEXT session must still re-engage.
+    fire(events, "session_start", {
+      sessionManager: { getBranch: () => [goalSnapshot(goal({ id: 1, verify: "npm test" }))] },
+      ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() },
+    } as unknown as ExtensionContext);
+    hangNext = true;
+    const settled2 = fire(events, "agent_before_settle", ctx);
+    await checkStarted;
+    release({ ok: false, exitCode: null, timedOut: false, aborted: true, output: "" });
+    expect(await settled2).toEqual({ continue: true });
+    expect(sentCustom).toHaveLength(1);
+    expect((sentCustom[0] as { msg: { content: string } }).msg.content).toContain("aborted before it finished");
   });
 
   it("shows the checking footer while a tool-call verify runs", async () => {
@@ -1714,9 +2084,13 @@ describe("registerGoalTool", () => {
     expect(collapsed).not.toContain("geomean");
     const expanded = renderCheckMessage(details, { expanded: true }, THEME);
     expect(expanded).toContain("geomean ratio: 0.553");
-    // Passing checks read as summarize-and-complete; missing details degrade to a dim row.
+    // Passing checks read as summarize-and-complete; aborted checks read as a
+    // re-measure notice; missing details degrade to a dim row.
     expect(renderCheckMessage({ ...details, ok: true }, { expanded: false }, THEME)).toContain(
       "verify passed — agent will summarize and complete",
+    );
+    expect(renderCheckMessage({ ...details, aborted: true }, { expanded: false }, THEME)).toContain(
+      "verify aborted — re-measuring next settle",
     );
     expect(renderCheckMessage(undefined, { expanded: false }, THEME)).toContain("goal check");
   });

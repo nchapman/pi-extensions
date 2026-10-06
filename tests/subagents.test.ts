@@ -38,7 +38,7 @@ import {
   type ChildUsage,
   type SpawnFn,
 } from "../extensions/subagents";
-import { createTaskRegistry, type AdoptedHandle } from "../lib/superbash";
+import { createTaskRegistry, getSharedTaskRegistry, type AdoptedHandle } from "../lib/superbash";
 
 /** Identity theme: strips styling so assertions see plain text. */
 const THEME = { fg: (_k: string, s: string) => s, bold: (s: string) => s } as never;
@@ -1170,6 +1170,22 @@ describe("registerSubagentsExtension (full wiring)", () => {
     expect(children[0].killed).toBe(false);
     return result;
   }
+
+  it("publishes its registry for cross-extension readers (goal's settle check), and re-registration replaces it", () => {
+    wireUp(); // registers the extension — the publish happens inside
+    const published = getSharedTaskRegistry();
+    expect(published).toBeDefined();
+    // The published registry is the live one this extension runs tasks through.
+    const id = published!.adopt({ name: "gpu", kind: "bash", kill: () => {} });
+    expect(published!.isRunning(id)).toBe(true);
+
+    // A re-registration (reload, session replacement) publishes the fresh
+    // registry — readers must never keep deferring on a dead one.
+    wireUp();
+    expect(getSharedTaskRegistry()).toBeDefined();
+    expect(getSharedTaskRegistry()).not.toBe(published);
+    expect(published!.isRunning(id)).toBe(true); // the old registry still answers for its own tasks
+  });
 
   it("delivers wakes as steering so a busy or sleep-polling model receives them", async () => {
     const wired = wireUp();

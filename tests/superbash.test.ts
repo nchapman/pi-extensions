@@ -265,6 +265,31 @@ describe("describeReminders", () => {
   });
 });
 
+describe("shared task registry holder", () => {
+  it("connects a writer and a reader holding separate module instances (pi's per-extension jiti loader)", async () => {
+    // The query makes Vite evaluate a second, independent copy of the module —
+    // the shape pi produces when two extension files import lib/superbash
+    // through separate jiti caches. A module-scoped holder would silently
+    // never connect the two; the Symbol.for process-global must.
+    const modA = await import("../lib/superbash");
+    // Non-literal specifier so tsc does not try to resolve the query as a
+    // module path; Vite still treats it as a distinct module id.
+    const query = "../lib/superbash?instance=b";
+    const modB = (await import(query)) as typeof modA;
+    // Guard against the infra deduping the two imports (which would make this
+    // test vacuous): distinct instances have distinct function identities.
+    expect(modB.createTaskRegistry).not.toBe(modA.createTaskRegistry);
+
+    const registry = modA.createTaskRegistry();
+    modA.publishSharedTaskRegistry(registry);
+    expect(modB.getSharedTaskRegistry()).toBe(registry);
+
+    // And the reader's view stays live: adopt via the writer, see it run.
+    const id = modA.getSharedTaskRegistry()!.adopt({ name: "gpu", kind: "bash", kill: () => {} });
+    expect(modB.getSharedTaskRegistry()!.isRunning(id)).toBe(true);
+  });
+});
+
 describe("createTaskRegistry", () => {
   function makeDeps() {
     const sendUserMessage = vi.fn();

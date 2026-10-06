@@ -22,10 +22,17 @@
  *   live progress onto the tool row (onUpdate partials — a multi-minute verify
  *   behind pi's generic working spinner reads as wedged) and honor the run's
  *   abort signal: Esc kills the verify's whole process tree and unblocks the
- *   call instead of forcing a pi restart. The settle-boundary check is the one
- *   verify pi exposes no abort signal for (agent.signal is cleared before the
- *   boundary fires), so it stays bounded by its timeout + spinner instead of
- *   Esc. A semantic
+ *   call instead of forcing a pi restart. The settle-boundary check gets no
+ *   signal from pi (agent.signal is cleared before the boundary fires, and
+ *   session.abort() then blocks until the handler returns — and a bare Esc
+ *   is pi's own interrupt at this boundary, plus popup-dismiss noise), so
+ *   the kill is a dedicated chord instead: alt+x, bound by nothing in pi's
+ *   defaults and never an editing gesture, observed on raw terminal input
+ *   for the check's duration. A kill re-engages with a notice rather than
+ *   parking the turn; a pi-side abort drops the queued continuation anyway;
+ *   and the administrative drains (/goal pause, /goal stop, session_shutdown)
+ *   stay silent — no extra turn after a halt.
+ *   A semantic
  *   second opinion (a Jev-style classifier) is a later pass behind the
  *   injectable GoalJudge seam; v1 ships no judge (fail-open floor)
  * - an agent_before_settle continuation loop drives the goal turn by turn: at
@@ -37,7 +44,15 @@
  *   check fails, "the check passed, summarize and call complete" when it
  *   passes. The check is graded, not boolean: it prints the measured state
  *   (coverage %, test summary) and exits 0 only when the objective is met, so
- *   the agent measures, narrates the gap, and works until it closes. While the
+ *   the agent measures, narrates the gap, and works until it closes. The one
+ *   thing that skips the check: superbash background tasks still running — the
+ *   turn is only temporarily done then (each completion wake re-engages the
+ *   agent as a fresh run), so the settle defers to the first calm one instead
+ *   of measuring a half-finished state or blocking on a lock the running work
+ *   holds; deferrals burn no budget. A task killed while idle or one that
+ *   never finishes gets no wake — the park is announced (notify once per
+ *   park) with its recovery: kill the task, and the next prompt's calm
+ *   settle runs the check. While the
  *   verify runs, an animated chat-area spinner widget shows the check in flight
  *   (pi clears its own working spinner at agent_end, so the settle boundary
  *   would otherwise render as a dead pause), and an expensive verify can be
@@ -77,6 +92,7 @@
 import { matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { spawn } from "node:child_process";
 import { Type } from "typebox";
+import { getSharedTaskRegistry, type BgTask } from "../lib/superbash";
 import type {
   AgentToolResult,
   ExtensionAPI,
@@ -109,6 +125,8 @@ export interface GoalCheckDetails {
   continuation: number;
   max: number;
   ok: boolean;
+  /** True when the check was cut short (Esc / run abort) — no measurement. */
+  aborted?: boolean;
   exitCode: number | null;
   timedOut: boolean;
   spawnError?: string;
@@ -197,6 +215,13 @@ export function parseCheckEvery(raw: string | undefined): number {
 export const VERIFY_TIMEOUT_MS_DEFAULT = 900_000;
 const VERIFY_TIMEOUT_ENV = "PI_GOAL_VERIFY_TIMEOUT_MS";
 const MAX_VERIFY_OUTPUT = 4096;
+
+/** Key that kills the settle-path check (see the settle handler). Chosen so
+ * no ordinary gesture produces it: pi binds a bare Esc to app.interrupt (and
+ * its editor has a double-Esc action), popup dismissals emit Esc, and plain
+ * keys type into the editor — but alt+x is bound by nothing in pi's defaults
+ * and is never an editing gesture, so observing it is attribution enough. */
+export const GOAL_KILL_KEY = "alt+x";
 
 /** Parse PI_GOAL_VERIFY_TIMEOUT_MS (ms). Invalid values fall back to the default. */
 export function parseVerifyTimeoutMs(raw: string | undefined): number {
@@ -435,6 +460,30 @@ export interface GoalVerdict {
  */
 export interface GoalJudge {
   evaluate(goal: Goal, evidence: string[], summary: string): GoalVerdict | undefined;
+}
+
+/**
+ * Best-effort raw-input hook for the settle boundary, where pi exposes no
+ * abort signal (agent.signal is cleared before agent_before_settle fires, and
+ * session.abort() then blocks in waitForIdle until the handler returns — so
+ * an unkillable multi-minute verify here wedges Esc too). Forwards every key
+ * to `onInput` for the check's duration only; the caller applies pi-tui's
+ * own key semantics (matchesKey), so a bare Esc stays distinguishable from
+ * arrow keys ("\x1b[A" → "up") and Alt-combos, and non-Esc input can break
+ * a pending key pair. Observe-only — the handler returns undefined, so pi's
+ * key handling (including run abort) still sees the key. A no-op when there
+ * is no interactive UI.
+ */
+export function listenForTerminalInput(
+  ui: Pick<ExtensionContext["ui"], "onTerminalInput"> | undefined,
+  onInput: (data: string) => void,
+): () => void {
+  if (!ui || typeof ui.onTerminalInput !== "function") return () => {};
+  const unsubscribe = ui.onTerminalInput((data) => {
+    onInput(data);
+    return undefined; // observe only — pi's own key handling still runs
+  });
+  return () => unsubscribe();
 }
 
 /** A typed second opinion on continuing past the continuation cap. */
@@ -806,16 +855,18 @@ export function renderCheckMessage(
   if (!details) return theme.fg("dim", "goal check");
   const outcome = details.ok
     ? theme.fg("success", "verify passed — agent will summarize and complete")
-    : theme.fg(
-        "accent",
-        `verify ${
-          details.timedOut
-            ? "timed out"
-            : details.spawnError
-              ? `could not run (${details.spawnError})`
-              : `failed (exit ${details.exitCode ?? "?"})`
-        } — continuing`,
-      );
+    : details.aborted
+      ? theme.fg("muted", "verify aborted — re-measuring next settle")
+      : theme.fg(
+          "accent",
+          `verify ${
+            details.timedOut
+              ? "timed out"
+              : details.spawnError
+                ? `could not run (${details.spawnError})`
+                : `failed (exit ${details.exitCode ?? "?"})`
+          } — continuing`,
+        );
   const stale =
     details.staleContinuations > 0 ? theme.fg("dim", ` · measured ${details.staleContinuations} turn(s) ago`) : "";
   const head = `${theme.fg("dim", `goal check ${details.continuation}/${details.max} · `)}${outcome}${stale}`;
@@ -1003,6 +1054,11 @@ export interface RegisterGoalOptions {
   maxTurnsPerRun?: number;
   /** Verifier run on `complete` (and prefetched on `set`). Inject a fake in tests. */
   verifyRunner?: VerifyRunner;
+  /** Live background tasks at settle time; the check defers while any run.
+   * Defaults to the shared superbash registry — absent registry means no
+   * background work (fail-open: the loop must not stall on a missing
+   * writer). Inject a fake in tests. */
+  runningTasks?: () => BgTask[];
   /** Timeout (ms) for a verify run. Defaults to PI_GOAL_VERIFY_TIMEOUT_MS, then VERIFY_TIMEOUT_MS_DEFAULT. */
   verifyTimeoutMs?: number;
 }
@@ -1026,6 +1082,10 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
   const judge = options.judge;
   const verifyTimeoutMs = options.verifyTimeoutMs ?? parseVerifyTimeoutMs(process.env[VERIFY_TIMEOUT_ENV]);
   const verifyRunner: VerifyRunner = options.verifyRunner ?? runVerify;
+  // Read per event, not captured at registration: a /reload rebuilds the
+  // superbash registry, and a registration-time capture would keep deferring
+  // on a dead registry (or miss the fresh one) after every reload.
+  const runningTasks: () => BgTask[] = options.runningTasks ?? (() => getSharedTaskRegistry()?.running() ?? []);
   // Verify outputs observed during the current budget window (oldest first) —
   // the evidence the progress judge reads at the cap. Cleared with the budget.
   let budgetOutputs: string[] = [];
@@ -1035,6 +1095,12 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
   // most turns reuse it instead of re-running an expensive verify.
   let lastCheck: VerifyResult | undefined;
   let lastCheckAge = 0;
+  // True while the loop is parked on background tasks; re-announced only
+  // after a check runs in between (the notify fires once per park).
+  let parkedForTasks = false;
+  // Set by session_shutdown: the in-flight settle (if any) must resolve
+  // without queueing anything — its continuation would outlive the teardown.
+  let shuttingDown = false;
 
   const activateTool = () => {
     const active = pi.getActiveTools();
@@ -1071,6 +1137,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     resetsUsed = 0;
     lastCheck = undefined; // a resumed goal re-establishes its measured state
     lastCheckAge = 0;
+    parkedForTasks = false; // a re-armed loop re-announces its next park
   };
 
   const adoptBranchState = (ctx: ExtensionContext) => {
@@ -1084,6 +1151,10 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     resetsUsed = 0;
     lastCheck = undefined;
     lastCheckAge = 0;
+    parkedForTasks = false; // branch adoption re-announces a park
+    shuttingDown = false; // a new session in this process re-arms everything —
+    // the latch must apply only to the in-flight settle of the teardown itself
+    // (extension closures survive session replacement: new/resume/fork)
     // Re-arm the continuation loop for an active goal on resume; a finished or
     // blocked snapshot stays disarmed. A branch with NO goal (a fresh session)
     // stays armed — disarming there would kill the loop for a goal the model
@@ -1105,6 +1176,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     budgetOutputs = [];
     lastCheck = undefined; // a new verify command invalidates the cached state
     lastCheckAge = 0;
+    parkedForTasks = false; // a new goal re-announces its park
     // A model-set goal does NOT reset the continuation budget: re-setting the goal
     // must not farm fresh auto-continuations and defeat the cap. The budget
     // re-arms only at resume, a gated completion, or a user /goal kickoff.
@@ -1117,6 +1189,10 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
   // — its timeout timer dies with the host process, so without this a reload
   // mid-check would orphan the whole tree.
   pi.on("session_shutdown", () => {
+    // A shutdown drain (reload, quit, session replacement) must not just kill
+    // the verify — a re-engage notice queued here would outlive the teardown
+    // (reload does not run session.abort(), so pi would honor the continue).
+    shuttingDown = true;
     for (const abort of [...liveVerifyAborts]) abort();
   });
 
@@ -1192,6 +1268,37 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     if (event.outcome === "error" || event.outcome === "aborted") return;
     if (!goal || goal.status !== "active" || stopped) return;
     if (!goal.verify) return;
+    // Background tasks in flight (superbash bash/subagent adoption): the turn
+    // is only temporarily done — every completion wake re-engages the agent as
+    // a fresh run — so a check now would measure a half-finished state (or
+    // block for hours on a lock the running work holds, e.g. a gate script).
+    // Defer to the first calm settle; a deferral burns no continuation budget
+    // and caches nothing. Waiting is not a stall: with wakes on, the last
+    // completion re-engages the agent and its settle runs the check; with
+    // PI_BG_WAKE=0 the next user prompt does. No registry wired (goal
+    // registered standalone) reads as zero tasks — fail-open.
+    const running = runningTasks();
+    if (running.length > 0) {
+      uiRef?.setStatus(
+        "goal",
+        `goal · holding check — ${running.length} background task${running.length === 1 ? "" : "s"} running`,
+      );
+      // Announce the park once per park (not per settle): the footer alone
+      // reads as "a check is in flight", and the two cases where no wake will
+      // ever re-engage the loop — a task killed while idle (killed tasks never
+      // wake) and a never-ending task (a dev server) — would otherwise park
+      // silently until the next user prompt.
+      if (!parkedForTasks) {
+        parkedForTasks = true;
+        ctx.ui?.notify(
+          `Goal #${goal.id} check held while ${running.length} background task${running.length === 1 ? "" : "s"} run — ` +
+            "it runs when they finish. If one never finishes, kill it (/tasks or task_kill): " +
+            "the check then runs on your next prompt.",
+        );
+      }
+      return undefined;
+    }
+    parkedForTasks = false;
     if (continuations >= maxContinuations) {
       // At the cap, a progress judge decides: still moving → reset the budget
       // and continue (itself capped, so the judge can't defeat the breaker);
@@ -1249,16 +1356,23 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
       uiRef?.setWidget(
         GOAL_CHECK_WIDGET_KEY,
         (tui: { requestRender(): void }, theme: Pick<Theme, "fg">) =>
-          new CheckSpinnerComponent(tui, theme, `running goal check: ${clip(verifyCommand, 60)}`),
+          new CheckSpinnerComponent(tui, theme, `running goal check: ${clip(verifyCommand, 60)} · alt+x aborts`),
       );
+      // Esc for this boundary cannot be built from Esc itself: pi binds a
+      // bare Esc to app.interrupt (aborting the run pi-side at this boundary)
+      // and its editor has a double-Esc action, while popup dismissals also
+      // emit Esc — none of those are addressed at the check. So the kill key
+      // is the dedicated GOAL_KILL_KEY (alt+x): unbound in pi's defaults and
+      // never an editing gesture, so observing it is attribution enough.
+      // ctx.signal is still folded in for the day pi wires one.
+      const killAbort = new AbortController();
+      const detachKillKey = listenForTerminalInput(uiRef, (data) => {
+        if (matchesKey(data, GOAL_KILL_KEY)) killAbort.abort();
+      });
       try {
         check = await verifyRunner(goal.verify, {
           timeoutMs: verifyTimeoutMs,
-          // Forwarded for the day pi wires a live signal here; today ctx.signal
-          // is undefined at this boundary (agent.signal is cleared before the
-          // settle fires), so the check is bounded by its timeout + spinner —
-          // Esc cannot cut it short. Documented in the file header.
-          signal: ctx.signal,
+          signal: ctx.signal ? AbortSignal.any([ctx.signal, killAbort.signal]) : killAbort.signal,
         });
       } catch (e) {
         // The built-in runner never rejects; an injected one might. A throw must
@@ -1271,14 +1385,48 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
           spawnError: e instanceof Error ? e.message : String(e),
           output: "",
         };
+      } finally {
+        detachKillKey(); // the listener lives exactly as long as the check
       }
       uiRef?.setWidget(GOAL_CHECK_WIDGET_KEY, undefined); // spinner lives only for the check's duration
       if (check.aborted) {
-        // The run was aborted mid-check — pi drops the continuation anyway, so
-        // queue no follow-up; the next settle re-measures rather than acting on
-        // a check that never finished (lastCheck stays unset).
+        // The abort is one of: the kill key (deliberate), a pi-side run abort
+        // (ctx.signal, the day pi wires one), or an administrative drain
+        // (/goal pause, /goal stop, session_shutdown) — the drains change
+        // state after this handler's guards ran, so re-check before
+        // re-engaging: a halted or tearing-down loop must not take one more
+        // turn, and the notice below would be false in that state.
+        if (shuttingDown || stopped || !goal || goal.status !== "active") {
+          updateFooter();
+          return undefined;
+        }
+        // A deliberate kill re-engages with a notice instead of parking the
+        // turn silently; on a real pi-side abort pi drops the queued
+        // continuation anyway (clearQueue on abort). lastCheck stays unset —
+        // the next settle re-measures rather than acting on a check that never
+        // finished — and no budget is burned.
         updateFooter();
-        return undefined;
+        pi.sendMessage(
+          {
+            customType: GOAL_CHECK_TYPE,
+            content:
+              "The goal check was aborted before it finished; nothing was measured. " +
+              "Do not run the verify command yourself — end your turn, and the next settle re-measures automatically.",
+            display: true,
+            details: {
+              continuation: continuations + 1,
+              max: maxContinuations,
+              ok: false,
+              aborted: true,
+              exitCode: null,
+              timedOut: false,
+              staleContinuations: 0, // nothing was measured — no age to report
+              output: "",
+            } satisfies GoalCheckDetails,
+          },
+          { deliverAs: "followUp" },
+        );
+        return { continue: true };
       }
       lastCheck = check;
       lastCheckAge = 0;

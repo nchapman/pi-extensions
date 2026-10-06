@@ -27,6 +27,7 @@ import {
   parseBgAfterMs,
   parseBashBgAfterMs,
   parseWakeEnabled,
+  publishSharedTaskRegistry,
 } from "../lib/superbash";
 
 export const BUILTIN_TOOLS = ["read", "write", "edit", "bash", "grep", "find", "ls"];
@@ -1086,6 +1087,10 @@ export function registerSubagentsExtension(
     setStatus: (key, text) => ui?.setStatus(key, text),
     wakeEnabled: parseWakeEnabled(process.env),
   });
+  // Cross-extension visibility (goal's settle check defers while tasks run):
+  // publish after creation so readers never see a half-built registry. A
+  // re-registration (reload, session replacement) publishes the new registry.
+  publishSharedTaskRegistry(registry);
   pi.on("session_start", (_event, ctx) => {
     ui = ctx.ui;
   });

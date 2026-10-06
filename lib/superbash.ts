@@ -394,6 +394,42 @@ export function createTaskRegistry(deps: TaskDeps = {}): TaskRegistry {
   };
 }
 
+/**
+ * Session-shared handle to the registry the subagents extension registers.
+ *
+ * Why a holder rather than a direct import: each extension file registers
+ * independently, and goal's settle check needs "are background tasks running?"
+ * without depending on the subagents module (or its agents-dir loading). The
+ * holder is written once at subagents registration and read lazily per event,
+ * so a /reload (new registry) is picked up without re-registration order
+ * mattering. Readers must treat `undefined` as "no background work" —
+ * fail-open, never stall the reader on a missing writer.
+ *
+ * The holder hangs off a Symbol.for process-global, NOT a module-scoped
+ * object: pi loads each extension file through its own jiti instance with the
+ * runtime module cache disabled, so two extension files importing this module
+ * can hold two separate copies — a module-scoped holder would silently never
+ * connect writer to reader (the deferral would no-op in production while
+ * working in tests, which share one module graph). Symbol.for keys are
+ * process-global by spec, identical across every copy.
+ */
+const SHARED_REGISTRY_KEY = Symbol.for("pi-extensions.superbash.registry");
+
+function sharedHolder(): { current?: TaskRegistry } {
+  const globals = globalThis as Record<symbol, { current?: TaskRegistry } | undefined>;
+  return (globals[SHARED_REGISTRY_KEY] ??= {});
+}
+
+/** Publish the session's registry for cross-extension readers (goal's settle check). */
+export function publishSharedTaskRegistry(registry: TaskRegistry): void {
+  sharedHolder().current = registry;
+}
+
+/** The session's live task registry, if the subagents extension has registered one. */
+export function getSharedTaskRegistry(): TaskRegistry | undefined {
+  return sharedHolder().current;
+}
+
 /** Rolling per-command output kept in memory so a chatty process can't grow the parent. */
 export const BASH_TAIL_CAP = 8_192;
 
