@@ -139,21 +139,58 @@ export type TargetSpec =
 export interface ParsedArgs {
   target: TargetSpec;
   effort?: Effort;
+  /** Child model overrides for this invocation (--model / --verify-model). */
+  model?: string;
+  verifyModel?: string;
+  /** A flag was given without a value — the caller must fail loudly. */
+  error?: string;
 }
 
 const EFFORT_WORDS = new Set(EFFORTS);
 const UNCOMMITTED_WORDS = new Set(["tree", "local", "uncommitted", "working"]);
 
+/** Effective models/effort for one invocation: command-line flag over env
+ * knob; when both are unset the model stays undefined and children inherit
+ * (session model, else pi's global default). Pure so tests can pin precedence. */
+export function resolveInvocation(
+  parsed: ParsedArgs,
+  config: Pick<ReviewConfig, "effort" | "model" | "verifyModel">,
+): { effort: Effort; model?: string; verifyModel?: string } {
+  return {
+    effort: parsed.effort ?? config.effort,
+    model: parsed.model ?? config.model,
+    verifyModel: parsed.verifyModel ?? config.verifyModel,
+  };
+}
+
 /**
- * Parse `/review [target] [effort]` tokens, order-insensitively: an effort
- * word; staged/cached; tree/local/uncommitted/working; a `a..b`/`a...b`
- * range; anything else is a ref (git validates it later and fails loudly).
+ * Parse `/review [target] [effort] [--model <m>] [--verify-model <m>]` tokens,
+ * order-insensitively: an effort word; staged/cached; tree/local/uncommitted/
+ * working; a `a..b`/`a...b` range; `--model=<m>`/`--model <m>` and
+ * `--verify-model` overrides (flag form because refs and model names both
+ * contain slashes — `origin/main` is a ref, `anthropic/claude-...` a model);
+ * anything else is a ref (git validates it later and fails loudly).
  */
 export function parseReviewArgs(args: string): ParsedArgs {
   const tokens = args.split(/\s+/).filter(Boolean);
   let effort: Effort | undefined;
   let target: TargetSpec | undefined;
-  for (const token of tokens) {
+  let model: string | undefined;
+  let verifyModel: string | undefined;
+  let error: string | undefined;
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    const flag = /^(--model|--verify-model)(?:=(.*))?$/.exec(token);
+    if (flag) {
+      const value = flag[2] ?? tokens[++i];
+      if (!value || value.startsWith("--")) {
+        error = `${flag[1]} requires a model name (e.g. ${flag[1]} glm-5.3)`;
+        break;
+      }
+      if (flag[1] === "--model") model = value;
+      else verifyModel = value;
+      continue;
+    }
     if (EFFORT_WORDS.has(token as Effort)) {
       effort = token as Effort;
       continue;
@@ -173,7 +210,7 @@ export function parseReviewArgs(args: string): ParsedArgs {
     }
     target ??= { kind: "ref", ref: token };
   }
-  return { target: target ?? { kind: "default" }, effort };
+  return { target: target ?? { kind: "default" }, effort, model, verifyModel, ...(error ? { error } : {}) };
 }
 
 // ---------------------------------------------------------------------------
@@ -761,13 +798,24 @@ export function defaultShell(cwd: string): (command: string) => Promise<string |
 
 export interface ReviewResult {
   report: string;
+  /** The final (capped) findings behind the report — data, not just display. */
+  findings: Finding[];
   usage?: ChildUsage;
   findingCount: number;
 }
 
-interface DiffSection {
+export interface DiffSection {
   label: string;
   text: string;
+}
+
+/** Pre-assembled review input — the eval harness drives the exact production
+ * pipeline over fixture diffs (no git, no working tree) by passing this. */
+export interface ProvidedReview {
+  sections: DiffSection[];
+  /** Stand-in repo root for guideline collection (an empty dir in eval). */
+  repoRoot: string;
+  targetLabel: string;
 }
 
 /** Resolve the target into diff sections (may run several git commands). */
@@ -1089,29 +1137,41 @@ export async function runReview(opts: {
   config: ReviewConfig;
   target: TargetSpec;
   deps: ReviewDeps;
+  /** Skip git entirely and review these pre-assembled sections (eval harness). */
+  provided?: ProvidedReview;
 }): Promise<ReviewResult> {
   const { config, deps } = opts;
   const now = deps.now ?? Date.now;
   const startedAt = now();
   const effort = config.effort;
 
-  const rootResult = await deps.git(["rev-parse", "--show-toplevel"]);
-  if (rootResult.code !== 0) {
-    throw new Error(`Not a git repository: ${rootResult.stderr.trim() || "git rev-parse failed"}`);
-  }
-  const repoRoot = rootResult.stdout.trim();
-
   // Stage 0a: diff sections.
-  const { sections, error } = await resolveDiffSections(opts.target, deps);
-  if (error) throw new Error(error);
-  if (opts.target.kind !== "staged") {
-    const untracked = await untrackedSection(repoRoot, deps, config.untrackedMaxBytes);
-    if (untracked) sections.push(untracked);
+  let sections: DiffSection[];
+  let repoRoot: string;
+  let label: string;
+  if (opts.provided) {
+    sections = opts.provided.sections;
+    repoRoot = opts.provided.repoRoot;
+    label = opts.provided.targetLabel;
+  } else {
+    const rootResult = await deps.git(["rev-parse", "--show-toplevel"]);
+    if (rootResult.code !== 0) {
+      throw new Error(`Not a git repository: ${rootResult.stderr.trim() || "git rev-parse failed"}`);
+    }
+    repoRoot = rootResult.stdout.trim();
+    label = targetLabel(opts.target);
+    const resolved = await resolveDiffSections(opts.target, deps);
+    if (resolved.error) throw new Error(resolved.error);
+    sections = resolved.sections;
+    if (opts.target.kind !== "staged") {
+      const untracked = await untrackedSection(repoRoot, deps, config.untrackedMaxBytes);
+      if (untracked) sections.push(untracked);
+    }
   }
   if (sections.length === 0) {
     const emptyNote =
       opts.target.kind === "default" ? " (nothing ahead of upstream, uncommitted, or untracked)" : " for this target";
-    return { report: `# Code review\n\nNo changes to review${emptyNote}.`, findingCount: 0 };
+    return { report: `# Code review\n\nNo changes to review${emptyNote}.`, findings: [], findingCount: 0 };
   }
 
   // Stage 0b: parse and exclude.
@@ -1127,12 +1187,12 @@ export async function runReview(opts: {
     const list = skipped.map((s) => `- ${s}`).join("\n");
     return {
       report: `# Code review\n\nAll changed files are excluded from review (lockfiles, logs, generated, or binary):\n${list}`,
+      findings: [],
       findingCount: 0,
     };
   }
   // Stage 0c: guidelines + prior findings + optional check output — before
   // chunking, so the per-chunk budget accounts for the context they consume.
-  const label = targetLabel(opts.target);
   const guidelines = await collectGuidelines(
     repoRoot,
     files.map((f) => f.path),
@@ -1294,7 +1354,7 @@ export async function runReview(opts: {
       // Persistence is best-effort; the review stands without it.
     }
   }
-  return { report: report + pipelineNotes, usage, findingCount: capped.length };
+  return { report: report + pipelineNotes, findings: capped, usage, findingCount: capped.length };
 }
 
 // ---------------------------------------------------------------------------
@@ -1335,18 +1395,25 @@ export function registerReview(pi: ExtensionAPI, deps?: Partial<ReviewDeps>): vo
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const config = parseReviewConfig(process.env);
       const parsed = parseReviewArgs(args);
-      const effort = parsed.effort ?? config.effort;
+      if (parsed.error) {
+        ctx.ui.notify(`/review: ${parsed.error}`, "error");
+        return;
+      }
+      const { effort, model, verifyModel } = resolveInvocation(parsed, config);
       const full = reviewDeps(ctx.cwd, {
         notify: (message, level) => ctx.ui.notify(message, level),
         sessionModel: ctx.model,
         ...deps,
         spawnFn: tracked.spawnFn,
       });
-      ctx.ui.notify("Starting code review…", "info");
+      ctx.ui.notify(
+        `Starting code review${model ? ` (${model}${verifyModel && verifyModel !== model ? `, verify: ${verifyModel}` : ""})` : ""}…`,
+        "info",
+      );
       try {
         const result = await runReview({
           cwd: ctx.cwd,
-          config: { ...config, effort },
+          config: { ...config, effort, model, verifyModel },
           target: parsed.target,
           deps: full,
         });

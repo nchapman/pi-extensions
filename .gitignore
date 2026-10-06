@@ -1,3 +1,6 @@
 node_modules/
 coverage/
 .playwright-mcp/
+
+# eval artifacts
+scripts/eval/results/

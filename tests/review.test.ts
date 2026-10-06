@@ -15,6 +15,7 @@ import {
   mergeFindings,
   parseFindings,
   parseReviewArgs,
+  resolveInvocation,
   parseReviewConfig,
   parseVerdicts,
   planFinderRuns,
@@ -194,6 +195,49 @@ describe("parseReviewArgs", () => {
     expect(parseReviewArgs("main").target).toEqual({ kind: "ref", ref: "main" });
     expect(parseReviewArgs("v1.2...v1.3").target).toEqual({ kind: "range", base: "v1.2", head: "v1.3" });
     expect(parseReviewArgs("main staged").target).toEqual({ kind: "ref", ref: "main" });
+  });
+
+  it("parses --model and --verify-model in space and equals form, anywhere", () => {
+    expect(parseReviewArgs("--model glm-5.3")).toMatchObject({ model: "glm-5.3" });
+    expect(parseReviewArgs("deep --verify-model=ollama/qwen3 staged")).toMatchObject({
+      effort: "deep",
+      verifyModel: "ollama/qwen3",
+      target: { kind: "staged" },
+    });
+    expect(parseReviewArgs("--model anthropic/claude-opus-4 main --verify-model glm-5.3")).toMatchObject({
+      model: "anthropic/claude-opus-4",
+      verifyModel: "glm-5.3",
+      target: { kind: "ref", ref: "main" },
+    });
+    // a slashed model must never be mistaken for a ref
+    expect(parseReviewArgs("--model ollama/qwen3").target).toEqual({ kind: "default" });
+  });
+
+  it("errors on flags missing a value, without swallowing the next flag", () => {
+    expect(parseReviewArgs("--model")).toMatchObject({ error: expect.stringContaining("--model") });
+    expect(parseReviewArgs("--verify-model --model x")).toMatchObject({
+      error: expect.stringContaining("--verify-model"),
+    });
+    expect(parseReviewArgs("--model --verify-model x")).toMatchObject({ error: expect.stringContaining("--model") });
+  });
+
+  it("resolves invocation models flag > env knob > inherit", () => {
+    const envCfg = { effort: "balanced" as const, model: "env-model" };
+    expect(resolveInvocation(parseReviewArgs(""), envCfg)).toEqual({
+      effort: "balanced",
+      model: "env-model",
+      verifyModel: undefined,
+    });
+    expect(resolveInvocation(parseReviewArgs("deep --model flag-model"), envCfg)).toEqual({
+      effort: "deep",
+      model: "flag-model",
+      verifyModel: undefined,
+    });
+    expect(resolveInvocation(parseReviewArgs("--model a --verify-model b"), { effort: "lite" })).toEqual({
+      effort: "lite",
+      model: "a",
+      verifyModel: "b",
+    });
   });
 });
 
@@ -679,8 +723,13 @@ describe("runReview", () => {
     // 3 finders + 1 verify
     expect(spawn.tasks).toHaveLength(4);
     expect(spawn.tasks.filter((t) => t.startsWith("# Verify"))).toHaveLength(1);
-    // security + correctness merge into one finding; verify confirms critical→downgraded important
+    // security + correctness merge into one finding (the id-2 downgrade verdict is
+    // out of range for 0-based ids, so critical stands — worst-severity-wins)
     expect(result.findingCount).toBe(1);
+    // structured findings are the same data the report renders — eval relies on this
+    expect(result.findings).toEqual([
+      expect.objectContaining({ severity: "critical", title: "Off-by-one", lenses: ["correctness", "security"] }),
+    ]);
     expect(result.report).toContain("Off-by-one");
     expect(result.report).toContain("found by correctness, security");
     expect(result.report).toContain("changes ahead of upstream plus working tree");
@@ -689,6 +738,38 @@ describe("runReview", () => {
     expect(written[0][0]).toBe("/repo/.pi/review-state.json");
     const state = JSON.parse(written[0][1]);
     expect(state.findings).toHaveLength(1);
+  });
+
+  it("caps structured findings at maxFindings, not just the report", async () => {
+    const spawn = fakeSpawn((task) => {
+      if (task.includes("Correctness and logic")) {
+        // far-apart lines: proximity merge (±3 lines) would collapse adjacent ones
+        const findings = [1, 40, 80].map((n) => ({
+          file: "src/a.ts",
+          line: n,
+          severity: "critical",
+          title: `Bug ${n}`,
+          detail: "D",
+        }));
+        return `\`\`\`json\n${JSON.stringify(findings)}\n\`\`\``;
+      }
+      return "[]";
+    });
+    const git = gitFor([
+      { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: "/repo\n", stderr: "" } },
+      {
+        match: (a) => a[0] === "diff" && a[a.length - 1] === "HEAD",
+        result: { code: 0, stdout: SAMPLE_DIFF, stderr: "" },
+      },
+    ]);
+    const result = await runReview({
+      cwd: "/repo",
+      config: CONFIG({ effort: "lite", maxFindings: 2 }),
+      target: { kind: "default" },
+      deps: emptyDeps({ git, spawnFn: spawn }) as never,
+    });
+    expect(result.findings.map((f) => f.title)).toEqual(["Bug 1", "Bug 40"]);
+    expect(result.findingCount).toBe(2);
   });
 
   it("includes upstream-ahead and untracked sections for the default target", async () => {
@@ -859,6 +940,35 @@ describe("runReview", () => {
     expect(result.report).toContain("chunk 1: correctness, robustness");
     expect(result.report).toContain("finder security/0");
     expect(result.report).not.toContain("chunk 1: correctness, security");
+  });
+
+  it("runs the provided-diff seam end to end without touching git", async () => {
+    const gitCalls: string[][] = [];
+    const spawn = fakeSpawn((task) =>
+      task.includes("Correctness and logic")
+        ? '```json\n[{"file":"src/a.ts","line":2,"severity":"critical","title":"Bug","detail":"D"}]\n```'
+        : "[]",
+    );
+    const result = await runReview({
+      cwd: "/repo",
+      config: CONFIG({ effort: "lite" }),
+      target: { kind: "default" },
+      deps: emptyDeps({
+        git: async (args: string[]) => {
+          gitCalls.push(args);
+          return { code: 1, stdout: "", stderr: "must not be called" };
+        },
+        spawnFn: spawn,
+      }) as never,
+      provided: {
+        sections: [{ label: "fixture PR", text: SAMPLE_DIFF }],
+        repoRoot: "/tmp/empty",
+        targetLabel: "fixture PR",
+      },
+    });
+    expect(gitCalls).toEqual([]); // the seam never touches git
+    expect(result.findingCount).toBe(1);
+    expect(result.report).toContain("fixture PR");
   });
 
   it("reports excluded files when nothing reviewable remains", async () => {
