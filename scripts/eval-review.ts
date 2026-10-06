@@ -263,12 +263,17 @@ describe("eval: review pipeline on code-review-bench", () => {
           durationMs: Date.now() - startedAt,
           judge: judged.audit,
         };
+        // Coverage rides outside PrResult (it is review-pipeline diagnostics,
+        // not matching data) but must persist: a quiet lens has to explain
+        // itself in the results file, not just in the discarded report.
+        const coverage = review.coverage;
         results.push(result);
         // Flush per PR: a killed run keeps everything already spent.
         appendFileSync(
           jsonlPath,
           JSON.stringify({
             ...result,
+            coverage,
             caught: [...result.caught.entries()],
             findings: result.findings.map((f) => ({
               file: f.file,
