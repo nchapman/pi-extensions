@@ -98,8 +98,23 @@ async function judgeFindings(
   try {
     let tokens = 0;
     let cost = 0;
-    const run = await ask(findings, issues);
-    if ("adopted" in run) throw new Error("judge child was adopted, not run");
+    // One retry: judge calls are short and the common failure is a transient
+    // provider error mid-run — a second attempt is ~25s and saves the PR's
+    // recall from falling to the heuristic.
+    const askWithRetry = async (fs: Finding[], is: GoldenIssue[]) => {
+      let lastErr: unknown;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const run = await ask(fs, is);
+          if (!("adopted" in run)) return run;
+          lastErr = new Error("judge child was adopted, not run");
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+      throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+    };
+    const run = await askWithRetry(findings, issues);
     tokens += run.usage?.totalTokens ?? 0;
     cost += run.usage?.cost.total ?? 0;
     const parsed = parseJudge(run.text);
@@ -138,8 +153,15 @@ async function judgeFindings(
     }
     return { caught, matcher: "judge", tokens, cost, audit };
   } catch (err) {
-    console.log(`  [${label}] judge failed (${err instanceof Error ? err.message : err}) — heuristic`);
-    return { caught: heuristicMatches(findings, issues), matcher: "heuristic" };
+    const reason = err instanceof Error ? err.message : String(err);
+    console.log(`  [${label}] judge failed (${reason}) — heuristic`);
+    // Audit the failure too: a heuristic row must explain itself in the JSONL,
+    // not silently look like the judge approved a zero.
+    return {
+      caught: heuristicMatches(findings, issues),
+      matcher: "heuristic",
+      audit: { text: `judge failed: ${reason}`, matches: [] },
+    };
   }
 }
 

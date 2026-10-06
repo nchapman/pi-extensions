@@ -89,13 +89,17 @@ describe("loadBench + sampleFixtures", () => {
 });
 
 describe("matching", () => {
-  it("scores token overlap between findings and issues", () => {
-    const score = matchScore(finding(), issue());
-    expect(score).toBeGreaterThan(0.1);
+  it("scores issue-side token coverage, robust to long findings", () => {
+    // near-verbatim title but padded detail — containment stays high where Jaccard diluted
+    const longFinding = finding({
+      detail:
+        "Async callbacks inside forEach are fire-and-forget, so the surrounding request pipeline continues before any of them settle, which can interleave commits and skew downstream analytics dashboards.",
+    });
+    expect(matchScore(longFinding, issue())).toBeGreaterThan(0.3);
     expect(matchScore(finding({ title: "Naming", detail: "rename variable" }), issue())).toBeLessThan(0.05);
   });
 
-  it("heuristic matcher catches clear overlap and misses paraphrase-only cases", () => {
+  it("heuristic matcher catches near-verbatim overlap and misses paraphrase-only cases", () => {
     const issues = [
       issue({ issue_index: 1 }),
       issue({ issue_index: 2, comment: "Inconsistent naming of exported function", severity: "Low" }),
@@ -105,6 +109,9 @@ describe("matching", () => {
     expect(caught.has(2)).toBe(false);
     expect(caught.get(1)).toBe(0);
     expect(heuristicMatches([], issues).size).toBe(0);
+    // a single shared token is not a match even at high coverage of a tiny issue
+    const tiny = [issue({ issue_index: 3, comment: "database pool", pr_title: "x" })];
+    expect(heuristicMatches([finding({ title: "database locked under load", detail: "x y z" })], tiny).size).toBe(0);
   });
 
   it("judge task labels each list distinctly; parser accepts empty matches and rejects garbage", () => {

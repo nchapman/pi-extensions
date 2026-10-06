@@ -703,7 +703,10 @@ describe("runReview", () => {
     });
     const git = gitFor([
       { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: "/repo\n", stderr: "" } },
-      { match: (a) => a[0] === "diff" && a[a.length - 1] === "HEAD", result: { code: 0, stdout: SAMPLE_DIFF, stderr: "" } },
+      {
+        match: (a) => a[0] === "diff" && a[a.length - 1] === "HEAD",
+        result: { code: 0, stdout: SAMPLE_DIFF, stderr: "" },
+      },
     ]);
     const result = await runReview({
       cwd: "/repo",

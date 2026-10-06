@@ -115,22 +115,31 @@ function tokens(text: string): Set<string> {
   );
 }
 
-/** Jaccard overlap between a finding and a golden issue's text. */
+/** Issue-side token coverage: what fraction of the golden issue's tokens the
+ * finding text contains. Containment, not Jaccard — Jaccard dilutes toward
+ * zero as findings get longer, missing near-verbatim title matches (seen on
+ * "NoMethodError before_validation" scored 0 against a finding titled
+ * "before_validation crashes with NoMethodError"). */
 export function matchScore(finding: Finding, issue: GoldenIssue): number {
   const ft = tokens(`${finding.title} ${finding.detail} ${finding.recommendation ?? ""}`);
   const it = tokens(`${issue.comment} ${issue.pr_title}`);
   let shared = 0;
-  for (const t of ft) if (it.has(t)) shared++;
-  const union = ft.size + it.size - shared;
-  return union === 0 ? 0 : shared / union;
+  for (const t of it) if (ft.has(t)) shared++;
+  return it.size === 0 ? 0 : shared / it.size;
 }
 
 /**
- * Deterministic fallback matcher (judge disabled or unparseable): an issue is
- * caught when some finding clears the token-overlap threshold. Deliberately
- * conservative — it under-matches paraphrases, so its recall is a lower bound.
+ * Deterministic fallback matcher (judge disabled, failed, or unparseable):
+ * an issue is caught when some finding covers ≥30% of its tokens with at
+ * least 2 shared. Deliberately conservative on paraphrase — its recall is a
+ * lower bound — but robust to finding length, unlike overlap ratios.
  */
-export function heuristicMatches(findings: Finding[], issues: GoldenIssue[], threshold = 0.14): Map<number, number> {
+export function heuristicMatches(
+  findings: Finding[],
+  issues: GoldenIssue[],
+  threshold = 0.3,
+  minShared = 2,
+): Map<number, number> {
   const caught = new Map<number, number>();
   issues.forEach((issue) => {
     let best = 0;
@@ -142,7 +151,14 @@ export function heuristicMatches(findings: Finding[], issues: GoldenIssue[], thr
         bestJ = j;
       }
     });
-    if (best >= threshold) caught.set(issue.issue_index, bestJ);
+    if (best >= threshold) {
+      const it = tokens(`${issue.comment} ${issue.pr_title}`);
+      const winner = findings[bestJ];
+      const ft = tokens(`${winner.title} ${winner.detail} ${winner.recommendation ?? ""}`);
+      let shared = 0;
+      for (const t of it) if (ft.has(t)) shared++;
+      if (shared >= minShared) caught.set(issue.issue_index, bestJ);
+    }
   });
   return caught;
 }
