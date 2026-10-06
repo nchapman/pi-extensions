@@ -17,7 +17,15 @@
  *   it names a failure, a criterion lacks proof, or the id is stale. If the
  *   goal carries a `verify` command, completion also requires it to exit 0 —
  *   the extension runs it itself (bounded), so the model can't fake success and a
- *   failed run is rejected with its output to fix the real cause. A semantic
+ *   failed run is rejected with its output to fix the real cause. The set-time
+ *   preflight and complete-time verify run inside the tool call, so they stream
+ *   live progress onto the tool row (onUpdate partials — a multi-minute verify
+ *   behind pi's generic working spinner reads as wedged) and honor the run's
+ *   abort signal: Esc kills the verify's whole process tree and unblocks the
+ *   call instead of forcing a pi restart. The settle-boundary check is the one
+ *   verify pi exposes no abort signal for (agent.signal is cleared before the
+ *   boundary fires), so it stays bounded by its timeout + spinner instead of
+ *   Esc. A semantic
  *   second opinion (a Jev-style classifier) is a later pass behind the
  *   injectable GoalJudge seam; v1 ships no judge (fail-open floor)
  * - an agent_before_settle continuation loop drives the goal turn by turn: at
@@ -69,7 +77,13 @@
 import { matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { spawn } from "node:child_process";
 import { Type } from "typebox";
-import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
+import type {
+  AgentToolResult,
+  ExtensionAPI,
+  ExtensionCommandContext,
+  ExtensionContext,
+  Theme,
+} from "@earendil-works/pi-coding-agent";
 
 export const GOAL_TOOL_NAME = "goal";
 export const MAX_OBJECTIVE_CHARS = 4000;
@@ -194,47 +208,137 @@ export function parseVerifyTimeoutMs(raw: string | undefined): number {
 
 /**
  * Result of running a goal's verify command. `ok` is true only on a clean exit 0
- * with no timeout/spawn error; `output` is a capped tail of combined output.
+ * with no timeout/spawn error/abort; `aborted` marks a run cut short by the
+ * agent run's abort signal (Esc) or a session teardown; `output` is a capped
+ * tail of combined output.
  */
 export interface VerifyResult {
   ok: boolean;
   exitCode: number | null;
   timedOut: boolean;
+  aborted?: boolean;
   spawnError?: string;
   output: string;
 }
 
 /** The verify boundary: execute a command, return its result. Injected in tests. */
-export type VerifyRunner = (command: string, opts: { timeoutMs?: number; cwd?: string }) => Promise<VerifyResult>;
+export type VerifyRunner = (
+  command: string,
+  opts: { timeoutMs?: number; cwd?: string; signal?: AbortSignal },
+) => Promise<VerifyResult>;
 
 function capVerifyOutput(s: string, n = MAX_VERIFY_OUTPUT): string {
   return s.length > n ? `…(truncated) ${s.slice(-n)}` : s;
 }
 
+/** Abort closures for verifies currently running — drained on session_shutdown
+ * so a reload mid-check doesn't leave an orphaned gate suite holding locks and
+ * GPUs (the timeout timer dies with the host process). Each closure aborts its
+ * verify's controller, which kills the whole process tree; the pending
+ * runVerify then resolves `aborted` (not a fabricated failure), so callers
+ * treat a teardown kill exactly like Esc. */
+const liveVerifyAborts = new Set<() => void>();
+
+/** Probe a process group: true while any member still exists. EPERM means the
+ * group exists but is foreign — report it as alive (conservative). */
+function groupAlive(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** Grace window (ms) between the shell's exit and stream close. A gap larger
+ * than this means a descendant held the inherited stdio open — the check
+ * backgrounded its work — so the shell's exit code is not the work's verdict.
+ * Normal foreground verifies close within a few ms of exit (stream drain). */
+const EXIT_TO_CLOSE_GRACE_MS = 250;
+
 /**
- * Run a verify command in a bounded shell: hard timeout + capped output. This is
- * the boundary the model cannot fake — the extension executes the command and
- * reads the exit code, so completion reflects reality, not a claim.
+ * Run a verify command in a bounded shell: hard timeout + capped output + whole
+ * process-tree kill on timeout/abort. This is the boundary the model cannot
+ * fake — the extension executes the command and reads the exit code, so
+ * completion reflects reality, not a claim.
+ *
+ * Deliberately NOT routed through pi's local bash backend (unlike superbash):
+ * that backend's grace-based wait reports the *shell's* exit while background
+ * work still runs, and a verify that backgrounds its check (`gate.sh &`) would
+ * then pass the completion gate on a shell exit alone — a trust-boundary
+ * bypass. Here the wait is close-based (a pipe-holding descendant holds the
+ * verdict open until the timeout), and after the shell exits the process group
+ * is probed: live leftover members mean the check backgrounded work — they are
+ * killed on any exit, and on a clean exit 0 the result is a failure, never a
+ * pass (the check has not finished).
+ *
+ * `signal` cuts the run short with `aborted: true`; a signal already aborted at
+ * entry skips the spawn entirely. Known cut: a hard host crash mid-verify can
+ * still orphan the tree (pi's detached-child tracker is not public API); the
+ * session_shutdown drain covers reloads and clean exits.
  */
-export function runVerify(command: string, opts: { timeoutMs?: number; cwd?: string } = {}): Promise<VerifyResult> {
+export function runVerify(
+  command: string,
+  opts: { timeoutMs?: number; cwd?: string; signal?: AbortSignal } = {},
+): Promise<VerifyResult> {
   const timeoutMs = opts.timeoutMs ?? VERIFY_TIMEOUT_MS_DEFAULT;
   const cwd = opts.cwd ?? process.cwd();
-  return new Promise((resolve) => {
+  const outer = opts.signal;
+  // A controller of our own chains the run's signal and session_shutdown into
+  // one kill switch — aborting it kills the tree and settles `aborted`.
+  const ctrl = new AbortController();
+  const abortNow = () => ctrl.abort();
+  if (outer?.aborted) ctrl.abort();
+  outer?.addEventListener("abort", abortNow, { once: true });
+  liveVerifyAborts.add(abortNow);
+  const cleanup = () => {
+    outer?.removeEventListener("abort", abortNow);
+    liveVerifyAborts.delete(abortNow);
+  };
+  return new Promise<VerifyResult>((resolve) => {
     let out = "";
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let child: ReturnType<typeof spawn> | undefined;
+    let exitedAt: number | undefined;
+    const cap = () => capVerifyOutput(out);
+    const onData = (d: Buffer) => {
+      if (out.length < MAX_VERIFY_OUTPUT * 4) out += d.toString();
+    };
+    // Detached (own process group) so a negative-pid kill reaches the shell's
+    // descendants too; killing only the shell orphans grandchildren. Windows
+    // has no group kill — the fallback degrades to the shell alone (these
+    // verifies are bash-isms on a *nix host).
+    const killGroup = () => {
+      if (child?.pid === undefined) return;
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // already dead
+        }
+      }
+    };
     const finish = (r: VerifyResult) => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      cleanup();
       resolve(r);
     };
-    const onData = (d: Buffer) => {
-      if (out.length < MAX_VERIFY_OUTPUT * 4) out += d.toString();
+    const onAbort = () => {
+      killGroup();
+      finish({ ok: false, exitCode: null, timedOut: false, aborted: true, output: cap() });
     };
-    let child: ReturnType<typeof spawn>;
+    if (ctrl.signal.aborted) {
+      onAbort();
+      return;
+    }
+    ctrl.signal.addEventListener("abort", onAbort, { once: true });
     try {
-      child = spawn(command, { shell: true, cwd });
+      child = spawn(command, { shell: true, cwd, detached: true, windowsHide: true });
     } catch (e) {
       finish({
         ok: false,
@@ -248,14 +352,40 @@ export function runVerify(command: string, opts: { timeoutMs?: number; cwd?: str
     child.stdout?.on("data", onData);
     child.stderr?.on("data", onData);
     timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      finish({ ok: false, exitCode: null, timedOut: true, output: capVerifyOutput(out) });
+      killGroup();
+      finish({ ok: false, exitCode: null, timedOut: true, output: cap() });
     }, timeoutMs);
     child.on("error", (e) => {
-      finish({ ok: false, exitCode: null, timedOut: false, spawnError: e.message, output: capVerifyOutput(out) });
+      finish({ ok: false, exitCode: null, timedOut: false, spawnError: e.message, output: cap() });
+    });
+    child.on("exit", () => {
+      exitedAt = Date.now();
     });
     child.on("close", (code) => {
-      finish({ ok: code === 0, exitCode: code, timedOut: false, output: capVerifyOutput(out) });
+      // Trust boundary: the shell's exit alone is not the verdict. Two shapes
+      // mean the check backgrounded its work: (a) group members still alive at
+      // close (redirected descendants), (b) close arriving materially after
+      // exit — a descendant with inherited stdio held the pipes open, and the
+      // work's outcome (not the shell's) is unknowable. Either way: kill the
+      // leftovers, and never let a shell exit 0 count as a pass. (A descendant
+      // that escapes the group entirely — setsid, double-fork — is a documented
+      // cut: undetectable without pid namespaces.)
+      const heldByDescendant = exitedAt !== undefined && Date.now() - exitedAt > EXIT_TO_CLOSE_GRACE_MS;
+      if (child?.pid !== undefined && (groupAlive(child.pid) || heldByDescendant)) {
+        killGroup();
+        if (code === 0) {
+          finish({
+            ok: false,
+            exitCode: code,
+            timedOut: false,
+            spawnError:
+              "verify left background processes running; a verify must run its check in the foreground and exit",
+            output: cap(),
+          });
+          return;
+        }
+      }
+      finish({ ok: code === 0, exitCode: code, timedOut: false, output: cap() });
     });
   });
 }
@@ -282,10 +412,14 @@ export interface Goal {
   startedAt: number;
 }
 
-/** Snapshot carried by every goal tool result (see lastGoalSnapshot). */
+/** Snapshot carried by every goal tool result (see lastGoalSnapshot). Running
+ * partials (onUpdate) reuse the same shape so an in-flight check renders on the
+ * tool row — including its `goal`, so even a persisted partial re-adopts on reload. */
 export interface GoalDetails {
   goal: Goal | null;
   error?: string;
+  /** Present on onUpdate partials while a baseline/completion check runs. */
+  running?: string;
 }
 
 /** A typed second opinion on completion. `undefined` = no opinion (fail-open). */
@@ -709,13 +843,18 @@ export function renderGoalCall(args: unknown, theme: Pick<Theme, "fg" | "bold">)
   return theme.fg("toolTitle", theme.bold("goal"));
 }
 
-/** Result row: `goal #N <status> — objective`, with the criteria list when expanded. */
+/** Result row: `goal #N <status> — objective`, with the criteria list when expanded.
+ * A `running` detail (onUpdate partial) renders the in-flight check instead. */
 export function renderGoalResult(
   details: GoalDetails | undefined,
   options: { expanded: boolean },
   theme: Pick<Theme, "fg" | "bold">,
 ): string {
   if (details?.error) return theme.fg("error", `✗ ${details.error}`);
+  if (details?.running) {
+    const id = details.goal ? ` #${details.goal.id}` : "";
+    return theme.fg("accent", `⏳ goal${id} ${details.running}`);
+  }
   const goal = details?.goal;
   if (!goal) return theme.fg("dim", "no goal");
   let text = theme.fg("toolTitle", theme.bold(`goal #${goal.id} `)) + theme.fg(STATUS_COLORS[goal.status], goal.status);
@@ -910,7 +1049,10 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
   // the next turn_end — visible as the footer "coming and going".
   const updateFooter = (checking = false) => {
     if (goal && goal.status === "active") {
-      uiRef?.setStatus("goal", checking ? `goal · checking (${goal.verify})` : renderGoalFooter(goal, Date.now()));
+      uiRef?.setStatus(
+        "goal",
+        checking ? `goal · checking (${clip(goal.verify ?? "", 30)})` : renderGoalFooter(goal, Date.now()),
+      );
     } else if (goal && goal.status === "paused") {
       // No elapsed while paused: startedAt never freezes, so a ticking clock
       // would read as active work time during a long conversation.
@@ -970,6 +1112,13 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     updateFooter();
     return goal;
   };
+
+  // Nothing outlives the session: a live verify is aborted on shutdown/reload
+  // — its timeout timer dies with the host process, so without this a reload
+  // mid-check would orphan the whole tree.
+  pi.on("session_shutdown", () => {
+    for (const abort of [...liveVerifyAborts]) abort();
+  });
 
   pi.on("session_start", (_event, ctx) => {
     adoptBranchState(ctx);
@@ -1085,12 +1234,13 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         return;
       }
     }
-    continuations += 1;
     let check: VerifyResult;
     // Throttle: with checkEvery > 1 only every Nth continuation re-runs the
     // verify; the others reuse the last measured state (aged) so the settle is
-    // instant instead of a silent multi-minute benchmark.
-    const due = continuations % checkEvery === 0 || !lastCheck;
+    // instant instead of a silent multi-minute benchmark. (`due` reads the
+    // would-be post-increment counter; the increment happens once the check
+    // survives the abort path below, so an aborted check never burns budget.)
+    const due = (continuations + 1) % checkEvery === 0 || !lastCheck;
     const verifyCommand = goal.verify; // captured for the closure: narrowing of `goal` doesn't cross it
     if (due) {
       // Animated chat-area spinner while the (possibly minutes-long) verify
@@ -1102,7 +1252,14 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
           new CheckSpinnerComponent(tui, theme, `running goal check: ${clip(verifyCommand, 60)}`),
       );
       try {
-        check = await verifyRunner(goal.verify, { timeoutMs: verifyTimeoutMs });
+        check = await verifyRunner(goal.verify, {
+          timeoutMs: verifyTimeoutMs,
+          // Forwarded for the day pi wires a live signal here; today ctx.signal
+          // is undefined at this boundary (agent.signal is cleared before the
+          // settle fires), so the check is bounded by its timeout + spinner —
+          // Esc cannot cut it short. Documented in the file header.
+          signal: ctx.signal,
+        });
       } catch (e) {
         // The built-in runner never rejects; an injected one might. A throw must
         // not escape the settle boundary — treat it as a failed check and
@@ -1115,13 +1272,21 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
           output: "",
         };
       }
+      uiRef?.setWidget(GOAL_CHECK_WIDGET_KEY, undefined); // spinner lives only for the check's duration
+      if (check.aborted) {
+        // The run was aborted mid-check — pi drops the continuation anyway, so
+        // queue no follow-up; the next settle re-measures rather than acting on
+        // a check that never finished (lastCheck stays unset).
+        updateFooter();
+        return undefined;
+      }
       lastCheck = check;
       lastCheckAge = 0;
-      uiRef?.setWidget(GOAL_CHECK_WIDGET_KEY, undefined); // spinner lives only for the check's duration
     } else {
       check = lastCheck!;
       lastCheckAge += 1;
     }
+    continuations += 1;
     updateFooter();
     if (due) recordBudgetOutput(budgetOutputs, check.output);
     pi.sendMessage(
@@ -1186,6 +1351,77 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     return text;
   });
 
+  /** Cadence for the tool-row progress partials while a verify runs (ms). */
+  const VERIFY_UPDATE_MS = 5_000;
+  /** Sentinel for the abort race — runVerify (or the runner) still finishes its
+   * own cleanup; this only unblocks the tool call. */
+  const ABORTED_VERIFY: VerifyResult = { ok: false, exitCode: null, timedOut: false, aborted: true, output: "" };
+
+  const throwToVerifyResult = (e: unknown): VerifyResult => ({
+    ok: false,
+    exitCode: null,
+    timedOut: false,
+    spawnError: e instanceof Error ? e.message : String(e),
+    output: "",
+  });
+
+  /**
+   * Run a verify inside a tool call (set-preflight or completion gate) with a
+   * live progress row and a real abort path. pi keeps the tool row rendered
+   * while execute is pending, so onUpdate partials ("running baseline check ·
+   * 45s") make a multi-minute verify legible instead of a dead "working"
+   * spinner. The abort race bounds the call even if an injected runner ignores
+   * the signal: Esc resolves immediately while runVerify kills the child tree.
+   */
+  const runGatedVerify = async (
+    g: Goal,
+    verifyCommand: string,
+    phase: "baseline" | "completion",
+    signal: AbortSignal | undefined,
+    onUpdate: ((partial: AgentToolResult<GoalDetails>) => void) | undefined,
+  ): Promise<VerifyResult> => {
+    updateFooter(true);
+    const startedAt = Date.now();
+    const elapsed = () => formatElapsed(Date.now() - startedAt);
+    const emit = () =>
+      onUpdate?.({
+        content: [
+          { type: "text" as const, text: `running ${phase} check \`${verifyCommand}\` — ${elapsed()} elapsed` },
+        ],
+        details: { goal: g, running: `${phase} check: ${verifyCommand} · ${elapsed()}` },
+      });
+    emit();
+    const ticker = setInterval(emit, VERIFY_UPDATE_MS);
+    ticker.unref?.();
+    const raced = (async () => {
+      try {
+        return await verifyRunner(verifyCommand, { timeoutMs: verifyTimeoutMs, signal });
+      } catch (e) {
+        return throwToVerifyResult(e);
+      }
+    })();
+    try {
+      if (!signal) return await raced;
+      if (signal.aborted) return ABORTED_VERIFY; // aborted during the runner call — raced may still be running
+      return await new Promise<VerifyResult>((resolve) => {
+        const onAbort = () => resolve(ABORTED_VERIFY);
+        signal.addEventListener("abort", onAbort, { once: true });
+        raced.then(
+          (r) => {
+            signal.removeEventListener("abort", onAbort);
+            resolve(r);
+          },
+          // raced never rejects (throwToVerifyResult converts), but a rejected
+          // chained runner must not wedge the race either
+          () => resolve(ABORTED_VERIFY),
+        );
+      });
+    } finally {
+      clearInterval(ticker);
+      updateFooter();
+    }
+  };
+
   pi.registerTool({
     name: GOAL_TOOL_NAME,
     label: "Goal",
@@ -1194,7 +1430,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     parameters: GoalParams,
     defaultActive: false,
     executionMode: "sequential",
-    async execute(_id, params) {
+    async execute(_id, params, signal, onUpdate) {
       if (params.action === "set") {
         // A user-paused goal must not be replaced: set is the one action that
         // persists a new snapshot, so an unguarded call would discard the
@@ -1225,13 +1461,29 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         // Preflight: run the verify now to establish the baseline. A verify that
         // already passes means the goal is likely already met or mis-specified,
         // so surface it before the model starts (and before it can "complete" trivially).
-        const pre = await verifyRunner(g.verify, { timeoutMs: verifyTimeoutMs });
+        // Progress streams onto the tool row and Esc aborts — a heavyweight
+        // verify (full gate suites run minutes) must never read as wedged.
+        const pre = await runGatedVerify(g, g.verify, "baseline", signal, onUpdate);
+        if (pre.aborted) {
+          // The goal stands (already persisted above); only the baseline is lost,
+          // and the settle loop re-measures at the end of the next turn anyway.
+          return finish(
+            g,
+            `Goal #${g.id} set: ${g.objective}.${criteriaLine} The baseline check was aborted before finishing — no baseline recorded; the verify re-runs at the end of each turn.`,
+            "baseline check aborted",
+          );
+        }
         // Seed the budget window with the baseline so the judge has a first
         // measured state even for tiny caps (PI_GOAL_MAX_CONTINUATIONS=1).
         recordBudgetOutput(budgetOutputs, pre.output);
+        const failWhy = pre.spawnError
+          ? ` — the check could not run: ${pre.spawnError}`
+          : pre.timedOut
+            ? " — the check timed out"
+            : "";
         const baseline = pre.ok
           ? ` NOTE: the verify command already passes — confirm the goal isn't already met or the check is too weak, and refine it if so.`
-          : ` It currently fails, as expected for an unmet goal; completion is gated on it passing.`;
+          : ` It currently fails${failWhy}, as expected for an unmet goal; completion is gated on it passing.`;
         return finish(
           g,
           `Goal #${g.id} set: ${g.objective}.${criteriaLine} Completion is gated on the verify command \`${g.verify}\` exiting 0${baseline} Call goal with action "complete" when done.`,
@@ -1260,7 +1512,16 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         // — which is what makes completion consistent and truthful. A failure is
         // rejected with its output so the model fixes the real cause and retries.
         if (goal.verify) {
-          const res = await verifyRunner(goal.verify, { timeoutMs: verifyTimeoutMs });
+          const res = await runGatedVerify(goal, goal.verify, "completion", signal, onUpdate);
+          if (res.aborted) {
+            // An aborted check proves nothing — the goal stays active and the
+            // completion must be retried (with fresh evidence) after the abort.
+            return finish(
+              goal,
+              `Goal #${goal.id} NOT completed — the completion check was aborted. Call complete again once the run resumes.`,
+              "completion check aborted",
+            );
+          }
           // A failed complete-time verify is the freshest measurement — cache it
           // so a throttled settle doesn't reuse (and over-age) an older result.
           if (!res.ok) {
@@ -1373,6 +1634,9 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
           ctx.ui.notify("No active goal to pause.");
           return;
         }
+        // Escape hatch: pi exposes no abort signal at the settle boundary, so an
+        // in-flight turn-end check cannot see Esc — /goal pause kills it here.
+        for (const abort of [...liveVerifyAborts]) abort();
         // Session-scoped, like stop: the loop halts and the goal shows paused,
         // but nothing is persisted to the branch — a reload re-adopts the last
         // snapshot. Unlike stop, the goal stays pursuing (not blocked) and all
@@ -1409,6 +1673,9 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
           ctx.ui.notify("No active or paused goal to stop.");
           return;
         }
+        // Escape hatch, as with pause: kill an in-flight settle-boundary check
+        // (unreachable by Esc — pi exposes no abort signal at that boundary).
+        for (const abort of [...liveVerifyAborts]) abort();
         // Session-scoped kill switch: pause auto-continuation and mark the goal
         // not-pursuing (blocked). Not persisted to the branch — goal state stays
         // model-owned, so a reload re-adopts the last snapshot and can re-arm.

@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
@@ -67,7 +69,12 @@ function makePi() {
     string,
     {
       description?: string;
-      execute: (id: string, params: unknown, signal?: AbortSignal) => Promise<unknown>;
+      execute: (
+        id: string,
+        params: unknown,
+        signal?: AbortSignal,
+        onUpdate?: (partial: unknown) => void,
+      ) => Promise<unknown>;
       renderCall?: (args: never, theme: never, context?: never) => unknown;
       renderResult?: (result: never, options: never, theme: never, context?: never) => unknown;
     }
@@ -83,7 +90,12 @@ function makePi() {
       name: string;
       description?: string;
       parameters?: unknown;
-      execute: (id: string, params: unknown, signal?: AbortSignal) => Promise<unknown>;
+      execute: (
+        id: string,
+        params: unknown,
+        signal?: AbortSignal,
+        onUpdate?: (partial: unknown) => void,
+      ) => Promise<unknown>;
       renderCall?: (args: never, theme: never, context?: never) => unknown;
       renderResult?: (result: never, options: never, theme: never, context?: never) => unknown;
     }) => {
@@ -397,6 +409,11 @@ describe("renderGoalCall", () => {
 });
 
 describe("renderGoalResult", () => {
+  it("renders the in-flight check when running is set (onUpdate partial)", () => {
+    const d: GoalDetails = { goal: goal({ verify: "npm test" }), running: "baseline check: npm test · 45s" };
+    expect(renderGoalResult(d, { expanded: false }, THEME)).toContain("npm test");
+    expect(renderGoalResult(d, { expanded: false }, THEME)).toContain("baseline check");
+  });
   it("shows status and objective collapsed, criteria when expanded", () => {
     const d: GoalDetails = { goal: goal({ criteria: ["a", "b"] }) };
     const collapsed = renderGoalResult(d, { expanded: false }, THEME);
@@ -558,6 +575,64 @@ describe("runVerify", () => {
     expect(r.timedOut).toBe(true);
     expect(Date.now() - start).toBeLessThan(5000);
   });
+  it("resolves as aborted without spawning when the signal is already aborted", async () => {
+    const start = Date.now();
+    const r = await runVerify("sleep 30", { timeoutMs: 5000, signal: AbortSignal.abort() });
+    expect(r.aborted).toBe(true);
+    expect(r.ok).toBe(false);
+    expect(r.timedOut).toBe(false);
+    expect(r.exitCode).toBeNull();
+    expect(Date.now() - start).toBeLessThan(1000); // no spawn, no timeout wait
+  });
+  it("kills a running verify and resolves as aborted when the signal fires", async () => {
+    const start = Date.now();
+    const ctrl = new AbortController();
+    const p = runVerify("sleep 30", { timeoutMs: 5000, signal: ctrl.signal });
+    setTimeout(() => ctrl.abort(), 50);
+    const r = await p;
+    expect(r.aborted).toBe(true);
+    expect(r.ok).toBe(false);
+    expect(r.timedOut).toBe(false);
+    expect(Date.now() - start).toBeLessThan(5000); // the abort, not the timeout, ended it
+  });
+  it("never passes a verify that backgrounds its work — leftovers are killed and reported", async () => {
+    const start = Date.now();
+    // The shell exits 0 instantly; the redirected sleep keeps running in the
+    // group. A shell-exit verdict would complete a goal whose check never ran.
+    const r = await runVerify("sleep 30 >/dev/null 2>&1 &", { timeoutMs: 5000 });
+    expect(r.ok).toBe(false);
+    expect(r.exitCode).toBe(0); // the shell did exit 0 — and it still doesn't pass
+    expect(r.timedOut).toBe(false);
+    expect(r.spawnError).toContain("background");
+    expect(Date.now() - start).toBeLessThan(5000); // reported at shell exit, not at the timeout
+  });
+  it("never passes a verify that backgrounds work with inherited stdio — the shell's exit is not the work's verdict", async () => {
+    // The shell exits 0 instantly; the backgrounded sleep keeps the inherited
+    // pipes open, so `close` fires only when it ends — the exit→close gap gives
+    // it away and the shell's 0 must not count as the check's result.
+    const r = await runVerify("sleep 0.5 &", { timeoutMs: 5000 });
+    expect(r.ok).toBe(false);
+    expect(r.spawnError).toContain("background");
+  });
+  it("kills the verify's whole process tree on abort", async () => {
+    const marker = `${tmpdir()}/goal-verify-tree-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.pid`;
+    const ctrl = new AbortController();
+    // `$$` is the spawned shell's pid — the leader of the verify's process
+    // group; the sleep is a group member that must die with the abort.
+    const p = runVerify(`echo $$ > ${marker}; sleep 30`, { timeoutMs: 5000, signal: ctrl.signal });
+    let pgid = 0;
+    await vi.waitFor(() => {
+      pgid = Number(readFileSync(marker, "utf8").trim());
+      expect(Number.isInteger(pgid)).toBe(true);
+    });
+    ctrl.abort();
+    const r = await p;
+    expect(r.aborted).toBe(true);
+    await vi.waitFor(() => {
+      // ESRCH once every group member (shell + sleep) is gone.
+      expect(() => process.kill(-pgid, 0)).toThrow();
+    });
+  });
   it("caps very large output to a tail", async () => {
     const r = await runVerify(`python3 -c "print('x' * 100000)" || node -e "console.log('x'.repeat(100000))"`, {
       timeoutMs: 5000,
@@ -624,6 +699,124 @@ describe("registerGoalTool — verify", () => {
       content: Array<{ type: string; text: string }>;
     };
     expect(r.content[0].text).toContain("already passes");
+  });
+
+  it("reports a timed-out baseline at set time", async () => {
+    const { pi, tools } = makePi();
+    registerGoalTool(pi, { verifyRunner: async () => timedOutVerify });
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    const r = (await tool.execute("1", { action: "set", objective: "ship", verify: "npm test" })) as {
+      details: GoalDetails;
+      content: Array<{ type: string; text: string }>;
+    };
+    expect(r.details.goal?.verify).toBe("npm test");
+    expect(r.content[0].text).toContain("the check timed out");
+  });
+
+  it("returns immediately when the run's signal is already aborted at set time", async () => {
+    const { pi, tools } = makePi();
+    registerGoalTool(pi, { verifyRunner: () => new Promise<VerifyResult>(() => {}) }); // ignores signals
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    const r = (await tool.execute(
+      "1",
+      { action: "set", objective: "ship", verify: "npm test" },
+      AbortSignal.abort(),
+    )) as { details: GoalDetails; content: Array<{ type: string; text: string }> };
+    expect(r.content[0].text).toContain("aborted");
+    expect(r.details.goal?.status).toBe("active");
+    expect(r.details.goal?.verify).toBe("npm test");
+  });
+
+  it("ticks tool-row progress while a slow verify runs", async () => {
+    vi.useFakeTimers();
+    try {
+      const { pi, tools } = makePi();
+      let release!: (r: VerifyResult) => void;
+      registerGoalTool(pi, { verifyRunner: () => new Promise<VerifyResult>((res) => (release = res)) });
+      const updates: Array<{ details?: GoalDetails }> = [];
+      const tool = tools.get(GOAL_TOOL_NAME)!;
+      const p = tool.execute("1", { action: "set", objective: "ship", verify: "npm test" }, undefined, (u) =>
+        updates.push(u as never),
+      );
+      // Immediate emit at t=0, then one per 5s tick — the "still alive" signal.
+      await vi.advanceTimersByTimeAsync(11_000);
+      expect(updates.length).toBeGreaterThanOrEqual(3);
+      expect(updates[2]!.details?.running).toContain("npm test");
+      release(failVerify);
+      const r = (await p) as { content: Array<{ type: string; text: string }> };
+      expect(r.content[0].text).toContain("currently fails");
+      // Teardown: once the call settles, the ticker stops — no late partials.
+      const settledCount = updates.length;
+      await vi.advanceTimersByTimeAsync(11_000);
+      expect(updates.length).toBe(settledCount);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("streams running progress onto the tool row during the set preflight", async () => {
+    const { pi, tools } = makePi();
+    let release!: (r: VerifyResult) => void;
+    registerGoalTool(pi, {
+      verifyRunner: () => new Promise<VerifyResult>((res) => (release = res)),
+    });
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    const updates: Array<{ content: Array<{ type: string; text: string }>; details: GoalDetails }> = [];
+    const p = tool.execute("1", { action: "set", objective: "ship", verify: "npm test" }, undefined, (u) =>
+      updates.push(u as never),
+    );
+    release(failVerify);
+    const r = (await p) as { content: Array<{ type: string; text: string }> };
+    expect(updates.length).toBeGreaterThanOrEqual(1);
+    expect(updates[0].details.running).toContain("npm test");
+    expect(updates[0].content[0].text).toContain("baseline check");
+    expect(r.content[0].text).toContain("currently fails");
+  });
+
+  it("aborts the set preflight promptly even when the runner ignores the signal", async () => {
+    const { pi, tools } = makePi();
+    registerGoalTool(pi, { verifyRunner: () => new Promise<VerifyResult>(() => {}) });
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    const ctrl = new AbortController();
+    const p = tool.execute("1", { action: "set", objective: "ship", verify: "npm test" }, ctrl.signal);
+    setTimeout(() => ctrl.abort(), 30);
+    const r = (await p) as { details: GoalDetails; content: Array<{ type: string; text: string }> };
+    // The goal itself stands — only the baseline was cut short.
+    expect(r.details.goal?.status).toBe("active");
+    expect(r.details.goal?.verify).toBe("npm test");
+    expect(r.content[0].text).toContain("aborted");
+  });
+
+  it("forwards the abort signal to the verify runner", async () => {
+    const { pi, tools } = makePi();
+    let captured: { signal?: AbortSignal } | undefined;
+    registerGoalTool(pi, {
+      verifyRunner: async (_cmd, opts) => {
+        captured = opts;
+        return failVerify;
+      },
+    });
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    const ctrl = new AbortController();
+    await tool.execute("1", { action: "set", objective: "ship", verify: "npm test" }, ctrl.signal);
+    expect(captured?.signal).toBe(ctrl.signal);
+  });
+
+  it("aborts the completion check, leaving the goal active", async () => {
+    const { pi, tools } = makePi();
+    let call = 0;
+    registerGoalTool(pi, {
+      verifyRunner: () => (call++ === 0 ? Promise.resolve(failVerify) : new Promise<VerifyResult>(() => {})),
+    });
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    await tool.execute("1", { action: "set", objective: "fix", criteria: ["x"], verify: "npm test" });
+    const ctrl = new AbortController();
+    const p = tool.execute("2", { action: "complete", goalId: 1, summary: "done", evidence: ["ok"] }, ctrl.signal);
+    setTimeout(() => ctrl.abort(), 30);
+    const r = (await p) as { details: GoalDetails; content: Array<{ type: string; text: string }> };
+    expect(r.details.goal?.status).toBe("active");
+    expect(r.content[0].text).toContain("NOT completed");
+    expect(r.content[0].text).toContain("aborted");
   });
 
   it("rejects complete when the verify fails, returning its output", async () => {
@@ -881,6 +1074,139 @@ describe("registerGoalTool", () => {
     await tool.execute("2", { action: "complete", goalId: 1, summary: "done", evidence: ["ok"] });
     expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
     expect(sentCustom).toHaveLength(3);
+  });
+
+  it("resolves (does not reject) when the runner throws at set or complete", async () => {
+    const { pi, tools } = makePi();
+    registerGoalTool(pi, {
+      verifyRunner: async () => {
+        throw new Error("boom");
+      },
+    });
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    const set = (await tool.execute("1", { action: "set", objective: "ship", verify: "npm test" })) as {
+      details: GoalDetails;
+      content: Array<{ type: string; text: string }>;
+    };
+    expect(set.details.goal?.verify).toBe("npm test");
+    expect(set.content[0].text).toContain("could not run");
+    expect(set.content[0].text).toContain("boom");
+
+    const done = (await tool.execute("2", {
+      action: "complete",
+      goalId: 1,
+      summary: "done",
+      evidence: ["ok"],
+    })) as { details: GoalDetails; content: Array<{ type: string; text: string }> };
+    expect(done.details.goal?.status).toBe("active");
+    expect(done.content[0].text).toContain("could not run: boom");
+  });
+
+  it("forwards the run's abort signal to the settle check and unwedges on Esc", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const ctrl = new AbortController();
+    const ctx = {
+      ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() },
+      signal: ctrl.signal,
+    } as unknown as ExtensionContext;
+    let settleSignal: AbortSignal | undefined;
+    let call = 0;
+    registerGoalTool(pi, {
+      maxContinuations: 10,
+      verifyRunner: (_cmd, opts) => {
+        if (call++ === 0) return Promise.resolve(failVerify); // set preflight
+        // Honor the signal like the real runner does — resolve as aborted on Esc.
+        return new Promise<VerifyResult>((resolve) => {
+          settleSignal = opts?.signal;
+          opts?.signal?.addEventListener(
+            "abort",
+            () => resolve({ ok: false, exitCode: null, timedOut: false, aborted: true, output: "" }),
+            { once: true },
+          );
+        });
+      },
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it", verify: "npm test" });
+
+    setTimeout(() => ctrl.abort(), 30); // Esc mid-check
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(settleSignal).toBe(ctrl.signal); // the wiring itself, not just the outcome
+    expect(sentCustom).toHaveLength(0);
+  });
+
+  it("session_shutdown aborts a running verify as an abort, not a fabricated failure", async () => {
+    const { pi, events } = makePi();
+    registerGoalTool(pi);
+    const p = runVerify("sleep 30", { timeoutMs: 5000 });
+    fire(events, "session_shutdown"); // reload mid-check
+    const r = await p;
+    expect(r.aborted).toBe(true);
+    expect(r.timedOut).toBe(false);
+    expect(r.ok).toBe(false);
+  });
+
+  it("an aborted settle check is not cached — the next settle re-measures", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const ctx = {
+      ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() },
+    } as unknown as ExtensionContext;
+    const abortedVerify: VerifyResult = { ok: false, exitCode: null, timedOut: false, aborted: true, output: "" };
+    let check: VerifyResult = abortedVerify;
+    let calls = 0;
+    registerGoalTool(pi, {
+      maxContinuations: 10,
+      checkEvery: 3, // settle 2 would REUSE a cached check if one survived the abort
+      verifyRunner: async () => {
+        calls++;
+        return check;
+      },
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it", verify: "npm test" }); // preflight: call 1
+
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined(); // settle 1: fresh (call 2), aborted
+    check = failVerify;
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // settle 2
+    expect(calls).toBe(3); // re-measured — a cached aborted result would leave this at 2
+    expect(sentCustom).toHaveLength(1);
+    expect((sentCustom[0] as { msg: { content: string } }).msg.content).toContain("1/10"); // no budget burned
+  });
+
+  it("/goal stop kills an in-flight verify (the settle-boundary escape hatch)", async () => {
+    const { pi, tools, commands } = makePi();
+    registerGoalTool(pi);
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    await tool.execute("1", { action: "set", objective: "ship it", verify: "echo hi" });
+    // A live check (the settle loop's verifyRunner is runVerify in production).
+    const p = runVerify("sleep 30", { timeoutMs: 5000 });
+    await commands.get("goal")!.handler("stop", { ui: { notify: vi.fn() }, mode: "tui" });
+    const r = await p;
+    expect(r.aborted).toBe(true);
+  });
+
+  it("/goal pause also kills an in-flight verify", async () => {
+    const { pi, tools, commands } = makePi();
+    registerGoalTool(pi);
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it", verify: "echo hi" });
+    const p = runVerify("sleep 30", { timeoutMs: 5000 });
+    await commands.get("goal")!.handler("pause", { ui: { notify: vi.fn() }, mode: "tui" });
+    const r = await p;
+    expect(r.aborted).toBe(true);
+  });
+
+  it("shows the checking footer while a tool-call verify runs", async () => {
+    const { pi, tools, events } = makePi();
+    const setStatus = vi.fn();
+    let release!: (r: VerifyResult) => void;
+    registerGoalTool(pi, { verifyRunner: () => new Promise<VerifyResult>((res) => (release = res)) });
+    fire(events, "session_start", {
+      ...sessionCtx([]),
+      ui: { notify: vi.fn(), setStatus, setWidget: vi.fn() },
+    });
+    const p = tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship", verify: "npm test" });
+    release(failVerify);
+    await p;
+    const texts = setStatus.mock.calls.map((c) => String(c[1]));
+    expect(texts.some((t) => t.includes("checking") && t.includes("npm test"))).toBe(true);
   });
 
   it("a passing check prompts the agent to summarize and complete", async () => {

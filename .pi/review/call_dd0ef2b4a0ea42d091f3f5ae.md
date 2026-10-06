@@ -1,0 +1,53 @@
+# Code review — uncommitted changes
+
+> ⚠️ Verification skipped (PI_REVIEW_VERIFY=0) — findings below are **unverified**.
+
+## 🟠 Important
+
+### The settle-path verify is never Esc-abortable: ctx.signal is undefined at agent_before_settle
+**`extensions/goal.ts:1261`** — found by correctness, security, robustness
+Carried over from the previous round (still valid; the diff documents the gap and adds /goal pause+stop hatches, but the primary interrupt still does nothing). The settle handler passes `signal: ctx.signal` (goal.ts:1261), and the tool path's race cannot help here because that boundary is not a tool call. Evidence that ctx.signal is always undefined there: ExtensionContext.signal is documented as "The current abort signal, or undefined when the agent is not streaming" (node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/types.d.ts:239-240) and is bound as `getSignal: () => this.agent.signal` (dist/core/agent-session.js:2688); AgentBeforeSettleEvent extends BoundaryState and carries no signal field (types.d.ts:742-755) — unlike SessionBeforeTreeEvent, which does carry `signal: AbortSignal` (types.d.ts:628) — because `_runBeforeSettleBoundary()` (agent-session.js:1384-1406) is awaited from the post-run loop of `_runAgentPrompt`, after the run's own controller is gone. Worse, `_isAgentRunActive = true` wraps that whole loop (agent-session.js:1305-1334), so `isIdle` is false (agent-session.js:1029-1031) while the handler is awaited, and Esc's `session.abort()` sets `_abortDuringBeforeSettle`, calls `agent.abort()` (a no-op between runs) and then `await waitForIdle()` (agent-session.js:1843-1857) — i.e. Esc cannot end the check, it only makes the boundary return false once the handler finally completes (agent-session.js:1394-1395). Consequence: a per-turn check (the most frequent verify call site) runs to verifyTimeoutMs — default 900_000 ms (goal.ts:194) — while the session is non-idle and Esc appears dead. The new /goal pause and /goal stop hatches do work (extension commands execute even while streaming: agent-session.js:1442-1464), but they require typing a command; the diff's own comment concedes "Esc cannot cut it short".
+
+**Fix**: Keep the documented limitation but make the abort reachable, or stop implying it is: either trip the same session-scoped kill switch from the Esc/abort path (AgentSession.abort() already knows it is inside the boundary via _abortDuringBeforeSettle), or relabel the test as wiring-only and surface 'Esc cannot abort this check; /goal stop kills it' in the settle spinner text.
+
+### The settle-path verify is never Esc-abortable: ctx.signal is undefined at agent_before_settle
+**`tests/goal.test.ts:1104`** — found by tests
+The new test `it("forwards the run's abort signal to the settle check and unwedges on Esc")` fabricates `ctx = { ui: {...}, signal: ctrl.signal }` and then asserts `settleSignal === ctrl.signal` plus `continue`-less return. In production the boundary ctx.signal is `this.agent.signal` (node_modules/@earendil-works/pi-coding-agent/dist/core/agent-session.js:2688, via runner.js:656-658), which the extension's own comment (extensions/goal.ts:1256-1260) and the README change in this diff both concede is undefined when agent_before_settle fires ("pi does not yet expose an abort signal at that boundary, so Esc cannot cut it short"). The test therefore passes only because it supplies a signal production never provides; it cannot fail if the advertised Esc-unwedge behavior is broken, and its title asserts behavior the README says does not exist.
+
+**Fix**: Drive the settle boundary with ctx.signal undefined (asserting the spinner+timeout path and that /goal stop|pause is the escape hatch), or rename the test to state it only covers the forwarded-signal wiring for a future pi signal.
+
+## 🟡 Suggestion
+
+### The exit→close gap is a wall-clock proxy, so an event-loop stall between the two callbacks fails a passing verify
+**`extensions/goal.ts:373`** — found by correctness, robustness, tests
+Carried over from the previous round (still valid; the new group probe closes the plain in-group case but not the residual ones). The close handler's guard is `groupAlive(child.pid) || heldByDescendant` (goal.ts:374): the first term is `process.kill(-pgid, 0)` on the shell's own process group (goal.ts:244-250), the second is a wall-clock delta between the *handler execution times* of 'exit' and 'close' (goal.ts:361-373). Two shapes still yield a false pass on a clean shell exit (`finish({ ok: code === 0 })`, goal.ts:386): (a) a check that hands its work to a process that leaves the group — `setsid ./gate.sh >/dev/null 2>&1 &`, a double-forking/daemonizing script, `systemd-run`/`at` — leaves the shell's group empty and releases the inherited stdio, so neither term fires and the completion gate (goal.ts:1515-1530) marks the goal complete while the gate suite is still running; (b) the gap heuristic is collapsed whenever the event loop is busy across the shell's exit: both callbacks are delivered when the loop returns, so `exitedAt` is stamped late and `Date.now() - exitedAt` is ~0 while the group is already empty (the new test `sleep 0.5 &`, tests/goal.test.ts:608-615, asserts `spawnError` contains "background" and therefore depends on exactly this 250 ms wall-clock delta — under a stall it fails as a flake, and the same stall in production is a false pass). The delegated-process precondition is that it must release the inherited pipes (real daemonization does), and the code itself documents the setsid case as an accepted cut.
+
+**Fix**: Derive the flag from stream state instead of timing: in the 'exit' handler record whether the pipes were still open (`!(child.stdout?.readableEnded ?? true) || !(child.stderr?.readableEnded ?? true)`) — that is literally what 'a descendant holds the inherited stdio' means — and keep the elapsed gap only as a coarse secondary bound (or drop it).
+
+### The 'goal · checking (...)' footer text has no test coverage
+**`extensions/goal.ts:1054`** — found by tests
+This diff changes the checking footer from raw `goal.verify` to `clip(goal.verify ?? "", 30)` (truncation + undefined-safety) and this branch is only reachable through runGatedVerify's `updateFooter(true)`. No test primes a UI ref and asserts the checking footer: grep for "checking" in tests/goal.test.ts returns nothing, and the existing footer assertions only match `/^goal · /` (tests/goal.test.ts:1542, 1576, 1598), which the paused/footer branch also satisfies. A regression in the truncation or the undefined goal.verify handling would pass unnoticed.
+
+**Fix**: Prime uiRef via session_start, run a gated set/complete with a long verify command, and assert setStatus was called with a `goal · checking (...)` string that is clipped to the 30-char budget.
+
+### /goal pause's new in-flight-verify kill is untested
+**`extensions/goal.ts:1639`** — found by tests
+This diff adds `for (const abort of [...liveVerifyAborts]) abort();` to both /goal pause (extensions/goal.ts:1639) and /goal stop (extensions/goal.ts:1678), but only /goal stop gets a test (tests/goal.test.ts:1173, "/goal stop kills an in-flight verify"). The pause path is the documented Esc substitute at the settle boundary (the turn-end check cannot see Esc), so its kill behavior has no protection; a regression that drops or misorders the pause drain would go unnoticed.
+
+**Fix**: Add a /goal pause variant of the stop test: start a live `runVerify("sleep 30")`, invoke the pause handler on an active goal, and assert the pending verify resolves `aborted`.
+
+### New tree-kill test writes a predictable path under /tmp through a shell redirect (symlink/truncate hazard)
+**`tests/goal.test.ts:617`** — found by security
+The new test derives its marker path from the pid alone — `const marker = \`/tmp/goal-verify-tree-test-${process.pid}.pid\`` (line 617) — and has runVerify's shell write it with `echo $$ > ${marker}` (line 621). /tmp is world-writable and the filename is fully predictable (pids are small and enumerable), so on a shared host a local attacker can pre-plant a symlink at that path and the shell's `>` redirection follows it and truncates whatever it points at (any file the test user can write, e.g. ~/.ssh/authorized_keys or ~/.bashrc). This is the only new path handling the diff introduces (the production code passes no cwd), and the test never removes the file, leaving the artifact behind after the run.
+
+**Fix**: Create the marker inside a private directory from fs.mkdtempSync(path.join(os.tmpdir(), "goal-verify-tree-")) (or give it a random suffix) and remove it in a finally block, instead of redirecting a shell into a fixed world-writable /tmp path.
+
+---
+
+**Scope reviewed**:
+- Files: README.md, extensions/goal.ts, tests/goal.test.ts
+- ⚠️ Excluded from review: .pi/review-state.json
+
+Continuing from a previous review (2 finding(s) carried over).
+
+_Reviewed 3 file(s) in 634s, 8670.4k tokens ($0.211). Next: address findings, then re-run /review — still-valid findings repeat verbatim, resolved ones stay gone._
