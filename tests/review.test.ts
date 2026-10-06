@@ -76,6 +76,7 @@ const CONFIG = (over: Partial<ReviewConfig> = {}): ReviewConfig => ({
   model: undefined,
   verifyModel: undefined,
   checkCmd: "",
+  verify: true,
   maxFindings: 25,
   priorChars: 8_000,
   persist: false,
@@ -685,6 +686,36 @@ describe("runReview", () => {
     ) =>
     async (args: string[]) =>
       responses.find((r) => r.match(args))?.result ?? { code: 1, stdout: "", stderr: `unexpected: ${args.join(" ")}` };
+
+  it("parses the verify on/off knob with fail-safe default", () => {
+    expect(parseReviewConfig({}).verify).toBe(true);
+    expect(parseReviewConfig({ PI_REVIEW_VERIFY: "0" }).verify).toBe(false);
+    expect(parseReviewConfig({ PI_REVIEW_VERIFY: "" }).verify).toBe(true);
+    expect(parseReviewConfig({ PI_REVIEW_VERIFY: "garbage" }).verify).toBe(true);
+  });
+
+  it("skips verification when the knob is off and discloses it in the report", async () => {
+    const spawn = fakeSpawn((task) => {
+      if (task.includes("Correctness and logic")) {
+        return '```json\n[{"file":"src/a.ts","line":2,"severity":"critical","title":"Bug","detail":"D"}]\n```';
+      }
+      return "[]";
+    });
+    const git = gitFor([
+      { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: "/repo\n", stderr: "" } },
+      { match: (a) => a[0] === "diff" && a[a.length - 1] === "HEAD", result: { code: 0, stdout: SAMPLE_DIFF, stderr: "" } },
+    ]);
+    const result = await runReview({
+      cwd: "/repo",
+      config: CONFIG({ effort: "balanced", verify: false }),
+      target: { kind: "default" },
+      deps: emptyDeps({ git, spawnFn: spawn }) as never,
+    });
+    // finders ran, no verify child, finding survives unverified but disclosed
+    expect(spawn.tasks.filter((t) => t.startsWith("# Verify"))).toHaveLength(0);
+    expect(result.findings).toHaveLength(1);
+    expect(result.report).toContain("Verification skipped (PI_REVIEW_VERIFY=0)");
+  });
 
   it("runs find → verify → report over the default target and persists state", async () => {
     const written: Array<[string, string]> = [];

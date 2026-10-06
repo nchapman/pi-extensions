@@ -87,6 +87,9 @@ export interface ReviewConfig {
   verifyModel?: string;
   /** Read-only command whose output feeds verification ("" disables). */
   checkCmd: string;
+  /** Verification stage on/off (PI_REVIEW_VERIFY=0 skips it — fast mode:
+   * findings ship unverified, disclosed like a failed verification). */
+  verify: boolean;
   /** Maximum findings in the final report. */
   maxFindings: number;
   /** Char budget for prior-findings context (0 disables). */
@@ -118,6 +121,7 @@ export function parseReviewConfig(env: NodeJS.ProcessEnv): ReviewConfig {
     model: env.PI_REVIEW_MODEL?.trim() || undefined,
     verifyModel: env.PI_REVIEW_VERIFY_MODEL?.trim() || undefined,
     checkCmd: env.PI_REVIEW_CHECK_CMD?.trim() ?? "",
+    verify: String(env.PI_REVIEW_VERIFY ?? "1") !== "0",
     maxFindings: clampInt(env.PI_REVIEW_MAX_FINDINGS, 25, 1, 100),
     priorChars: clampInt(env.PI_REVIEW_PRIOR_CHARS, 8_000, 0, 32_000),
     persist: String(env.PI_REVIEW_STATE ?? "1") !== "0",
@@ -932,6 +936,8 @@ export function planFinderRuns(
 export function renderReport(opts: {
   targetLabel: string;
   effort: Effort;
+  /** Verification deliberately off (PI_REVIEW_VERIFY=0) — disclosed, not silent. */
+  verifySkipped?: boolean;
   reviewedFiles: string[];
   /** Files in chunks no finder covered (child cap or failures) — disclosed, never listed as reviewed. */
   uncoveredFiles: string[];
@@ -956,6 +962,8 @@ export function renderReport(opts: {
     lines.push("", `**No actionable findings.**${rejectedNote}`);
   } else {
     if (bundle.unverified) lines.push("", "> ⚠️ Verification stage failed — findings below are **unverified**.");
+    else if (opts.verifySkipped)
+      lines.push("", "> ⚠️ Verification skipped (PI_REVIEW_VERIFY=0) — findings below are **unverified**.");
     let lastSev = "";
     for (const f of bundle.findings) {
       if (f.severity !== lastSev) {
@@ -1288,7 +1296,7 @@ export async function runReview(opts: {
 
   // Stage 2: verify.
   let bundle: VerifiedBundle = { findings: candidates, rejected: [], unverified: false };
-  if (candidates.length > 0 && effort !== "lite") {
+  if (candidates.length > 0 && config.verify && effort !== "lite") {
     deps.notify(`Verifying ${candidates.length} candidate finding(s)…`, "info");
     const vAgent = verifyAgent();
     const { task: vTask } = fitTask(
@@ -1332,6 +1340,7 @@ export async function runReview(opts: {
   const report = renderReport({
     targetLabel: label,
     effort,
+    verifySkipped: !config.verify && effort !== "lite",
     reviewedFiles,
     uncoveredFiles,
     skippedFiles: skipped,
