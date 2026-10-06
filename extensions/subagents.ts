@@ -241,7 +241,8 @@ export interface ChildLike {
 
 export type SpawnFn = (command: string, args: string[], options: { stdio: ["ignore", "pipe", "pipe"] }) => ChildLike;
 
-const defaultSpawn: SpawnFn = (command, args, options) => nodeSpawn(command, args, options) as unknown as ChildLike;
+export const defaultSpawn: SpawnFn = (command, args, options) =>
+  nodeSpawn(command, args, options) as unknown as ChildLike;
 
 export interface RunChildOptions {
   timeoutMs?: number;

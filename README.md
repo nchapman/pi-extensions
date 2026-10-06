@@ -24,6 +24,7 @@ Pi loads the TypeScript in this directory directly; there is no build step. The 
 | [`overflow`](extensions/overflow.ts)               | —                                                                                  | Preventing large custom-tool results from crowding out useful context. Oversized text is capped and the full result is saved beside the session for recovery.                                                                           |
 | [`openai-gateways`](extensions/openai-gateways.ts) | OpenAI-compatible providers                                                        | Discovering models from local gateways and proxies such as Ollama, vLLM, or LM Studio, including for headless subagent runs.                                                                                                            |
 | [`shortcuts`](extensions/shortcuts.ts)             | `/exit`, `/bye`, `/q`, `/close`, `/comp`, `/summarize`, `/info`, `/time`           | Common command aliases and quick session information.                                                                                                                                                                                   |
+| [`review`](extensions/review.ts)                   | `/review`                                                                          | Local multi-stage code review: specialist finder agents review the diff in parallel, an adversarial verifier prunes false positives, and one severity-ranked report lands in the conversation.                                      |
 
 ## Plans, goals, and memory
 
@@ -51,6 +52,19 @@ Frontmatter can also set `model` and `thinking`. Available tools can be restrict
 
 Background shell and agent tasks can be inspected and managed with `task`, `task_kill`, `task_remind`, and `/tasks`. With wake messages enabled, a completed background task delivers its result automatically as the parent's next message; `task <id>` can peek at a running task, and `task_remind` sets an optional one-shot check-in. The extension's replacement `bash` keeps pi's normal behavior for `wait: "inline"` (the default). `wait: "auto"` waits up to its configured window before promoting a still-running command; `wait: "background"` starts it in the background immediately. Background work is session-scoped and is stopped when the session shuts down.
 
+## Code review
+
+`/review` runs a multi-stage review pipeline over local changes — the same architecture as the hosted AI reviewers (parallel specialist finders, an adversarial verification pass, one merged report), but entirely local:
+
+1. **Assemble** (deterministic): computes the diff, synthesizes diffs for untracked files, drops excluded paths (lockfiles, logs, generated and binary files), chunks on file boundaries, and collects repo instructions — `REVIEW.md` at the repo root plus the `## Review guidelines` section of the closest `AGENTS.md` for each changed file.
+2. **Find**: one read-only subagent per lens (`lite`: correctness; `balanced`: correctness, security, robustness; `deep`: adds tests, conventions) explores the working tree with diff-anchored workflow instructions and returns findings as JSON. Large diffs chunk; a child cap bounds spend, shedding lenses (correctness first) and disclosing coverage when it binds.
+3. **Verify**: one adversarial subagent re-traces every merged candidate against the diff and repo; only evidence-backed findings survive. A broken verifier fails open — findings are reported labeled unverified rather than dropped.
+4. **Report**: deterministic dedupe (worst severity wins), severity ordering, and one markdown report delivered as a follow-up message. Findings persist to `<repo>/.pi/review-state.json`, so a re-review repeats still-valid findings verbatim and skips resolved ones.
+
+Usage: `/review [target] [effort]`. The target defaults to commits ahead of upstream plus uncommitted and untracked work; `staged`, `tree` (uncommitted only), a ref like `main`, or a range like `v1..v2` override. Effort is `lite`/`balanced`/`deep` (default `balanced`, or `PI_REVIEW_EFFORT`). Repos can tailor reviews by adding a `REVIEW.md` or a `## Review guidelines` section to any `AGENTS.md` (the closest one to a changed file wins). An optional read-only check command (`PI_REVIEW_CHECK_CMD`, e.g. `npm run check`) feeds its output to the verifier — the local equivalent of the hosted tools' static-analysis layers.
+
+`review` imports the subagent runtime, so keep both when packaging extensions selectively.
+
 ## OpenAI-compatible gateways
 
 Create `~/.pi/agent/openai-gateways.json` to configure gateways. The top-level keys become provider names; each entry needs a `baseUrl` and may include `apiKey`, `contextWindow`, `maxTokens`, and a seed `models` list:
@@ -76,6 +90,7 @@ Configuration is mostly through environment variables. Invalid values generally 
 | `recall`    | `PI_RECALL_SCOPE=session` (`project` includes sibling sessions), `PI_RECALL_EMBED=0` (disable embeddings), `PI_RECALL_COMPACT_TARGET=256000` (token cap; `0` disables), `PI_RECALL_COMPACT_RATIO=0.7` (fraction of the model window) |
 | `goal`      | `PI_GOAL_MAX_CONTINUATIONS=25`, `PI_GOAL_MAX_TURNS_PER_RUN=50`, `PI_GOAL_VERIFY_TIMEOUT_MS=900000`; `PI_GOAL_CHECK_EVERY` throttles verification                                                                                     |
 | `overflow`  | `PI_OVERFLOW_MAX_CHARS=10000`; `0` disables capping                                                                                                                                                                                  |
+| `review`    | `PI_REVIEW_EFFORT=balanced`, `PI_REVIEW_CHUNK_CHARS=96000`, `PI_REVIEW_MAX_CHILDREN=8`, `PI_REVIEW_TIMEOUT_MS`, `PI_REVIEW_MODEL`/`PI_REVIEW_VERIFY_MODEL` (child model overrides), `PI_REVIEW_CHECK_CMD` (read-only check whose output feeds verification), `PI_REVIEW_MAX_FINDINGS=25`, `PI_REVIEW_PRIOR_CHARS=8000`, `PI_REVIEW_STATE=0` (disable persistence), `PI_REVIEW_UNTRACKED_MAX_BYTES`          |
 
 ## Development
 
