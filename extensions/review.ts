@@ -1258,6 +1258,7 @@ export async function runReview(opts: {
     runs.map((run) => () => {
       const lens = lenses.get(run.lens)!;
       const agent = finderAgent(lens);
+      if (signal?.aborted) throw new Error("review aborted");
       const { task } = fitTask(
         (diff) =>
           finderTask({
@@ -1493,7 +1494,7 @@ export function registerReview(pi: ExtensionAPI, deps?: Partial<ReviewDeps>): vo
     name: "review",
     label: "Review",
     description:
-      "Run the multi-lens code-review pipeline (correctness, security, robustness, tests finders over a diff, then a deterministic merge) on local changes. Use it to review your own work before committing or when asked to review changes. target defaults to commits ahead of upstream plus uncommitted and untracked work; 'staged', 'tree' (uncommitted only), a ref like 'main', or a range like 'HEAD~3..HEAD' override. Returns one line per finding (severity, location, title); the full report with details and recommendations is written to .pi/review-report.md — read it for any finding you act on.",
+      "Run the multi-lens code-review pipeline (correctness, security, robustness, tests finders over a diff, then a deterministic merge) on local changes. Use it to review your own work before committing or when asked to review changes. target defaults to commits ahead of upstream plus uncommitted and untracked work; 'staged', 'tree' (uncommitted only), a ref like 'main', or a range like 'HEAD~3..HEAD' override. Returns one line per finding (severity, location, title); the full report with details and recommendations is written to .pi/review/<callId>.md (path included in the result) — read it for any finding you act on.",
     promptSnippet:
       "review — run the multi-lens review pipeline on a diff (default: ahead of upstream + working tree; or 'staged', 'tree', a ref, 'a..b'); returns compact findings, full report on disk",
     parameters: Type.Object({
@@ -1535,8 +1536,11 @@ export function registerReview(pi: ExtensionAPI, deps?: Partial<ReviewDeps>): vo
         // overwrite each other — .pi/review/<callId>.md accumulates, diffable.
         const reportDir = path.join(cwd, ".pi", "review");
         await mkdir(reportDir, { recursive: true });
-        const reportPath = path.join(reportDir, `${id}.md`);
-        await writeFile(reportPath, result.report, "utf8");
+        // The call id is pi-generated, but it feeds a file path — sanitize at
+        // the boundary so a future id scheme can't traverse out of .pi/review.
+        const safeId = id.replace(/[^a-zA-Z0-9_-]/g, "_") || "call";
+        const reportPath = path.join(reportDir, `${safeId}.md`);
+        await full.writeFile(reportPath, result.report);
         return {
           content: [{ type: "text" as const, text: summarizeForTool(result, reportPath) }],
           details: { findingCount: result.findingCount },

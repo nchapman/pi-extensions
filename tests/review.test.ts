@@ -1,3 +1,6 @@
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import type { EventEmitter } from "node:events";
 import { EventEmitter as EE } from "node:events";
 import { describe, expect, it } from "vitest";
@@ -14,6 +17,7 @@ import {
   mergeFindings,
   parseFindings,
   parseReviewArgs,
+  registerReview,
   resolveInvocation,
   summarizeForTool,
   parseReviewConfig,
@@ -701,6 +705,80 @@ describe("trackedSpawn", () => {
   });
 });
 
+describe("review tool", () => {
+  const sandbox = mkdtempSync(path.join(tmpdir(), "review-tool-"));
+  type ToolExecute = (
+    id: string,
+    params: { target?: string },
+    signal?: AbortSignal,
+    onUpdate?: unknown,
+    ctx?: unknown,
+  ) => Promise<unknown>;
+  const register = () => {
+    const tools = new Map<string, { description?: string; execute: ToolExecute }>();
+    const pi = {
+      registerTool: (t: { name: string; description?: string; execute: ToolExecute }) => tools.set(t.name, t),
+      registerCommand: () => {},
+      on: () => {},
+    } as unknown as Parameters<typeof registerReview>[0];
+    // repoRoot resolves to the sandbox: review state and report both land
+    // inside the temp cwd instead of escaping to a real /repo
+    const git = async (args: string[]) =>
+      args[0] === "rev-parse" && args[1] === "--show-toplevel"
+        ? { code: 0, stdout: `${sandbox}\n`, stderr: "" }
+        : args[0] === "diff" && args[args.length - 1] === "HEAD"
+          ? { code: 0, stdout: SAMPLE_DIFF, stderr: "" }
+          : args[0] === "ls-files"
+            ? { code: 0, stdout: "", stderr: "" }
+            : { code: 1, stdout: "", stderr: `unexpected: ${args.join(" ")}` };
+    const spawn = fakeSpawn((task) =>
+      task.includes("Correctness and logic")
+        ? '```json\n[{"file":"src/a.ts","line":2,"severity":"critical","title":"Bug","detail":"D"}]\n```'
+        : "[]",
+    );
+    // writeFile stays real (defaults): the tool's report artifact is asserted
+    // on disk; only git and child spawning are hermetic.
+    registerReview(pi, {
+      git,
+      spawnFn: spawn,
+      readFile: async () => undefined,
+      sessionModel: null,
+    });
+    return { tools, spawn };
+  };
+
+  it("executes end to end: compact summary back, full report to a unique sanitized path", async () => {
+    const { tools } = register();
+    const tool = tools.get("review")!;
+    const result = (await tool.execute("call_../../evil", {}, undefined, undefined, {
+      cwd: sandbox,
+      model: null,
+    } as never)) as { content: Array<{ type: string; text: string }>; details: { findingCount: number } };
+    expect(result.details.findingCount).toBe(1);
+    const text = result.content[0].text;
+    expect(text).toContain("1 finding(s): 1 critical.");
+    expect(text).toContain("[critical] src/a.ts:2 — Bug");
+    // traversal-safe filename, written for real, and the summary points at it
+    const safe = "call_../../evil".replace(/[^a-zA-Z0-9_-]/g, "_") + ".md";
+    const reportPath = path.join(sandbox, ".pi", "review", safe);
+    expect(text).toContain(reportPath);
+    expect(existsSync(reportPath)).toBe(true);
+    const onDisk = readFileSync(reportPath, "utf8");
+    expect(onDisk).toContain("# Code review");
+    expect(onDisk).toContain("Bug");
+  });
+
+  it("surfaces bad targets as tool errors instead of throwing", async () => {
+    const { tools } = register();
+    const result = (await tools.get("review")!.execute("call_x", { target: "--model" }, undefined, undefined, {
+      cwd: sandbox,
+      model: null,
+    } as never)) as { isError?: boolean; content: Array<{ text: string }> };
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("--model requires a model name");
+  });
+});
+
 describe("runReview", () => {
   const gitFor =
     (
@@ -771,8 +849,35 @@ describe("runReview", () => {
     expect(spawn.tasks).toHaveLength(0);
   });
 
+  it("stops queued finders when aborted mid-run", async () => {
+    // Two oversized files force two chunks x four lenses = 8 runs; the pool
+    // starts four and queues four. Aborting on the first spawn must stop the
+    // queued closures from ever spawning.
+    const big = `+${"x".repeat(9_000)}`;
+    const multi = `diff --git a/src/big1.ts b/src/big1.ts\n@@ -0,0 +1 @@\n${big}\ndiff --git a/src/big2.ts b/src/big2.ts\n@@ -0,0 +1 @@\n${big}\n`;
+    const controller = new AbortController();
+    const spawn = fakeSpawn(() => {
+      controller.abort();
+      return "[]";
+    });
+    const git = gitFor([
+      { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: "/repo\n", stderr: "" } },
+      { match: (a) => a[0] === "diff" && a[a.length - 1] === "HEAD", result: { code: 0, stdout: multi, stderr: "" } },
+    ]);
+    await expect(
+      runReview({
+        cwd: "/repo",
+        config: CONFIG({ chunkChars: 8_000 }),
+        target: { kind: "default" },
+        deps: emptyDeps({ git, spawnFn: spawn }) as never,
+        signal: controller.signal,
+      }),
+    ).rejects.toThrow("review aborted");
+    // first batch of four spawned; the queued four never did
+    expect(spawn.tasks.length).toBeLessThan(8);
+  });
+
   it("runs find → verify → report over the default target and persists state", async () => {
-    const written: Array<[string, string]> = [];
     const spawn = fakeSpawn((task) => {
       if (task.includes("Correctness and logic")) {
         return '```json\n[{"file":"src/a.ts","line":2,"severity":"important","title":"Off-by-one","detail":"Loop exits early.","recommendation":"Use <="}]\n```';
@@ -785,6 +890,7 @@ describe("runReview", () => {
       }
       return "[]";
     });
+    const written: Array<[string, string]> = [];
     const git = gitFor([
       { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: "/repo\n", stderr: "" } },
       { match: (a) => a.includes("@{upstream}"), result: { code: 1, stdout: "", stderr: "no upstream" } },
