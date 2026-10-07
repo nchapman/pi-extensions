@@ -456,10 +456,23 @@ describe("scanGoalState / lastGoalSnapshot", () => {
   it("skips malformed state entries, keeping the newest valid one", () => {
     const branch = [
       goalState(goal({ id: 1 })),
-      { type: "message", message: { role: "toolResult", toolName: GOAL_TOOL_NAME, details: { goal: "bad" } } },
-      { type: "message", message: { role: "toolResult", toolName: "read", details: { goal: goal({ id: 9 }) } } },
+      // A goal.state entry with invalid data must fall to the prior state...
+      { type: "custom", customType: "goal.state", data: { goal: "bad" } },
+      // ...and another extension's custom entry must never be read as goal state.
+      { type: "custom", customType: "other.state", data: { goal: goal({ id: 9 }) } },
     ];
     expect(lastGoalSnapshot(branch)).toEqual(goal({ id: 1 }));
+  });
+  it("derives the loop latch: explicit flag wins, else only paused, else none", () => {
+    expect(scanGoalState([goalState(goal({ id: 1, status: "paused" }))]).sessionStopped).toBe(true);
+    expect(scanGoalState([goalState(goal({ id: 1, status: "blocked" }))]).sessionStopped).toBe(false);
+    expect(scanGoalState([goalState(goal({ id: 1, status: "complete" }))]).sessionStopped).toBe(false);
+    expect(scanGoalState([goalState(goal({ id: 1, status: "active" }))]).sessionStopped).toBe(false);
+    // An explicit flag overrides the status derivation in both directions.
+    expect(scanGoalState([goalState(goal({ id: 1, status: "active" }), true)]).sessionStopped).toBe(true);
+    expect(scanGoalState([goalState(goal({ id: 1, status: "blocked" }), false)]).sessionStopped).toBe(false);
+    // No state entry at all: nothing derived — adoption falls back to armed.
+    expect(scanGoalState([{ type: "compaction" }]).sessionStopped).toBeUndefined();
   });
   it("reports a compaction after the snapshot as hiding the goal", () => {
     const branch = [goalState(goal({ id: 1 })), { type: "compaction" }];
@@ -2230,6 +2243,63 @@ describe("registerGoalTool", () => {
     expect(renderPlain(rendered as never)).toContain("goal #1");
   });
 
+  it("a kickoff does not resurrect a terminal goal and durably releases its latch", async () => {
+    const { pi, tools, commands, entries, sent } = makePi();
+    const ui = { notify: vi.fn(), setStatus: vi.fn() };
+    registerGoalTool(pi, {
+      verifyRunner: async () => ({ ok: true, exitCode: 0, timedOut: false, output: "PASS" }),
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
+    await tools.get(GOAL_TOOL_NAME)!.execute("2", {
+      action: "complete",
+      goalId: 1,
+      summary: "done",
+      evidence: ["PASS"],
+    });
+
+    // /goal <objective> routes the new goal through the model; it must not
+    // resurrect the completed one (re-running its verify, ticking its footer)
+    // before the replacement exists — but it DOES durably release the latch so
+    // a reload before the set lands cannot re-instate a superseded stop.
+    await commands.get("goal")!.handler("next thing", { mode: "headless", ui });
+    expect(entries.at(-1)).toMatchObject({
+      customType: "goal.state",
+      data: { goal: { status: "complete" }, stopped: false },
+    });
+    expect(sent.at(-1)?.text).toContain("next thing");
+    await commands.get("goal")!.handler("status", { mode: "headless", ui });
+    expect(ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("(complete)"));
+
+    // Stop → kickoff: the objective stays blocked (not resurrected), but the
+    // latch is released on the branch — the reload-window regression.
+    const second = makePi();
+    registerGoalTool(second.pi, { verifyRunner: async () => failVerify });
+    const sui = { notify: vi.fn(), setStatus: vi.fn() };
+    await second.tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "y", verify: "npm test" });
+    await second.commands.get("goal")!.handler("stop", { mode: "headless", ui: sui });
+    await second.commands.get("goal")!.handler("replacement", { mode: "headless", ui: sui });
+    expect(second.entries.at(-1)).toMatchObject({
+      customType: "goal.state",
+      data: { goal: { status: "blocked" }, stopped: false },
+    });
+
+    // Reload before the model's set lands, then set: the new goal must be
+    // unlatched (previously the stop re-instated and poisoned the set).
+    const fresh = makePi();
+    const notify = vi.fn();
+    const setStatus = vi.fn();
+    registerGoalTool(fresh.pi, { verifyRunner: async () => failVerify });
+    const settleCtx = { ui: { notify, setStatus, setWidget: vi.fn() } } as unknown as ExtensionContext;
+    fire(fresh.events, "session_start", { ...sessionCtx(second.entries), ui: settleCtx.ui });
+    const r = (await fresh.tools.get(GOAL_TOOL_NAME)!.execute("3", {
+      action: "set",
+      objective: "replacement",
+      verify: "npm test",
+    })) as { content: Array<{ type: string; text: string }> };
+    expect(r.content[0].text).not.toContain("loop is STOPPED");
+    expect(await fire(fresh.events, "agent_before_settle", settleCtx)).toEqual({ continue: true });
+  });
+
   it("registers /goal: status view and a model-routed kickoff", async () => {
     const { pi, commands, sent, activeTools } = makePi();
     registerGoalTool(pi);
@@ -2376,82 +2446,161 @@ describe("registerGoalTool", () => {
   });
 
   describe("state persistence across reload", () => {
-    it("stop survives a reload: the goal stays blocked, no footer, loop down", async () => {
-      const { pi, tools, commands, events, entries } = makePi();
+    // True round trips: mutations land in a fake branch via appendEntry, and a
+    // FRESH registration (empty memory) must reconstruct everything from that
+    // branch alone — remove the writes or the adoption and these fail.
+    const reloadWith = (entries: unknown[]) => {
+      const fresh = makePi();
       const notify = vi.fn();
       const setStatus = vi.fn();
+      registerGoalTool(fresh.pi, { verifyRunner: async () => failVerify });
+      const settleCtx = { ui: { notify, setStatus, setWidget: vi.fn() } } as unknown as ExtensionContext;
+      fire(fresh.events, "session_start", { ...sessionCtx(entries), ui: settleCtx.ui });
+      return { fresh, notify, setStatus, settleCtx };
+    };
+
+    it("stop survives a reload: the goal stays blocked, no footer, loop down", async () => {
+      const { pi, tools, commands, entries } = makePi();
+      const ui = { notify: vi.fn(), setStatus: vi.fn() };
       registerGoalTool(pi, { verifyRunner: async () => failVerify });
       await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
-      await commands.get("goal")!.handler("stop", { mode: "headless", ui: { notify, setStatus } });
-      expect(notify).toHaveBeenLastCalledWith("Goal #1 stopped.");
+      await commands.get("goal")!.handler("stop", { mode: "headless", ui });
+      expect(ui.notify).toHaveBeenLastCalledWith("Goal #1 stopped.");
+      // The durable write: an explicit latch on a blocked goal.
+      expect(entries.at(-1)).toMatchObject({
+        customType: "goal.state",
+        data: { goal: { status: "blocked" }, stopped: true },
+      });
 
-      // Reload: session_start re-adopts from the goal.state entries the set and
-      // the stop command appended — the stopped goal must NOT resurrect.
-      const settleCtx = { ui: { notify, setStatus, setWidget: vi.fn() } } as unknown as ExtensionContext;
-      fire(events, "session_start", { ...sessionCtx(entries), ui: { notify, setStatus } });
-      expect(await fire(events, "agent_before_settle", settleCtx)).toBeUndefined();
-      expect(setStatus).toHaveBeenLastCalledWith("goal", undefined);
+      const re = reloadWith(entries);
+      expect(await fire(re.fresh.events, "agent_before_settle", re.settleCtx)).toBeUndefined();
+      expect(re.setStatus).toHaveBeenLastCalledWith("goal", undefined);
+      // Adopted, not merely absent: the status command sees the blocked goal.
+      await re.fresh.commands.get("goal")!.handler("status", { mode: "headless", ui: re.settleCtx.ui });
+      expect(re.notify).toHaveBeenLastCalledWith(expect.stringContaining("(blocked)"));
     });
 
     it("pause survives a reload and /goal resume re-arms after it", async () => {
-      const { pi, tools, commands, events, entries, sentCustom } = makePi();
-      const notify = vi.fn();
-      const setStatus = vi.fn();
+      const { pi, tools, commands, entries } = makePi();
+      const ui = { notify: vi.fn(), setStatus: vi.fn() };
       registerGoalTool(pi, { verifyRunner: async () => failVerify });
       await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
-      await commands.get("goal")!.handler("pause", { mode: "headless", ui: { notify, setStatus } });
+      await commands.get("goal")!.handler("pause", { mode: "headless", ui });
 
-      const cmdCtx = { mode: "headless", ui: { notify, setStatus } };
-      const settleCtx = { ui: { notify, setStatus, setWidget: vi.fn() } } as unknown as ExtensionContext;
-      fire(events, "session_start", { ...sessionCtx(entries), ui: { notify, setStatus } });
-      expect(await fire(events, "agent_before_settle", settleCtx)).toBeUndefined(); // still paused
-
-      await commands.get("goal")!.handler("resume", cmdCtx);
-      expect(notify).toHaveBeenLastCalledWith("Goal #1 resumed.");
-      expect(await fire(events, "agent_before_settle", settleCtx)).toEqual({ continue: true });
-      expect(sentCustom).toHaveLength(1);
+      const re = reloadWith(entries);
+      expect(await fire(re.fresh.events, "agent_before_settle", re.settleCtx)).toBeUndefined(); // still paused
+      await re.fresh.commands.get("goal")!.handler("resume", { mode: "headless", ui: re.settleCtx.ui });
+      expect(re.notify).toHaveBeenLastCalledWith("Goal #1 resumed.");
+      expect(await fire(re.fresh.events, "agent_before_settle", re.settleCtx)).toEqual({ continue: true });
+      expect(re.fresh.sentCustom).toHaveLength(1);
     });
 
     it("an active goal survives a reload with its loop armed", async () => {
-      const { pi, tools, events, entries, sentCustom } = makePi();
-      const notify = vi.fn();
-      const setStatus = vi.fn();
+      const { pi, tools, entries } = makePi();
       registerGoalTool(pi, { verifyRunner: async () => failVerify });
       await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
 
-      const settleCtx = { ui: { notify, setStatus, setWidget: vi.fn() } } as unknown as ExtensionContext;
-      fire(events, "session_start", { ...sessionCtx(entries), ui: { notify, setStatus } });
-      expect(await fire(events, "agent_before_settle", settleCtx)).toEqual({ continue: true });
-      expect(sentCustom).toHaveLength(1);
+      // Empty memory + this branch must yield a running loop (a broken scan
+      // leaves no goal and a silent settle instead).
+      const re = reloadWith(entries);
+      expect(await fire(re.fresh.events, "agent_before_settle", re.settleCtx)).toEqual({ continue: true });
+      expect(re.fresh.sentCustom).toHaveLength(1);
     });
 
     it("a model set while the loop is stopped keeps the latch across a reload", async () => {
-      const { pi, tools, commands, events, entries } = makePi();
-      const notify = vi.fn();
-      const setStatus = vi.fn();
-      const cmdCtx = { mode: "headless", ui: { notify, setStatus } };
+      const { pi, tools, commands, entries } = makePi();
+      const ui = { notify: vi.fn(), setStatus: vi.fn() };
       registerGoalTool(pi, { verifyRunner: async () => failVerify });
       await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "first", verify: "npm test" });
-      await commands.get("goal")!.handler("stop", cmdCtx);
+      await commands.get("goal")!.handler("stop", { mode: "headless", ui });
 
-      // The warp3090 shape: the model sets a new goal while the loop is down.
-      // The set persists {goal: active #2, stopped: true} — a reload must not
-      // silently re-arm it, and the footer must show the halt, not a clock.
+      // The warp3090 shape: the model sets a new goal while the loop is down —
+      // the set persists {goal: active #2, stopped: true}.
       const r = (await tools.get(GOAL_TOOL_NAME)!.execute("2", {
         action: "set",
         objective: "second",
         verify: "npm test",
       })) as { content: Array<{ type: string; text: string }> };
       expect(r.content[0].text).toContain("loop is STOPPED");
+      expect(entries.at(-1)).toMatchObject({
+        customType: "goal.state",
+        data: { goal: { id: 2, status: "active" }, stopped: true },
+      });
 
-      const settleCtx = { ui: { notify, setStatus, setWidget: vi.fn() } } as unknown as ExtensionContext;
-      fire(events, "session_start", { ...sessionCtx(entries), ui: { notify, setStatus } });
-      expect(await fire(events, "agent_before_settle", settleCtx)).toBeUndefined(); // latch survived
-      expect(setStatus).toHaveBeenLastCalledWith("goal", "goal · halted — /goal resume re-arms");
+      const re = reloadWith(entries);
+      expect(await fire(re.fresh.events, "agent_before_settle", re.settleCtx)).toBeUndefined(); // latch survived
+      expect(re.setStatus).toHaveBeenLastCalledWith("goal", "goal · halted — /goal resume re-arms");
+      await re.fresh.commands.get("goal")!.handler("resume", { mode: "headless", ui: re.settleCtx.ui });
+      expect(await fire(re.fresh.events, "agent_before_settle", re.settleCtx)).toEqual({ continue: true });
+    });
 
-      // And recovery survives the reload too.
-      await commands.get("goal")!.handler("resume", cmdCtx);
-      expect(await fire(events, "agent_before_settle", settleCtx)).toEqual({ continue: true });
+    it("a terminal goal (model blocked) derives no latch — a later set runs free", async () => {
+      // The blocked action persists {goal: blocked} with NO latch. A fresh
+      // registration must reconstruct blocked-but-unlatched, so the model's
+      // next set behaves exactly as it would without the reload (previously
+      // the derived latch poisoned the new goal's state entry).
+      const { pi, tools, entries } = makePi();
+      registerGoalTool(pi, { verifyRunner: async () => failVerify });
+      await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "first", verify: "npm test" });
+      await tools.get(GOAL_TOOL_NAME)!.execute("2", {
+        action: "blocked",
+        goalId: 1,
+        reason: "user pivoted",
+      });
+      expect(entries.at(-1)).toMatchObject({ data: { goal: { status: "blocked" } } });
+      expect((entries.at(-1) as { data: { stopped?: unknown } }).data.stopped).toBeUndefined();
+
+      const re = reloadWith(entries);
+      expect(await fire(re.fresh.events, "agent_before_settle", re.settleCtx)).toBeUndefined(); // terminal guard
+      // Adoption identity: the blocked goal really was reconstructed (goalSeq
+      // resumed from it — the set below creates goal #2, not #1 again).
+      await re.fresh.commands.get("goal")!.handler("status", { mode: "headless", ui: re.settleCtx.ui });
+      expect(re.notify).toHaveBeenLastCalledWith(expect.stringContaining("(blocked)"));
+      const r = (await re.fresh.tools.get(GOAL_TOOL_NAME)!.execute("3", {
+        action: "set",
+        objective: "second",
+        verify: "npm test",
+      })) as { content: Array<{ type: string; text: string }> };
+      expect(r.content[0].text).toContain("Goal #2 set");
+      expect(r.content[0].text).not.toContain("loop is STOPPED");
+      expect(await fire(re.fresh.events, "agent_before_settle", re.settleCtx)).toEqual({ continue: true });
+    });
+
+    it("blocked and complete survive a reload as terminal states", async () => {
+      const { pi, tools, entries } = makePi();
+      registerGoalTool(pi, { verifyRunner: async () => failVerify });
+      await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
+      await tools.get(GOAL_TOOL_NAME)!.execute("2", {
+        action: "blocked",
+        goalId: 1,
+        reason: "user pivoted",
+      });
+
+      // Blocked: loop down via the status guard, but the goal tool stays
+      // active (blocked ≠ complete) and the state reports terminal.
+      const re = reloadWith(entries);
+      expect(await fire(re.fresh.events, "agent_before_settle", re.settleCtx)).toBeUndefined();
+      expect(re.fresh.activeTools).toContain(GOAL_TOOL_NAME);
+      await re.fresh.commands.get("goal")!.handler("status", { mode: "headless", ui: re.settleCtx.ui });
+      expect(re.notify).toHaveBeenLastCalledWith(expect.stringContaining("(blocked)"));
+
+      // Complete: same loop-down, but the goal tool is NOT re-activated.
+      const done = makePi();
+      registerGoalTool(done.pi, {
+        verifyRunner: async () => ({ ok: true, exitCode: 0, timedOut: false, output: "PASS" }),
+      });
+      await done.tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
+      await done.tools.get(GOAL_TOOL_NAME)!.execute("2", {
+        action: "complete",
+        goalId: 1,
+        summary: "done",
+        evidence: ["PASS"],
+      });
+      const rd = reloadWith(done.entries);
+      expect(await fire(rd.fresh.events, "agent_before_settle", rd.settleCtx)).toBeUndefined();
+      expect(rd.fresh.activeTools).not.toContain(GOAL_TOOL_NAME);
+      await rd.fresh.commands.get("goal")!.handler("status", { mode: "headless", ui: rd.settleCtx.ui });
+      expect(rd.notify).toHaveBeenLastCalledWith(expect.stringContaining("(complete)"));
     });
   });
 

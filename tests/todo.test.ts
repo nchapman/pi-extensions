@@ -424,14 +424,22 @@ describe("registerTodoTool", () => {
   });
 
   it("adopts the todo.state entries a tool call persisted, across a reload", async () => {
-    const { pi, tools, events, entries } = makePi();
+    // Round trip through a FRESH registration: the write lands in the fake
+    // branch, and empty memory must reconstruct the list from it alone.
+    const { pi, tools, entries } = makePi();
     registerTodoTool(pi);
     await tools.get(TODO_TOOL_NAME)!.execute("1", { todos: [item("persisted", "in_progress")] });
     expect(entries).toHaveLength(1);
 
-    fire(events, "session_start", { sessionManager: { getBranch: () => entries } } as unknown as ExtensionContext);
+    const reloaded = makePi();
+    registerTodoTool(reloaded.pi);
+    fire(reloaded.events, "session_start", {
+      sessionManager: { getBranch: () => entries },
+    } as unknown as ExtensionContext);
     // Prove adoption: a rejected update echoes the adopted list as current.
-    const r = (await tools.get(TODO_TOOL_NAME)!.execute("2", { todos: "bogus" })) as { details: TodoDetails };
+    const r = (await reloaded.tools.get(TODO_TOOL_NAME)!.execute("2", { todos: "bogus" })) as {
+      details: TodoDetails;
+    };
     expect(r.details.todos).toEqual([item("persisted", "in_progress")]);
   });
 

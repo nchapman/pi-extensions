@@ -45,7 +45,6 @@ import {
   type RecallConfig,
   type SearchHit,
 } from "../extensions/recall";
-import { TODO_TOOL_NAME } from "../extensions/todo";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -2403,9 +2402,9 @@ describe("compaction summary ownership", () => {
     };
   }
 
-  /** A todo tool-result snapshot on the branch, as the todo extension records it. */
+  /** A todo.state branch entry, as the todo extension records it (appendEntry). */
   function todoSnapshotEntry(todos: Array<{ content: string; status: string }>) {
-    return msgEntry("toolResult", { toolName: TODO_TOOL_NAME, details: { todos } });
+    return { type: "custom", customType: "todo.state", data: { todos } };
   }
 
   it("generates the summary with the extension's own prompt via modelRegistry.complete", async () => {

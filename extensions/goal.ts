@@ -1017,11 +1017,14 @@ function isGoalStateData(d: unknown): d is GoalStateData {
   return data.stopped === undefined || typeof data.stopped === "boolean";
 }
 
-/** Derive the loop latch from a state entry: an explicit flag wins; otherwise
- * a non-active goal (complete/blocked/paused snapshot) means the loop is down. */
+/** Derive the loop latch from a state entry: an explicit flag wins.
+ * Without one, only a paused goal means "halted" — blocked/complete goals keep
+ * the loop down through the status guards, so deriving a latch from them
+ * would let a later model `set` inherit a permanent stop the user never made
+ * (the derived value differed depending on whether a reload happened). */
 function stoppedFromState(data: GoalStateData): boolean {
   if (typeof data.stopped === "boolean") return data.stopped;
-  return data.goal ? data.goal.status !== "active" : false;
+  return data.goal?.status === "paused";
 }
 
 /** Reconstruct goal state from the session branch: the newest goal.state
@@ -1197,13 +1200,13 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     shuttingDown = false; // a new session in this process re-arms everything —
     // the latch must apply only to the in-flight settle of the teardown itself
     // (extension closures survive session replacement: new/resume/fork)
-    // Re-arm the continuation loop for an active goal unless the persisted
-    // latch says otherwise (a stop/pause, or a model set while stopped); a
-    // finished or blocked snapshot stays disarmed. A branch with NO goal (a
-    // fresh session) stays armed — disarming there would kill the loop for a
-    // goal the model sets later in the same session, since a model set never
-    // re-arms.
-    stopped = sessionStopped ?? (g ? g.status !== "active" : false);
+    // Re-arm the continuation loop unless the persisted latch says otherwise
+    // (stop/pause, or a model set while stopped). Terminal goals keep the loop
+    // down through the status guards; only an explicit flag (or a legacy
+    // paused entry) yields a latch. A branch with NO goal stays armed —
+    // disarming there would kill the loop for a goal the model sets later in
+    // the same session, since a model set never re-arms.
+    stopped = sessionStopped ?? false;
     if (g && g.status !== "complete") activateTool();
     updateFooter();
   };
@@ -1931,7 +1934,12 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
       }
       activateTool();
       if (goal) {
-        goal = { ...goal, status: "active" };
+        // A kickoff is a deliberate engagement: release the loop latch durably
+        // so a reload between here and the model's set cannot re-instate a
+        // superseded stop onto the goal the user is replacing. Only a paused
+        // goal is resurrected to active; terminal goals keep their status —
+        // the model's set persists the replacement goal (and its own state).
+        goal = goal.status === "paused" ? { ...goal, status: "active" } : goal;
         stopped = false;
         persistGoalState(false);
       }
