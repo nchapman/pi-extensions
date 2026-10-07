@@ -9,9 +9,12 @@
  * - Updates that drop unfinished items are accepted with a note naming them:
  *   deliberate restructuring (reword, split, abandon) stays friction-free
  *   while accidental drops remain visible
- * - State snapshots ride in tool-result `details`; replaying the session
- *   branch on session_start/session_tree restores the right list for every
- *   branch, rewind, and resume (no filesystem, nothing desyncs)
+ * - State is persisted as `todo.state` custom entries via pi.appendEntry on
+ *   every successful write (the shared branch-state pattern from lib/branchstate:
+ *   same mechanism pi's codemode store uses) and reconstructed on
+ *   session_start/session_tree by scanning the branch — durable, invisible to
+ *   the model, correct across reload/rewind/resume. Tool-result `details` are
+ *   render-only
  * - One-shot reminders on before_agent_start when the plan is unfinished and
  *   stale (or compaction wiped it — summaries never carry the plan: recall
  *   re-injects it as a tail message after mid-run drafts, and this reminder
@@ -23,6 +26,7 @@
  */
 
 import { isWakeMessage } from "../lib/superbash";
+import { scanCustomState } from "../lib/branchstate";
 import { matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
@@ -37,7 +41,8 @@ export interface TodoItem {
   status: TodoStatus;
 }
 
-/** Snapshot carried by every todo tool result (see reconstruct). */
+/** Snapshot carried by every todo tool result — render-only; durable state
+ * lives in todo.state branch entries (see TODO_STATE_TYPE). */
 export interface TodoDetails {
   todos: TodoItem[];
   error?: string;
@@ -327,39 +332,35 @@ class TodoListComponent {
   }
 }
 
+/** customType of the durable todo-state entries (pi.appendEntry): the single
+ * source of truth for the list across reload/rewind/resume. */
+export const TODO_STATE_TYPE = "todo.state";
+
+interface TodoStateData {
+  todos: TodoItem[];
+}
+
+function isTodoStateData(d: unknown): d is TodoStateData {
+  const data = d as Partial<TodoStateData> | null;
+  return !!data && typeof data === "object" && Array.isArray(data.todos);
+}
+
 /** Loose entry shape so the scan accepts both SessionEntry[] and test doubles. */
 type TodoBranchEntry = {
   type?: string;
-  summary?: unknown;
   customType?: unknown;
-  message?: { role?: string; content?: unknown; toolName?: string; details?: unknown } | null;
+  data?: unknown;
+  // Branches mix entry kinds (messages, compactions); the scan only reads the
+  // fields above — `message` keeps foreign entries type-compatible in tests.
+  message?: unknown;
 };
 
-/**
- * One scan of the branch: the newest valid todo snapshot (tool results carry
- * the state) and its index, -1 when none. Snapshots with malformed details
- * never win — the scan keeps the last one whose `details.todos` is an array.
- */
-function scanTodoSnapshots(branch: TodoBranchEntry[]): { todos: TodoItem[]; index: number } {
-  let todos: TodoItem[] = [];
-  let index = -1;
-  for (let i = 0; i < branch.length; i++) {
-    const entry = branch[i];
-    if (entry.type !== "message") continue;
-    const msg = entry.message;
-    if (msg?.role !== "toolResult" || msg.toolName !== TODO_TOOL_NAME) continue;
-    const d = msg.details as TodoDetails | undefined;
-    if (!Array.isArray(d?.todos)) continue;
-    // Filter in place — intermediate snapshots are throwaway work.
-    todos = d.todos.filter(isTodoItem);
-    index = i;
-  }
-  return { todos, index };
-}
-
-/** Newest todo snapshot recorded on the session branch (tool results carry the state). */
+/** Newest todo list recorded on the session branch (todo.state entries carry the state). */
 export function lastTodoSnapshot(branch: TodoBranchEntry[]): TodoItem[] {
-  return scanTodoSnapshots(branch).todos;
+  const data = scanCustomState(branch, TODO_STATE_TYPE, isTodoStateData).data;
+  // Filter in place — a malformed item inside a valid-shaped entry must not
+  // surface as a phantom task (recall renders this list verbatim).
+  return data ? data.todos.filter(isTodoItem) : [];
 }
 
 /** Title of the plan block in recall's post-compaction plan message. */
@@ -383,7 +384,10 @@ const PLAN_CARRIERS = new Set([PLAN_MESSAGE_TYPE, TODO_REMINDER_TYPE]);
  */
 function reconstructFromSession(ctx: ExtensionContext): { todos: TodoItem[]; planHiddenByCompaction: boolean } {
   const branch = ctx.sessionManager.getBranch() as TodoBranchEntry[];
-  const { todos, index: lastIndex } = scanTodoSnapshots(branch);
+  const { data, index: lastIndex } = scanCustomState(branch, TODO_STATE_TYPE, isTodoStateData);
+  // Filter in place — a malformed item inside a valid-shaped entry must not
+  // resurrect as a phantom task.
+  const todos = data ? data.todos.filter(isTodoItem) : [];
   // Only the newest compaction after the snapshot decides: a later one folds
   // the earlier and is what the context actually shows.
   let lastCompactionIndex = -1;
@@ -471,6 +475,9 @@ export function registerTodoTool(pi: ExtensionAPI): void {
       const dropped = droppedUnfinishedItems(todos, next);
       const changes = summarizeChanges(todos, next);
       todos = next;
+      // Durable state: the branch entry is the single source of truth across
+      // reload/rewind/resume; the tool-result details below are render-only.
+      pi.appendEntry(TODO_STATE_TYPE, { todos: todos.map((t) => ({ ...t })) });
       turnsSinceUpdate = 0;
       compactedSinceUpdate = false;
       const note =

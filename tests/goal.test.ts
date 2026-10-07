@@ -31,7 +31,7 @@ import {
   renderGoalResult,
   renderGoalReminder,
   runVerify,
-  scanGoalBranch,
+  scanGoalState,
   validateCriteria,
   validateObjective,
   validateVerify,
@@ -86,6 +86,9 @@ function makePi() {
   const activeTools: string[] = ["read", "bash"];
   const sent: Array<{ text: string; opts?: unknown }> = [];
   const sentCustom: Array<{ msg: unknown; opts?: unknown }> = [];
+  // Custom state entries appended via pi.appendEntry — hand the same array to
+  // sessionCtx(entries) to simulate a reload picking them up from the branch.
+  const entries: Array<{ type: string; customType: string; data?: unknown }> = [];
   const messageRenderers = new Map<string, (message: never, options: never, theme: never) => unknown>();
   const pi = {
     registerTool: (t: {
@@ -121,11 +124,14 @@ function makePi() {
     sendMessage: (msg: unknown, opts?: unknown) => {
       sentCustom.push({ msg, opts });
     },
+    appendEntry: (customType: string, data?: unknown) => {
+      entries.push({ type: "custom", customType, data });
+    },
     registerMessageRenderer: (type: string, renderer: (message: never, options: never, theme: never) => unknown) => {
       messageRenderers.set(type, renderer);
     },
   } as unknown as ExtensionAPI;
-  return { pi, tools, commands, events, activeTools, sent, sentCustom, messageRenderers };
+  return { pi, tools, commands, events, activeTools, sent, sentCustom, messageRenderers, entries };
 }
 
 /** Fire a captured event handler (an optional event body overrides the synthesized one). */
@@ -141,8 +147,12 @@ function fire(
 }
 
 /** Build a branch where each snapshot is a goal tool result carrying that goal. */
-function goalSnapshot(g: Goal) {
-  return { type: "message", message: { role: "toolResult", toolName: GOAL_TOOL_NAME, details: { goal: g } } };
+function goalState(g: Goal, stopped?: boolean) {
+  return {
+    type: "custom",
+    customType: "goal.state",
+    data: stopped === undefined ? { goal: g } : { goal: g, stopped },
+  };
 }
 
 function sessionCtx(entries: unknown[]): ExtensionContext {
@@ -434,73 +444,73 @@ describe("renderGoalResult", () => {
   });
 });
 
-describe("scanGoalBranch / lastGoalSnapshot", () => {
+describe("scanGoalState / lastGoalSnapshot", () => {
   it("returns the newest valid goal snapshot", () => {
-    const branch = [goalSnapshot(goal({ id: 1 })), goalSnapshot(goal({ id: 2, objective: "newer" }))];
+    const branch = [goalState(goal({ id: 1 })), goalState(goal({ id: 2, objective: "newer" }))];
     expect(lastGoalSnapshot(branch)).toEqual(goal({ id: 2, objective: "newer" }));
   });
-  it("returns null when there is no goal snapshot", () => {
+  it("returns null when there is no goal state entry", () => {
     expect(lastGoalSnapshot([{ type: "message", message: { role: "user", content: "hi" } }])).toBeNull();
     expect(lastGoalSnapshot([])).toBeNull();
   });
-  it("skips malformed snapshots, keeping the newest valid one", () => {
+  it("skips malformed state entries, keeping the newest valid one", () => {
     const branch = [
-      goalSnapshot(goal({ id: 1 })),
+      goalState(goal({ id: 1 })),
       { type: "message", message: { role: "toolResult", toolName: GOAL_TOOL_NAME, details: { goal: "bad" } } },
       { type: "message", message: { role: "toolResult", toolName: "read", details: { goal: goal({ id: 9 }) } } },
     ];
     expect(lastGoalSnapshot(branch)).toEqual(goal({ id: 1 }));
   });
   it("reports a compaction after the snapshot as hiding the goal", () => {
-    const branch = [goalSnapshot(goal({ id: 1 })), { type: "compaction" }];
-    expect(scanGoalBranch(branch).hiddenByCompaction).toBe(true);
+    const branch = [goalState(goal({ id: 1 })), { type: "compaction" }];
+    expect(scanGoalState(branch).hiddenByCompaction).toBe(true);
   });
   it("does not hide the goal when a reminder carrier follows the compaction", () => {
     const branch = [
-      goalSnapshot(goal({ id: 1 })),
+      goalState(goal({ id: 1 })),
       { type: "compaction" },
       { type: "custom_message", customType: GOAL_REMINDER_TYPE, content: "GOAL REMINDER" },
     ];
-    expect(scanGoalBranch(branch).hiddenByCompaction).toBe(false);
+    expect(scanGoalState(branch).hiddenByCompaction).toBe(false);
   });
   it("does not hide the goal when a turn-end check carrier follows the compaction", () => {
     // A goal.check message after a compaction restates the objective too, so it
     // is a carrier like the reminder — no redundant re-injection on resume.
     const branch = [
-      goalSnapshot(goal({ id: 1 })),
+      goalState(goal({ id: 1 })),
       { type: "compaction" },
       { type: "custom_message", customType: GOAL_CHECK_TYPE, content: "GOAL CHECK" },
     ];
-    expect(scanGoalBranch(branch).hiddenByCompaction).toBe(false);
+    expect(scanGoalState(branch).hiddenByCompaction).toBe(false);
   });
   it("does not hide a non-active goal even after compaction", () => {
-    const branch = [goalSnapshot(goal({ id: 1, status: "paused" })), { type: "compaction" }];
-    expect(scanGoalBranch(branch).hiddenByCompaction).toBe(false);
+    const branch = [goalState(goal({ id: 1, status: "paused" })), { type: "compaction" }];
+    expect(scanGoalState(branch).hiddenByCompaction).toBe(false);
   });
   it("does not hide the goal when the compaction is before the snapshot", () => {
-    const branch = [{ type: "compaction" }, goalSnapshot(goal({ id: 1 }))];
-    expect(scanGoalBranch(branch).hiddenByCompaction).toBe(false);
+    const branch = [{ type: "compaction" }, goalState(goal({ id: 1 }))];
+    expect(scanGoalState(branch).hiddenByCompaction).toBe(false);
   });
   it("lets only the newest compaction after the snapshot decide", () => {
     // A reminder carrier after the second compaction clears the hide.
     const withCarrier = [
-      goalSnapshot(goal({ id: 1 })),
+      goalState(goal({ id: 1 })),
       { type: "compaction" },
       { type: "compaction" },
       { type: "custom_message", customType: GOAL_REMINDER_TYPE, content: "GOAL REMINDER" },
     ];
-    expect(scanGoalBranch(withCarrier).hiddenByCompaction).toBe(false);
+    expect(scanGoalState(withCarrier).hiddenByCompaction).toBe(false);
     // No carrier after the second compaction: still hidden.
-    const noCarrier = [goalSnapshot(goal({ id: 1 })), { type: "compaction" }, { type: "compaction" }];
-    expect(scanGoalBranch(noCarrier).hiddenByCompaction).toBe(true);
+    const noCarrier = [goalState(goal({ id: 1 })), { type: "compaction" }, { type: "compaction" }];
+    expect(scanGoalState(noCarrier).hiddenByCompaction).toBe(true);
     // A carrier after only the first compaction does not clear the second.
     const staleCarrier = [
-      goalSnapshot(goal({ id: 1 })),
+      goalState(goal({ id: 1 })),
       { type: "compaction" },
       { type: "custom_message", customType: GOAL_REMINDER_TYPE, content: "GOAL REMINDER" },
       { type: "compaction" },
     ];
-    expect(scanGoalBranch(staleCarrier).hiddenByCompaction).toBe(true);
+    expect(scanGoalState(staleCarrier).hiddenByCompaction).toBe(true);
   });
 });
 
@@ -910,7 +920,7 @@ describe("registerGoalTool — verify", () => {
   });
 
   it("carries verify through the branch snapshot", () => {
-    const { goal: scanned } = scanGoalBranch([goalSnapshot(goal({ verify: "npm test" }))]);
+    const { goal: scanned } = scanGoalState([goalState(goal({ verify: "npm test" }))]);
     expect(scanned!.verify).toBe("npm test");
   });
 });
@@ -999,7 +1009,7 @@ describe("registerGoalTool", () => {
     const { pi, tools, events } = makePi();
     registerGoalTool(pi);
 
-    fire(events, "session_start", sessionCtx([goalSnapshot(goal({ id: 7, objective: "resumed" }))]));
+    fire(events, "session_start", sessionCtx([goalState(goal({ id: 7, objective: "resumed" }))]));
 
     // The tool is re-activated for an unfinished goal.
     const tool = tools.get(GOAL_TOOL_NAME)!;
@@ -1010,7 +1020,7 @@ describe("registerGoalTool", () => {
   it("does not re-activate the tool for a completed goal on resume", async () => {
     const { pi, events, activeTools } = makePi();
     registerGoalTool(pi);
-    fire(events, "session_start", sessionCtx([goalSnapshot(goal({ id: 3, status: "complete" }))]));
+    fire(events, "session_start", sessionCtx([goalState(goal({ id: 3, status: "complete" }))]));
     expect(activeTools).not.toContain(GOAL_TOOL_NAME);
   });
 
@@ -1067,7 +1077,7 @@ describe("registerGoalTool", () => {
   it("re-adopts goal state from the branch on session_tree, not only session_start", async () => {
     const { pi, tools, events } = makePi();
     registerGoalTool(pi);
-    const branch = [goalSnapshot(goal({ id: 5, objective: "carried over" }))];
+    const branch = [goalState(goal({ id: 5, objective: "carried over" }))];
     fire(events, "session_tree", sessionCtx(branch));
 
     const result = (await tools.get(GOAL_TOOL_NAME)!.execute("1", {
@@ -1551,7 +1561,7 @@ describe("registerGoalTool", () => {
     // session replacement (new/resume/fork re-run session_start), so an
     // aborted check in the NEXT session must still re-engage.
     fire(events, "session_start", {
-      sessionManager: { getBranch: () => [goalSnapshot(goal({ id: 1, verify: "npm test" }))] },
+      sessionManager: { getBranch: () => [goalState(goal({ id: 1, verify: "npm test" }))] },
       ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() },
     } as unknown as ExtensionContext);
     hangNext = true;
@@ -1637,7 +1647,7 @@ describe("registerGoalTool", () => {
     expect(notify).toHaveBeenCalledTimes(1);
 
     // Resume re-derives the (still active) goal and re-arms the loop.
-    const branch = [goalSnapshot(goal({ id: 1, objective: "resumable", verify: "npm test", status: "active" }))];
+    const branch = [goalState(goal({ id: 1, objective: "resumable", verify: "npm test", status: "active" }))];
     fire(events, "session_start", sessionCtx(branch));
     expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // re-engages with a fresh budget
     expect(sentCustom).toHaveLength(2);
@@ -1965,7 +1975,7 @@ describe("registerGoalTool", () => {
     });
     // Seed the goal via resume (bypasses the set-time preflight, which would
     // surface the injected throw directly) — the house pattern.
-    fire(events, "session_start", sessionCtx([goalSnapshot(goal({ id: 1, objective: "x", verify: "npm test" }))]));
+    fire(events, "session_start", sessionCtx([goalState(goal({ id: 1, objective: "x", verify: "npm test" }))]));
 
     expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
     expect(setWidget).toHaveBeenCalledWith("goal-check", expect.any(Function));
@@ -2131,7 +2141,7 @@ describe("registerGoalTool", () => {
     });
 
     // Seed the goal via resume (bypasses the set-time preflight).
-    fire(events, "session_start", sessionCtx([goalSnapshot(goal({ id: 1, objective: "x", verify: "npm test" }))]));
+    fire(events, "session_start", sessionCtx([goalState(goal({ id: 1, objective: "x", verify: "npm test" }))]));
 
     expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
     const msg = sentCustom[0] as { msg: { content: string } };
@@ -2305,9 +2315,9 @@ describe("registerGoalTool", () => {
     expect(await fire(events, "agent_before_settle", settleCtx)).toEqual({ continue: true });
     expect(sentCustom).toHaveLength(2);
 
-    // Resuming with no paused goal is a no-op.
+    // Resuming with no paused or stopped goal is a no-op.
     await commands.get("goal")!.handler("resume", cmdCtx);
-    expect(notify).toHaveBeenLastCalledWith("No paused goal to resume.");
+    expect(notify).toHaveBeenLastCalledWith("No paused or stopped goal to resume.");
   });
 
   it("the model cannot set, stop, or work a paused goal away from the user", async () => {
@@ -2327,6 +2337,122 @@ describe("registerGoalTool", () => {
     // /goal stop accepts a paused goal (strictly stronger than pause).
     await commands.get("goal")!.handler("stop", { mode: "headless", ui });
     expect(ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("stopped"));
+  });
+
+  it("a set while the loop is stopped warns instead of trapping — and /goal resume re-arms the active goal", async () => {
+    const { pi, tools, commands, events, sentCustom } = makePi();
+    const notify = vi.fn();
+    const setStatus = vi.fn();
+    const cmdCtx = { mode: "headless", ui: { notify, setStatus } };
+    const settleCtx = { ui: { notify, setStatus, setWidget: vi.fn() } } as unknown as ExtensionContext;
+    registerGoalTool(pi, { maxContinuations: 1, verifyRunner: async () => failVerify });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "first", verify: "npm test" });
+
+    // Burn the 1-continuation budget and trip the cap: stopped = true, the
+    // goal itself stays active — the production trap shape from warp3090.
+    expect(await fire(events, "agent_before_settle", settleCtx)).toEqual({ continue: true });
+    expect(await fire(events, "agent_before_settle", settleCtx)).toBeUndefined();
+    expect(notify).toHaveBeenLastCalledWith(expect.stringContaining("still active after"));
+
+    // A model set re-activates a NEW goal (allowed — the cap says "adjust it")
+    // but the loop stays dead: both sides must be told, not trapped silently.
+    const r = (await tools.get(GOAL_TOOL_NAME)!.execute("2", {
+      action: "set",
+      objective: "second",
+      verify: "npm test",
+    })) as { content: Array<{ type: string; text: string }> };
+    expect(r.content[0].text).toContain("loop is STOPPED");
+    expect(r.content[0].text).toContain("/goal resume");
+    expect(notify).toHaveBeenLastCalledWith(expect.stringContaining("loop is stopped"));
+    expect(await fire(events, "agent_before_settle", settleCtx)).toBeUndefined(); // still dead
+    expect(sentCustom).toHaveLength(1);
+
+    // Recovery: resume accepts an ACTIVE-but-stopped goal (the old guard only
+    // took paused, leaving this state unrecoverable short of a new kickoff).
+    await commands.get("goal")!.handler("resume", cmdCtx);
+    expect(notify).toHaveBeenLastCalledWith("Goal #2 resumed.");
+    expect(await fire(events, "agent_before_settle", settleCtx)).toEqual({ continue: true }); // re-armed
+    expect(sentCustom).toHaveLength(2);
+  });
+
+  describe("state persistence across reload", () => {
+    it("stop survives a reload: the goal stays blocked, no footer, loop down", async () => {
+      const { pi, tools, commands, events, entries } = makePi();
+      const notify = vi.fn();
+      const setStatus = vi.fn();
+      registerGoalTool(pi, { verifyRunner: async () => failVerify });
+      await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
+      await commands.get("goal")!.handler("stop", { mode: "headless", ui: { notify, setStatus } });
+      expect(notify).toHaveBeenLastCalledWith("Goal #1 stopped.");
+
+      // Reload: session_start re-adopts from the goal.state entries the set and
+      // the stop command appended — the stopped goal must NOT resurrect.
+      const settleCtx = { ui: { notify, setStatus, setWidget: vi.fn() } } as unknown as ExtensionContext;
+      fire(events, "session_start", { ...sessionCtx(entries), ui: { notify, setStatus } });
+      expect(await fire(events, "agent_before_settle", settleCtx)).toBeUndefined();
+      expect(setStatus).toHaveBeenLastCalledWith("goal", undefined);
+    });
+
+    it("pause survives a reload and /goal resume re-arms after it", async () => {
+      const { pi, tools, commands, events, entries, sentCustom } = makePi();
+      const notify = vi.fn();
+      const setStatus = vi.fn();
+      registerGoalTool(pi, { verifyRunner: async () => failVerify });
+      await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
+      await commands.get("goal")!.handler("pause", { mode: "headless", ui: { notify, setStatus } });
+
+      const cmdCtx = { mode: "headless", ui: { notify, setStatus } };
+      const settleCtx = { ui: { notify, setStatus, setWidget: vi.fn() } } as unknown as ExtensionContext;
+      fire(events, "session_start", { ...sessionCtx(entries), ui: { notify, setStatus } });
+      expect(await fire(events, "agent_before_settle", settleCtx)).toBeUndefined(); // still paused
+
+      await commands.get("goal")!.handler("resume", cmdCtx);
+      expect(notify).toHaveBeenLastCalledWith("Goal #1 resumed.");
+      expect(await fire(events, "agent_before_settle", settleCtx)).toEqual({ continue: true });
+      expect(sentCustom).toHaveLength(1);
+    });
+
+    it("an active goal survives a reload with its loop armed", async () => {
+      const { pi, tools, events, entries, sentCustom } = makePi();
+      const notify = vi.fn();
+      const setStatus = vi.fn();
+      registerGoalTool(pi, { verifyRunner: async () => failVerify });
+      await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
+
+      const settleCtx = { ui: { notify, setStatus, setWidget: vi.fn() } } as unknown as ExtensionContext;
+      fire(events, "session_start", { ...sessionCtx(entries), ui: { notify, setStatus } });
+      expect(await fire(events, "agent_before_settle", settleCtx)).toEqual({ continue: true });
+      expect(sentCustom).toHaveLength(1);
+    });
+
+    it("a model set while the loop is stopped keeps the latch across a reload", async () => {
+      const { pi, tools, commands, events, entries } = makePi();
+      const notify = vi.fn();
+      const setStatus = vi.fn();
+      const cmdCtx = { mode: "headless", ui: { notify, setStatus } };
+      registerGoalTool(pi, { verifyRunner: async () => failVerify });
+      await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "first", verify: "npm test" });
+      await commands.get("goal")!.handler("stop", cmdCtx);
+
+      // The warp3090 shape: the model sets a new goal while the loop is down.
+      // The set persists {goal: active #2, stopped: true} — a reload must not
+      // silently re-arm it, and the footer must show the halt, not a clock.
+      const r = (await tools.get(GOAL_TOOL_NAME)!.execute("2", {
+        action: "set",
+        objective: "second",
+        verify: "npm test",
+      })) as { content: Array<{ type: string; text: string }> };
+      expect(r.content[0].text).toContain("loop is STOPPED");
+
+      const settleCtx = { ui: { notify, setStatus, setWidget: vi.fn() } } as unknown as ExtensionContext;
+      fire(events, "session_start", { ...sessionCtx(entries), ui: { notify, setStatus } });
+      expect(await fire(events, "agent_before_settle", settleCtx)).toBeUndefined(); // latch survived
+      expect(setStatus).toHaveBeenLastCalledWith("goal", "goal · halted — /goal resume re-arms");
+
+      // And recovery survives the reload too.
+      await commands.get("goal")!.handler("resume", cmdCtx);
+      expect(await fire(events, "agent_before_settle", settleCtx)).toEqual({ continue: true });
+    });
   });
 
   it("resume re-arms the continuation budget", async () => {
@@ -2370,7 +2496,7 @@ describe("registerGoalTool", () => {
     // While paused: every agent start carries a do-not-work-on-it steer —
     // the model's context still holds the original "work toward it" instruction.
     const paused = fire(events, "before_agent_start") as { message: { customType: string; content: string } };
-    // Its own type, not goal.reminder: scanGoalBranch treats post-compaction
+    // Its own type, not goal.reminder: scanGoalState treats post-compaction
     // goal.reminder messages as proof the goal is in context, and a paused
     // steer masquerading as one would mask compaction of the real reminder.
     expect(paused.message.customType).toBe("goal.paused");
@@ -2392,7 +2518,7 @@ describe("registerGoalTool", () => {
     // A view-only status command must leave the branch (and thus resume) intact.
     await commands.get("goal")!.handler("status", ctx);
 
-    const branch = [goalSnapshot(goal({ id: 1, objective: "persisted" }))];
+    const branch = [goalState(goal({ id: 1, objective: "persisted" }))];
     fire(events, "session_start", sessionCtx(branch));
     // After resume the goal is #1 and active: a stale-id complete is rejected
     // naming #1, proving the state was re-adopted from the branch.

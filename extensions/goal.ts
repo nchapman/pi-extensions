@@ -4,9 +4,11 @@
  *
  * Design (a deliberate cut of pi-goal, keeping the parent context small):
  * - one active goal per session, thread-owned (not a global per-directory
- *   goal). State snapshots ride in the goal tool result `details` and are
- *   reconstructed on session_start / session_tree — the branch-safe pattern
- *   from todo.ts, no filesystem, nothing desyncs on rewind or resume
+ *   goal). State — the goal plus the session loop latch — is persisted as
+ *   `goal.state` custom entries via pi.appendEntry on every mutation (tool
+ *   actions and user commands alike) and reconstructed on session_start /
+ *   session_tree by scanning the branch: durable, invisible to the model, and
+ *   correct across reload/rewind/resume. Tool-result `details` are render-only
  * - one tool, `goal`, with an `action` discriminator (set | complete | blocked)
  *   instead of three separate tools; it registers inactive and is revealed on
  *   the first goal (after-first-goal visibility) so a fresh session adds zero
@@ -77,22 +79,25 @@
  *   model's set/complete/blocked actions never reset
  *   either (a stuck model can't farm fresh turns by re-setting or faking a
  *   completion); both re-arm only on a resumed session or when the user starts a
- *   goal via /goal, and /goal stop halts the loop session-scoped
+ *   goal via /goal, and /goal stop halts the loop (persisted — a reload cannot
+ *   resurrect a stopped goal)
  * - a before_agent_start reminder re-injects the objective + criteria when a
  *   compaction hid it (summaries never carry the goal); a compaction mid-turn
  *   additionally re-injects immediately by steering the in-progress run (no new
  *   turn), since before_agent_start won't re-fire until the next user prompt
  * - /goal is a view + kickoff: it shows the goal, starts one by routing the
- *   objective through the model (the goal tool creates and persists it), or stops
- *   the loop with /goal stop. Goal state is owned by the model and reconstructed
- *   from the branch, so nothing user-side desyncs it; the stop is the only
- *   user-side mutation and it is session-scoped loop control, not a persisted change
+ *   objective through the model (the goal tool creates and persists it), or
+ *   halts the loop with /goal stop / pause. State — goal plus loop latch —
+ *   lives in goal.state branch entries (pi.appendEntry, shared pattern from
+ *   lib/branchstate.ts), written by tool actions and user commands alike: the
+ *   single source of truth across reload/rewind/resume, invisible to the model
  */
 
 import { matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { spawn } from "node:child_process";
 import { Type } from "typebox";
 import { getSharedTaskRegistry, type BgTask } from "../lib/superbash";
+import { scanCustomState } from "../lib/branchstate";
 import type {
   AgentToolResult,
   ExtensionAPI,
@@ -437,9 +442,9 @@ export interface Goal {
   startedAt: number;
 }
 
-/** Snapshot carried by every goal tool result (see lastGoalSnapshot). Running
- * partials (onUpdate) reuse the same shape so an in-flight check renders on the
- * tool row — including its `goal`, so even a persisted partial re-adopts on reload. */
+/** Render data carried by goal tool results (durable state lives in goal.state
+ * branch entries; this shape drives the result row). Running partials (onUpdate)
+ * reuse the same shape so an in-flight check renders on the tool row. */
 export interface GoalDetails {
   goal: Goal | null;
   error?: string;
@@ -984,30 +989,56 @@ class GoalStatusComponent {
 type GoalBranchEntry = {
   type?: string;
   customType?: unknown;
-  message?: { role?: string; toolName?: string; content?: unknown; details?: unknown } | null;
+  data?: unknown;
+  // Branches mix entry kinds (messages, compactions); the scan only reads the
+  // fields above — `message` keeps foreign entries type-compatible in tests.
+  message?: unknown;
 };
 
-/**
- * One scan of the branch: the newest valid goal snapshot (tool results carry the
- * state) and whether a compaction after it hid the goal (no reminder carrier
- * follows it). Snapshots with malformed details never win — the scan keeps the
- * last one whose `details.goal` is a valid Goal.
- */
-export function scanGoalBranch(branch: GoalBranchEntry[]): { goal: Goal | null; hiddenByCompaction: boolean } {
-  let goal: Goal | null = null;
-  let lastIndex = -1;
-  for (let i = 0; i < branch.length; i++) {
-    const entry = branch[i];
-    if (entry.type !== "message") continue;
-    const msg = entry.message;
-    if (msg?.role !== "toolResult" || msg.toolName !== GOAL_TOOL_NAME) continue;
-    const g = (msg.details as GoalDetails | undefined)?.goal;
-    if (!isGoal(g)) continue;
-    goal = g;
-    lastIndex = i;
-  }
-  // Only the newest compaction after the snapshot decides: a later one folds the
-  // earlier and is what the context actually shows.
+/** customType of the durable goal-state entries (pi.appendEntry): the single
+ * source of truth for goal state across reload/rewind/resume. Model tool calls
+ * and user commands both append the full goal here; tool-result details are
+ * render-only. Invisible to the LLM, rides the branch. */
+export const GOAL_STATE_TYPE = "goal.state";
+
+/** Data carried by goal.state entries. `stopped` is the session loop latch —
+ * written explicitly when it must not be derived from the goal status (a
+ * model `set` while the loop is stopped persists an ACTIVE goal + stopped:
+ * true, the warp3090 trap shape). */
+export interface GoalStateData {
+  goal: Goal | null;
+  stopped?: boolean;
+}
+
+function isGoalStateData(d: unknown): d is GoalStateData {
+  const data = d as Partial<GoalStateData> | null;
+  if (!data || typeof data !== "object") return false;
+  if (data.goal !== null && !isGoal(data.goal)) return false;
+  return data.stopped === undefined || typeof data.stopped === "boolean";
+}
+
+/** Derive the loop latch from a state entry: an explicit flag wins; otherwise
+ * a non-active goal (complete/blocked/paused snapshot) means the loop is down. */
+function stoppedFromState(data: GoalStateData): boolean {
+  if (typeof data.stopped === "boolean") return data.stopped;
+  return data.goal ? data.goal.status !== "active" : false;
+}
+
+/** Reconstruct goal state from the session branch: the newest goal.state
+ * entry is the state (every writer appends the full goal, so the last valid
+ * entry alone suffices — no replay ordering). Also reports whether a
+ * compaction that hides the goal follows the state entry with no in-context
+ * carrier (reminder/check message) after it, which re-arms the reminder. */
+export function scanGoalState(branch: GoalBranchEntry[]): {
+  goal: Goal | null;
+  sessionStopped: boolean | undefined;
+  hiddenByCompaction: boolean;
+} {
+  const { data, index: lastIndex } = scanCustomState(branch, GOAL_STATE_TYPE, isGoalStateData);
+  const goal = data?.goal ?? null;
+  // Only an explicit latch from a real entry counts; undefined = derive from
+  // the goal status (no state entry on this branch at all).
+  const sessionStopped = data ? stoppedFromState(data) : undefined;
   let lastCompactionIndex = -1;
   for (let i = branch.length - 1; i > lastIndex; i--) {
     if (branch[i].type === "compaction") {
@@ -1024,14 +1055,15 @@ export function scanGoalBranch(branch: GoalBranchEntry[]): { goal: Goal | null; 
       .some(
         (entry) =>
           entry.type === "custom_message" &&
+          typeof entry.customType === "string" &&
           (entry.customType === GOAL_REMINDER_TYPE || entry.customType === GOAL_CHECK_TYPE),
       );
-  return { goal, hiddenByCompaction };
+  return { goal, sessionStopped, hiddenByCompaction };
 }
 
-/** Newest goal snapshot recorded on the session branch, or null. */
+/** Newest goal recorded on the session branch, or null. */
 export function lastGoalSnapshot(branch: GoalBranchEntry[]): Goal | null {
-  return scanGoalBranch(branch).goal;
+  return scanGoalState(branch).goal;
 }
 
 export interface RegisterGoalOptions {
@@ -1117,7 +1149,13 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     if (goal && goal.status === "active") {
       uiRef?.setStatus(
         "goal",
-        checking ? `goal · checking (${clip(goal.verify ?? "", 30)})` : renderGoalFooter(goal, Date.now()),
+        checking
+          ? `goal · checking (${clip(goal.verify ?? "", 30)})`
+          : stopped
+            ? // An active-but-latched goal must not look like live work: the
+              // ticking clock read as pursuit during the warp3090 incident.
+              "goal · halted — /goal resume re-arms"
+            : renderGoalFooter(goal, Date.now()),
       );
     } else if (goal && goal.status === "paused") {
       // No elapsed while paused: startedAt never freezes, so a ticking clock
@@ -1142,7 +1180,11 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
 
   const adoptBranchState = (ctx: ExtensionContext) => {
     if (ctx.ui) uiRef = ctx.ui;
-    const { goal: g, hiddenByCompaction } = scanGoalBranch(ctx.sessionManager.getBranch() as GoalBranchEntry[]);
+    const {
+      goal: g,
+      sessionStopped,
+      hiddenByCompaction,
+    } = scanGoalState(ctx.sessionManager.getBranch() as GoalBranchEntry[]);
     goal = g;
     if (g) goalSeq = g.id;
     compactedSinceUpdate = hiddenByCompaction;
@@ -1155,13 +1197,28 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     shuttingDown = false; // a new session in this process re-arms everything —
     // the latch must apply only to the in-flight settle of the teardown itself
     // (extension closures survive session replacement: new/resume/fork)
-    // Re-arm the continuation loop for an active goal on resume; a finished or
-    // blocked snapshot stays disarmed. A branch with NO goal (a fresh session)
-    // stays armed — disarming there would kill the loop for a goal the model
-    // sets later in the same session, since a model set never re-arms.
-    stopped = g ? g.status !== "active" : false;
+    // Re-arm the continuation loop for an active goal unless the persisted
+    // latch says otherwise (a stop/pause, or a model set while stopped); a
+    // finished or blocked snapshot stays disarmed. A branch with NO goal (a
+    // fresh session) stays armed — disarming there would kill the loop for a
+    // goal the model sets later in the same session, since a model set never
+    // re-arms.
+    stopped = sessionStopped ?? (g ? g.status !== "active" : false);
     if (g && g.status !== "complete") activateTool();
     updateFooter();
+  };
+
+  // Persist goal + loop latch to the branch: goal.state entries are the single
+  // source of truth across reload/rewind/resume. An explicit stopped flag is
+  // required exactly when memory and goal status disagree (a model set while
+  // the loop is stopped persists an ACTIVE goal that must stay latched).
+  const persistGoalState = (stoppedFlag?: boolean) => {
+    pi.appendEntry(
+      GOAL_STATE_TYPE,
+      stoppedFlag === undefined
+        ? { goal: goal ? { ...goal } : null }
+        : { goal: goal ? { ...goal } : null, stopped: stoppedFlag },
+    );
   };
 
   const setGoal = (objective: string, criteria: string[], verify?: string): Goal => {
@@ -1598,12 +1655,29 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         const v = validateVerify(params.verify);
         if (v.error) return finish(null, `Error: ${v.error}`);
         const g = setGoal(o.objective, c.criteria, v.verify);
+        // Persist the new goal with the latch exactly as it stands in memory:
+        // when the loop is stopped (a /goal stop or the cap), an ACTIVE goal
+        // must be recorded as latched or a reload would silently re-arm it.
+        persistGoalState(stopped ? true : undefined);
+        // setGoal deliberately does NOT re-arm a stopped loop (a model set
+        // must not farm continuations past a stop) — but an active goal with
+        // a dead loop is a silent trap observed in production: the footer
+        // ticks "goal · Nh", nothing ever checks, and stop/resume both
+        // refuse it. Say so to the model and the user instead.
+        const stoppedSuffix = stopped
+          ? " NOTE: the auto-check loop is STOPPED for this session (a /goal stop or the continuation cap); the verify will NOT re-run at turn end until the user re-arms it with /goal resume — tell them."
+          : "";
+        if (stopped) {
+          uiRef?.notify(
+            `Goal #${g.id} set, but the auto-check loop is stopped for this session — /goal resume re-arms it.`,
+          );
+        }
         const criteriaLine =
           g.criteria.length > 0 ? ` Criteria: ${g.criteria.map((cr, i) => `${i + 1}. ${cr}`).join("; ")}.` : "";
         if (!g.verify) {
           return finish(
             g,
-            `Goal #${g.id} set: ${g.objective}.${criteriaLine} Call goal with action "complete" and per-criterion evidence when done.`,
+            `Goal #${g.id} set: ${g.objective}.${criteriaLine}${stoppedSuffix} Call goal with action "complete" and per-criterion evidence when done.`,
           );
         }
         // Preflight: run the verify now to establish the baseline. A verify that
@@ -1617,7 +1691,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
           // and the settle loop re-measures at the end of the next turn anyway.
           return finish(
             g,
-            `Goal #${g.id} set: ${g.objective}.${criteriaLine} The baseline check was aborted before finishing — no baseline recorded; the verify re-runs at the end of each turn.`,
+            `Goal #${g.id} set: ${g.objective}.${criteriaLine} The baseline check was aborted before finishing — no baseline recorded; the verify re-runs at the end of each turn.${stoppedSuffix}`,
             "baseline check aborted",
           );
         }
@@ -1634,7 +1708,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
           : ` It currently fails${failWhy}, as expected for an unmet goal; completion is gated on it passing.`;
         return finish(
           g,
-          `Goal #${g.id} set: ${g.objective}.${criteriaLine} Completion is gated on the verify command \`${g.verify}\` exiting 0${baseline} Call goal with action "complete" when done.`,
+          `Goal #${g.id} set: ${g.objective}.${criteriaLine} Completion is gated on the verify command \`${g.verify}\` exiting 0${baseline}${stoppedSuffix} Call goal with action "complete" when done.`,
         );
       }
 
@@ -1696,6 +1770,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
           return finish(goal, `Goal #${goal.id} NOT completed: ${judgeReason}`, judgeReason);
         }
         goal = { ...goal, status: "complete" };
+        persistGoalState();
         clearFooter();
         // A completion does NOT re-arm the budget: the structural gate is
         // presence-only (no judge in v1), so a self-certifying model could
@@ -1731,6 +1806,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         return finish(goal, `Goal NOT blocked: ${r}`, r);
       }
       goal = { ...goal, status: "blocked", blockedReason: reason };
+      persistGoalState();
       clearFooter();
       return finish(goal, `Goal #${goal.id} blocked: ${reason}`);
 
@@ -1785,32 +1861,41 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         // Escape hatch: pi exposes no abort signal at the settle boundary, so an
         // in-flight turn-end check cannot see Esc — /goal pause kills it here.
         for (const abort of [...liveVerifyAborts]) abort();
-        // Session-scoped, like stop: the loop halts and the goal shows paused,
-        // but nothing is persisted to the branch — a reload re-adopts the last
-        // snapshot. Unlike stop, the goal stays pursuing (not blocked) and all
-        // progress is retained for /goal resume.
+        // Paused is persisted (a goal.state entry): a reload must not resume
+        // the pursuit under the user. Unlike stop, the goal stays pursuing
+        // (not blocked) and all progress is retained for /goal resume.
         stopped = true;
         goal = { ...goal, status: "paused" };
+        persistGoalState(true);
         updateFooter();
-        ctx.ui.notify(
-          `Goal #${goal.id} paused — talk freely; /goal resume when ready. Session-scoped: reloading the session resumes it.`,
-        );
+        ctx.ui.notify(`Goal #${goal.id} paused — talk freely; /goal resume when ready.`);
         return;
       }
 
       if (trimmed === "resume") {
-        if (!goal || goal.status !== "paused") {
-          ctx.ui.notify("No paused goal to resume.");
+        // An active goal can also be loop-stopped: a /goal stop or the
+        // continuation cap, then a later model set — set re-activates the goal
+        // but deliberately never re-arms the loop, and without this arm that
+        // goal would tick its footer forever with a dead loop and no recovery
+        // (stop refuses it as already-stopped, resume as not-paused).
+        const resumableGoal =
+          goal && (goal.status === "paused" || (goal.status === "active" && stopped)) ? goal : undefined;
+        if (!resumableGoal) {
+          ctx.ui.notify("No paused or stopped goal to resume.");
           return;
         }
+        const wasPaused = resumableGoal.status === "paused";
         // A user resuming is a deliberate engagement: re-arm the continuation
         // budget, exactly like a user (re)starting a goal.
-        goal = { ...goal, status: "active" };
+        goal = { ...resumableGoal, status: "active" };
         stopped = false;
+        persistGoalState(false);
         resetContinuationBudget();
         ctx.ui.notify(`Goal #${goal.id} resumed.`);
         pi.sendUserMessage(
-          `The user paused goal #${goal.id} to have a conversation; that conversation is over and the goal is active again. Continue working toward it — the goal is: ${goal.objective}`,
+          wasPaused
+            ? `The user paused goal #${goal.id} to have a conversation; that conversation is over and the goal is active again. Continue working toward it — the goal is: ${goal.objective}`
+            : `The user re-armed goal #${goal.id} — its auto-check loop was stopped (a /goal stop or the continuation cap); the turn-end verify runs again from the next turn. Continue working toward it — the goal is: ${goal.objective}`,
           { deliverAs: "followUp" },
         );
         return;
@@ -1824,27 +1909,32 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         // Escape hatch, as with pause: kill an in-flight settle-boundary check
         // (unreachable by Esc — pi exposes no abort signal at that boundary).
         for (const abort of [...liveVerifyAborts]) abort();
-        // Session-scoped kill switch: pause auto-continuation and mark the goal
-        // not-pursuing (blocked). Not persisted to the branch — goal state stays
-        // model-owned, so a reload re-adopts the last snapshot and can re-arm.
+        // Kill switch, persisted as a goal.state entry: the goal is marked
+        // not-pursuing (blocked) and the loop latch set, so a reload can no
+        // longer resurrect a goal the user stopped.
         stopped = true;
         goal = { ...goal, status: "blocked", blockedReason: "stopped by user" };
+        persistGoalState(true);
         clearFooter();
-        ctx.ui.notify(`Goal #${goal.id} stopped (auto-continuation paused for this session).`);
+        ctx.ui.notify(`Goal #${goal.id} stopped.`);
         return;
       }
 
       // Start a goal by routing it through the model: the goal is created by the
-      // goal tool (which persists a branch snapshot), so the branch stays the
-      // single source of truth. Pause/resume are the deliberate user-control
-      // exceptions: they only steer the session loop (the model still owns the
-      // branch snapshot).
+      // goal tool, which persists the goal.state entry — the branch stays the
+      // single source of truth. If a goal already exists, the kickoff is a
+      // deliberate re-engagement: re-arm it in memory AND on the branch.
       const o = validateObjective(trimmed);
       if (o.error) {
         ctx.ui.notify(o.error, "error");
         return;
       }
       activateTool();
+      if (goal) {
+        goal = { ...goal, status: "active" };
+        stopped = false;
+        persistGoalState(false);
+      }
       // A user (re)starting a goal re-arms the loop budget — a deliberate
       // engagement, distinct from the model's autonomous set (which can't re-arm).
       resetContinuationBudget();

@@ -38,6 +38,9 @@ function makePi() {
   >();
   const commands = new Map<string, { description?: string; handler: (args: string, ctx: unknown) => Promise<void> }>();
   const events = new Map<string, (event?: unknown, ctx?: unknown) => unknown>();
+  // Custom state entries appended via pi.appendEntry — hand the same array to
+  // the session_start ctx to simulate a reload picking them up from the branch.
+  const entries: Array<{ type: string; customType: string; data?: unknown }> = [];
   const pi = {
     registerTool: (t: {
       name: string;
@@ -52,8 +55,11 @@ function makePi() {
     on: (event: string, handler: (event?: unknown, ctx?: unknown) => unknown) => {
       events.set(event, handler);
     },
+    appendEntry: (customType: string, data?: unknown) => {
+      entries.push({ type: "custom", customType, data });
+    },
   } as unknown as ExtensionAPI;
-  return { pi, tools, commands, events };
+  return { pi, tools, commands, events, entries };
 }
 
 /** Fire a captured event handler (an optional event body overrides the synthesized one) and return its result. */
@@ -73,8 +79,9 @@ function sessionCtx(todosSnapshots: Array<TodoItem[]>): ExtensionContext {
     sessionManager: {
       getBranch: () =>
         todosSnapshots.map((todos) => ({
-          type: "message",
-          message: { role: "toolResult", toolName: TODO_TOOL_NAME, details: { todos } },
+          type: "custom",
+          customType: "todo.state",
+          data: { todos },
         })),
     },
   } as unknown as ExtensionContext;
@@ -294,11 +301,12 @@ describe("renderReminder", () => {
 
 describe("lastTodoSnapshot", () => {
   const snapshot = (todos: unknown) => ({
-    type: "message",
-    message: { role: "toolResult", toolName: TODO_TOOL_NAME, details: { todos } },
+    type: "custom",
+    customType: "todo.state",
+    data: { todos },
   });
 
-  it("returns the newest todo snapshot on the branch", () => {
+  it("returns the newest todo list on the branch", () => {
     const branch = [
       { type: "message", message: { role: "user", content: "plan the work" } },
       snapshot([item("old", "completed")]),
@@ -308,44 +316,28 @@ describe("lastTodoSnapshot", () => {
     expect(lastTodoSnapshot(branch)).toEqual([item("new", "in_progress")]);
   });
 
-  it("returns [] when the branch has no todo snapshots", () => {
+  it("returns [] when the branch has no todo state entries", () => {
     expect(lastTodoSnapshot([{ type: "message", message: { role: "user", content: "hi" } }])).toEqual([]);
     expect(lastTodoSnapshot([])).toEqual([]);
   });
 
-  it("skips snapshots with malformed details, keeping the newest valid one", () => {
-    const branch = [snapshot([item("valid", "pending")]), snapshot("not an array"), snapshot({})];
+  it("skips malformed state entries, keeping the newest valid one", () => {
+    const branch = [
+      snapshot([item("valid", "pending")]),
+      { type: "custom", customType: "todo.state", data: "junk" },
+      snapshot({}),
+    ];
     expect(lastTodoSnapshot(branch)).toEqual([item("valid", "pending")]);
   });
 
-  it("ignores other tools' results even when they carry todos-shaped details", () => {
-    const branch = [
-      { type: "message", message: { role: "toolResult", toolName: "read", details: { todos: [item("x")] } } },
-    ];
+  it("ignores other extensions' custom entries even when they carry todos-shaped data", () => {
+    const branch = [{ type: "custom", customType: "other.state", data: { todos: [item("x")] } }];
     expect(lastTodoSnapshot(branch)).toEqual([]);
   });
 
-  it("accepts rejected-update snapshots (error + current list) as the newest state", () => {
-    const branch = [
-      snapshot([item("stale")]),
-      {
-        type: "message",
-        message: {
-          role: "toolResult",
-          toolName: TODO_TOOL_NAME,
-          details: { todos: [item("current")], error: "bad list" },
-        },
-      },
-    ];
-    expect(lastTodoSnapshot(branch)).toEqual([item("current")]);
-  });
-
-  it("falls back past error-only details to the previous valid snapshot", () => {
-    const branch = [
-      snapshot([item("valid", "in_progress")]),
-      { type: "message", message: { role: "toolResult", toolName: TODO_TOOL_NAME, details: { error: "bad list" } } },
-    ];
-    expect(lastTodoSnapshot(branch)).toEqual([item("valid", "in_progress")]);
+  it("drops malformed items inside the newest state entry instead of surfacing them", () => {
+    const branch = [snapshot([item("valid", "in_progress")]), snapshot([{ content: "x", status: "bogus" }])];
+    expect(lastTodoSnapshot(branch)).toEqual([]);
   });
 });
 
@@ -431,6 +423,18 @@ describe("registerTodoTool", () => {
     expect(text).toContain("▸ b");
   });
 
+  it("adopts the todo.state entries a tool call persisted, across a reload", async () => {
+    const { pi, tools, events, entries } = makePi();
+    registerTodoTool(pi);
+    await tools.get(TODO_TOOL_NAME)!.execute("1", { todos: [item("persisted", "in_progress")] });
+    expect(entries).toHaveLength(1);
+
+    fire(events, "session_start", { sessionManager: { getBranch: () => entries } } as unknown as ExtensionContext);
+    // Prove adoption: a rejected update echoes the adopted list as current.
+    const r = (await tools.get(TODO_TOOL_NAME)!.execute("2", { todos: "bogus" })) as { details: TodoDetails };
+    expect(r.details.todos).toEqual([item("persisted", "in_progress")]);
+  });
+
   it("reconstructs state from the session branch (last snapshot wins)", async () => {
     const { pi, tools, events } = makePi();
     registerTodoTool(pi);
@@ -458,10 +462,7 @@ describe("registerTodoTool", () => {
 
   it("reminds on the first turn after resume when compaction hides the plan", () => {
     const branch = [
-      {
-        type: "message",
-        message: { role: "toolResult", toolName: TODO_TOOL_NAME, details: { todos: [item("a", "in_progress")] } },
-      },
+      { type: "custom", customType: "todo.state", data: { todos: [item("a", "in_progress")] } },
       { type: "compaction" },
     ];
     const { pi, events } = makePi();
@@ -489,10 +490,7 @@ describe("registerTodoTool", () => {
 
   it("stays quiet on resume when a plan message follows the compaction", () => {
     const branch = [
-      {
-        type: "message",
-        message: { role: "toolResult", toolName: TODO_TOOL_NAME, details: { todos: [item("a", "in_progress")] } },
-      },
+      { type: "custom", customType: "todo.state", data: { todos: [item("a", "in_progress")] } },
       { type: "compaction", summary: "## Goal\nwork" },
       { type: "custom_message", customType: "todo.plan", content: "## Current Plan\n1/2 resolved\n [>] a" },
     ];
@@ -505,10 +503,7 @@ describe("registerTodoTool", () => {
 
   it("stays quiet on resume when the extension's own reminder follows the compaction", () => {
     const branch = [
-      {
-        type: "message",
-        message: { role: "toolResult", toolName: TODO_TOOL_NAME, details: { todos: [item("a", "in_progress")] } },
-      },
+      { type: "custom", customType: "todo.state", data: { todos: [item("a", "in_progress")] } },
       { type: "compaction", summary: "## Goal\nwork" },
       { type: "custom_message", customType: "todo.reminder", content: "TODO REMINDER — current plan (0/1)" },
     ];
@@ -521,10 +516,7 @@ describe("registerTodoTool", () => {
 
   it("stays quiet on resume when no compaction follows the snapshot", () => {
     const branch = [
-      {
-        type: "message",
-        message: { role: "toolResult", toolName: TODO_TOOL_NAME, details: { todos: [item("a", "in_progress")] } },
-      },
+      { type: "custom", customType: "todo.state", data: { todos: [item("a", "in_progress")] } },
       { type: "message", message: { role: "user", content: "still here" } },
     ];
     const { pi, events } = makePi();
@@ -536,10 +528,7 @@ describe("registerTodoTool", () => {
 
   it("on resume, a plan message before a newer compaction still reminds", () => {
     const branch = [
-      {
-        type: "message",
-        message: { role: "toolResult", toolName: TODO_TOOL_NAME, details: { todos: [item("a", "in_progress")] } },
-      },
+      { type: "custom", customType: "todo.state", data: { todos: [item("a", "in_progress")] } },
       { type: "compaction", summary: "## Goal\nwork" },
       { type: "custom_message", customType: "todo.plan", content: "## Current Plan\n1/2 resolved\n [>] a" },
       { type: "compaction", summary: "## Goal\nwork" },

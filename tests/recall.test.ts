@@ -3125,10 +3125,11 @@ describe("mid-run compaction wiring (turn_end)", () => {
     const { pi, events } = makePi();
     registerRecallTool(pi, CONFIG);
     const branch = [
-      msgEntry("toolResult", {
-        toolName: TODO_TOOL_NAME,
-        details: { todos: [{ content: "survive compaction", status: "in_progress" }] },
-      }),
+      {
+        type: "custom",
+        customType: "todo.state",
+        data: { todos: [{ content: "survive compaction", status: "in_progress" }] },
+      },
     ];
     const result = (await fire(
       events,
