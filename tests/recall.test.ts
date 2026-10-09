@@ -16,6 +16,7 @@ import {
   configFromEnv,
   draftPreparation,
   fsProjectReader,
+  hasDanglingToolCalls,
   extractEntrySections,
   extractSnippet,
   formatReadResult,
@@ -2146,6 +2147,38 @@ describe("context budget", () => {
     ).not.toBe(fp); // equal length, different content: only the content hash sees it
     expect(compactionFingerprint({ ...base, previousSummary: "## Goal\n- new" })).not.toBe(fp);
     expect(compactionFingerprint({ ...base, modelId: "prov/other" })).not.toBe(fp);
+    // Missing optional fields hash as empty strings, not "undefined".
+    expect(compactionFingerprint({ ...base, previousSummary: undefined, modelId: undefined })).not.toBe(fp);
+    expect(
+      compactionFingerprint({
+        firstKeptEntryId: "c",
+        spanMessages: [],
+        previousSummary: undefined,
+        modelId: undefined,
+      }),
+    ).toBe(
+      compactionFingerprint({
+        firstKeptEntryId: "c",
+        spanMessages: [],
+        previousSummary: undefined,
+        modelId: undefined,
+      }),
+    );
+  });
+
+  it("compactionFingerprint degrades on unserializable messages instead of throwing", () => {
+    // JSON.stringify throws on BigInt content; the hash must fall back to the
+    // role so a malformed span still produces a comparable fingerprint.
+    const weird = () =>
+      compactionFingerprint({
+        firstKeptEntryId: "cut1",
+        spanMessages: [{ role: "user", content: [1n] }] as unknown as Parameters<
+          typeof compactionFingerprint
+        >[0]["spanMessages"],
+        previousSummary: undefined,
+        modelId: undefined,
+      });
+    expect(weird()).toBe(weird()); // deterministic degrade
   });
 });
 
@@ -2409,7 +2442,17 @@ describe("auto-compact wiring", () => {
       reason: "manual",
       aborted: true,
     });
-    expect(crumbs).toEqual([expect.stringContaining("compaction failed (threshold): summarizer blew up")]);
+    // No message from the provider: the crumb still names the stop reason.
+    await fire(events, "session_compact_failed", undefined, {
+      type: "session_compact_failed",
+      reason: "threshold",
+      errorMessage: undefined,
+      aborted: false,
+    });
+    expect(crumbs).toEqual([
+      expect.stringContaining("compaction failed (threshold): summarizer blew up"),
+      expect.stringContaining("compaction failed (threshold): unknown error"),
+    ]);
   });
 
   it("with summary ownership off, the settled trigger calls ctx.compact directly (pi's summarizer runs)", async () => {
@@ -2831,6 +2874,142 @@ describe("background idle compaction", () => {
     await vi.waitFor(() => expect(compactCalls).toHaveLength(1));
     expect(calls).toBe(1);
     expect(crumbs).toEqual([]);
+  });
+
+  it("commits nothing when there is nothing compactable, or usage is unknown", async () => {
+    const crumbs: string[] = [];
+    const { pi, events } = makePi();
+    registerRecallTool(pi, CONFIG, undefined, { logCompactionError: (l) => crumbs.push(l) });
+    // Usage says far over target, but the projection walk finds nothing to
+    // cut (the whole context fits the kept tail): the pass starts and stops
+    // silently — pi's near-limit backstop owns such sessions.
+    const small = [
+      {
+        sourceEntry: msgEntry("user", { content: "hi" }),
+        messages: [{ role: "user", content: "hi" }],
+      },
+    ] as unknown as Parameters<typeof draftPreparation>[0];
+    const tiny = settledCtx({ entries: small });
+    await fire(events, "agent_settled", tiny.ctx);
+    await new Promise((r) => setTimeout(r, 5));
+    expect(tiny.completeCalls).toHaveLength(0);
+    expect(tiny.compactCalls).toHaveLength(0);
+    expect(crumbs).toEqual([]);
+    // Unknown usage never arms a pass either (the defensive getContextUsage
+    // defaults — null tokens, zero window — both mean "do not compact").
+    const unknown = settledCtx();
+    (unknown.ctx as { getContextUsage: () => unknown }).getContextUsage = () => undefined;
+    await fire(events, "agent_settled", unknown.ctx);
+    await new Promise((r) => setTimeout(r, 5));
+    expect(unknown.completeCalls).toHaveLength(0);
+    expect(unknown.compactCalls).toHaveLength(0);
+    expect(crumbs).toEqual([]);
+  });
+
+  it("a synchronous ctx.compact throw fails to a breadcrumb and clears the pending result", async () => {
+    const crumbs: string[] = [];
+    const { pi, events } = makePi();
+    registerRecallTool(pi, CONFIG, undefined, { logCompactionError: (l) => crumbs.push(l) });
+    const { ctx, compactCalls, completeCalls } = settledCtx();
+    (ctx as Record<string, unknown>).compact = () => {
+      throw "compact exploded"; // a non-Error throw: the crumb must stringify it
+    };
+    await fire(events, "agent_settled", ctx);
+    await new Promise((r) => setTimeout(r, 5));
+    expect(crumbs).toEqual([expect.stringContaining("background compaction failed: compact exploded")]);
+    // The pending result was cleared: the next settle regenerates instead of
+    // re-throwing on the same commit.
+    (ctx as Record<string, unknown>).compact = (o: Record<string, unknown>) => {
+      compactCalls.push(o);
+    };
+    await fire(events, "agent_settled", ctx);
+    await vi.waitFor(() => expect(completeCalls).toHaveLength(2));
+    await vi.waitFor(() => expect(compactCalls).toHaveLength(1));
+  });
+
+  it("retires a landed result silently when the model vanished before the commit", async () => {
+    // Session replacement between generation and commit: no model on the
+    // context means nothing to summarize for — retire without noise.
+    const crumbs: string[] = [];
+    const { pi, events } = makePi();
+    registerRecallTool(pi, CONFIG, undefined, { logCompactionError: (l) => crumbs.push(l) });
+    let idle = false; // hold the landed result while the session transitions
+    const { ctx, compactCalls, completeCalls } = settledCtx({ isIdle: () => idle });
+    const model = ctx.model;
+    await fire(events, "agent_settled", ctx);
+    await vi.waitFor(() => expect(completeCalls).toHaveLength(1));
+    await new Promise((r) => setTimeout(r, 5));
+    (ctx as { model: unknown }).model = undefined; // vanished at commit time
+    await fire(events, "agent_settled", ctx);
+    expect(compactCalls).toHaveLength(0);
+    expect(crumbs).toEqual([]); // silent retire, not a failure
+    (ctx as { model: unknown }).model = model; // restored: a fresh pass, not the stale commit
+    idle = true;
+    await fire(events, "agent_settled", ctx);
+    await vi.waitFor(() => expect(completeCalls).toHaveLength(2));
+    await vi.waitFor(() => expect(compactCalls).toHaveLength(1));
+  });
+
+  it("an abort during the retry backoff is silent — teardown, not a failure", async () => {
+    const crumbs: string[] = [];
+    // Retryable failure shape: defaultSummaryFn flags provider errors, so the
+    // pass enters backoff; the teardown abort must reject it without a crumb.
+    let attempts = 0;
+    const complete = async () => {
+      attempts++;
+      return { content: [], usage: {}, stopReason: "error", errorMessage: "connection reset" };
+    };
+    const { pi, events } = makePi();
+    registerRecallTool(pi, CONFIG, undefined, {
+      logCompactionError: (l) => crumbs.push(l),
+      retryDelayMs: 10_000, // backoff outlives the test — the abort listener owns it
+    });
+    const { ctx, compactCalls } = settledCtx({ complete });
+    await fire(events, "agent_settled", ctx);
+    await vi.waitFor(() => expect(attempts).toBe(1)); // attempt 1 failed; backoff armed
+    await fire(events, "session_compact", ctx); // teardown mid-backoff: abort + retire
+    await new Promise((r) => setTimeout(r, 5));
+    expect(compactCalls).toHaveLength(0);
+    expect(crumbs).toEqual([]); // aborted, not failed — the crumb would lie
+  });
+
+  it("surfaces a discarded background summary at the hook with a breadcrumb, then regenerates inline", async () => {
+    const crumbs: string[] = [];
+    const { pi, events } = makePi();
+    registerRecallTool(pi, CONFIG, undefined, { logCompactionError: (l) => crumbs.push(l) });
+    const { ctx, completeCalls, entries } = settledCtx({ isIdle: false });
+    await fire(events, "agent_settled", ctx);
+    await vi.waitFor(() => expect(completeCalls).toHaveLength(1));
+    await new Promise((r) => setTimeout(r, 5)); // landed, held (busy)
+    // The span moved between generation and pi's compaction: the hook's
+    // fingerprint check fails, the pending result is dropped with a crumb,
+    // and this compaction pays for its own summary.
+    const grown = [
+      ...entries,
+      {
+        sourceEntry: msgEntry("assistant", { label: "t5" }),
+        messages: [{ role: "assistant", content: [{ type: "text", text: `t5\n${"y".repeat(60_000)}` }] }],
+      },
+    ] as unknown as Parameters<typeof draftPreparation>[0];
+    (ctx.sessionManager as { buildSessionProjection: () => { entries: unknown } }).buildSessionProjection = () => ({
+      entries: grown,
+    });
+    const result = (await fire(events, "session_before_compact", ctx, beforeCompactFromProjection(grown))) as {
+      compaction: Record<string, unknown>;
+    };
+    expect(crumbs).toEqual([expect.stringContaining("background summary discarded")]);
+    expect(completeCalls).toHaveLength(2); // regenerated, not served
+    expect(result.compaction.summary).toBe("## Goal\n- background summary");
+  });
+
+  it("a provider error with no message still fails to a descriptive breadcrumb", async () => {
+    const crumbs: string[] = [];
+    const complete = async () => ({ content: [], usage: {}, stopReason: "error" });
+    const { pi, events } = makePi();
+    registerRecallTool(pi, CONFIG, undefined, { logCompactionError: (l) => crumbs.push(l), retryDelayMs: 0 });
+    const { ctx } = settledCtx({ complete });
+    await fire(events, "agent_settled", ctx);
+    await vi.waitFor(() => expect(crumbs[0]).toContain("background compaction skipped: summarizer error"));
   });
 
   it("a failed background commit clears the pending result with a breadcrumb — no re-commit of the rejected span", async () => {
@@ -3580,6 +3759,15 @@ describe("mid-run compaction preparation", () => {
   });
   const readCall = (p: string) => ({ type: "toolCall", id: "t1", name: "read", arguments: { path: p } });
 
+  it("hasDanglingToolCalls flags unanswered calls and orphaned results, skipping degenerate shapes", () => {
+    const messages = (msgs: unknown[]) => msgs as unknown as Parameters<typeof hasDanglingToolCalls>[0];
+    // A plain-prose assistant (string content) carries no calls to dangle.
+    expect(hasDanglingToolCalls(messages([user("go"), { role: "assistant", content: "plain prose" }]))).toBe(false);
+    expect(hasDanglingToolCalls(messages([assistant("calling", [readCall("a.ts")])]))).toBe(true); // call, no result
+    expect(hasDanglingToolCalls(messages([toolResult()]))).toBe(true); // result, no call
+    expect(hasDanglingToolCalls(messages([assistant("calling", [readCall("a.ts")]), toolResult()]))).toBe(false); // paired
+  });
+
   /** Projected entry over a raw entry, projecting exactly `messages`. */
   const proj = (sourceEntry: SessionEntry, messages: unknown[]) =>
     ({ sourceEntry, messages }) as unknown as Parameters<typeof draftPreparation>[0][number];
@@ -3668,6 +3856,24 @@ describe("mid-run compaction preparation", () => {
     expect(prep!.prefixCacheable).toBe(true);
   });
 
+  it("skips zero-token entries while walking the kept tail — they cannot satisfy it", () => {
+    // An edit-omitted entry projects no messages: the tail walk must step
+    // over it, not count it toward the kept budget or cut inside it.
+    const omitted = (label: string) =>
+      ({
+        sourceEntry: msgEntry("message", { label }, "2026-09-26T10:00:03.000Z"),
+        messages: [],
+      }) as unknown as Parameters<typeof draftPreparation>[0][number];
+    const a = entryOf([assistant("a".repeat(4_000))]);
+    const b = entryOf([assistant("b".repeat(4_000))]);
+    const tail = entryOf([user("t".repeat(400))]);
+    const prep = draftPreparation([a, omitted("omitted-1"), b, tail, omitted("omitted-2")], 1);
+    expect(prep!.firstKeptEntryId).toBe(tail.sourceEntry.id);
+    expect(prep!.messages).toEqual([a.messages[0], b.messages[0]]);
+    expect(prep!.prefixMessages).toEqual([a.messages[0], b.messages[0]]);
+    expect(prep!.prefixCacheable).toBe(true);
+  });
+
   it("marks a prefix with an unanswered toolCall not replayable — the cached layout must decline", () => {
     // A context edit can omit a toolResult entry while its assistant call
     // stays: the prefix then contains a toolCall no result answers, which
@@ -3724,6 +3930,17 @@ describe("collectFileOps", () => {
       written: new Set(["b.ts"]),
       edited: new Set(["c.ts"]),
     });
+  });
+
+  it("tolerates degenerate message shapes — projected transcript data is not type-guaranteed", () => {
+    // String-content assistants and non-object blocks: the property walks
+    // skip them, never throw.
+    const messages = [
+      { role: "assistant", content: "plain prose" },
+      { role: "assistant", content: ["a bare string block", null] },
+      { role: "toolResult", toolCallId: "t1", content: "ok" },
+    ] as never[];
+    expect(collectFileOps(messages)).toEqual({ read: new Set(), written: new Set(), edited: new Set() });
   });
 });
 
@@ -3990,6 +4207,40 @@ describe("mid-run compaction wiring (turn_end)", () => {
     registerRecallTool(pi, CONFIG, undefined, { logCompactionError: (l) => crumbs.push(l) });
     expect(await fire(events, "turn_end", turnEndCtx(OVER, { model: undefined }), turnEndEvent())).toBeUndefined();
     expect(crumbs).toEqual([expect.stringContaining("no model on session context")]);
+  });
+
+  it("still proposes the draft when the context exposes no routing id (child pi processes)", async () => {
+    // Observed live: some agent contexts carry a sessionManager without
+    // getSessionId. The draft must degrade to an un-routed request, not skip
+    // the compaction — a skipped draft defers the whole budget to pi's backstop.
+    const { pi, events } = makePi();
+    registerRecallTool(pi, CONFIG);
+    const ctx = turnEndCtx(OVER, { sessionManager: { getBranch: () => [] } });
+    const result = (await fire(events, "turn_end", ctx, turnEndEvent())) as { entries: unknown[] };
+    expect((result.entries[0] as Record<string, unknown>).type).toBe("compaction");
+  });
+
+  it("skips silently when usage is over target but the projection has nothing to cut", async () => {
+    // Usage counts context the projection excludes; the walk then finds the
+    // whole context inside the kept tail and the draft defers to pi's backstop.
+    const crumbs: string[] = [];
+    const { pi, events } = makePi();
+    registerRecallTool(pi, CONFIG, undefined, { logCompactionError: (l) => crumbs.push(l) });
+    const tiny = [{ role: "user", content: "hi" }];
+    expect(
+      await fire(
+        events,
+        "turn_end",
+        turnEndCtx(OVER),
+        turnEndEvent({}, [
+          {
+            sourceEntry: msgEntry("user", { content: "hi" }),
+            messages: tiny,
+          } as unknown as Parameters<typeof draftPreparation>[0][number],
+        ]),
+      ),
+    ).toBeUndefined();
+    expect(crumbs).toEqual([]);
   });
 
   it("does not re-trigger while the post-draft context is below the target", async () => {

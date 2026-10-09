@@ -1352,8 +1352,12 @@ export function registerRecallTool(
   const modelKeyId = (model: SummaryModel): string => `${model.provider}/${model.id}`;
 
   /** The session's routing id, when the context exposes a manager — cache affinity for the summary request. */
+  // Total on purpose: a degenerate context (no manager, or one without the
+  // method — observed live from child pi processes) degrades to "no routing
+  // id" — the summary still fires, just without provider cache affinity —
+  // instead of throwing away the whole compaction.
   const sessionRoutingId = (ctx: ExtensionContext): string | undefined =>
-    (ctx as Partial<ExtensionContext>).sessionManager?.getSessionId();
+    (ctx as Partial<ExtensionContext>).sessionManager?.getSessionId?.();
 
   /** Fresh preparation from the live projection. `keepRecentTokens` defaults to pi's — resolved per-model settings are not exposed to extensions. */
   const livePreparation = (
@@ -1461,7 +1465,7 @@ export function registerRecallTool(
             messages: preparation.messages,
             prefixMessages:
               config.summaryReuseCache && preparation.prefixCacheable ? preparation.prefixMessages : undefined,
-            sessionId: sm?.getSessionId(),
+            sessionId: sm?.getSessionId?.(), // same tolerance as sessionRoutingId: degenerate managers degrade, never throw
             previousSummary: preparation.previousSummary,
             userFocus: undefined, // background triggers never carry /compact focus
             budgetChars: config.summaryChars,
@@ -2549,7 +2553,11 @@ export interface SummaryFnArgs {
 }
 export type SummaryFn = (args: SummaryFnArgs) => Promise<{ text: string; usage: unknown }>;
 
-const defaultSummaryFn: SummaryFn = async ({
+/**
+ * The production summarizer seam — exported so tests and validation harnesses
+ * drive the exact request the extension sends (boundary-injected `complete`).
+ */
+export const defaultSummaryFn: SummaryFn = async ({
   model,
   complete,
   thinkingLevel,
