@@ -75,9 +75,9 @@ describe("review finder latency benchmark", () => {
           rows.push(
             `| ${model.split("/")[1] ?? model} | ${arm} | ${wall}s | ${
               u ? `${u.input}/${u.output}` : "?"
-            }${u?.reasoning ? ` (reasoning ${u.reasoning})` : ""} | ok, ${(
-              result.text.length / 1024
-            ).toFixed(1)}KB out |`,
+            }${u?.reasoning ? ` (reasoning ${u.reasoning})` : ""} | ok, ${(result.text.length / 1024).toFixed(
+              1,
+            )}KB out |`,
           );
           // BENCH_DUMP=1: full final text for suspiciously short results —
           // a valid empty-findings JSON and a formatting failure both round to 0.0KB.

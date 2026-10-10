@@ -83,6 +83,7 @@ const CONFIG = (over: Partial<ReviewConfig> = {}): ReviewConfig => ({
   chunkChars: 96_000,
   attachChars: 64_000,
   maxChildren: 8,
+  concurrency: 8,
   timeoutMs: 60_000,
   idleTimeoutMs: 300_000,
   model: undefined,
@@ -308,6 +309,92 @@ describe("attachments", () => {
     expect(off.tasks[0]).not.toContain("Current contents of the changed files");
   });
 
+  it("runs the finder pool at the configured wave width, not a hardcoded 4", async () => {
+    // Two fat files → two chunks (chunkChars 8k floor) → 8 lens×chunk runs.
+    // Children close on a microtask, so every worker spawns before any child
+    // settles — peak in-flight equals the pool limit, deterministically.
+    const fatFile = (name: string) =>
+      [
+        `diff --git a/${name} b/${name}`,
+        "--- a/" + name,
+        "+++ b/" + name,
+        "@@ -1,200 +1,200 @@",
+        ...Array.from({ length: 200 }, () => "+" + "x".repeat(50)),
+      ].join("\n");
+    const bigDiff = [fatFile("src/big1.ts"), fatFile("src/big2.ts")].join("\n");
+    const runAt = (concurrency: number) => {
+      let inFlight = 0;
+      let peak = 0;
+      const spawn = ((_c: string, args: string[], _o: unknown) => {
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        const child = childWithMessage("[]");
+        child.on?.("close", () => inFlight--);
+        void args;
+        return child;
+      }) as SpawnFn;
+      const git = gitFor([
+        { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: "/repo\n", stderr: "" } },
+        {
+          match: (a) => a[0] === "diff" && a[a.length - 1] === "HEAD",
+          result: { code: 0, stdout: bigDiff, stderr: "" },
+        },
+      ]);
+      return runReview({
+        cwd: "/repo",
+        config: CONFIG({ verify: false, chunkChars: 8_000, concurrency }),
+        target: { kind: "uncommitted" },
+        deps: emptyDeps({ git, spawnFn: spawn, readFile: async () => undefined }) as never,
+      }).then(() => peak);
+    };
+    expect(await runAt(8)).toBe(8); // one full wave — the new default
+    expect(await runAt(4)).toBe(4); // the knob limits, not the run count
+  });
+
+  it("never shrinks the diff when attachment headers overflow the margin — drops attachments instead", async () => {
+    // 150 changed files with long paths: bodies fit the budget, but ~45 bytes
+    // of header per file (~6.7k) overflow the 2k margin — the compose-measure-
+    // drop loop must shed attachments until the task fits, keeping the diff whole.
+    const DEEP = "a/very/deeply/nested/path/component/src";
+    const files = Array.from({ length: 150 }, (_, i) =>
+      [
+        `diff --git ${DEEP}/f${i}.ts ${DEEP}/f${i}.ts`,
+        `--- ${DEEP}/f${i}.ts`,
+        `+++ ${DEEP}/f${i}.ts`,
+        "@@ -1 +1 @@",
+        `+change-f${i}`,
+      ].join("\n"),
+    );
+    const spawn = fakeSpawn(() => "[]");
+    const readFile = async (p: string) => {
+      const m = /f(\d+)\.ts$/.exec(p);
+      return m ? `MARK-f${m[1]} ` + "x".repeat(700) : undefined;
+    };
+    const git = gitFor([
+      { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: "/repo\n", stderr: "" } },
+      {
+        match: (a) => a[0] === "diff" && a[a.length - 1] === "HEAD",
+        result: { code: 0, stdout: files.join("\n"), stderr: "" },
+      },
+    ]);
+    await runReview({
+      cwd: "/repo",
+      config: CONFIG({ verify: false, attachChars: 300_000 }),
+      target: { kind: "uncommitted" },
+      deps: emptyDeps({ git, spawnFn: spawn, readFile }) as never,
+    });
+    for (const task of spawn.tasks) {
+      // The byte-cap invariant holds without diff truncation…
+      expect(Buffer.byteLength(task, "utf8")).toBeLessThanOrEqual(120_000);
+      expect(task).toContain("+change-f0");
+      expect(task).toContain("+change-f149");
+      // …because attachments were shed: not all 150 made it.
+      const attached = (task.match(/MARK-f\d+/g) ?? []).length;
+      expect(attached).toBeGreaterThan(0);
+      expect(attached).toBeLessThan(150);
+    }
+  });
+
   it("attaches hunk windows of files too large to attach whole", async () => {
     // 200 lines, changed at line 10 (SAMPLE_DIFF's b.ts hunk @@ -10,3 +10,3 @@):
     // the whole file cannot fit a 1k budget, but the window around the hunk can.
@@ -423,6 +510,7 @@ describe("parseReviewConfig", () => {
     expect(c.chunkChars).toBe(96_000);
     expect(c.attachChars).toBe(64_000);
     expect(c.maxChildren).toBe(8);
+    expect(c.concurrency).toBe(8);
     expect(c.model).toBe("opencode-go/deepseek-v4.1-flash:off");
     expect(c.checkCmd).toBe("");
     expect(c.persist).toBe(true);
@@ -435,6 +523,7 @@ describe("parseReviewConfig", () => {
       PI_REVIEW_CHUNK_CHARS: "1",
       PI_REVIEW_ATTACH_CHARS: "9999999",
       PI_REVIEW_MAX_CHILDREN: "999",
+      PI_REVIEW_CONCURRENCY: "999",
       PI_REVIEW_TIMEOUT_MS: "5",
       PI_REVIEW_IDLE_TIMEOUT_MS: "1000",
       PI_REVIEW_MODEL: "ollama/qwen3 ",
@@ -446,6 +535,8 @@ describe("parseReviewConfig", () => {
     expect(c.attachChars).toBe(262_144); // clamped to max
     expect(parseReviewConfig({ PI_REVIEW_ATTACH_CHARS: "0" }).attachChars).toBe(0); // numeric zero disables
     expect(c.maxChildren).toBe(32); // clamped to max
+    expect(c.concurrency).toBe(16); // clamped to max
+    expect(parseReviewConfig({ PI_REVIEW_CONCURRENCY: "1" }).concurrency).toBe(1);
     expect(c.timeoutMs).toBe(10_000); // clamped to min
     expect(c.idleTimeoutMs).toBe(10_000); // clamped to min
     expect(c.model).toBe("ollama/qwen3");

@@ -99,6 +99,9 @@ export interface ReviewConfig {
   chunkChars: number;
   /** Cap on total finder children per review. */
   maxChildren: number;
+  /** Finder children in flight at once — the wave width. Default matches
+   * maxChildren so two-chunk reviews run as one wave. */
+  concurrency: number;
   /** Per-child timeout. */
   timeoutMs: number;
   /** Kill a child that has waited on its LLM this long without an event —
@@ -151,6 +154,7 @@ export function parseReviewConfig(env: NodeJS.ProcessEnv): ReviewConfig {
     chunkChars: clampInt(env.PI_REVIEW_CHUNK_CHARS, 96_000, 8_000, 512_000),
     attachChars: clampInt(env.PI_REVIEW_ATTACH_CHARS, 64_000, 0, 262_144),
     maxChildren: clampInt(env.PI_REVIEW_MAX_CHILDREN, 8, 1, 32),
+    concurrency: clampInt(env.PI_REVIEW_CONCURRENCY, 8, 1, 16),
     timeoutMs: clampInt(env.PI_REVIEW_TIMEOUT_MS, 20 * 60_000, 10_000, 6 * 60 * 60_000),
     idleTimeoutMs,
     model: env.PI_REVIEW_MODEL?.trim() || DEFAULT_REVIEW_MODEL,
@@ -661,7 +665,7 @@ Start from the diff. Form specific review questions (Where is this called? Is th
  * center — not thinking, which the default model runs without. */
 const TURN_ECONOMY_RULES = `## Turn economy
 
-Your generated tokens are the wall-clock cost of this review. In intermediate turns, emit tool calls only — no preamble, no narration of what you are about to check, no summaries of what you just read. The changed files' current contents are already attached; do not re-read what you have. Batch every independent tool call into one turn instead of serializing them. All writing happens once, at the end, in the JSON.`;
+Your generated tokens are the wall-clock cost of this review. In intermediate turns, emit tool calls only — no preamble, no narration of what you are about to check, no summaries of what you just read. Do not re-read anything already in this task — the diff, any attached file contents, or prior tool results. Batch every independent tool call into one turn instead of serializing them. All writing happens once, at the end, in the JSON.`;
 
 /** What the finder reports — the verifier gets its own deciding rule instead. */
 const FINDER_RULES = `## Deciding what to report
@@ -1486,14 +1490,37 @@ export async function runReview(opts: {
       }
     }
     if (read.length === 0 && oversized.length === 0) continue;
-    const sel = selectAttachments(
-      read.map(({ path: p, size }) => ({ path: p, size })),
-      budget,
-    );
-    attachments[i] = renderAttachments(
-      read.filter((f) => sel.attached.includes(f.path)),
-      [...sel.skipped, ...oversized],
-    );
+    // Charge the rendered section, not just file bodies — per-file headers and
+    // the preamble are real bytes, and dozens of files can overflow any fixed
+    // margin. Compose, measure, drop the largest attachment, repeat: the
+    // composed task fits the cap or nothing is attached — the diff never
+    // truncates to make room.
+    let candidates = read;
+    let section = "";
+    for (;;) {
+      const sel = selectAttachments(
+        candidates.map(({ path: p, size }) => ({ path: p, size })),
+        budget,
+      );
+      const kept = candidates.filter((f) => sel.attached.includes(f.path));
+      section = renderAttachments(kept, [...sel.skipped, ...oversized]);
+      const taskBytes = Buffer.byteLength(
+        finderTask({
+          lens: FINDER_LENSES[0],
+          chunkIndex: i,
+          chunkCount: chunks.length,
+          diffText: chunkText(i),
+          guidelines,
+          priorFindings,
+          attachments: section,
+        }),
+        "utf8",
+      );
+      if (taskBytes <= TASK_MAX_BYTES || kept.length === 0) break;
+      const largest = kept.reduce((a, b) => (b.size > a.size ? b : a));
+      candidates = candidates.filter((f) => f !== largest);
+    }
+    attachments[i] = section;
   }
 
   // Stage 1: finders.
@@ -1537,7 +1564,7 @@ export async function runReview(opts: {
         ),
       );
     }),
-    Math.min(4, runs.length) || 1,
+    Math.min(config.concurrency, runs.length) || 1,
   );
   const usageParts: Array<ChildUsage | undefined> = [];
   const findingLists: Finding[][] = [];
