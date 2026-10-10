@@ -15,13 +15,17 @@
  *   session_start/session_tree by scanning the branch — durable, invisible to
  *   the model, correct across reload/rewind/resume. Tool-result `details` are
  *   render-only
- * - One-shot reminders on before_agent_start when the plan is unfinished and
- *   stale (or compaction wiped it — summaries never carry the plan: recall
- *   re-injects it as a tail message after mid-run drafts, and this reminder
- *   covers every other compaction). Wake-driven starts (background task
- *   completions and check-ins from superbash) don't count toward staleness:
- *   the plan is blocked on the very task the wake reports, and counting them
- *   churned reminders during long waits
+ * - One-shot staleness reminders on before_agent_start when the plan is
+ *   unfinished and stale. Compaction re-injects the plan immediately at the
+ *   session_compact commit (sendMessage, appended behind the compaction) —
+ *   summaries never carry the plan, and recall re-injects it as a tail
+ *   message after mid-run drafts (those fire no session_compact; the resume
+ *   scan recognizes that carrier). Injecting at before_agent_start instead
+ *   would land the plan after the user's next message, where it competes
+ *   with it. Wake-driven starts (background task completions and check-ins
+ *   from superbash) don't count toward staleness: the plan is blocked on the
+ *   very task the wake reports, and counting them churned reminders during
+ *   long waits
  * - /todos renders the list full-screen in the TUI
  */
 
@@ -429,11 +433,30 @@ export function registerTodoTool(pi: ExtensionAPI): void {
     adoptBranchState(ctx);
   });
   pi.on("session_compact", () => {
-    // Summaries never carry the plan, so every compaction re-arms the reminder
-    // and the list is re-injected at the next run start. Mid-run draft
+    // Summaries never carry the plan, so re-inject it here, at the commit:
+    // pi.sendMessage (triggerTurn:false) appends behind the compaction while
+    // idle and defers to turn end mid-run — always before whatever the user
+    // sends next, where a before_agent_start injection would instead land
+    // after the user's message and compete with it. Mid-run draft
     // compactions fire no session_compact — recall chains a plan message
     // after them instead, and the resume scan above recognizes that carrier.
-    compactedSinceUpdate = true;
+    //
+    // Failure is fire-and-forget: pi.sendMessage never throws — a failed
+    // append surfaces as a pi extension error, and the plan re-injection is
+    // simply lost for this compaction until the staleness leg re-arms
+    // (turnsSinceUpdate climbing back to REMINDER_MIN_TURNS). No catch can
+    // observe that; pretending otherwise would hide it.
+    const plan = summarizeTodos(todos);
+    if (plan.resolved >= plan.total) {
+      compactedSinceUpdate = false;
+      return;
+    }
+    compactedSinceUpdate = false;
+    turnsSinceUpdate = 0;
+    pi.sendMessage(
+      { customType: TODO_REMINDER_TYPE, content: renderReminder(todos), display: false },
+      { triggerTurn: false },
+    );
   });
 
   pi.on("before_agent_start", (event) => {

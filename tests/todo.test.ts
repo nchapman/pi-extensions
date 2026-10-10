@@ -41,7 +41,11 @@ function makePi() {
   // Custom state entries appended via pi.appendEntry — hand the same array to
   // the session_start ctx to simulate a reload picking them up from the branch.
   const entries: Array<{ type: string; customType: string; data?: unknown }> = [];
+  // Messages sent via pi.sendMessage (the compaction plan re-injection).
+  const sent: Array<{ message: Record<string, unknown>; options?: Record<string, unknown> }> = [];
   const pi = {
+    sendMessage: (message: Record<string, unknown>, options?: Record<string, unknown>) =>
+      sent.push({ message, options }),
     registerTool: (t: {
       name: string;
       execute: (id: string, params: unknown, signal?: AbortSignal) => Promise<unknown>;
@@ -59,7 +63,7 @@ function makePi() {
       entries.push({ type: "custom", customType, data });
     },
   } as unknown as ExtensionAPI;
-  return { pi, tools, commands, events, entries };
+  return { pi, tools, commands, events, entries, sent };
 }
 
 /** Fire a captured event handler (an optional event body overrides the synthesized one) and return its result. */
@@ -481,8 +485,8 @@ describe("registerTodoTool", () => {
     expect(reminder.message.content).toContain("[>] a");
   });
 
-  it("reminds after every compaction — extension-written summaries are plan-less too", async () => {
-    const { pi, tools, events } = makePi();
+  it("re-injects the plan at the compaction commit, behind the compaction — extension-written summaries are plan-less too", async () => {
+    const { pi, tools, events, sent } = makePi();
     registerTodoTool(pi);
 
     await tools.get(TODO_TOOL_NAME)!.execute("1", { todos: [item("a", "in_progress")] });
@@ -491,9 +495,25 @@ describe("registerTodoTool", () => {
       compactionEntry: { type: "compaction", summary: "## Goal\nwork" },
       fromExtension: true,
     });
+    expect(sent).toHaveLength(1);
+    expect(sent[0].message).toMatchObject({ customType: "todo.reminder", display: false });
+    expect(sent[0].message.content).toContain("[>] a");
+    // Appended at the commit — never steering, never a run start.
+    expect(sent[0].options).toEqual({ triggerTurn: false });
+    // One injection per compaction: the run-start leg stays quiet.
+    expect(fire(events, "before_agent_start")).toBeUndefined();
+  });
 
-    const reminder = fire(events, "before_agent_start") as { message: { content: string } };
-    expect(reminder.message.content).toContain("[>] a");
+  it("a resolved plan sends nothing at the compaction commit", async () => {
+    const { pi, tools, events, sent } = makePi();
+    registerTodoTool(pi);
+    await tools.get(TODO_TOOL_NAME)!.execute("1", { todos: [item("a", "completed")] });
+    fire(events, "session_compact", undefined, {
+      type: "session_compact",
+      compactionEntry: { type: "compaction", summary: "## Goal\nwork" },
+      fromExtension: true,
+    });
+    expect(sent).toHaveLength(0);
   });
 
   it("stays quiet on resume when a plan message follows the compaction", () => {
@@ -616,32 +636,6 @@ describe("registerTodoTool", () => {
     }) as {
       message: { content: string };
     };
-    expect(reminder.message.content).toContain("[>] a");
-  });
-
-  it("reminds on the next turn after compaction", async () => {
-    const { pi, tools, events } = makePi();
-    registerTodoTool(pi);
-
-    await tools.get(TODO_TOOL_NAME)!.execute("1", { todos: [item("a", "in_progress")] });
-    fire(events, "session_compact");
-
-    const reminder = fire(events, "before_agent_start") as { message: { content: string } };
-    expect(reminder.message.content).toContain("[>] a");
-  });
-
-  it("still reminds after a plan-less compaction even when an extension wrote the summary", async () => {
-    const { pi, tools, events } = makePi();
-    registerTodoTool(pi);
-
-    await tools.get(TODO_TOOL_NAME)!.execute("1", { todos: [item("a", "in_progress")] });
-    fire(events, "session_compact", undefined, {
-      type: "session_compact",
-      compactionEntry: { type: "compaction", summary: "## Goal\nwork" },
-      fromExtension: true,
-    });
-
-    const reminder = fire(events, "before_agent_start") as { message: { content: string } };
     expect(reminder.message.content).toContain("[>] a");
   });
 

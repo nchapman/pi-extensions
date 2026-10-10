@@ -139,7 +139,10 @@ function makePi() {
     }
   >();
   const events = new Map<string, (event?: unknown, ctx?: unknown) => unknown>();
+  const sent: Array<{ message: Record<string, unknown>; options?: Record<string, unknown> }> = [];
   const pi = {
+    sendMessage: (message: Record<string, unknown>, options?: Record<string, unknown>) =>
+      sent.push({ message, options }),
     registerTool: (t: {
       name: string;
       execute: (
@@ -155,7 +158,7 @@ function makePi() {
     registerCommand: () => {},
     on: (event: string, handler: (event?: unknown, ctx?: unknown) => unknown) => events.set(event, handler),
   } as unknown as ExtensionAPI;
-  return { pi, tools, events };
+  return { pi, tools, events, sent };
 }
 
 /** Same shape visibleEntryIds() consumes in the tool: projection-visible ids. */
@@ -894,11 +897,12 @@ describe("fsProjectReader", () => {
 
 describe("registerRecallTool", () => {
   function setup(config = CONFIG) {
-    const { pi, tools, events } = makePi();
+    const { pi, tools, events, sent } = makePi();
     registerRecallTool(pi, config);
     return {
       tools,
       events,
+      sent,
       run: (params: unknown, ctx = sessionCtx()) =>
         tools.get(RECALL_TOOL_NAME)!.execute("t1", params, undefined, undefined, ctx),
     };
@@ -1132,26 +1136,20 @@ describe("registerRecallTool", () => {
     expect(read.content[0].text).toContain("the exact foreign detail we need to read fully");
   });
 
-  it("fires a one-shot reminder after compaction", async () => {
-    const { events } = setup();
-    const ctx = sessionCtx();
-    await fire(events, "session_compact", ctx);
-    const first = (await fire(events, "before_agent_start", ctx)) as { message: { content: string } } | undefined;
-    expect(first?.message.content).toContain("recall");
-    // Not-miss-a-beat contract: the reminder forces re-orientation from the freshest
-    // ground truth (kept messages), not just the possibly-stale summary.
-    expect(first?.message.content).toContain("Re-orient");
-    expect(first?.message.content).toContain("most recent messages");
-    const second = await fire(events, "before_agent_start", ctx);
-    expect(second).toBeUndefined();
-  });
-
-  it("session_start clears a pending reminder", async () => {
-    const { events } = setup();
-    const ctx = sessionCtx();
-    await fire(events, "session_compact", ctx);
-    await fire(events, "session_start", ctx);
-    expect(await fire(events, "before_agent_start", ctx)).toBeUndefined();
+  it("sends the reminder at the compaction commit, behind the compaction — never at run start", async () => {
+    const { events, sent } = setup();
+    await fire(events, "session_compact", sessionCtx());
+    expect(sent).toHaveLength(1);
+    expect(sent[0].message).toMatchObject({ customType: "recall.reminder", display: false });
+    // triggerTurn:false — appended while idle, never steering a running agent.
+    expect(sent[0].options).toEqual({ triggerTurn: false });
+    // Background framing, not a directive: at this position the model must
+    // read it as context, and the user's next message stays the latest thing.
+    expect(sent[0].message.content).toContain("wins on conflict");
+    expect(sent[0].message.content).toContain("recall");
+    // No run-start injection anymore — that landed after the user's next
+    // message and got answered instead of the user (observed live).
+    expect(events.get("before_agent_start")).toBeUndefined();
   });
 });
 
@@ -2188,17 +2186,23 @@ describe("summarization prompt", () => {
     for (const section of [
       "## Goal",
       "## Constraints & Preferences",
+      "## Working Patterns",
       "## Progress",
       "### Done",
-      "### In Progress",
+      "### Left Unfinished",
       "### Blocked",
       "### Dead Ends",
       "## Key Decisions",
-      "## Next Steps",
+      "## Open Threads",
       "## Critical Context",
     ]) {
       expect(prompt).toContain(section);
     }
+    // Position framing: the precedence preamble and the non-directive mood
+    // rule keep the summary readable as background at the front of context,
+    // not a task list that competes with the user's newer messages.
+    expect(prompt).toContain("the messages that follow this summary are newer and win on any conflict");
+    expect(prompt).toContain("never as directives");
     // Dead ends are load-bearing: forgetting one invites retrying it.
     expect(prompt).toContain("invites retrying");
     expect(prompt).toContain("<conversation>\n[User]: do the thing\n</conversation>");
@@ -2269,7 +2273,7 @@ describe("summarization prompt", () => {
 
   it("buildSummarizationInstruction carries the same template with no embedded conversation", () => {
     const instruction = buildSummarizationInstruction("## Goal\n- stale", "focus on auth", 5_000, 20_000);
-    for (const section of ["## Goal", "### Dead Ends", "## Key Decisions", "## Next Steps", "## Critical Context"]) {
+    for (const section of ["## Goal", "### Dead Ends", "## Key Decisions", "## Open Threads", "## Critical Context"]) {
       expect(instruction).toContain(section);
     }
     // No conversation is embedded — it rides as the message history instead.
@@ -2401,12 +2405,16 @@ describe("auto-compact wiring", () => {
     return { ctx, compactCalls };
   }
 
-  it("never triggers from before_agent_start even over budget — ctx.compact() would abort/race the starting run", async () => {
+  it("delivers the compaction trigger through ctx.compact, never a run-start hook", async () => {
     const { ctx, compactCalls } = setup({ tokens: 190_000, contextWindow: 200_000 });
     const { pi, events } = makePi();
     registerRecallTool(pi, CONFIG);
-    await fire(events, "before_agent_start", ctx);
+    // Over budget at a run start: no compaction may fire from here —
+    // ctx.compact() begins with abort()+waitForIdle(), which would race the
+    // very run this event starts. The budget trigger lives on agent_settled.
+    expect(events.get("before_agent_start")).toBeUndefined();
     expect(compactCalls).toHaveLength(0);
+    void ctx;
   });
 
   it("does not trigger below the target, on unknown tokens, or when disabled (ownSummaries off keeps the direct trigger)", async () => {
@@ -2643,7 +2651,7 @@ describe("background idle compaction", () => {
     expect(call.context.messages[5].role).toBe("user");
     const instruction = (call.context.messages[5].content as { type: string; text: string }[])[0].text;
     expect(instruction).toContain("Summarize the conversation above");
-    expect(instruction).toContain("## Next Steps");
+    expect(instruction).toContain("## Open Threads");
     expect(instruction).toContain("<previous-summary>");
     expect(instruction).not.toContain("<conversation>");
     expect(call.options.sessionId).toBe("sess-settled");
@@ -3143,7 +3151,7 @@ describe("compaction summary ownership", () => {
     const prompt = call.context.messages[0].content[0].text;
     expect(prompt.indexOf("older-span work")).toBeLessThan(prompt.indexOf("split turn prefix"));
     expect(prompt).toContain("<previous-summary>\n## Goal\n- Earlier\n</previous-summary>");
-    expect(prompt).toContain("## Next Steps");
+    expect(prompt).toContain("## Open Threads");
     expect(prompt).toContain("under 5,000 characters");
     // pi's own summarizer conventions: one-off prompt (no cache writes), bounded
     // output, fresh routing id, abortable.
@@ -4034,13 +4042,16 @@ describe("mid-run compaction wiring (turn_end)", () => {
       { entries: unknown[]; continue?: boolean } | undefined;
     expect(result).toBeDefined();
     expect(result!.continue).toBeUndefined(); // pi's own continuation decision stands
-    const [draft] = result!.entries as Array<Record<string, unknown>>;
+    const [draft, reminder] = result!.entries as Array<Record<string, unknown>>;
     expect(draft.type).toBe("compaction");
     expect(draft.summary).toBe("## Goal\n- mid-run summary");
     expect(typeof draft.firstKeptEntryId).toBe("string");
     expect(draft.usage).toEqual({ totalTokens: 7 });
-    // No todo state on the branch — the draft stands alone, no plan message.
-    expect(result!.entries).toHaveLength(1);
+    // No todo state on the branch — no plan message, but the chained
+    // reminder still rides behind the compaction draft.
+    expect(result!.entries).toHaveLength(2);
+    expect(reminder.type).toBe("custom_message");
+    expect(reminder.customType).toBe("recall.reminder");
   });
 
   it("chains the current plan as a message after the draft — drafts fire no session_compact, so nothing else carries it", async () => {
@@ -4060,7 +4071,9 @@ describe("mid-run compaction wiring (turn_end)", () => {
       turnEndEvent(),
     )) as { entries: Array<Record<string, unknown>> };
 
-    // Plan-less compaction first, then the plan carrier at the recent position.
+    // Plan-less compaction first, then the plan carrier, then the reminder —
+    // all at the recent position, chained in order.
+    expect(result.entries).toHaveLength(3);
     expect(result.entries[0].type).toBe("compaction");
     expect(result.entries[0].summary).not.toContain("## Current Plan");
     const planMessage = result.entries[1] as {
@@ -4074,6 +4087,9 @@ describe("mid-run compaction wiring (turn_end)", () => {
     expect(planMessage.content).toContain("## Current Plan");
     expect(planMessage.content).toContain("[>] survive compaction");
     expect(planMessage.display).toBe(false);
+    const reminder = result.entries[2] as { type: string; customType: string };
+    expect(reminder.type).toBe("custom_message");
+    expect(reminder.customType).toBe("recall.reminder");
   });
 
   it("summarizes the projection chronologically with the previous compaction summary, and unions file lists", async () => {
@@ -4296,12 +4312,12 @@ describe("mid-run compaction wiring (turn_end)", () => {
     expect(draft.entries[0].type).toBe("compaction");
     expect(draft.entries[0].summary).toBe("## Goal\n- background summary");
     expect(draft.entries[0].usage).toEqual({ totalTokens: 9 });
-    // Boundary commits fire no session_compact — the fast path must arm the
-    // post-compaction reminder itself, or the next run starts without it.
-    const reminder = (await fire(events, "before_agent_start", turnEndCtx())) as {
-      message: { customType: string };
-    };
-    expect(reminder.message.customType).toBe("recall.reminder");
+    // Boundary commits fire no session_compact — the reminder rides the same
+    // chain, behind the compaction draft, instead of waiting for a run start.
+    expect(draft.entries.at(-1)).toMatchObject({
+      type: "custom_message",
+      customType: "recall.reminder",
+    });
   });
 
   it("drops a stale background result at the boundary and regenerates inline", async () => {
@@ -4347,15 +4363,12 @@ describe("mid-run compaction wiring (turn_end)", () => {
     const result = (await fire(events, "turn_end", turnEndCtx(), turnEndEvent({ entries: [earlier] }))) as {
       entries: Array<Record<string, unknown>>;
     };
-    expect(result.entries).toHaveLength(2);
+    expect(result.entries).toHaveLength(3);
     expect(result.entries[0]).toEqual(earlier); // not clobbered
     expect(result.entries[1].type).toBe("compaction");
-    // Boundary commits never fire session_compact — the reminder must fire at
-    // the next run start anyway.
-    const reminder = (await fire(events, "before_agent_start", turnEndCtx())) as {
-      message: { customType: string };
-    };
-    expect(reminder.message.customType).toBe("recall.reminder");
+    // Boundary commits never fire session_compact — the reminder rides the
+    // chained entries rather than a run-start injection.
+    expect(result.entries[2]).toMatchObject({ type: "custom_message", customType: "recall.reminder" });
   });
 
   it("defers when another handler already proposed a compaction this boundary", async () => {
