@@ -79,11 +79,14 @@ import {
 // Config
 // ---------------------------------------------------------------------------
 
-/** Default finder model — the benchmarked configuration: 85.7% recall / 90.5%
- * Crit-High on code-review-bench at ~1/10 the cost of heavier models. Env knob
- * PI_REVIEW_MODEL and --model still override; note this default means reviews
- * no longer inherit the session model unless --model says so. */
-export const DEFAULT_REVIEW_MODEL = "opencode-go/deepseek-v4.1-flash";
+/** Default finder model — the benchmarked configuration: 100% recall
+ * (31/31, all severities) on code-review-bench at ~1/4 the wall time of the
+ * same model with default thinking (which needs >6 minutes per finder child
+ * on the benchmark diff — the production hard cap is 20m, so default
+ * thinking means reviews measured in many minutes). Thinking-off is the
+ * load-bearing part: pi's `provider/id:thinking` suffix means PI_REVIEW_MODEL
+ * and --model still override model and level together. */
+export const DEFAULT_REVIEW_MODEL = "opencode-go/deepseek-v4.1-flash:off";
 
 export interface ReviewConfig {
   /** Characters of diff per finder chunk (file-boundary aligned). */

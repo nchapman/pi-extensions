@@ -200,7 +200,7 @@ describe("parseReviewConfig", () => {
     expect(c.verify).toBe(false);
     expect(c.chunkChars).toBe(96_000);
     expect(c.maxChildren).toBe(8);
-    expect(c.model).toBe("opencode-go/deepseek-v4.1-flash");
+    expect(c.model).toBe("opencode-go/deepseek-v4.1-flash:off");
     expect(c.checkCmd).toBe("");
     expect(c.persist).toBe(true);
     expect(c.idleTimeoutMs).toBe(5 * 60_000);

@@ -32,6 +32,7 @@
   },
   "scripts": {
     "bench:recall": "vitest run --config scripts/bench.config.ts",
+    "bench:review-models": "vitest run --config scripts/bench-review-models.config.ts",
     "eval:review": "vitest run --config scripts/eval-review.config.ts",
     "check": "tsc --noEmit && vitest run",
     "check:format": "prettier --check extensions lib scripts tests",
