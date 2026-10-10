@@ -11,8 +11,14 @@
  *   (lockfiles, logs, vendored/generated/minified), chunk on file boundaries,
  *   and collect repo instructions — REVIEW.md at the root plus the
  *   "Review guidelines" section of the closest AGENTS.md for each changed
- *   file (Codex's convention). An optional read-only check command
- *   (PI_REVIEW_CHECK_CMD) runs once and feeds its output to verification.
+ *   file (Codex's convention). Each chunk's changed files are then attached
+ *   (hunk-centered windows of current contents — whole file when small —
+ *   smallest-first under PI_REVIEW_ATTACH_CHARS): finders start from the
+ *   changed regions in the task instead of paying tool round trips to
+ *   re-discover the very files under review — attachments never shrink the
+ *   diff (they use only task-cap headroom). An optional
+ *   read-only check command (PI_REVIEW_CHECK_CMD) runs once and feeds its
+ *   output to verification.
  * - Stage 1 (find): one read-only subagent per (lens × chunk) explores the
  *   working tree with review-shaped workflow instructions and returns
  *   findings as JSON. Lenses focus attention; chunks bound context; the
@@ -100,6 +106,10 @@ export interface ReviewConfig {
    * detector). Tool executions are exempt (see RunChildOptions.idleTimeoutMs).
    * 0 disables the watchdog. */
   idleTimeoutMs: number;
+  /** Char budget for attaching changed files' current contents to finder
+   * tasks — collapses the re-read round trips that dominate child wall time
+   * (0 disables; always bounded by task headroom so the diff never truncates). */
+  attachChars: number;
   /** Model override for all stages. */
   model?: string;
   /** Model override for the verify stage only (wins over `model`). */
@@ -139,6 +149,7 @@ export function parseReviewConfig(env: NodeJS.ProcessEnv): ReviewConfig {
       : clampInt(env.PI_REVIEW_IDLE_TIMEOUT_MS, 5 * 60_000, 10_000, 6 * 60 * 60_000);
   return {
     chunkChars: clampInt(env.PI_REVIEW_CHUNK_CHARS, 96_000, 8_000, 512_000),
+    attachChars: clampInt(env.PI_REVIEW_ATTACH_CHARS, 64_000, 0, 262_144),
     maxChildren: clampInt(env.PI_REVIEW_MAX_CHILDREN, 8, 1, 32),
     timeoutMs: clampInt(env.PI_REVIEW_TIMEOUT_MS, 20 * 60_000, 10_000, 6 * 60 * 60_000),
     idleTimeoutMs,
@@ -705,6 +716,8 @@ export function finderTask(opts: {
   diffText: string;
   guidelines: string;
   priorFindings: string;
+  /** Rendered attachment section (current contents of changed files). */
+  attachments?: string;
 }): string {
   const parts: string[] = [];
   parts.push(
@@ -719,6 +732,7 @@ export function finderTask(opts: {
       `## Findings from the previous review of this change\nRepeat each still-valid finding with the same title so the author recognizes it; do not re-raise one whose code has been fixed unless this change reintroduces it.\n${opts.priorFindings}`,
     );
   }
+  if (opts.attachments) parts.push(opts.attachments);
   parts.push(`## The diff\n${opts.diffText}`);
   // Same sandwich: restate the objective after the payload.
   parts.push(`Verdict every candidate: one JSON array of {id, verdict, reason} — evidence, not inference.`);
@@ -1095,6 +1109,114 @@ export function truncateUtf8Bytes(text: string, maxBytes: number): { text: strin
   return { text: out, omittedBytes: Buffer.byteLength(text, "utf8") - Buffer.byteLength(out, "utf8") };
 }
 
+/** Lines of context around each hunk when windowing attachments of large
+ * files — enough to capture the enclosing function, cheap enough to attach
+ * every changed region instead of winner-take-all whole files. */
+const ATTACH_WINDOW_LINES = 40;
+/** Per-file cap on attached content; a window set over this (a ~400-line
+ * change) is not attached rather than partially attached. */
+const ATTACH_SLICE_MAX_CHARS = 16_000;
+
+/** New-file line ranges of a file's hunks — the anchors windowed attachment
+ * widens around. Count-less headers are single-line hunks; a zero-count
+ * hunk (pure deletion) still anchors a window at its position. */
+export function hunkRanges(fileDiff: string): Array<{ start: number; end: number }> {
+  const ranges: Array<{ start: number; end: number }> = [];
+  for (const m of fileDiff.matchAll(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gm)) {
+    const start = Number(m[1]);
+    const count = m[2] === undefined ? 1 : Number(m[2]);
+    ranges.push({ start, end: start + Math.max(count, 1) - 1 });
+  }
+  return ranges;
+}
+
+/** Widen ranges by `width` lines, clamp to [1, maxLine], merge overlaps. */
+export function mergeRanges(
+  ranges: Array<{ start: number; end: number }>,
+  width: number,
+  maxLine: number,
+): Array<{ start: number; end: number }> {
+  const widened = ranges.map((r) => ({
+    start: Math.max(1, r.start - width),
+    end: Math.min(maxLine, r.end + width),
+  }));
+  widened.sort((a, b) => a.start - b.start);
+  const merged: Array<{ start: number; end: number }> = [];
+  for (const r of widened) {
+    const last = merged[merged.length - 1];
+    if (last && r.start <= last.end + 1) last.end = Math.max(last.end, r.end);
+    else merged.push({ ...r });
+  }
+  return merged;
+}
+
+/** The per-file attachment: windows around the hunks sliced from current
+ * contents, or the whole file when the windows cover it anyway. Null when
+ * there is no anchor (mode-only/rename diffs) or the slice overflows the
+ * per-file cap — partial windows mislead more than they inform. */
+export function sliceAttachment(
+  content: string,
+  ranges: Array<{ start: number; end: number }>,
+  width: number = ATTACH_WINDOW_LINES,
+  maxChars: number = ATTACH_SLICE_MAX_CHARS,
+): { label: string; content: string } | null {
+  const lines = content.split("\n");
+  const merged = mergeRanges(ranges, width, lines.length);
+  if (merged.length === 0) return null;
+  if (merged.length === 1 && merged[0].start <= 1 && merged[0].end >= lines.length) {
+    return { label: "whole file", content };
+  }
+  const text = merged.map((w) => lines.slice(w.start - 1, w.end).join("\n")).join("\n…\n");
+  if (text.length > maxChars) return null;
+  const label = merged.map((w) => `lines ${w.start}-${w.end}`).join("; ");
+  return { label, content: text };
+}
+
+/** Choose whole attachments to attach under a byte budget, smallest first —
+ * the budget buys complete files rather than one partial tail, and a monster
+ * file never displaces several useful ones. Sizes are bytes so the budget
+ * composes with the task byte cap. Files that do not fit are named so the
+ * finder knows to read them itself. */
+export function selectAttachments(
+  files: Array<{ path: string; size: number }>,
+  budget: number,
+): { attached: string[]; skipped: string[] } {
+  const ordered = [...files].sort((a, b) => a.size - b.size);
+  const attached: string[] = [];
+  const skipped: string[] = [];
+  let used = 0;
+  for (const f of ordered) {
+    if (used + f.size <= budget) {
+      attached.push(f.path);
+      used += f.size;
+    } else {
+      skipped.push(f.path);
+    }
+  }
+  return { attached, skipped };
+}
+
+/** Render the attachment section: current contents of the changed files as
+ * reference material for the diff — the finder consults these before paying
+ * for a tool round trip. */
+export function renderAttachments(
+  files: Array<{ path: string; label?: string; content: string }>,
+  skipped: string[],
+): string {
+  const parts: string[] = [];
+  if (files.length > 0) {
+    parts.push(
+      "## Current contents of the changed files\nAnswer questions the diff raises from these before reaching for tools. Large files appear as windows around their changed regions; `…` marks elided spans.",
+    );
+    for (const f of files)
+      parts.push(`### ${f.path}${f.label && f.label !== "whole file" ? ` (${f.label})` : ""}\n${f.content}`);
+  }
+  if (skipped.length > 0) {
+    parts.push(`Files not attached (over budget — read them if needed): ${skipped.join(", ")}`);
+  }
+  return parts.join("\n\n");
+}
+
 /** Build a task whose diff is truncated so the whole task fits the byte cap.
  * `build` is called with the (possibly truncated) diff; the truncation note is
  * appended so the child knows the diff is partial. */
@@ -1298,6 +1420,71 @@ export async function runReview(opts: {
   // Stage 0d: chunk on file boundaries with the effective budget.
   const contextChars = guidelines.length + priorFindings.length + 2_000;
   const chunks = chunkDiffFiles(files, Math.max(8_000, config.chunkChars - contextChars));
+  const chunkText = (i: number) => chunks[i].files.map((f) => f.text).join("\n");
+
+  // Stage 0e: attach each chunk's changed files — hunk-centered windows of
+  // current contents (whole file when small), so every changed region rides
+  // in the task regardless of file size. The finder's first tool calls are
+  // re-reads of exactly these regions; paying for them up front gives every
+  // lens the same head start instead of four independent discoveries. Never
+  // shrinks the diff: attachments use only the headroom the task byte cap
+  // leaves, so fitTask never truncates the diff to make room. A missing file
+  // is a deletion (or eval's empty tree) — absence is in the diff, nothing to
+  // attach; a no-hunk file diff (rename/mode-only) has nothing to anchor a
+  // window on.
+  const attachments: string[] = [];
+  for (let i = 0; i < chunks.length; i++) {
+    attachments.push("");
+    if (config.attachChars <= 0) continue;
+    const skeleton = finderTask({
+      lens: FINDER_LENSES[0],
+      chunkIndex: i,
+      chunkCount: chunks.length,
+      diffText: "",
+      guidelines,
+      priorFindings,
+    });
+    const headroom =
+      TASK_MAX_BYTES -
+      Buffer.byteLength(skeleton, "utf8") -
+      Buffer.byteLength(chunkText(i), "utf8") -
+      2_048; /* truncation-note margin */
+    const budget = Math.min(config.attachChars, headroom);
+    if (budget <= 0) continue;
+    // Sizes are BYTES, matching headroom and TASK_MAX_BYTES — a chars-based
+    // count would silently overrun the task cap on multibyte content (em-dashes
+    // in comments are 3 bytes counted as 1) and truncate the diff we promised
+    // never to shrink. Paths resolve against repoRoot, not cwd: git diff
+    // prints repo-root-relative paths, and the session cwd may be a
+    // subdirectory. Files whose windows overflow the per-file cap are named
+    // in the skipped note — a finder that knows what it is missing reads it.
+    const read: Array<{ path: string; label: string; size: number; content: string }> = [];
+    const oversized: string[] = [];
+    for (const f of chunks[i].files) {
+      const content = await deps.readFile(path.join(repoRoot, f.path));
+      if (content === undefined) continue;
+      const piece = sliceAttachment(content, hunkRanges(f.text));
+      if (piece) {
+        read.push({
+          path: f.path,
+          label: piece.label,
+          size: Buffer.byteLength(piece.content, "utf8"),
+          content: piece.content,
+        });
+      } else if (hunkRanges(f.text).length > 0) {
+        oversized.push(f.path);
+      }
+    }
+    if (read.length === 0 && oversized.length === 0) continue;
+    const sel = selectAttachments(
+      read.map(({ path: p, size }) => ({ path: p, size })),
+      budget,
+    );
+    attachments[i] = renderAttachments(
+      read.filter((f) => sel.attached.includes(f.path)),
+      [...sel.skipped, ...oversized],
+    );
+  }
 
   // Stage 1: finders.
   // One configuration — every lens, every review. Tiers are gone: the eval
@@ -1312,7 +1499,6 @@ export async function runReview(opts: {
     `Reviewing ${files.length} file(s) in ${chunks.length} chunk(s) with ${runs.length} finder run(s)…`,
     "info",
   );
-  const chunkText = (i: number) => chunks[i].files.map((f) => f.text).join("\n");
   const findResults = await runWithLimit(
     runs.map((run) => () => {
       const lens = lenses.get(run.lens)!;
@@ -1327,6 +1513,7 @@ export async function runReview(opts: {
             diffText: diff,
             guidelines,
             priorFindings,
+            attachments: attachments[run.chunk] || undefined,
           }),
         chunkText(run.chunk),
       );

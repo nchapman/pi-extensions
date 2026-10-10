@@ -13,12 +13,17 @@ import {
   finderAgent,
   finderTask,
   fitTask,
+  hunkRanges,
   isExcludedPath,
   mergeFindings,
+  mergeRanges,
   parseFindings,
   parseReviewArgs,
   registerReview,
+  renderAttachments,
   resolveInvocation,
+  selectAttachments,
+  sliceAttachment,
   summarizeForTool,
   parseReviewConfig,
   parseVerdicts,
@@ -76,6 +81,7 @@ const finding = (over: Partial<Finding> = {}): Finding => ({
 
 const CONFIG = (over: Partial<ReviewConfig> = {}): ReviewConfig => ({
   chunkChars: 96_000,
+  attachChars: 64_000,
   maxChildren: 8,
   timeoutMs: 60_000,
   idleTimeoutMs: 300_000,
@@ -168,6 +174,222 @@ const emptyDeps = (over: Record<string, unknown> = {}) => ({
   ...over,
 });
 
+describe("attachments", () => {
+  it("selects whole files smallest-first under the budget, naming the rest", () => {
+    const sel = selectAttachments(
+      [
+        { path: "big.ts", size: 50_000 },
+        { path: "a.ts", size: 2_000 },
+        { path: "b.ts", size: 3_000 },
+      ],
+      4_000,
+    );
+    expect(sel.attached).toEqual(["a.ts"]); // whole small file first
+    expect(sel.skipped).toEqual(["b.ts", "big.ts"]); // neither fits the remainder
+  });
+
+  it("renders contents as reference material and names over-budget files", () => {
+    const text = renderAttachments([{ path: "src/a.ts", content: "const A = 1;" }], ["gen/huge.ts"]);
+    expect(text).toContain("## Current contents of the changed files");
+    expect(text).toContain("before reaching for tools");
+    expect(text).toContain("### src/a.ts\nconst A = 1;");
+    expect(text).toContain("read them if needed): gen/huge.ts");
+  });
+
+  it("parses hunk ranges including single-line and pure-deletion hunks", () => {
+    const ranges = hunkRanges(
+      ["@@ -1,3 +1,4 @@", " ctx", "@@ -10,1 +9,0 @@", "-gone", "@@ -20 +21 @@", "+solo"].join("\n"),
+    );
+    expect(ranges).toEqual([
+      { start: 1, end: 4 },
+      { start: 9, end: 9 }, // zero-count deletion still anchors a window
+      { start: 21, end: 21 }, // count-less header is a single line
+    ]);
+  });
+
+  it("widens, clamps, and merges overlapping ranges", () => {
+    const merged = mergeRanges(
+      [
+        { start: 100, end: 110 },
+        { start: 50, end: 60 },
+        { start: 95, end: 96 },
+      ],
+      40,
+      200,
+    );
+    expect(merged).toEqual([{ start: 10, end: 150 }]); // 50-60 and 95-110 windows overlap
+  });
+
+  it("slices hunk windows from large files and whole files from small ones", () => {
+    const big = Array.from({ length: 200 }, (_, i) => `line ${i + 1}`).join("\n");
+    const windowed = sliceAttachment(big, [{ start: 100, end: 105 }]);
+    expect(windowed?.label).toBe("lines 60-145");
+    expect(windowed?.content).toContain("line 100");
+    expect(windowed?.content).not.toContain("\nline 10\n"); // outside the window (newline-anchored: "line 100" is inside)
+
+    // Two distant hunks: two windows, with the elided span marked between.
+    const huge = Array.from({ length: 400 }, (_, i) => `line ${i + 1}`).join("\n");
+    const split = sliceAttachment(huge, [
+      { start: 20, end: 25 },
+      { start: 300, end: 305 },
+    ]);
+    expect(split?.label).toBe("lines 1-65; lines 260-345");
+    expect(split?.content).toContain("…");
+    expect(split?.content).toContain("\nline 302\n");
+    expect(split?.content).not.toContain("\nline 200\n"); // between the windows
+
+    const small = sliceAttachment("a\nb\nc", [{ start: 2, end: 2 }]);
+    expect(small).toEqual({ label: "whole file", content: "a\nb\nc" });
+
+    expect(sliceAttachment("a\nb", [])).toBeNull(); // nothing to anchor on
+  });
+
+  it("attaches changed files' current contents to every finder task", async () => {
+    const spawn = fakeSpawn(() => "[]");
+    const reads: string[] = [];
+    const readFile = async (p: string) => {
+      reads.push(p);
+      return p.endsWith("src/a.ts") ? "CONTENT_A" : p.endsWith("src/b.ts") ? "CONTENT_B" : undefined;
+    };
+    const git = gitFor([
+      // repo root differs from cwd: git diff paths are repo-root-relative and
+      // attachment reads must follow the root, not the session cwd.
+      { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: "/repo\n", stderr: "" } },
+      {
+        match: (a) => a[0] === "diff" && a[a.length - 1] === "HEAD",
+        result: { code: 0, stdout: SAMPLE_DIFF, stderr: "" },
+      },
+    ]);
+    await runReview({
+      cwd: "/repo/packages/app",
+      config: CONFIG({ verify: false }),
+      target: { kind: "uncommitted" },
+      deps: emptyDeps({ git, spawnFn: spawn, readFile }) as never,
+    });
+    expect(reads.some((p) => p === "/repo/src/a.ts")).toBe(true); // rooted, not cwd-joined
+    expect(spawn.tasks.length).toBeGreaterThan(0);
+    for (const task of spawn.tasks) {
+      expect(task).toContain("### src/a.ts\nCONTENT_A");
+      expect(task).toContain("### src/b.ts\nCONTENT_B");
+      expect(task).toContain("## The diff"); // the review subject still rides along
+      expect(Buffer.byteLength(task, "utf8")).toBeLessThanOrEqual(120_000); // the byte-cap invariant
+    }
+  });
+
+  it("names over-budget files instead of attaching partials, and 0 disables attaching", async () => {
+    const big = "B".repeat(5_000);
+    const spawn = fakeSpawn(() => "[]");
+    const readFile = async (p: string) =>
+      p.endsWith("src/a.ts") ? "CONTENT_A" : p.endsWith("src/b.ts") ? big : undefined;
+    const git = gitFor([
+      { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: "/repo\n", stderr: "" } },
+      {
+        match: (a) => a[0] === "diff" && a[a.length - 1] === "HEAD",
+        result: { code: 0, stdout: SAMPLE_DIFF, stderr: "" },
+      },
+    ]);
+    await runReview({
+      cwd: "/repo",
+      config: CONFIG({ verify: false, attachChars: 100 }),
+      target: { kind: "uncommitted" },
+      deps: emptyDeps({ git, spawnFn: spawn, readFile }) as never,
+    });
+    expect(spawn.tasks[0]).toContain("### src/a.ts\nCONTENT_A"); // whole file fits
+    expect(spawn.tasks[0]).not.toContain("### src/b.ts"); // partials never attach
+    expect(spawn.tasks[0]).toContain("read them if needed): src/b.ts"); // fallback is named
+
+    const off = fakeSpawn(() => "[]");
+    await runReview({
+      cwd: "/repo",
+      config: CONFIG({ verify: false, attachChars: 0 }),
+      target: { kind: "uncommitted" },
+      deps: emptyDeps({ git, spawnFn: off, readFile }) as never,
+    });
+    expect(off.tasks[0]).not.toContain("Current contents of the changed files");
+  });
+
+  it("attaches hunk windows of files too large to attach whole", async () => {
+    // 200 lines, changed at line 10 (SAMPLE_DIFF's b.ts hunk @@ -10,3 +10,3 @@):
+    // the whole file cannot fit a 1k budget, but the window around the hunk can.
+    const big = Array.from({ length: 200 }, (_, i) => `const v${i} = ${i};`).join("\n");
+    const spawn = fakeSpawn(() => "[]");
+    const readFile = async (p: string) => (p.endsWith("src/b.ts") ? big : undefined);
+    const git = gitFor([
+      { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: "/repo\n", stderr: "" } },
+      {
+        match: (a) => a[0] === "diff" && a[a.length - 1] === "HEAD",
+        result: { code: 0, stdout: SAMPLE_DIFF, stderr: "" },
+      },
+    ]);
+    await runReview({
+      cwd: "/repo",
+      config: CONFIG({ verify: false, attachChars: 2_000 }),
+      target: { kind: "uncommitted" },
+      deps: emptyDeps({ git, spawnFn: spawn, readFile }) as never,
+    });
+    // The window (hunk at 10-12 widened by 40, clamped at file start) fits
+    // where the whole file (≈3.8k) would not.
+    expect(spawn.tasks[0]).toContain("### src/b.ts (lines 1-52)");
+    expect(spawn.tasks[0]).toContain("const v10 = 10;");
+  });
+
+  it("names files whose windows overflow the per-file cap instead of attaching partials", async () => {
+    // 400-byte lines × 120 lines: the 40-line window around the hunk far
+    // exceeds ATTACH_SLICE_MAX_CHARS, so the file is named, not half-attached.
+    const wide = Array.from({ length: 120 }, () => "x".repeat(400)).join("\n");
+    const spawn = fakeSpawn(() => "[]");
+    const readFile = async (p: string) => (p.endsWith("src/b.ts") ? wide : undefined);
+    const git = gitFor([
+      { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: "/repo\n", stderr: "" } },
+      {
+        match: (a) => a[0] === "diff" && a[a.length - 1] === "HEAD",
+        result: { code: 0, stdout: SAMPLE_DIFF, stderr: "" },
+      },
+    ]);
+    await runReview({
+      cwd: "/repo",
+      config: CONFIG({ verify: false }),
+      target: { kind: "uncommitted" },
+      deps: emptyDeps({ git, spawnFn: spawn, readFile }) as never,
+    });
+    expect(spawn.tasks[0]).not.toContain("### src/b.ts");
+    expect(spawn.tasks[0]).toContain("read them if needed): src/b.ts");
+  });
+
+  it("skips deleted files silently — their absence is the diff", async () => {
+    const spawn = fakeSpawn(() => "[]");
+    const readFile = async (p: string) => (p.endsWith("src/a.ts") ? "CONTENT_A" : undefined);
+    const git = gitFor([
+      { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: "/repo\n", stderr: "" } },
+      {
+        match: (a) => a[0] === "diff" && a[a.length - 1] === "HEAD",
+        result: { code: 0, stdout: SAMPLE_DIFF, stderr: "" },
+      },
+    ]);
+    await runReview({
+      cwd: "/repo",
+      config: CONFIG({ verify: false }),
+      target: { kind: "uncommitted" },
+      deps: emptyDeps({ git, spawnFn: spawn, readFile }) as never,
+    });
+    expect(spawn.tasks[0]).toContain("### src/a.ts\nCONTENT_A");
+    expect(spawn.tasks[0]).not.toContain("### src/b.ts");
+    expect(spawn.tasks[0]).not.toContain("read them if needed");
+  });
+});
+
+/** Git fake routed by arg matcher: first matching response wins, misses fail
+ * with a stderr naming the unexpected command. */
+const gitFor =
+  (
+    responses: Array<{
+      match: (args: string[]) => boolean;
+      result: { code: number; stdout: string; stderr: string };
+    }>,
+  ) =>
+  async (args: string[]) =>
+    responses.find((r) => r.match(args))?.result ?? { code: 1, stdout: "", stderr: `unexpected: ${args.join(" ")}` };
+
 describe("parseReviewConfig", () => {
   it("summarizes a review compactly for the agent-facing tool", () => {
     const full = {
@@ -199,6 +421,7 @@ describe("parseReviewConfig", () => {
     const c = parseReviewConfig({});
     expect(c.verify).toBe(false);
     expect(c.chunkChars).toBe(96_000);
+    expect(c.attachChars).toBe(64_000);
     expect(c.maxChildren).toBe(8);
     expect(c.model).toBe("opencode-go/deepseek-v4.1-flash:off");
     expect(c.checkCmd).toBe("");
@@ -210,6 +433,7 @@ describe("parseReviewConfig", () => {
     const c = parseReviewConfig({
       PI_REVIEW_VERIFY: "1",
       PI_REVIEW_CHUNK_CHARS: "1",
+      PI_REVIEW_ATTACH_CHARS: "9999999",
       PI_REVIEW_MAX_CHILDREN: "999",
       PI_REVIEW_TIMEOUT_MS: "5",
       PI_REVIEW_IDLE_TIMEOUT_MS: "1000",
@@ -219,6 +443,8 @@ describe("parseReviewConfig", () => {
     });
     expect(c.verify).toBe(true);
     expect(c.chunkChars).toBe(8_000); // clamped to min
+    expect(c.attachChars).toBe(262_144); // clamped to max
+    expect(parseReviewConfig({ PI_REVIEW_ATTACH_CHARS: "0" }).attachChars).toBe(0); // numeric zero disables
     expect(c.maxChildren).toBe(32); // clamped to max
     expect(c.timeoutMs).toBe(10_000); // clamped to min
     expect(c.idleTimeoutMs).toBe(10_000); // clamped to min
@@ -599,10 +825,15 @@ describe("prompts", () => {
       diffText: "diff --git a/x b/x",
       guidelines: "- never log PII",
       priorFindings: "- [important] a.ts:2 — old finding",
+      attachments: renderAttachments([{ path: "src/a.ts", content: "const A = 1;" }], []),
     });
     expect(task).toContain("# Code review: Correctness and logic (chunk 1/2)");
     expect(task).toContain("never log PII");
     expect(task).toContain("old finding");
+    // Attachments sit between the context sections and the diff — reference
+    // material before the object under review.
+    expect(task.indexOf("Current contents of the changed files")).toBeGreaterThan(task.indexOf("## Your job"));
+    expect(task.indexOf("Current contents of the changed files")).toBeLessThan(task.indexOf("## The diff"));
     expect(task).toContain("diff --git a/x b/x");
   });
 
@@ -903,16 +1134,6 @@ describe("review tool", () => {
 });
 
 describe("runReview", () => {
-  const gitFor =
-    (
-      responses: Array<{
-        match: (args: string[]) => boolean;
-        result: { code: number; stdout: string; stderr: string };
-      }>,
-    ) =>
-    async (args: string[]) =>
-      responses.find((r) => r.match(args))?.result ?? { code: 1, stdout: "", stderr: `unexpected: ${args.join(" ")}` };
-
   it("parses the verify opt-in knob (off by default)", () => {
     expect(parseReviewConfig({}).verify).toBe(false);
     expect(parseReviewConfig({ PI_REVIEW_VERIFY: "1" }).verify).toBe(true);
