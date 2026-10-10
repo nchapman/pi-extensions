@@ -804,6 +804,10 @@ describe("prompts", () => {
     expect(agent.instructions).toContain("Security");
     expect(agent.instructions).toContain("## Evidence discipline");
     expect(agent.instructions).toContain("## Deciding what to report");
+    // Turn economy sits with the discipline sections — it is what keeps the
+    // generation floor (the finder's dominant wall-time cost) low.
+    expect(agent.instructions).toContain("## Turn economy");
+    expect(agent.instructions).toContain("emit tool calls only");
     expect(agent.instructions.indexOf("## Evidence discipline")).toBeGreaterThan(
       agent.instructions.indexOf("Precision over volume"),
     );
