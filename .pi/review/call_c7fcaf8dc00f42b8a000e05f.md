@@ -1,0 +1,64 @@
+# Code review — uncommitted changes
+
+> ⚠️ Verification skipped (PI_REVIEW_VERIFY=0) — findings below are **unverified**.
+
+## 🟠 Important
+
+### The idle watchdog is now ON by default for the subagent tools, so a healthy child inside a long tool call is SIGKILLed as a 'dead request'
+**`extensions/subagents.ts:584`** — found by correctness, robustness, tests
+`const idleMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS` flips runChild from opt-in to on-by-default: before this change the fallback was the option itself, so an unset `idleTimeoutMs` meant no watchdog. The subagent/subagents tool layer now always supplies a value (subagents.ts:916 and :993), so every delegated child gets a 5-minute silence kill. The heartbeat is stdout data only (`lastActivityAt = Date.now()` in the stdout handler, subagents.ts:548), and a child executing its own `bash` tool emits nothing between the tool_call event and the tool_result — the exact case the new README paragraph warns about ("a child running a long build emits nothing while it runs"). Any command that runs longer than 5 minutes (full test suite, build, install, docker pull) trips `stall()` → `child.kill("SIGKILL")` (subagents.ts:585-590) and the whole child tree dies with `Subagent "<agent>" stalled: no output for 300s (request likely dead)`, discarding the child's in-flight work. The kill also survives background adoption (subagents.ts:582-583), so a long backgrounded agent task — the case `background: true` exists for — is killed and delivers an ERROR wake instead of a result. Unlike /review, which retries a stalled child once and discloses it in coverage, the subagent path retries nothing, and there is no per-task or per-agent override: `taskItem` only accepts agent/agent_md/task/model/background (subagents.ts:836-847), so the sole knob is the process-wide PI_SUBAGENT_IDLE_TIMEOUT_MS — raising it for one long task loosens detection for every other child.
+
+**Fix**: Do not let the idle window detach from the hard timeout. Either keep the watchdog opt-in for `subagent`/`subagents` (let `PI_SUBAGENT_IDLE_TIMEOUT_MS` enable it, as /review's `PI_REVIEW_IDLE_TIMEOUT_MS` does) or derive it from the hard timeout, e.g. `const idleMs = options.idleTimeoutMs ?? Math.min(DEFAULT_IDLE_TIMEOUT_MS, Math.max(60_000, timeoutMs / 2));`, so raising the timeout for long work raises the silence allowance too.
+
+### The three new "0 disables the watchdog" tests cannot fail: they pass on the pre-change implementation and under a 0→default coercion
+**`tests/subagents.test.ts:600`** — found by tests
+This change's contract is `options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS` (extensions/subagents.ts:584) with `idleMs > 0` gating the interval (subagents.ts:600). Every test added for the "0 disables" half pins nothing: (a) tests/subagents.test.ts:600-605 runs `runChild(..., { timeoutMs: 40, idleTimeoutMs: 0 })` and asserts `/timed out/` + `isStalledError(err) === false`; (b) tests/subagents.test.ts:1116-1131 sets `PI_SUBAGENT_IDLE_TIMEOUT_MS=0`, `PI_SUBAGENT_TIMEOUT_MS=40` and asserts `/timed out after 0s/`; (c) tests/review.test.ts:1226-1250 passes `CONFIG({ idleTimeoutMs: 0, timeoutMs: 40 })` and asserts the errors match `/timed out/` and never `stalled`. In all three the hard timeout is 40 ms, so it always reaps the child first, whatever the idle resolution does. Concretely: if line 584 regressed to `options.idleTimeoutMs || DEFAULT_IDLE_TIMEOUT_MS`, `0` would resolve to the 5-minute default, the 40 ms hard timeout would still fire first, and all three tests stay green — the exact regression they exist to catch. Symmetrically, all three also pass on the pre-change code, where 0/undefined meant "no watchdog", so they add zero protection for the flipped default. Nothing else in the diff observes the watchdog's presence (every stall test that actually sees a stall passes an explicit value: 20, 25, 400 at tests/subagents.test.ts:547, 557, 572, 591, 1081, 1098). The failure mode this leaves open is the one that matters: a child configured with the watchdog off gets SIGKILLed mid-request (or, under the `||` variant, a caller's explicit 0 silently becomes a 5-minute kill window).
+
+**Fix**: Make the resolution observable instead of only its side effect. Extract a pure resolver, e.g. `export function resolveIdleTimeoutMs(opts: RunChildOptions): number { return opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS; }`, use it at subagents.ts:584, and assert both branches (`resolveIdleTimeoutMs({}) === DEFAULT_IDLE_TIMEOUT_MS`, `resolveIdleTimeoutMs({ idleTimeoutMs: 0 }) === 0`). Alternatively make the existing test deterministic with fake timers, as the repo already does at tests/goal.test.ts:1457: `vi.useFakeTimers()`, then advance past DEFAULT_IDLE_TIMEOUT_MS and assert the omitted-option child stalls while the `idleTimeoutMs: 0` child does not (only the hard timeout's error, no `stalled` flag).
+
+## 🟡 Suggestion
+
+### Untrusted tool output is copied raw into the judge's prompt, and the judge's verdict then steers the agent in the harness's voice
+**`extensions/goal.ts:976`** — found by security
+Carried forward from the previous review; unchanged by this diff. buildTriageTask/buildSettleJudgeTask splice ctx.workDigest — built from session assistant notes, tool-call arguments and tool results (buildWorkDigest, goal.ts:765-790) — verbatim into the child's prompt (goal.ts:854 and 976). The child's verdict (continue/verify, or complete/blocked/working) is then consumed by the settle handler as the harness's own decision, so an instruction injected into command output can influence the agent's next step. The child's system prompt does warn the model that the digest is untrusted data (SETTLE_TRIAGE_AGENT instructions, goal.ts:952-963), which is a mitigation, not a boundary.
+
+**Fix**: Keep untrusted digest content clearly delimited/labelled as data in the prompt and treat the verdict as advisory, and (see the argv finding) stop carrying the digest in argv so injection and exposure are reduced together.
+
+### The judge's task — a 6 KB digest of session content, including tool output — is passed to the child as a command-line argument
+**`extensions/goal.ts:992`** — found by security, robustness
+Carried forward from the previous review; goal.ts is untouched by this diff (the diff only reworks the idle watchdog in subagents.ts/review.ts), so the path is unchanged and still valid. createLlmSettleTriage calls childRunner(SETTLE_TRIAGE_AGENT, buildTriageTask(goal, ctx), …) (goal.ts:990-996). buildTriageTask interpolates ctx.workDigest (goal.ts:976), and buildWorkDigest harvests assistant notes, tool-call arguments and tool-result text up to WORK_DIGEST_MAX_CHARS = 6_000 (goal.ts:757, 765-790, 2103/2252). buildChildArgs places that task after `--` (extensions/subagents.ts:301) and runChild spawns `pi` with that argv and stdio ["ignore","pipe","pipe"] (extensions/subagents.ts:464) — so the full digest, including any credential passed inline on a bash command and its output, sits in the child's process argument vector, readable by other local users via ps // /proc/<pid>/cmdline and commonly captured in process-accounting/audit logs.
+
+**Fix**: Feed the triage/judge task on stdin instead of argv (runChild already spawns with a pipe for stdout and no stdin use), or stop harvesting tool-call arguments and tool-result text into the argv-carried prompt.
+
+### PI_GOAL_TRIAGE is documented as opt-in but defaults ON, silently adding an LLM child call per settle for every verify goal
+**`extensions/goal.ts:1720`** — found by robustness
+Still valid in the working tree: the construction-site comment reads "The settle triage for verify goals (PI_GOAL_TRIAGE): opt-in like the judge — every LLM call at the settle boundary is deliberate configuration" (goal.ts:1720-1721), but the gate is `parseJudgeEnabled(process.env[GOAL_TRIAGE_ENV])` (goal.ts:1726) and parseJudgeEnabled returns GOAL_JUDGE_DEFAULT = true for an unset/blank value (goal.ts:590-592); the knob's own doc comment now says "Default ON … PI_GOAL_TRIAGE=0 restores the always-measure behavior" (goal.ts:619-622) and the tests assert the production default is ON (tests/goal.test.ts:1359). So on a default install every verify goal's settle spawns a tool-less child model call, while this comment tells a reader the opposite.
+
+**Fix**: Rewrite the comment at goal.ts:1720 to state the triage is ON by default and PI_GOAL_TRIAGE=0 opts out, matching GOAL_TRIAGE_ENV's comment, the README and the tests.
+
+### Judge-authored `remaining` text is still the continuation window's measured state — a reworded plateau still reads as progress and resets the cap
+**`extensions/goal.ts:2358`** — found by robustness
+Still valid: `recordBudgetOutput(budgetOutputs, judged ? `${lastCheckKind ?? "unavailable"}:[${[...lastJudgeRemaining].sort().join("|")}]` : check.output)` (goal.ts:2358-2361) stores the judge's own free-form `remaining` strings, taken straight from `verdict.remaining` (goal.ts:2345) — model-authored prose the judge rewords on every call. defaultProgressJudge only compares the first and last window entries, so a plateau the judge describes with different wording ("wire the badge" → "wire in-browser badge") registers as movement and resets the continuation cap on exactly the goals the judge drives. The plateau test only pins the identical-wording case (tests/goal.test.ts:2527-2565).
+
+**Fix**: Record only non-model-authored state for judge checks (the verdict alone, or verdict plus the remaining item count), or normalize the remaining set (lowercase + dedupe) before it becomes the measured state.
+
+### parseIdleTimeoutMs decides 'disabled' by trimmed string equality while parsing the value numerically, so numerically-zero spellings silently leave the watchdog ON
+**`extensions/subagents.ts:61`** — found by correctness, robustness
+`parseIdleTimeoutMs` returns any finite value > 0 unchanged (subagents.ts:60-64), including non-integers — the new test pins `"2.9"` → 2.9 and `"1500"` → 1500 (tests/subagents.test.ts:307-308). The watchdog interval floor is 100 ms (`Math.max(100, Math.min(5_000, Math.floor(idleMs / 4)))`, subagents.ts:608), so any window below ~100 ms fires on the first tick: `PI_SUBAGENT_IDLE_TIMEOUT_MS=1`, or a value meant as seconds (`300` for "5 minutes"), SIGKILLs every subagent child at 100-300 ms with `stalled: no output for 1s (request likely dead)` — a total, silent failure of the subagent tools with no hint that the env value caused it. The sibling knob in the same repo clamps (`clampInt(env.PI_REVIEW_IDLE_TIMEOUT_MS, 5 * 60_000, 10_000, 6 * 60 * 60_000)`, extensions/review.ts:134-137). The disable sentinel is also exact-string only: `trim() === "0"` (subagents.ts:61) means `0.0`, `00` or `+0` do not disable — they fall through to the 5-minute default, the opposite of the documented "`0` disables".
+
+**Fix**: Normalize once and compare numerically, guarding the blank case explicitly: `const raw = env.PI_SUBAGENT_IDLE_TIMEOUT_MS?.trim(); if (!raw) return DEFAULT_IDLE_TIMEOUT_MS; const n = Number(raw); if (n === 0) return 0; return Number.isFinite(n) && n > 0 ? n : DEFAULT_IDLE_TIMEOUT_MS;` (and the same for PI_REVIEW_IDLE_TIMEOUT_MS), plus parse tests for "00" / "0.0".
+
+### `toHaveLength(4)` encodes the current lens count rather than "one attempt per lens"
+**`tests/review.test.ts:1247`** — found by tests
+The comment says "one attempt per lens — hard timeout, not a stall", but the literal 4 is `FINDER_LENSES.length` (extensions/review.ts:601-641 has four lenses) times one chunk (SAMPLE_DIFF fits a single chunk, so `planFinderRuns` yields one run per lens and `maxChildren: 8` does not bind). Adding a fifth lens — a normal change unrelated to idle watchdogs — breaks this test with a message about stall retries, and nothing in the assertion states the property it means. The rest of the file asserts per-lens counts instead (e.g. `spawn.tasks.filter((t) => t.includes("Correctness and logic")).toHaveLength(2)` at tests/review.test.ts:1176), which is robust to that change.
+
+**Fix**: Import the exported `FINDER_LENSES` (already exported at extensions/review.ts:601) and assert `expect(spawn.tasks).toHaveLength(FINDER_LENSES.length)`, or count per lens as the neighbouring stall tests do; keep an explicit `not.toMatch(/stalled/)` assertion as the property check.
+
+---
+
+**Scope reviewed**:
+- Files: README.md, extensions/review.ts, extensions/subagents.ts, tests/review.test.ts, tests/subagents.test.ts
+
+Continuing from a previous review (10 finding(s) carried over).
+
+_Reviewed 5 file(s) in 316s, 2822.9k tokens ($0.138). Next: address findings, then re-run /review — still-valid findings repeat verbatim, resolved ones stay gone._
