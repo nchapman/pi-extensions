@@ -32,6 +32,7 @@ import {
   sumUsages,
   summarizeTask,
   renderSubagentResult,
+  isStalledError,
   type AgentDef,
   type ChildLike,
   type ChildRun,
@@ -525,6 +526,67 @@ describe("runChild", () => {
     const promise = runChild(AGENT, "task", undefined, { timeoutMs: 30 }, () => child);
     await expect(promise).rejects.toThrow(/timed out after 0s/);
     expect(child.killed).toBe(true);
+  });
+
+  it("kills a child that falls silent and rejects with a stall error", async () => {
+    const child = fakeChild();
+    const promise = runChild(AGENT, "task", undefined, { timeoutMs: 5000, idleTimeoutMs: 20 }, () => child);
+    const err = (await promise.catch((e: unknown) => e)) as Error;
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toMatch(/stalled: no output for \d+s \(request likely dead\)/);
+    expect(isStalledError(err)).toBe(true);
+    expect(child.killed).toBe(true);
+  });
+
+  it("counts every stdout chunk as a heartbeat, so a chatty child never stalls", async () => {
+    const child = fakeChild();
+    const promise = runChild(AGENT, "task", undefined, { timeoutMs: 5000, idleTimeoutMs: 400 }, () => child);
+    // Chatter every 20ms well past several watchdog ticks (100ms each); only
+    // then finish for real. The 400ms window gives the scheduler 20 chatter
+    // periods of slack, so a GC pause can't read as a stall.
+    const chatter = setInterval(() => child.stdoutEmit(`${usageLine(USAGE())}\n`), 20);
+    await new Promise((r) => setTimeout(r, 600));
+    clearInterval(chatter);
+    child.stdoutEmit(`${assistantLine("done")}\n`);
+    child.close(0);
+    await expect(promise).resolves.toMatchObject({ text: "done" });
+    expect(child.killed).toBe(false);
+  });
+
+  it("attaches usage burned before the stall", async () => {
+    const child = fakeChild();
+    const promise = runChild(AGENT, "task", undefined, { timeoutMs: 5000, idleTimeoutMs: 20 }, () => child);
+    child.stdoutEmit(
+      JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "partial" }], usage: USAGE() },
+      }) + "\n",
+    );
+    const err = (await promise.catch((e: unknown) => e)) as Error & { usage?: ChildUsage };
+    expect(isStalledError(err)).toBe(true);
+    expect(err.usage).toEqual(USAGE());
+  });
+
+  it("rejects an adopted child's completion promise on stall", async () => {
+    const child = fakeChild();
+    let handle: AdoptedHandle<ChildRun> | undefined;
+    const promise = runChild(
+      AGENT,
+      "task",
+      undefined,
+      { timeoutMs: 5000, idleTimeoutMs: 20, adoptAfterMs: 5, onAdopted: (h) => ((handle = h), "t-1") },
+      () => child,
+    );
+    await expect(promise).resolves.toEqual({ adopted: true, id: "t-1" });
+    const err = (await handle!.completion.catch((e: unknown) => e)) as Error;
+    expect(isStalledError(err)).toBe(true);
+    expect(child.killed).toBe(true);
+  });
+
+  it("isStalledError is false for ordinary errors", () => {
+    expect(isStalledError(new Error("timed out after 5s"))).toBe(false);
+    expect(isStalledError("string")).toBe(false);
+    expect(isStalledError(undefined)).toBe(false);
   });
 
   it("rejects with the abort reason when the signal fires", async () => {

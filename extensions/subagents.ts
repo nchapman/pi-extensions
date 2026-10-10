@@ -247,6 +247,13 @@ export const defaultSpawn: SpawnFn = (command, args, options) =>
 
 export interface RunChildOptions {
   timeoutMs?: number;
+  /** Kill the child when its stdout has been silent this long. stdout events
+   * (stream deltas, tool calls, tool results) are the child's heartbeat; a
+   * dead LLM request — dropped connection, wedged provider stream — otherwise
+   * hangs until `timeoutMs`. Size it above the longest legitimate quiet
+   * stretch: a child running a long bash tool emits nothing while it runs.
+   * Undefined disables the watchdog. */
+  idleTimeoutMs?: number;
   onUpdate?: (partial: AgentToolResult) => void;
   signal?: AbortSignal;
   /** Soft threshold in ms: hand the still-running child to onAdopted instead of waiting.
@@ -261,6 +268,12 @@ export type OnAdopted = (handle: AdoptedHandle<ChildRun>) => string;
 
 /** runChild's result: the child's outcome, or a marker carrying the background task id. */
 export type ChildOutcome = ChildRun | { adopted: true; id: string };
+
+/** True when the error is an idle-watchdog kill — the transient "request died
+ * silently" failure that callers may worth retrying, unlike other errors. */
+export function isStalledError(reason: unknown): boolean {
+  return reason instanceof Error && (reason as Error & { stalled?: boolean }).stalled === true;
+}
 
 /**
  * Children inherit the parent chat's model unless something more explicit pins
@@ -461,6 +474,10 @@ export function runChild(
   const { onUpdate, signal } = options;
   return new Promise((resolve, reject) => {
     const startedAt = Date.now();
+    // The heartbeat clock: every stdout chunk counts, whether or not it parses
+    // into an event. Initialized at spawn so a child that never emits anything
+    // is caught too.
+    let lastActivityAt = startedAt;
     const child = spawnFn("pi", buildChildArgs(agent, task, model), { stdio: ["ignore", "pipe", "pipe"] });
     let stdoutBuf = "";
     let stderrBuf = "";
@@ -516,6 +533,7 @@ export function runChild(
     };
 
     child.stdout.on("data", (chunk: Buffer) => {
+      lastActivityAt = Date.now();
       stdoutBuf += chunk.toString();
       if (stdoutBuf.length > STDOUT_BUF_MAX) {
         const nl = stdoutBuf.lastIndexOf("\n");
@@ -545,6 +563,37 @@ export function runChild(
       } else settle(() => rejectWith(error));
     }, timeoutMs);
     timeout.unref?.();
+
+    // Idle watchdog: kill a silent child as soon as it has been quiet past the
+    // threshold instead of burning the rest of the hard timeout on a request
+    // that will never return. Survives adoption like the hard timeout does.
+    const idleMs = options.idleTimeoutMs;
+    const stall = () => {
+      child.kill("SIGKILL");
+      const silentFor = Math.max(1, Math.round((Date.now() - lastActivityAt) / 1000));
+      const error = new Error(
+        `Subagent "${agent.name}" stalled: no output for ${silentFor}s (request likely dead)`,
+      ) as Error & { stalled: true };
+      error.stalled = true;
+      if (adopted) {
+        if (completionSettled) return;
+        completionSettled = true;
+        if (lastUsage) Object.assign(error, { usage: lastUsage });
+        completionReject(error);
+      } else settle(() => rejectWith(error));
+    };
+    // Check often enough to notice promptly, never more than 5s between ticks;
+    // unref'd so a forgotten watchdog can't hold the process open.
+    const watchdog = idleMs
+      ? setInterval(
+          () => {
+            if (settled && !adopted) return;
+            if (Date.now() - lastActivityAt >= idleMs) stall();
+          },
+          Math.max(100, Math.min(5_000, Math.floor(idleMs / 4))),
+        )
+      : undefined;
+    watchdog?.unref?.();
 
     const onAbort = () => {
       child.kill("SIGKILL");
@@ -590,6 +639,7 @@ export function runChild(
 
     const cleanup = () => {
       clearTimeout(timeout);
+      clearInterval(watchdog);
       clearTimeout(adoptTimer);
       signal?.removeEventListener("abort", onAbort);
     };

@@ -43,6 +43,11 @@
  *   the task is one execve argument, so an uncapped diff would fail to spawn.
  * - Children are tracked and killed on session shutdown — nothing outlives
  *   the session (the superbash invariant).
+ * - Dead requests are detected, not awaited: a child silent on stdout for
+ *   PI_REVIEW_IDLE_TIMEOUT_MS (default 5m) is a dead LLM request, not a slow
+ *   one — it is killed at once (the hard timeout is the backstop, not the
+ *   detector) and retried once; a twice-stalled child surfaces in coverage
+ *   like any other finder failure.
  * - Prior findings persist to <repo>/.pi/review-state.json (PR-Agent's
  *   pattern): a re-review repeats still-valid findings verbatim and does not
  *   re-raise resolved ones unless the code reintroduces them; priors carry
@@ -60,7 +65,9 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import {
   defaultSpawn,
   type AgentDef,
+  type ChildRun,
   type ChildUsage,
+  isStalledError,
   resolveChildModel,
   runChild,
   runWithLimit,
@@ -85,6 +92,10 @@ export interface ReviewConfig {
   maxChildren: number;
   /** Per-child timeout. */
   timeoutMs: number;
+  /** Kill a child whose stdout falls silent this long — a dead LLM request
+   * otherwise hangs until `timeoutMs` (the backstop, not the detector).
+   * Undefined disables the watchdog (the 0-env convention). */
+  idleTimeoutMs: number | undefined;
   /** Model override for all stages. */
   model?: string;
   /** Model override for the verify stage only (wins over `model`). */
@@ -117,6 +128,13 @@ export function parseReviewConfig(env: NodeJS.ProcessEnv): ReviewConfig {
     chunkChars: clampInt(env.PI_REVIEW_CHUNK_CHARS, 96_000, 8_000, 512_000),
     maxChildren: clampInt(env.PI_REVIEW_MAX_CHILDREN, 8, 1, 32),
     timeoutMs: clampInt(env.PI_REVIEW_TIMEOUT_MS, 20 * 60_000, 10_000, 6 * 60 * 60_000),
+    // 5m of absolute stdout silence from a streaming child means the request
+    // died, not that it is slow — kill and retry instead of waiting 20m. "0"
+    // disables (the sibling-knob convention); blank keeps the default.
+    idleTimeoutMs:
+      env.PI_REVIEW_IDLE_TIMEOUT_MS?.trim() === "0"
+        ? undefined
+        : clampInt(env.PI_REVIEW_IDLE_TIMEOUT_MS, 5 * 60_000, 10_000, 6 * 60 * 60_000),
     model: env.PI_REVIEW_MODEL?.trim() || DEFAULT_REVIEW_MODEL,
     verifyModel: env.PI_REVIEW_VERIFY_MODEL?.trim() || undefined,
     checkCmd: env.PI_REVIEW_CHECK_CMD?.trim() ?? "",
@@ -1109,6 +1127,40 @@ export function trackedSpawn(inner: SpawnFn): { spawnFn: SpawnFn; killAll: () =>
   };
 }
 
+/** Run a child, retrying exactly once when it stalls. A silent child is the
+ * one transient failure worth a re-attempt — the request died mid-run, and a
+ * fresh child simply re-does the work; every other error surfaces as-is.
+ * Usage burned by stalled attempts is carried into the result (or onto the
+ * terminal error, when the retry fails too) so the spend stays accounted.
+ * Pure wrapper over an injected run for direct testing. */
+export async function withStallRetry(
+  opts: { label: string; notify: ReviewDeps["notify"]; signal?: AbortSignal },
+  run: () => Promise<ChildRun>,
+): Promise<ChildRun> {
+  let carried: ChildUsage | undefined;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const result = await run();
+      const usage = sumUsages([carried, result.usage]);
+      return carried ? { ...result, usage } : result;
+    } catch (err) {
+      // A cancelled review must not spawn retries; other errors are not stalls.
+      if (attempt >= 2 || !isStalledError(err) || opts.signal?.aborted) {
+        // Earlier stalled attempts still spent tokens; their usage rides the
+        // terminal error so callers crediting r.reason.usage see every child.
+        const merged = sumUsages([carried, (err as { usage?: ChildUsage }).usage]);
+        if (carried && merged) Object.assign(err as object, { usage: merged });
+        throw err;
+      }
+      carried = sumUsages([carried, (err as { usage?: ChildUsage }).usage]);
+      opts.notify(
+        `${opts.label} stalled (no output from the model, likely a dead request) — retrying, attempt 2 of 2`,
+        "warning",
+      );
+    }
+  }
+}
+
 function renderPrior(findings: Finding[], budget: number): string {
   if (budget <= 0 || findings.length === 0) return "";
   const line = (f: Finding) => `- [${f.severity}] ${f.file}${f.line ? `:${f.line}` : ""} — ${f.title}`;
@@ -1271,15 +1323,14 @@ export async function runReview(opts: {
           }),
         chunkText(run.chunk),
       );
-      return runChild(
-        agent,
-        task,
-        resolveChildModel(config.model, agent.model, deps.sessionModel),
-        {
-          timeoutMs: config.timeoutMs,
-          signal,
-        },
-        deps.spawnFn,
+      return withStallRetry({ label: `finder ${run.lens}/${run.chunk}`, notify: deps.notify, signal }, () =>
+        runChild(
+          agent,
+          task,
+          resolveChildModel(config.model, agent.model, deps.sessionModel),
+          { timeoutMs: config.timeoutMs, idleTimeoutMs: config.idleTimeoutMs, signal },
+          deps.spawnFn,
+        ),
       );
     }),
     Math.min(4, runs.length) || 1,
@@ -1325,12 +1376,14 @@ export async function runReview(opts: {
       files.map((f) => f.text).join("\n"),
     );
     try {
-      const run = await runChild(
-        vAgent,
-        vTask,
-        resolveChildModel(config.verifyModel ?? config.model, vAgent.model, deps.sessionModel),
-        { timeoutMs: config.timeoutMs, signal },
-        deps.spawnFn,
+      const run = await withStallRetry({ label: "verifier", notify: deps.notify, signal }, () =>
+        runChild(
+          vAgent,
+          vTask,
+          resolveChildModel(config.verifyModel ?? config.model, vAgent.model, deps.sessionModel),
+          { timeoutMs: config.timeoutMs, idleTimeoutMs: config.idleTimeoutMs, signal },
+          deps.spawnFn,
+        ),
       );
       if ("adopted" in run) throw new Error("verifier backgrounded unexpectedly");
       const verdicts = parseVerdicts(run.text);

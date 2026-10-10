@@ -33,8 +33,9 @@ import {
   verifyAgent,
   verifyTask,
   type Verdict,
+  withStallRetry,
 } from "../extensions/review";
-import type { ChildLike, SpawnFn } from "../extensions/subagents";
+import type { ChildLike, ChildRun, ChildUsage, SpawnFn } from "../extensions/subagents";
 
 // ---------------------------------------------------------------------------
 // Test fixtures
@@ -76,6 +77,7 @@ const CONFIG = (over: Partial<ReviewConfig> = {}): ReviewConfig => ({
   chunkChars: 96_000,
   maxChildren: 8,
   timeoutMs: 60_000,
+  idleTimeoutMs: 300_000,
   model: undefined,
   verifyModel: undefined,
   checkCmd: "",
@@ -120,6 +122,37 @@ function childWithMessage(text: string, exitCode = 0): ChildLike {
     child.emit("close", exitCode);
   });
   return child as unknown as ChildLike;
+}
+
+/** A child that never emits stdout and exits only when killed — the shape of a
+ * dead LLM request, for exercising the idle watchdog end to end. */
+function silentChild(): ChildLike {
+  const child = new EE() as unknown as { stdout: EE; stderr: EE } & EventEmitter;
+  (child as unknown as { stdout: EE; stderr: EE }).stdout = new EE();
+  (child as unknown as { stdout: EE; stderr: EE }).stderr = new EE();
+  (child as unknown as { kill: (sig?: string) => void }).kill = () => queueMicrotask(() => child.emit("close", null));
+  return child as unknown as ChildLike;
+}
+
+/** Spawn fake whose matching children emit nothing until killed (dead
+ * requests); shouldStall sees the task text and its 1-based attempt number. */
+function spawnWithStalls(
+  shouldStall: (task: string, attempt: number) => boolean,
+  respond: (task: string) => string,
+): SpawnFn & { tasks: string[] } {
+  const counts = new Map<string, number>();
+  const tasks: string[] = [];
+  const fn = ((_command: string, args: string[], _options: unknown) => {
+    const dash = args.lastIndexOf("--");
+    const task = dash >= 0 ? String(args[dash + 1]) : "";
+    tasks.push(task);
+    const attempt = (counts.get(task) ?? 0) + 1;
+    counts.set(task, attempt);
+    if (shouldStall(task, attempt)) return silentChild();
+    return childWithMessage(respond(task));
+  }) as SpawnFn & { tasks: string[] };
+  fn.tasks = tasks;
+  return fn;
 }
 
 const emptyDeps = (over: Record<string, unknown> = {}) => ({
@@ -169,6 +202,7 @@ describe("parseReviewConfig", () => {
     expect(c.model).toBe("opencode-go/deepseek-v4.1-flash");
     expect(c.checkCmd).toBe("");
     expect(c.persist).toBe(true);
+    expect(c.idleTimeoutMs).toBe(5 * 60_000);
   });
 
   it("accepts valid overrides and clamps invalid ones", () => {
@@ -177,6 +211,7 @@ describe("parseReviewConfig", () => {
       PI_REVIEW_CHUNK_CHARS: "1",
       PI_REVIEW_MAX_CHILDREN: "999",
       PI_REVIEW_TIMEOUT_MS: "5",
+      PI_REVIEW_IDLE_TIMEOUT_MS: "1000",
       PI_REVIEW_MODEL: "ollama/qwen3 ",
       PI_REVIEW_CHECK_CMD: "npm run check",
       PI_REVIEW_STATE: "0",
@@ -185,6 +220,7 @@ describe("parseReviewConfig", () => {
     expect(c.chunkChars).toBe(8_000); // clamped to min
     expect(c.maxChildren).toBe(32); // clamped to max
     expect(c.timeoutMs).toBe(10_000); // clamped to min
+    expect(c.idleTimeoutMs).toBe(10_000); // clamped to min
     expect(c.model).toBe("ollama/qwen3");
     expect(c.checkCmd).toBe("npm run check");
     expect(c.persist).toBe(false);
@@ -200,6 +236,13 @@ describe("parseReviewConfig", () => {
     const c = parseReviewConfig({ PI_REVIEW_TIMEOUT_MS: "", PI_REVIEW_MAX_CHILDREN: "  " });
     expect(c.timeoutMs).toBe(20 * 60_000);
     expect(c.maxChildren).toBe(8);
+    expect(c.idleTimeoutMs).toBe(5 * 60_000);
+  });
+
+  it("disables the idle watchdog only on an explicit 0", () => {
+    expect(parseReviewConfig({ PI_REVIEW_IDLE_TIMEOUT_MS: "0" }).idleTimeoutMs).toBeUndefined();
+    expect(parseReviewConfig({ PI_REVIEW_IDLE_TIMEOUT_MS: "0 " }).idleTimeoutMs).toBeUndefined();
+    expect(parseReviewConfig({ PI_REVIEW_IDLE_TIMEOUT_MS: "1000" }).idleTimeoutMs).toBe(10_000);
   });
 });
 
@@ -705,6 +748,83 @@ describe("trackedSpawn", () => {
   });
 });
 
+describe("withStallRetry", () => {
+  const RUN = (text: string, usage?: ChildUsage): ChildRun => ({ text, ...(usage ? { usage } : {}) });
+  const USAGE_A: ChildUsage = {
+    input: 100,
+    output: 5,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 105,
+    cost: { input: 0.1, output: 0.02, cacheRead: 0, cacheWrite: 0, total: 0.12 },
+  };
+  const USAGE_B: ChildUsage = {
+    ...USAGE_A,
+    totalTokens: 210,
+    cost: { ...USAGE_A.cost, total: 0.24 },
+  };
+  const stallError = (usage?: ChildUsage) =>
+    Object.assign(new Error('Subagent "x" stalled: no output for 300s'), {
+      stalled: true,
+      ...(usage ? { usage } : {}),
+    });
+
+  it("retries once on a stall and carries the burned usage into the result", async () => {
+    const notes: Array<[string, string]> = [];
+    let calls = 0;
+    const outcomes: Array<Promise<ChildRun>> = [
+      Promise.reject(stallError(USAGE_A)),
+      Promise.resolve(RUN("done", USAGE_B)),
+    ];
+    const result = await withStallRetry(
+      { label: "finder correctness/0", notify: (m, l) => notes.push([m, l]) },
+      () => outcomes[calls++]!,
+    );
+    expect(calls).toBe(2);
+    expect(result.text).toBe("done");
+    expect(result.usage?.totalTokens).toBe(USAGE_A.totalTokens + USAGE_B.totalTokens);
+    expect(notes).toHaveLength(1);
+    expect(notes[0][0]).toContain("finder correctness/0 stalled");
+    expect(notes[0][1]).toBe("warning");
+  });
+
+  it("gives up after the second stall with both attempts' usage on the error", async () => {
+    const error = stallError(USAGE_B);
+    let calls = 0;
+    const outcomes: Array<Promise<ChildRun>> = [Promise.reject(stallError(USAGE_A)), Promise.reject(error)];
+    await expect(withStallRetry({ label: "v", notify: () => {} }, () => outcomes[calls++]!)).rejects.toBe(error);
+    expect(calls).toBe(2);
+    // the first attempt's spend rides the terminal error — same identity, merged usage
+    expect((error as Error & { usage?: ChildUsage }).usage?.totalTokens).toBe(
+      USAGE_A.totalTokens + USAGE_B.totalTokens,
+    );
+  });
+
+  it("does not retry failures that are not stalls", async () => {
+    let calls = 0;
+    await expect(
+      withStallRetry({ label: "v", notify: () => {} }, () => {
+        calls++;
+        return Promise.reject(new Error("exited with code 2"));
+      }),
+    ).rejects.toThrow(/exited with code 2/);
+    expect(calls).toBe(1);
+  });
+
+  it("does not retry when the review was aborted", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    let calls = 0;
+    await expect(
+      withStallRetry({ label: "v", notify: () => {}, signal: controller.signal }, () => {
+        calls++;
+        return Promise.reject(stallError());
+      }),
+    ).rejects.toThrow(/stalled/);
+    expect(calls).toBe(1);
+  });
+});
+
 describe("review tool", () => {
   const sandbox = mkdtempSync(path.join(tmpdir(), "review-tool-"));
   type ToolExecute = (
@@ -1018,6 +1138,89 @@ describe("runReview", () => {
     expect(openResult.report).toContain("**unverified**");
     expect(openResult.report).toContain("verification failed");
     expect(openResult.findingCount).toBe(1);
+  });
+
+  it("detects a stalled finder early, retries it, and keeps full coverage", async () => {
+    const git = gitFor([
+      { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: "/repo\n", stderr: "" } },
+      {
+        match: (a) => a[0] === "diff" && a[a.length - 1] === "HEAD",
+        result: { code: 0, stdout: SAMPLE_DIFF, stderr: "" },
+      },
+      { match: (a) => a[0] === "ls-files", result: { code: 0, stdout: "", stderr: "" } },
+    ]);
+    // The correctness finder's first child is a dead request; its second succeeds.
+    const spawn = spawnWithStalls(
+      (task, attempt) => attempt === 1 && task.includes("Correctness and logic"),
+      () => "[]",
+    );
+    const notes: string[] = [];
+    const result = await runReview({
+      cwd: "/repo",
+      config: CONFIG({ verify: false, idleTimeoutMs: 20 }),
+      target: { kind: "uncommitted" },
+      deps: emptyDeps({ git, spawnFn: spawn, notify: (m: string) => notes.push(m) }) as never,
+    });
+    // the stalled finder ran twice: one dead attempt + one recovery
+    expect(spawn.tasks.filter((t) => t.includes("Correctness and logic"))).toHaveLength(2);
+    expect(result.coverage.errors).toEqual([]);
+    expect(result.coverage.lensCoverage[0]).toContain("correctness");
+    expect(result.report).not.toContain("NOT COVERED");
+    expect(notes.some((n) => n.includes("stalled"))).toBe(true);
+  });
+
+  it("discloses a twice-stalled finder as a coverage gap instead of hanging", async () => {
+    const git = gitFor([
+      { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: "/repo\n", stderr: "" } },
+      {
+        match: (a) => a[0] === "diff" && a[a.length - 1] === "HEAD",
+        result: { code: 0, stdout: SAMPLE_DIFF, stderr: "" },
+      },
+      { match: (a) => a[0] === "ls-files", result: { code: 0, stdout: "", stderr: "" } },
+    ]);
+    // Every attempt of the correctness finder is a dead request: one retry, then honesty.
+    const spawn = spawnWithStalls(
+      (task) => task.includes("Correctness and logic"),
+      () => "[]",
+    );
+    const result = await runReview({
+      cwd: "/repo",
+      config: CONFIG({ verify: false, idleTimeoutMs: 20 }),
+      target: { kind: "uncommitted" },
+      deps: emptyDeps({ git, spawnFn: spawn }) as never,
+    });
+    expect(spawn.tasks.filter((t) => t.includes("Correctness and logic"))).toHaveLength(2);
+    expect(result.coverage.errors[0]).toMatch(/finder correctness\/0: .* stalled/);
+    expect(result.coverage.lensCoverage[0]).not.toContain("correctness");
+    expect(result.report).toContain("stalled");
+  });
+
+  it("retries a stalled verifier once, then fails open", async () => {
+    const git = gitFor([
+      { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: "/repo\n", stderr: "" } },
+      {
+        match: (a) => a[0] === "diff" && a[a.length - 1] === "HEAD",
+        result: { code: 0, stdout: SAMPLE_DIFF, stderr: "" },
+      },
+      { match: (a) => a[0] === "ls-files", result: { code: 0, stdout: "", stderr: "" } },
+    ]);
+    const spawn = spawnWithStalls(
+      (task) => task.startsWith("# Verify"),
+      (task) =>
+        task.includes("Correctness and logic")
+          ? '```json\n[{"file":"src/a.ts","line":2,"severity":"critical","title":"Bug","detail":"D"}]\n```'
+          : "[]",
+    );
+    const result = await runReview({
+      cwd: "/repo",
+      config: CONFIG({ verify: true, idleTimeoutMs: 20 }),
+      target: { kind: "uncommitted" },
+      deps: emptyDeps({ git, spawnFn: spawn }) as never,
+    });
+    expect(spawn.tasks.filter((t) => t.startsWith("# Verify"))).toHaveLength(2);
+    expect(result.report).toContain("**unverified**");
+    expect(result.report).toMatch(/verification failed: .* stalled/);
+    expect(result.findingCount).toBe(1);
   });
 
   it("passes prior findings to finders and the verifier", async () => {
