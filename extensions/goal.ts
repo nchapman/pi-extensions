@@ -55,15 +55,23 @@
  *   check fails, "the check passed, summarize and call complete" when it
  *   passes. The check is graded, not boolean: it prints the measured state
  *   (coverage %, test summary) and exits 0 only when the objective is met, so
- *   the agent measures, narrates the gap, and works until it closes. The one
- *   thing that skips the check: superbash background tasks still running — the
- *   turn is only temporarily done then (each completion wake re-engages the
- *   agent as a fresh run), so the settle defers to the first calm one instead
- *   of measuring a half-finished state or blocking on a lock the running work
- *   holds; deferrals burn no budget. A task killed while idle or one that
- *   never finishes gets no wake — the park is announced (notify once per
- *   park) with its recovery: kill the task, and the next prompt's calm
- *   settle runs the check. While the
+ *   the agent measures, narrates the gap, and works until it closes. Superbash
+ *   background tasks still running get a judge's call, not a blanket skip:
+ *   the turn may be only temporarily done (each completion wake re-engages
+ *   the agent as a fresh run), so measuring now could read a half-finished
+ *   state or block on a lock the running work holds — but a never-ending
+ *   task (a dev server) never wakes, and a blanket defer would park the
+ *   loop until the next user prompt. So the settle triage / milestone judge
+ *   also receives the live task list and answers "hold" (defer to the first
+ *   calm settle — the pre-judge behavior: no budget burned, nothing cached,
+ *   announced once per park) or lets the check proceed while the tasks run.
+ *   A hold at the continuation cap defers the breaker to a calm settle; a
+ *   proceed meets it like any calm settle would.
+ *   A verify goal without the triage (PI_GOAL_TRIAGE=0), and a triage that
+ *   errors or returns no opinion while tasks run, keep the unconditional
+ *   deferral; a milestone judge failure still fails open (its contract). A
+ *   task killed while idle gets no wake — the park notice names the recovery:
+ *   kill the task, and the next prompt's calm settle runs the check. While the
  *   verify runs, an animated chat-area spinner widget shows the check in flight
  *   (pi clears its own working spinner at agent_end, so the settle boundary
  *   would otherwise render as a dead pause), and an expensive verify can be
@@ -643,8 +651,10 @@ export function parseTriageTimeoutMs(raw: string | undefined): number {
  * persistence and the structural completion gate stay the single path. */
 export interface SettleVerdict {
   /** working: re-engage on remaining work. complete: steer summarize+complete.
-   * blocked: steer the agent to confirm the impasse (call blocked) or refute it. */
-  verdict: "working" | "complete" | "blocked";
+   * blocked: steer the agent to confirm the impasse (call blocked) or refute it.
+   * hold: park for running background tasks (offered only when the context
+   * lists them) — the settle defers to their completion wake, no budget. */
+  verdict: "working" | "complete" | "blocked" | "hold";
   /** Short basis for the decision — goes to the agent and, compactly, the user. */
   reason?: string;
   /** Unmet work for "working" — free-form short strings (not criterion indexes). */
@@ -659,6 +669,12 @@ export interface SettleJudgeContext {
   continuation: number;
   maxContinuations: number;
   previousReason?: string;
+  /** Live background tasks at this settle, described compactly
+   *  ("bash t-x (4m 12s): npm run dev"), oldest first. Present only when
+   *  tasks run: the judge then also owns the park decision — answering
+   *  "hold" defers the check to their completion wake instead of running it
+   *  against a half-finished state. */
+  runningTasks?: string[];
   /** Kill switch for the assessment: fires on the alt+x chord, an
    *  administrative drain (/goal pause, /goal stop, session_shutdown), or a
    *  pi-side run abort. An implementing judge must wire it into its runner so
@@ -676,7 +692,18 @@ export interface SettleJudge {
   assess(goal: Goal, ctx: SettleJudgeContext): SettleVerdict | undefined | Promise<SettleVerdict | undefined>;
 }
 
-const SETTLE_VERDICTS = ["working", "complete", "blocked"] as const;
+/** Judge labels that ride a check row or prompt. "hold" never does — a hold
+ * parks the settle before any check message exists, so it is excluded here at
+ * the type level: leaking one into the prompt channel is a compile error. */
+export type MilestoneKind = Exclude<SettleVerdict["verdict"], "hold"> | "unavailable";
+
+/** Map a raw verdict to its prompt-channel label: "hold" (only reachable via
+ * drift on a calm settle) and no-opinion both read as "unavailable". */
+export function milestoneKind(v: SettleVerdict | undefined): MilestoneKind {
+  return v && v.verdict !== "hold" ? v.verdict : "unavailable";
+}
+
+const SETTLE_VERDICTS = ["working", "complete", "blocked", "hold"] as const;
 
 /** Trust-boundary caps on the judge's free text: its reply is model-rewritten
  * session content (tool output is attacker-influenceable), so reason and
@@ -750,6 +777,23 @@ function jsonCandidates(text: string): string[] {
   }
   for (const match of text.matchAll(/\{[^{}]*\}/g)) candidates.push(match[0]);
   return candidates;
+}
+
+/** Cap on task descriptions offered to a judge context: a runaway task farm
+ * must not bloat the judge's input — the first (oldest) few carry the decision. */
+export const MAX_JUDGE_TASKS = 10;
+
+/** Describe the live background tasks for a judge context:
+ * `bash t-1134z8v (4m 12s): npm run dev`, oldest first (the registry's
+ * order), name clipped, count capped with an overflow line. Pure — tests pin
+ * the shape the judge parses. */
+export function describeBgTasks(tasks: BgTask[], now = Date.now()): string[] {
+  const desc = tasks
+    .slice(0, MAX_JUDGE_TASKS)
+    .map((t) => `${t.kind} ${t.id} (${formatElapsed(now - t.startedAt)}): ${clip(t.name, 200)}`);
+  const more = tasks.length - MAX_JUDGE_TASKS;
+  if (more > 0) desc.push(`…and ${more} more`);
+  return desc;
 }
 
 /** Digest char budget (PI_GOAL_JUDGE digest): enough for a real work trail,
@@ -835,25 +879,32 @@ const SETTLE_JUDGE_AGENT: AgentDef = {
     '- "complete": every criterion is genuinely met — success claims are backed by command output in the digest, not assertions. Be skeptical of self-reported success without output evidence.',
     '- "blocked": a true, non-transient impasse the agent cannot resolve itself (missing access, contradictory requirements), not mere difficulty.',
     '- "working": anything else. List the concrete remaining work in "remaining".',
+    '- "hold": background tasks are still running and the agent is genuinely waiting on them — its turn is only temporarily done and their completion will re-engage it, so the check should wait too. Offered ONLY when the task list shows running tasks; a long-lived task the agent works alongside (a dev server) is NOT waiting — answer "working" or "complete" then.',
     'If the digest shows no movement since your previous assessment, still answer "working" but say so in the reason — a plateau is for the caller\'s progress judge, not a verdict change.',
-    'Respond with ONLY a JSON object: {"verdict":"working|complete|blocked","reason":"<1-3 sentences>","remaining":["<short item>", ...]}. No prose outside the JSON.',
+    'Respond with ONLY a JSON object: {"verdict":"working|complete|blocked|hold","reason":"<1-3 sentences>","remaining":["<short item>", ...]}. No prose outside the JSON.',
   ].join("\n"),
   tools: [],
 };
 
-/** The judge child's task text — pure so tests pin what the judge is told. */
+/** The judge child's task text — pure so tests pin what the judge is told.
+ * The background-task section (and the hold option it enables) appears only
+ * while tasks actually run; a calm settle must not offer a parking verdict. */
 export function buildSettleJudgeTask(goal: Goal, ctx: SettleJudgeContext): string {
   const criteria = effectiveCriteria(goal)
     .map((c, i) => `${i + 1}. ${c}`)
     .join("\n");
+  const holding = (ctx.runningTasks?.length ?? 0) > 0;
   return [
     `# Milestone assessment (continuation ${ctx.continuation}/${ctx.maxContinuations})`,
     `## Goal #${goal.id}\n${goal.objective}`,
     `## Success criteria\n${criteria}`,
     ctx.previousReason ? `## Your previous assessment\n${ctx.previousReason}` : "",
+    holding
+      ? `## Background tasks still running (the agent's turn ended with these in flight)\n${ctx.runningTasks!.join("\n")}`
+      : "",
     `## Digest of the agent's recent work (oldest first, clipped)\n${ctx.workDigest}`,
     "",
-    "Decide: complete / blocked / working. Respond with ONLY the JSON object.",
+    `Decide: complete / blocked / working${holding ? " / hold (waiting on those tasks)" : ""}. Respond with ONLY the JSON object.`,
   ]
     .filter((s) => s !== "")
     .join("\n\n");
@@ -909,10 +960,11 @@ export function createLlmSettleJudge(deps: LlmSettleJudgeDeps = {}): SettleJudge
 }
 
 /** The settle triage's decision for a verify goal: skip the script (the judge
- * sees mid-work) or run it (the agent claims done — or the triage could not
- * tell, in which case the caller fails open to measuring). */
+ * sees mid-work), run it (the agent claims done — or the triage could not
+ * tell, in which case the caller fails open to measuring), or hold for
+ * running background tasks (offered only when the context lists them). */
 export interface TriageVerdict {
-  action: "verify" | "continue";
+  action: "verify" | "continue" | "hold";
   /** Short basis — goes to the agent and, compactly, the user. */
   reason?: string;
 }
@@ -924,7 +976,7 @@ export interface SettleTriage {
   triage(goal: Goal, ctx: SettleJudgeContext): TriageVerdict | undefined | Promise<TriageVerdict | undefined>;
 }
 
-const TRIAGE_ACTIONS = ["verify", "continue"] as const;
+const TRIAGE_ACTIONS = ["verify", "continue", "hold"] as const;
 
 /** Parse the triage reply with the same tolerance as parseSettleVerdict:
  * child models wrap JSON in prose, drift the enum's case, and add fields. */
@@ -962,25 +1014,34 @@ const SETTLE_TRIAGE_AGENT: AgentDef = {
     "The verify command is expensive (minutes, locks); it must not run while pointless. Decide exactly one action:",
     '- "continue": the agent is visibly mid-work — its latest notes name unfinished steps, an in-flight plan, or work plainly remaining. The verify will NOT run.',
     '- "verify": the agent claims the work is done or ready to check (a final summary, "done"/"complete"/"ready to verify", or asking for the check), OR you cannot tell from the digest. Doubt means verify.',
-    'Respond with ONLY a JSON object: {"action":"continue|verify","reason":"<1-2 sentences>"}. No prose outside the JSON.',
+    '- "hold": background tasks are still running and the agent is genuinely waiting on them — its turn is only temporarily done and their completion will re-engage it, so the verify should wait too. Offered ONLY when the task list shows running tasks; a long-lived task the agent works alongside (a dev server) is NOT waiting — answer "verify" or "continue" then.',
+    'Respond with ONLY a JSON object: {"action":"continue|verify|hold","reason":"<1-2 sentences>"}. No prose outside the JSON.',
   ].join("\n"),
   tools: [],
 };
 
-/** The triage child's task text — pure so tests pin what the judge is told. */
+/** The triage child's task text — pure so tests pin what the judge is told.
+ * The background-task section (and the hold option it enables) appears only
+ * while tasks actually run; a calm settle must not offer a parking action. */
 export function buildTriageTask(goal: Goal, ctx: SettleJudgeContext): string {
   const criteria = effectiveCriteria(goal)
     .map((c, i) => `${i + 1}. ${c}`)
     .join("\n");
+  const holding = (ctx.runningTasks?.length ?? 0) > 0;
   return [
     `# Settle triage (continuation ${ctx.continuation}/${ctx.maxContinuations})`,
     `## Goal #${goal.id}\n${goal.objective}`,
     `## Success criteria\n${criteria}`,
     `## Verify command (not yet run this turn)\n${goal.verify ?? "(none)"}`,
+    holding
+      ? `## Background tasks still running (the agent's turn ended with these in flight)\n${ctx.runningTasks!.join("\n")}`
+      : "",
     `## Digest of the agent's recent work (oldest first, clipped)\n${ctx.workDigest}`,
     "",
-    "Decide: continue / verify. Respond with ONLY the JSON object.",
-  ].join("\n");
+    `Decide: continue / verify${holding ? " / hold (waiting on those tasks)" : ""}. Respond with ONLY the JSON object.`,
+  ]
+    .filter((s) => s !== "")
+    .join("\n");
 }
 
 /** The default triage: one tool-less child pass, verdict parsed from its final
@@ -1344,11 +1405,12 @@ export function renderCheckPrompt(
 
 /** Turn-end prompt for a judge-driven (verify-less) goal — the milestone
  * analog of renderCheckPrompt. `kind` is the verdict or "unavailable" (the
- * judge threw / returned nothing — fail open). None of the branches change
+ * judge threw / returned nothing — fail open); a "hold" parks before any
+ * prompt exists, so the type excludes it. None of the branches change
  * goal state: they steer; the model's own complete/blocked calls do. */
 export function renderMilestonePrompt(
   goal: Goal,
-  kind: SettleVerdict["verdict"] | "unavailable",
+  kind: MilestoneKind,
   note: string,
   remaining: string[],
   continuation: number,
@@ -1680,10 +1742,12 @@ export interface RegisterGoalOptions {
    *  the registration-path wiring (model inheritance, signal, timeout) is
    *  assertable without spawning pi. */
   judgeRunChildFn?: JudgeChildRunner;
-  /** Live background tasks at settle time; the check defers while any run.
-   * Defaults to the shared superbash registry — absent registry means no
-   * background work (fail-open: the loop must not stall on a missing
-   * writer). Inject a fake in tests. */
+  /** Live background tasks at settle time; while any run, the settle's
+   *  judge (triage / milestone judge) decides hold-vs-proceed — without one
+   *  in the loop, the check defers unconditionally. Defaults to the shared
+   *  superbash registry — absent registry means no background work
+   *  (fail-open: the loop must not stall on a missing writer). Inject a fake
+   *  in tests. */
   runningTasks?: () => BgTask[];
   /** Timeout (ms) for a verify run. Defaults to PI_GOAL_VERIFY_TIMEOUT_MS, then VERIFY_TIMEOUT_MS_DEFAULT. */
   verifyTimeoutMs?: number;
@@ -1755,7 +1819,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
   // Judge-path companions to lastCheck: the verdict label and remaining work
   // (for prompt wording), and the last reason (fed back as previousReason so
   // the next assessment can tell movement from repetition).
-  let lastCheckKind: SettleVerdict["verdict"] | "unavailable" | undefined;
+  let lastCheckKind: MilestoneKind | undefined;
   let lastJudgeRemaining: string[] = [];
   let lastJudgeReason: string | undefined;
   // True while the loop is parked on background tasks; re-announced only
@@ -1981,38 +2045,54 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     // result and branch adoption both said so loudly when this goal was created.
     const judged = !goal.verify;
     if (judged && !settleJudge) return;
-    // Background tasks in flight (superbash bash/subagent adoption): the turn
-    // is only temporarily done — every completion wake re-engages the agent as
-    // a fresh run — so a check now would measure a half-finished state (or
-    // block for hours on a lock the running work holds, e.g. a gate script).
-    // Defer to the first calm settle; a deferral burns no continuation budget
-    // and caches nothing. Waiting is not a stall: with wakes on, the last
-    // completion re-engages the agent and its settle runs the check; with
-    // PI_BG_WAKE=0 the next user prompt does. No registry wired (goal
+    // Background tasks in flight (superbash bash/subagent adoption): the
+    // turn may be only temporarily done — every completion wake re-engages
+    // the agent as a fresh run — so a check now could measure a half-finished
+    // state (or block for hours on a lock the running work holds, e.g. a gate
+    // script). But a blanket defer parks forever on never-ending tasks (a
+    // dev server never wakes — the observed production failure), so the
+    // judge owns the call whenever one is in the loop: the settle triage
+    // (verify goals) / milestone judge receives the live task list and
+    // answers "hold" — defer to the first calm settle, exactly the
+    // pre-judge behavior — or lets the check proceed while the tasks run.
+    // A verify goal without the triage (PI_GOAL_TRIAGE=0), and a triage
+    // that errors or returns no opinion while tasks run, keep the
+    // unconditional deferral; a milestone judge failure still fails open to
+    // the continuation (its established contract). No registry wired (goal
     // registered standalone) reads as zero tasks — fail-open.
     const running = runningTasks();
-    if (running.length > 0) {
+    const holding = running.length > 0;
+    const activeGoal = goal; // narrowed for the closures — `goal`'s narrowing doesn't cross them
+    const park = (): undefined => {
       uiRef?.setStatus(
         "goal",
         `goal · holding check — ${running.length} background task${running.length === 1 ? "" : "s"} running`,
       );
       // Announce the park once per park (not per settle): the footer alone
-      // reads as "a check is in flight", and the two cases where no wake will
-      // ever re-engage the loop — a task killed while idle (killed tasks never
-      // wake) and a never-ending task (a dev server) — would otherwise park
-      // silently until the next user prompt.
+      // reads as "a check is in flight", and the cases where no wake will
+      // ever re-engage the loop — a task killed while idle (killed tasks
+      // never wake) and a never-ending task the judge keeps holding for —
+      // would otherwise park silently until the next user prompt.
       if (!parkedForTasks) {
         parkedForTasks = true;
         ctx.ui?.notify(
-          `Goal #${goal.id} check held while ${running.length} background task${running.length === 1 ? "" : "s"} run — ` +
+          `Goal #${activeGoal.id} check held while ${running.length} background task${running.length === 1 ? "" : "s"} run — ` +
             "it runs when they finish. If one never finishes, kill it (/tasks or task_kill): " +
             "the check then runs on your next prompt.",
         );
       }
       return undefined;
-    }
-    parkedForTasks = false;
-    if (continuations >= maxContinuations) {
+    };
+    // The continuation-cap gate: true when the loop must halt (the notify and
+    // footer already said so). On a calm settle it runs before any judge call
+    // (a stop must not spend a triage/judge pass) — its old position. On a
+    // holding settle it must wait for the hold decision: parking at the cap
+    // is the pre-judge invariant ("the cap decision belongs to a calm
+    // settle" — the breaker must not read a parked run as a plateau), so it
+    // is re-invoked after the triage/judge declines to hold and gates every
+    // budget-burning action from there down.
+    const applyCap = async (): Promise<boolean> => {
+      if (continuations < maxContinuations) return false;
       // At the cap, a progress judge decides: still moving → reset the budget
       // and continue (itself capped, so the judge can't defeat the breaker);
       // plateaued or no opinion → stop. Fail-closed on ambiguity.
@@ -2020,7 +2100,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
       try {
         // Awaited so an async (LLM) judge needs no adapter; its rejection lands
         // in this catch and fails closed.
-        verdict = await progressJudge.assess(goal, budgetOutputs);
+        verdict = await progressJudge.assess(activeGoal, budgetOutputs);
       } catch {
         verdict = undefined; // a throwing judge must not extend the run
       }
@@ -2036,23 +2116,28 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         lastCheck = undefined;
         lastCheckAge = 0;
         ctx.ui?.notify(
-          `Goal #${goal.id} hit the continuation cap but is still progressing (${verdict.reason ?? "judge approved"}) — ` +
+          `Goal #${activeGoal.id} hit the continuation cap but is still progressing (${verdict.reason ?? "judge approved"}) — ` +
             `resetting the budget (reset ${resetsUsed}/${maxProgressResets}).`,
         );
-      } else {
-        stopped = true;
-        const why = verdict?.continueRun
-          ? `progress-judge resets exhausted (${resetsUsed}/${maxProgressResets})`
-          : verdict
-            ? (verdict.reason ?? "no progress signal")
-            : "progress judge unavailable — failing closed";
-        ctx.ui?.notify(
-          `Goal #${goal.id} still active after ${maxContinuations} auto-continuations — stopping (${why}). ` +
-            "Complete it via the goal tool, adjust it, or /goal stop.",
-        );
-        updateFooter();
-        return;
+        return false;
       }
+      stopped = true;
+      const why = verdict?.continueRun
+        ? `progress-judge resets exhausted (${resetsUsed}/${maxProgressResets})`
+        : verdict
+          ? (verdict.reason ?? "no progress signal")
+          : "progress judge unavailable — failing closed";
+      ctx.ui?.notify(
+        `Goal #${activeGoal.id} still active after ${maxContinuations} auto-continuations — stopping (${why}). ` +
+          "Complete it via the goal tool, adjust it, or /goal stop.",
+      );
+      updateFooter();
+      return true;
+    };
+    if (holding && !judged && !triage) return park();
+    if (!holding) {
+      parkedForTasks = false;
+      if (await applyCap()) return;
     }
     let check: VerifyResult;
     // Throttle: with checkEvery > 1 only every Nth continuation re-runs the
@@ -2060,8 +2145,12 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     // (aged) so the settle is instant instead of a silent multi-minute
     // benchmark. (`due` reads the would-be post-increment counter; the
     // increment happens once the check survives the abort path below, so an
-    // aborted check never burns budget.)
-    const due = (continuations + 1) % checkEvery === 0 || !lastCheck;
+    // aborted check never burns budget.) A holding settle is always due:
+    // the judge owns the park decision there, and a throttled turn would
+    // otherwise re-engage on the stale check without asking whether the
+    // agent is just waiting on the running tasks — the park the hold
+    // verdict exists for. The triage still gates the expensive part.
+    const due = holding || (continuations + 1) % checkEvery === 0 || !lastCheck;
     const verifyCommand = goal.verify; // captured for the closure: narrowing of `goal` doesn't cross it
     if (due) {
       // Settle triage for verify goals (PI_GOAL_TRIAGE / options.triage): a
@@ -2070,7 +2159,10 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
       // mid-work, the loop continues without measuring, and the script runs
       // only when the agent claims done. No opinion or error fails OPEN to
       // measuring — a broken triage degrades to the old behavior, never to a
-      // gate that silently stops verifying.
+      // gate that silently stops verifying — except while background tasks
+      // run, where it defers instead: measuring against work still in flight
+      // is what the deferral exists to avoid, and a broken judge degrades to
+      // the pre-judge deferral rather than bypassing it.
       if (!judged && triage) {
         uiRef?.setWidget(
           GOAL_CHECK_WIDGET_KEY,
@@ -2110,6 +2202,9 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
                 continuation: continuations + 1,
                 maxContinuations,
                 signal: tSignal,
+                // The live tasks the hold decision needs: without them the
+                // judge cannot tell in-flight work from an ambient server.
+                ...(holding ? { runningTasks: describeBgTasks(running) } : {}),
               });
             } catch (e) {
               triageError = e instanceof Error ? e.message : String(e);
@@ -2131,6 +2226,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
             return undefined;
           }
           updateFooter();
+          parkedForTasks = false; // the abort re-engages with a notice — the park episode ends
           pi.sendMessage(
             {
               customType: GOAL_CHECK_TYPE,
@@ -2154,6 +2250,31 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
           );
           return { continue: true };
         }
+        // The judge read the running tasks and chose to wait for them: park
+        // — no budget, nothing cached, first calm settle (or the next user
+        // prompt) re-triages. A calm "hold" (no tasks running) is drift —
+        // the option is offered only with tasks in flight — and falls
+        // through to the measure path below.
+        if (triaged?.action === "hold" && holding) return park();
+        // No opinion or an error while tasks run: defer like the triage-less
+        // path — measuring against work still in flight (or on a lock it
+        // holds) is what the deferral exists to avoid, and a broken triage
+        // degrades to the pre-judge behavior rather than bypassing it. Said
+        // out loud when it was an error — silent degradation reads as a hang.
+        if (!triaged && holding) {
+          if (triageError !== "") {
+            uiRef?.notify(
+              `Goal #${goal.id} settle triage failed (${triageError}) — holding the check while background tasks run.`,
+            );
+          }
+          return park();
+        }
+        // A decided settle (continue or measure) ends any park episode.
+        parkedForTasks = false;
+        // The cap still gates every budget-burning action — but only now,
+        // after the hold decision declined to park (a parked run at the cap
+        // defers the breaker to a calm settle; a proceeding one meets it).
+        if (holding && (await applyCap())) return;
         if (triaged?.action === "continue") {
           // Mid-work: continue without measuring. It is a real auto-continuation
           // (budget burns) but contributes NO evidence to the progress window —
@@ -2193,8 +2314,8 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
           );
           return { continue: true };
         }
-        // "verify", no opinion, or an error: fall through and measure. A triage
-        // failure is said out loud — silent degradation reads as a hang.
+        // "verify" or an error on a calm settle: fall through and measure. A
+        // triage failure is said out loud — silent degradation reads as a hang.
         if (triageError !== "" && !triaged) {
           uiRef?.notify(`Goal #${goal.id} settle triage failed (${triageError}) — running the verify.`);
         }
@@ -2260,6 +2381,9 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
                 maxContinuations,
                 ...(lastJudgeReason ? { previousReason: lastJudgeReason } : {}),
                 signal: judgeSignal,
+                // The live tasks the hold decision needs: without them the
+                // judge cannot tell in-flight work from an ambient server.
+                ...(holding ? { runningTasks: describeBgTasks(running) } : {}),
               });
             } catch (e) {
               judgeError = e instanceof Error ? e.message : String(e);
@@ -2309,6 +2433,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         // the next settle re-measures rather than acting on a check that never
         // finished — and no budget is burned.
         updateFooter();
+        parkedForTasks = false; // the abort re-engages with a notice — the park episode ends
         pi.sendMessage(
           {
             customType: GOAL_CHECK_TYPE,
@@ -2335,6 +2460,15 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         return { continue: true };
       }
       if (judged) {
+        // The judge read the running tasks and chose to wait for them: park —
+        // no budget, nothing cached. A calm "hold" (no tasks running) is
+        // drift the park gate never offers; milestoneKind below maps it to
+        // the fail-open "unavailable" continuation instead.
+        if (verdict?.verdict === "hold" && holding) return park();
+        parkedForTasks = false; // a decided settle ends any park episode
+        // The cap gates the re-engagement — after the hold decision, not
+        // before it (same ordering as the triage path above).
+        if (holding && (await applyCap())) return;
         const note = verdict?.reason ?? "the judge returned no opinion";
         check = {
           ok: verdict?.verdict === "complete",
@@ -2347,7 +2481,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
       }
       lastCheck = check;
       lastCheckAge = 0;
-      lastCheckKind = judged ? (verdict?.verdict ?? "unavailable") : undefined;
+      lastCheckKind = judged ? milestoneKind(verdict) : undefined;
       lastJudgeRemaining = judged ? (verdict?.remaining ?? []) : [];
     } else {
       check = lastCheck!;

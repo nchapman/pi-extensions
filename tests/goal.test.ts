@@ -31,6 +31,7 @@ import {
   parseTriageVerdict,
   parseTriageTimeoutMs,
   buildTriageTask,
+  describeBgTasks,
   renderTriagePrompt,
   buildWorkDigest,
   buildSettleJudgeTask,
@@ -422,6 +423,10 @@ describe("parseSettleVerdict", () => {
   it("normalizes a case- or space-drifted verdict instead of dropping it", () => {
     expect(parseSettleVerdict('{"verdict":" Working "}')).toEqual({ verdict: "working" });
     expect(parseSettleVerdict('{"verdict":"COMPLETE"}')).toEqual({ verdict: "complete" });
+    expect(parseSettleVerdict('sure {"verdict":" Hold ","reason":"gate suite in flight"}')).toEqual({
+      verdict: "hold",
+      reason: "gate suite in flight",
+    });
   });
   it("finds the verdict inside a reply with nested JSON fields", () => {
     const v = parseSettleVerdict(
@@ -457,6 +462,33 @@ describe("parseSettleVerdict", () => {
     expect(v!.reason!.length).toBeLessThanOrEqual(601); // 600 + the truncation ellipsis char
     expect(v!.remaining).toHaveLength(8);
     for (const item of v!.remaining!) expect(item.length).toBeLessThanOrEqual(201);
+  });
+});
+
+describe("describeBgTasks", () => {
+  it("describes each task with kind, id, elapsed, and name", () => {
+    expect(
+      describeBgTasks(
+        [
+          { id: "t-1134z8v", name: "npm run dev", kind: "bash", state: "running", startedAt: 0 },
+          { id: "t-abcd", name: "reviewer", kind: "subagent", state: "running", startedAt: 30_000 },
+        ],
+        252_000,
+      ),
+    ).toEqual(["bash t-1134z8v (4m 12s): npm run dev", "subagent t-abcd (3m 42s): reviewer"]);
+  });
+  it("caps the list with an overflow line", () => {
+    const many = Array.from({ length: 13 }, (_, i) => ({
+      id: `t-${i}`,
+      name: `task ${i}`,
+      kind: "bash" as const,
+      state: "running" as const,
+      startedAt: 0,
+    }));
+    const desc = describeBgTasks(many, 0);
+    expect(desc).toHaveLength(11);
+    expect(desc[0]).toBe("bash t-0 (0s): task 0");
+    expect(desc[10]).toBe("…and 3 more");
   });
 });
 
@@ -551,6 +583,20 @@ describe("buildSettleJudgeTask", () => {
   it("omits the previous-assessment section when there was none", () => {
     const task = buildSettleJudgeTask(goal(), { workDigest: "", continuation: 1, maxContinuations: 5 });
     expect(task).not.toContain("Your previous assessment");
+    // A calm settle offers no parking verdict and shows no task section.
+    expect(task).not.toContain("Background tasks");
+    expect(task).not.toContain("/ hold");
+  });
+  it("offers the hold verdict and lists the running tasks while they run", () => {
+    const task = buildSettleJudgeTask(goal(), {
+      workDigest: "did A",
+      continuation: 1,
+      maxContinuations: 10,
+      runningTasks: ["subagent t-2 (1m 3s): reviewer"],
+    });
+    expect(task).toContain("## Background tasks still running");
+    expect(task).toContain("subagent t-2 (1m 3s): reviewer");
+    expect(task).toContain("/ hold (waiting on those tasks)");
   });
 });
 
@@ -1044,6 +1090,12 @@ describe("settle triage — parser and task", () => {
     expect(parseTriageVerdict('{"action":"maybe"}')).toBeUndefined();
     expect(parseTriageVerdict("")).toBeUndefined();
   });
+  it("parses the hold action offered while background tasks run", () => {
+    expect(parseTriageVerdict('sure! {"action": "Hold", "reason": "gate suite in flight"}')).toEqual({
+      action: "hold",
+      reason: "gate suite in flight",
+    });
+  });
   it("builds the triage task with the goal, criteria, and the verify command", () => {
     const g = goal({ id: 3, objective: "port KVarN", criteria: ["P1", "P2"], verify: "bash scripts/tq_gate.sh" });
     const task = buildTriageTask(g, { workDigest: "did A", continuation: 4, maxContinuations: 25 });
@@ -1052,6 +1104,20 @@ describe("settle triage — parser and task", () => {
     expect(task).toContain("bash scripts/tq_gate.sh");
     expect(task).toContain("did A");
     expect(task).toContain("4/25");
+    // A calm settle offers no parking action and shows no task section.
+    expect(task).not.toContain("Background tasks");
+    expect(task).not.toContain("/ hold");
+  });
+  it("offers the hold action and lists the running tasks while they run", () => {
+    const task = buildTriageTask(goal({ verify: "npm test" }), {
+      workDigest: "did A",
+      continuation: 1,
+      maxContinuations: 25,
+      runningTasks: ["bash t-1134z8v (4m 12s): npm run dev"],
+    });
+    expect(task).toContain("## Background tasks still running");
+    expect(task).toContain("bash t-1134z8v (4m 12s): npm run dev");
+    expect(task).toContain("/ hold (waiting on those tasks)");
   });
   it("renders the triage prompt as a self-contained goal carrier", () => {
     const p = renderTriagePrompt(goal({ id: 2, objective: "port KVarN", criteria: ["P1"] }), "mid-work on P2", 3, 25);
@@ -1388,6 +1454,481 @@ describe("registerGoalTool — settle triage", () => {
     await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
     expect(await fire(events, "agent_before_settle", settleCtx())).toEqual({ continue: true });
     expect(verifyRunner).toHaveBeenCalledTimes(2); // set baseline + the settle's run
+  });
+});
+
+describe("registerGoalTool — judge-decided holds on background tasks", () => {
+  const devServer: BgTask = { id: "t-1", name: "npm run dev", kind: "bash", state: "running", startedAt: 0 };
+  const settleCtx = (notify?: ReturnType<typeof vi.fn>) =>
+    ({
+      ui: { notify: notify ?? vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() },
+      sessionManager: { getBranch: () => [] },
+    }) as unknown as ExtensionContext;
+
+  it("the triage 'hold' verdict parks: no verify, no budget, notice once per park", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const notify = vi.fn();
+    const setStatus = vi.fn();
+    const ctx = {
+      ui: { notify, setStatus, setWidget: vi.fn() },
+      sessionManager: { getBranch: () => [] },
+    } as unknown as ExtensionContext;
+    let running: BgTask[] = [devServer];
+    const seen: Array<string[] | undefined> = [];
+    const verifyRunner = vi.fn(async () => failVerify);
+    registerGoalTool(pi, {
+      maxContinuations: 10,
+      runningTasks: () => running,
+      verifyRunner,
+      triage: {
+        triage: (_g, tctx) => {
+          seen.push(tctx.runningTasks);
+          return { action: "hold", reason: "gate suite still running" };
+        },
+      },
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it", verify: "npm test" });
+
+    // The judge saw the live task list — without it, hold is a guess.
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(seen[0]).toEqual([expect.stringContaining("npm run dev")]);
+    expect(verifyRunner).toHaveBeenCalledTimes(1); // the set baseline only — the settle parked
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("check held"));
+    expect(setStatus).toHaveBeenCalledWith("goal", "goal · holding check — 1 background task running");
+    expect(sentCustom).toHaveLength(0); // nothing queued — no budget burned, nothing cached
+
+    // Still parked: no re-announce.
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(seen).toHaveLength(2); // the judge is re-asked each settle
+
+    // Calm settle: the check runs from continuation 1 — holds burned no budget.
+    running = [];
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    expect(verifyRunner).toHaveBeenCalledTimes(2);
+    expect((sentCustom[0]!.msg as { content: string }).content).toContain("1/10");
+    // The proceed ended the park episode: the next hold re-announces.
+    running = [devServer];
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(notify).toHaveBeenCalledTimes(2);
+  });
+
+  it("the triage lets the verify run alongside ambient tasks — the dev-server fix", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const ctx = settleCtx();
+    const running: BgTask[] = [devServer];
+    const verifyRunner = vi.fn(async () => failVerify);
+    registerGoalTool(pi, {
+      maxContinuations: 10,
+      runningTasks: () => running,
+      verifyRunner,
+      triage: { triage: async () => ({ action: "verify", reason: "claims done; the server is ambient" }) },
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it", verify: "npm test" });
+
+    // Old behavior parked here forever (a dev server never wakes). Now the
+    // judge said proceed, so the verify runs and the loop re-engages.
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    expect(verifyRunner).toHaveBeenCalledTimes(2);
+    const msg = sentCustom[0]!.msg as { content: string };
+    expect(msg.content).toContain("1/10");
+    expect(msg.content).toContain("did not pass");
+  });
+
+  it("the triage 'continue' verdict re-engages without measuring while tasks run", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const ctx = settleCtx();
+    const running: BgTask[] = [devServer];
+    const verifyRunner = vi.fn(async () => failVerify);
+    registerGoalTool(pi, {
+      maxContinuations: 10,
+      runningTasks: () => running,
+      verifyRunner,
+      triage: { triage: async () => ({ action: "continue", reason: "P2 in flight beside the server" }) },
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it", verify: "npm test" });
+
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    expect(verifyRunner).toHaveBeenCalledTimes(1); // baseline only — no script
+    const msg = sentCustom[0]!.msg as { content: string; details: GoalCheckDetails };
+    expect(msg.content).toContain("did NOT run the verify");
+    expect(msg.details.triage).toBe("continue");
+  });
+
+  it("a triage with no opinion or an error while tasks run defers — the pre-judge behavior", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const notify = vi.fn();
+    const ctx = settleCtx(notify);
+    const running: BgTask[] = [devServer];
+    const verifyRunner = vi.fn(async () => failVerify);
+    let mode: "none" | "throw" = "none";
+    registerGoalTool(pi, {
+      maxContinuations: 10,
+      runningTasks: () => running,
+      verifyRunner,
+      triage: {
+        triage: () => {
+          if (mode === "throw") throw new Error("child spawn failed");
+          return undefined;
+        },
+      },
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it", verify: "npm test" });
+
+    // No opinion while holding: defer, not fail-open-to-measure — measuring
+    // against work still in flight is what the deferral exists to avoid.
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(verifyRunner).toHaveBeenCalledTimes(1);
+    expect(notify).toHaveBeenCalledTimes(1); // the park announcement
+
+    // An error while holding: same deferral, but the failure is said out loud.
+    mode = "throw";
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(verifyRunner).toHaveBeenCalledTimes(1);
+    expect(notify).toHaveBeenCalledTimes(2);
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("settle triage failed (child spawn failed)"));
+    expect(sentCustom).toHaveLength(0); // nothing queued in either case
+  });
+
+  it("the milestone judge holds for in-flight tasks and proceeds past ambient ones", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const ctx = settleCtx();
+    let running: BgTask[] = [devServer];
+    const seen: Array<string[] | undefined> = [];
+    const verdicts: SettleVerdict[] = [
+      { verdict: "hold", reason: "waiting on the build" },
+      { verdict: "working", reason: "criterion 1 open", remaining: ["wire the badge"] },
+    ];
+    let call = 0;
+    registerGoalTool(pi, {
+      maxContinuations: 10,
+      runningTasks: () => running,
+      settleJudge: {
+        assess: (_g, jctx) => {
+          seen.push(jctx.runningTasks);
+          return verdicts[call++]!;
+        },
+      },
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it" });
+
+    // Hold: park — no budget, no message; the judge saw the task list.
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(seen[0]).toEqual([expect.stringContaining("npm run dev")]);
+    expect(sentCustom).toHaveLength(0);
+
+    // Working beside the ambient server: re-engage (the verify-less dev-server
+    // fix) — old behavior parked the loop until the next user prompt.
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    const msg = sentCustom[0]!.msg as { content: string; details: GoalCheckDetails };
+    expect(msg.content).toContain("continuation 1/10"); // the hold burned no budget
+    expect(msg.details.judge).toBe("working");
+  });
+
+  it("a holding settle is always due — the throttle cannot skip the park decision", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const ctx = settleCtx();
+    let running: BgTask[] = [];
+    const triageCalls = vi.fn(async () => ({ action: "verify" as const, reason: "claims done" }));
+    const verifyRunner = vi.fn(async () => failVerify);
+    registerGoalTool(pi, {
+      maxContinuations: 10,
+      checkEvery: 3,
+      runningTasks: () => running,
+      verifyRunner,
+      triage: { triage: triageCalls },
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it", verify: "npm test" });
+
+    // Settle 1 (calm, due): measured.
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    expect(verifyRunner).toHaveBeenCalledTimes(2);
+    // Settle 2 (holding): (1+1)%3 !== 0, so the throttle would reuse the
+    // stale check and re-engage without asking — the hold verdict must be
+    // offered anyway.
+    running = [devServer];
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    expect(triageCalls).toHaveBeenCalledTimes(2);
+    expect((sentCustom[1]!.msg as { content: string }).content).toContain("2/10");
+  });
+
+  it("a judge-decided hold at the continuation cap defers — the breaker reads a calm settle", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const notify = vi.fn();
+    const ctx = settleCtx(notify);
+    let running: BgTask[] = [];
+    const assess = vi.fn(() => undefined);
+    const verifyRunner = vi.fn(async () => failVerify);
+    registerGoalTool(pi, {
+      maxContinuations: 1,
+      progressJudge: { assess },
+      runningTasks: () => running,
+      verifyRunner,
+      triage: { triage: async () => ({ action: "hold", reason: "gate suite in flight" }) },
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it", verify: "npm test" });
+
+    // Calm settle: continuation 1/1 — the budget is spent (a calm "hold" is
+    // drift; the verify ran).
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    expect(verifyRunner).toHaveBeenCalledTimes(2);
+    expect(sentCustom).toHaveLength(1);
+
+    // At the cap with tasks running: the triage holds — no stop, no progress
+    // judge, no budget (the cap decision belongs to a calm settle, exactly
+    // like the pre-judge unconditional deferral).
+    running = [devServer];
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(assess).not.toHaveBeenCalled();
+    expect(sentCustom).toHaveLength(1);
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("check held"));
+    expect(notify).not.toHaveBeenCalledWith(expect.stringContaining("stopping"));
+
+    // Calm again: the breaker decides now (no opinion → fail closed to the stop).
+    running = [];
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(assess).toHaveBeenCalledTimes(1);
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("stopping"));
+  });
+
+  it("a judge-decided proceed at the cap meets the breaker: the progress judge gates it", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const notify = vi.fn();
+    const ctx = settleCtx(notify);
+    let running: BgTask[] = [];
+    const assess = vi.fn(() => undefined);
+    const verifyRunner = vi.fn(async () => failVerify);
+    registerGoalTool(pi, {
+      maxContinuations: 1,
+      progressJudge: { assess },
+      runningTasks: () => running,
+      verifyRunner,
+      triage: { triage: async () => ({ action: "verify", reason: "claims done beside the server" }) },
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it", verify: "npm test" });
+
+    // Calm settle first: continuation 1/1 — the budget is spent.
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    expect(verifyRunner).toHaveBeenCalledTimes(2);
+    expect(sentCustom).toHaveLength(1);
+
+    // Settle at the cap while holding: the triage declined to hold, so the
+    // cap fires before the verify — fail closed (no opinion → stop).
+    running = [devServer];
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(assess).toHaveBeenCalledTimes(1);
+    expect(verifyRunner).toHaveBeenCalledTimes(2); // no verify past the stop
+    expect(sentCustom).toHaveLength(1);
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("stopping"));
+  });
+
+  it("the milestone judge hold at the cap defers; its proceed meets the breaker", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const notify = vi.fn();
+    const ctx = settleCtx(notify);
+    let running: BgTask[] = [];
+    const assess = vi.fn(() => undefined);
+    const verdicts: SettleVerdict[] = [
+      { verdict: "working", reason: "criterion 1 open" },
+      { verdict: "hold", reason: "waiting on the build" },
+      { verdict: "working", reason: "still open" },
+    ];
+    let call = 0;
+    registerGoalTool(pi, {
+      maxContinuations: 1,
+      progressJudge: { assess },
+      runningTasks: () => running,
+      settleJudge: { assess: () => verdicts[call++] },
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it" });
+
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 1/1
+    // Hold at the cap: park, breaker not consulted.
+    running = [devServer];
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(assess).not.toHaveBeenCalled();
+    expect(sentCustom).toHaveLength(1);
+    // Working at the cap (beside the ambient server): the breaker gates it.
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(assess).toHaveBeenCalledTimes(1);
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("stopping"));
+  });
+
+  it("an aborted triage ends the park episode: the next hold re-announces", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const notify = vi.fn();
+    const handlers = new Set<(data: string) => unknown>();
+    const ctx = {
+      ui: {
+        notify,
+        setStatus: vi.fn(),
+        setWidget: vi.fn(),
+        onTerminalInput: (h: (data: string) => unknown) => {
+          handlers.add(h);
+          return () => handlers.delete(h);
+        },
+      },
+      sessionManager: { getBranch: () => [] },
+    } as unknown as ExtensionContext;
+    const running: BgTask[] = [devServer];
+    let mode: "hold" | "hang" = "hold";
+    let started!: () => void;
+    const triageStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    registerGoalTool(pi, {
+      maxContinuations: 10,
+      runningTasks: () => running,
+      verifyRunner: async () => failVerify,
+      triage: {
+        triage: (_g, tctx) => {
+          if (mode === "hold") return Promise.resolve({ action: "hold", reason: "gate suite in flight" });
+          mode = "hold"; // the next settle answers again
+          return new Promise<TriageVerdict | undefined>((resolve) => {
+            started();
+            tctx.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
+          });
+        },
+      },
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it", verify: "npm test" });
+
+    // Holding settle 1: hold → park, announced once.
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(notify).toHaveBeenCalledTimes(1);
+
+    // Holding settle 2: the triage is killed mid-flight (alt+x) — the abort
+    // notice re-engages, ending the park episode without a second announce.
+    mode = "hang";
+    const settle = fire(events, "agent_before_settle", ctx);
+    await triageStarted;
+    for (const h of [...handlers]) h("\x1bx");
+    expect(await settle).toEqual({ continue: true });
+    expect((sentCustom[0]!.msg as { content: string }).content).toContain("triage was aborted");
+    expect(notify).toHaveBeenCalledTimes(1);
+
+    // Holding settle 3: hold again → re-announced (a deleted reset would stay
+    // silent for the rest of the park).
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(notify).toHaveBeenCalledTimes(2);
+  });
+
+  it("an aborted milestone judge ends the park episode: the next hold re-announces", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const notify = vi.fn();
+    const handlers = new Set<(data: string) => unknown>();
+    const ctx = {
+      ui: {
+        notify,
+        setStatus: vi.fn(),
+        setWidget: vi.fn(),
+        onTerminalInput: (h: (data: string) => unknown) => {
+          handlers.add(h);
+          return () => handlers.delete(h);
+        },
+      },
+      sessionManager: { getBranch: () => [] },
+    } as unknown as ExtensionContext;
+    const running: BgTask[] = [devServer];
+    let mode: "hold" | "hang" = "hold";
+    let started!: () => void;
+    const judgeStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    registerGoalTool(pi, {
+      maxContinuations: 10,
+      runningTasks: () => running,
+      settleJudge: {
+        assess: (_g, jctx) => {
+          if (mode === "hold") return Promise.resolve({ verdict: "hold", reason: "waiting on the build" });
+          mode = "hold"; // the next settle answers again
+          return new Promise<SettleVerdict | undefined>((resolve) => {
+            started();
+            jctx.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
+          });
+        },
+      },
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it" });
+
+    // Holding settle 1: hold → park, announced once.
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(notify).toHaveBeenCalledTimes(1);
+
+    // Holding settle 2: the judge is killed mid-flight (alt+x) — the abort
+    // notice re-engages, ending the park episode.
+    mode = "hang";
+    const settle = fire(events, "agent_before_settle", ctx);
+    await judgeStarted;
+    for (const h of [...handlers]) h("\x1bx");
+    expect(await settle).toEqual({ continue: true });
+    expect((sentCustom[0]!.msg as { content: string }).content).toContain("judge was aborted");
+    expect(notify).toHaveBeenCalledTimes(1);
+
+    // Holding settle 3: hold again → re-announced.
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(notify).toHaveBeenCalledTimes(2);
+  });
+
+  it("a throwing or opinion-less milestone judge fails OPEN even while tasks run", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const ctx = settleCtx();
+    const running: BgTask[] = [devServer];
+    const modes = ["throw", "no-opinion"] as const;
+    let call = 0;
+    registerGoalTool(pi, {
+      maxContinuations: 10,
+      runningTasks: () => running,
+      settleJudge: {
+        assess: () => {
+          const mode = modes[call++];
+          if (mode === "throw") throw new Error("spawn failed");
+          return undefined;
+        },
+      },
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it" });
+
+    // Both failures re-engage (fail-open — the milestone contract), burning
+    // budget rather than parking: a broken judge must not resurrect the
+    // park-forever trap while a dev server runs.
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    let msg = sentCustom[0]!.msg as { content: string; details: GoalCheckDetails };
+    expect(msg.content).toContain("the judge could not run: spawn failed");
+    expect(msg.content).toContain("continuation 1/10");
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    msg = sentCustom[1]!.msg as { content: string; details: GoalCheckDetails };
+    expect(msg.content).toContain("the judge returned no opinion");
+    expect(msg.content).toContain("continuation 2/10");
+  });
+
+  it("a calm 'hold' is drift: the triage measures, the judge fails open", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const ctx = settleCtx();
+    const verifyRunner = vi.fn(async () => failVerify);
+    registerGoalTool(pi, {
+      maxContinuations: 10,
+      runningTasks: () => [],
+      verifyRunner,
+      triage: { triage: async () => ({ action: "hold", reason: "drifted" }) },
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it", verify: "npm test" });
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    expect(verifyRunner).toHaveBeenCalledTimes(2); // fell through to measure — no calm park
+    expect((sentCustom[0]!.msg as { content: string }).content).toContain("did not pass");
+
+    const { pi: pi2, tools: tools2, events: events2, sentCustom: sent2 } = makePi();
+    registerGoalTool(pi2, {
+      maxContinuations: 10,
+      runningTasks: () => [],
+      settleJudge: { assess: async () => ({ verdict: "hold", reason: "drifted" }) },
+    });
+    await tools2.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it" });
+    expect(await fire(events2, "agent_before_settle", ctx)).toEqual({ continue: true });
+    const msg = sent2[0]!.msg as { content: string; details: GoalCheckDetails };
+    expect(msg.content).toContain("Milestone judge (unavailable)"); // fail-open continuation, not a park
+    expect(msg.content).toContain("continuation 1/10");
   });
 });
 
