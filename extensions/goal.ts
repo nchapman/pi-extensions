@@ -864,7 +864,7 @@ export type JudgeChildRunner = (
   agent: AgentDef,
   task: string,
   model: string | undefined,
-  options: { timeoutMs?: number; signal?: AbortSignal },
+  options: { timeoutMs?: number; idleTimeoutMs?: number; signal?: AbortSignal },
   spawnFn?: SpawnFn,
 ) => Promise<ChildRun | { adopted: true }>;
 
@@ -895,7 +895,11 @@ export function createLlmSettleJudge(deps: LlmSettleJudgeDeps = {}): SettleJudge
         SETTLE_JUDGE_AGENT,
         buildSettleJudgeTask(goal, ctx),
         model,
-        { timeoutMs, ...(ctx.signal ? { signal: ctx.signal } : {}) },
+        // idleTimeoutMs: 0 — a judge is one tool-less LLM call whose timeoutMs
+        // is the whole budget; a silence watchdog could only pre-empt a
+        // knob-raised budget (slow local models take minutes to first token)
+        // or re-label its expiry as a stall.
+        { timeoutMs, idleTimeoutMs: 0, ...(ctx.signal ? { signal: ctx.signal } : {}) },
         deps.spawnFn,
       );
       if ("adopted" in run) return undefined; // adoption is never configured here; belt-and-braces
@@ -991,7 +995,9 @@ export function createLlmSettleTriage(deps: LlmSettleJudgeDeps = {}): SettleTria
         SETTLE_TRIAGE_AGENT,
         buildTriageTask(goal, ctx),
         model,
-        { timeoutMs, ...(ctx.signal ? { signal: ctx.signal } : {}) },
+        // idleTimeoutMs: 0 — same reasoning as the judge: the triage timeout
+        // is the budget; tool-less silence is not a dead-request signal here.
+        { timeoutMs, idleTimeoutMs: 0, ...(ctx.signal ? { signal: ctx.signal } : {}) },
         deps.spawnFn,
       );
       if ("adopted" in run) return undefined; // adoption is never configured here; belt-and-braces

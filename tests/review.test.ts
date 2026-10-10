@@ -34,6 +34,7 @@ import {
   verifyTask,
   type Verdict,
   withStallRetry,
+  FINDER_LENSES,
 } from "../extensions/review";
 import type { ChildLike, ChildRun, ChildUsage, SpawnFn } from "../extensions/subagents";
 
@@ -239,9 +240,11 @@ describe("parseReviewConfig", () => {
     expect(c.idleTimeoutMs).toBe(5 * 60_000);
   });
 
-  it("disables the idle watchdog only on an explicit 0", () => {
-    expect(parseReviewConfig({ PI_REVIEW_IDLE_TIMEOUT_MS: "0" }).idleTimeoutMs).toBeUndefined();
-    expect(parseReviewConfig({ PI_REVIEW_IDLE_TIMEOUT_MS: "0 " }).idleTimeoutMs).toBeUndefined();
+  it("disables the idle watchdog on any numerically-zero value", () => {
+    expect(parseReviewConfig({ PI_REVIEW_IDLE_TIMEOUT_MS: "0" }).idleTimeoutMs).toBe(0);
+    expect(parseReviewConfig({ PI_REVIEW_IDLE_TIMEOUT_MS: "0 " }).idleTimeoutMs).toBe(0);
+    expect(parseReviewConfig({ PI_REVIEW_IDLE_TIMEOUT_MS: "0.0" }).idleTimeoutMs).toBe(0);
+    expect(parseReviewConfig({ PI_REVIEW_IDLE_TIMEOUT_MS: "00" }).idleTimeoutMs).toBe(0);
     expect(parseReviewConfig({ PI_REVIEW_IDLE_TIMEOUT_MS: "1000" }).idleTimeoutMs).toBe(10_000);
   });
 });
@@ -1031,8 +1034,8 @@ describe("runReview", () => {
         writeFile: async (p: string, d: string) => void written.push([p, d]),
       }) as never,
     });
-    // 4 finders + 1 verify (this fixture opts into verification)
-    expect(spawn.tasks).toHaveLength(5);
+    // one finder per lens + 1 verify (this fixture opts into verification)
+    expect(spawn.tasks).toHaveLength(FINDER_LENSES.length + 1);
     expect(spawn.tasks.filter((t) => t.startsWith("# Verify"))).toHaveLength(1);
     // security + correctness merge into one finding (the id-2 downgrade verdict is
     // out of range for 0-based ids, so critical stands — worst-severity-wins)

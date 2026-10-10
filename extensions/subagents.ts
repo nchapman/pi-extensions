@@ -32,6 +32,10 @@ import {
 
 export const BUILTIN_TOOLS = ["read", "write", "edit", "bash", "grep", "find", "ls"];
 const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000;
+/** Default idle watchdog: a child waiting on its LLM this long without a
+ * single stdout event is a dead request, not a slow one — exported so tests
+ * and docs pin the contract. Tool executions are exempt (see runChild). */
+export const DEFAULT_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_CONCURRENCY = 4;
 const STDERR_TAIL_MAX = 8 * 1024;
 const STDOUT_BUF_MAX = 1024 * 1024;
@@ -48,6 +52,29 @@ export interface AgentDef {
 export function parseTimeoutMs(env: NodeJS.ProcessEnv): number {
   const raw = Number(env.PI_SUBAGENT_TIMEOUT_MS);
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_TIMEOUT_MS;
+}
+
+/** Idle watchdog for child runs: kill a child that has waited on its LLM
+ * this long without a stdout event. Any numerically-zero spelling ("0",
+ * "0.0", "00") disables (the sibling-knob convention); anything missing or
+ * unparseable keeps the 5-minute default — a silent wait is the dead-request
+ * signal, so bad input fails toward detection, not away from it. Milliseconds
+ * and unclamped, deliberately matching PI_SUBAGENT_TIMEOUT_MS (the sibling
+ * hard-timeout knob); the watchdog ticks at most every 100ms, so a window
+ * at or below that kills on the first tick. */
+export function parseIdleTimeoutMs(env: NodeJS.ProcessEnv): number {
+  const raw = env.PI_SUBAGENT_IDLE_TIMEOUT_MS?.trim();
+  if (!raw) return DEFAULT_IDLE_TIMEOUT_MS;
+  const n = Number(raw);
+  if (n === 0) return 0;
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_IDLE_TIMEOUT_MS;
+}
+
+/** Resolve a run's idle window from its options: an explicit value wins
+ * (0 = off), an omitted one keeps the on-by-default watchdog. Pure so tests
+ * can pin both branches without racing real timers. */
+export function resolveIdleTimeoutMs(options: Pick<RunChildOptions, "idleTimeoutMs">): number {
+  return options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
 }
 
 export function parseConcurrency(env: NodeJS.ProcessEnv): number {
@@ -247,12 +274,15 @@ export const defaultSpawn: SpawnFn = (command, args, options) =>
 
 export interface RunChildOptions {
   timeoutMs?: number;
-  /** Kill the child when its stdout has been silent this long. stdout events
-   * (stream deltas, tool calls, tool results) are the child's heartbeat; a
-   * dead LLM request — dropped connection, wedged provider stream — otherwise
-   * hangs until `timeoutMs`. Size it above the longest legitimate quiet
-   * stretch: a child running a long bash tool emits nothing while it runs.
-   * Undefined disables the watchdog. */
+  /** Kill the child when it has waited on its LLM this long without a stdout
+   * event — on by default (DEFAULT_IDLE_TIMEOUT_MS, 5 minutes); 0 disables.
+   * Stdout events (stream deltas, tool calls, tool results, retries) are the
+   * child's heartbeat, but only while it is *between* tool executions: a
+   * tool run in progress suspends the watchdog, because a long build or test
+   * emits nothing while it works and is healthy — the hard timeout remains
+   * the backstop there. What the window judges is the LLM wait itself: a
+   * dead request (dropped connection, wedged provider stream) hangs silently
+   * until killed. */
   idleTimeoutMs?: number;
   onUpdate?: (partial: AgentToolResult) => void;
   signal?: AbortSignal;
@@ -478,6 +508,15 @@ export function runChild(
     // into an event. Initialized at spawn so a child that never emits anything
     // is caught too.
     let lastActivityAt = startedAt;
+    // Tool executions in flight, keyed by call id. Silence while a tool runs
+    // is the tool working (a long build or test emits nothing between start
+    // and end), not a dead LLM request — the watchdog stands down while any
+    // execution is open. Ids rather than a count so a lost or duplicated end
+    // line cannot corrupt the phase: an unmatched end is a no-op, and a
+    // missing one is healed at the next assistant message_start (the child
+    // only requests again after every tool of the turn has finished) or when
+    // the stdout cap discards data — both fail toward detection, never away.
+    const openToolRuns = new Set<string>();
     const child = spawnFn("pi", buildChildArgs(agent, task, model), { stdio: ["ignore", "pipe", "pipe"] });
     let stdoutBuf = "";
     let stderrBuf = "";
@@ -508,7 +547,20 @@ export function runChild(
       const trimmed = line.trim();
       if (!trimmed) return;
       try {
-        const event = JSON.parse(trimmed);
+        const event = JSON.parse(trimmed) as {
+          type?: string;
+          toolCallId?: string;
+          message?: { role?: string; usage?: unknown; content?: unknown };
+        };
+        if (event.type === "tool_execution_start") {
+          openToolRuns.add(event.toolCallId ?? "");
+        } else if (event.type === "tool_execution_end") {
+          openToolRuns.delete(event.toolCallId ?? "");
+        } else if (event.type === "message_start" && event.message?.role === "assistant") {
+          // A new assistant message means the previous turn's tools all
+          // finished — heal any end line the stdout cap ate below.
+          openToolRuns.clear();
+        }
         if (event.type === "message_end" && event.message?.role === "assistant") {
           // Each assistant message carries its request's final usage; summing them
           // mirrors pi's own session accounting (message_update resets per request).
@@ -536,6 +588,10 @@ export function runChild(
       lastActivityAt = Date.now();
       stdoutBuf += chunk.toString();
       if (stdoutBuf.length > STDOUT_BUF_MAX) {
+        // The discard can lose whole event lines — a >1MiB tool result makes
+        // its own tool_execution_end the culprit — so the tool-phase
+        // bookkeeping becomes unreliable: re-arm the watchdog.
+        openToolRuns.clear();
         const nl = stdoutBuf.lastIndexOf("\n");
         stdoutBuf = nl >= 0 ? stdoutBuf.slice(nl + 1) : "";
       }
@@ -564,10 +620,13 @@ export function runChild(
     }, timeoutMs);
     timeout.unref?.();
 
-    // Idle watchdog: kill a silent child as soon as it has been quiet past the
-    // threshold instead of burning the rest of the hard timeout on a request
-    // that will never return. Survives adoption like the hard timeout does.
-    const idleMs = options.idleTimeoutMs;
+    // Idle watchdog: kill a child that has waited on its LLM past the
+    // threshold without a single event, instead of burning the rest of the
+    // hard timeout on a request that will never return. The clock only judges
+    // LLM waits — a tool execution in progress stands it down (silence there
+    // is healthy work; `timeoutMs` is the backstop). Survives adoption like
+    // the hard timeout does; 0 opts out (the option is on by default).
+    const idleMs = resolveIdleTimeoutMs(options);
     const stall = () => {
       child.kill("SIGKILL");
       const silentFor = Math.max(1, Math.round((Date.now() - lastActivityAt) / 1000));
@@ -584,15 +643,17 @@ export function runChild(
     };
     // Check often enough to notice promptly, never more than 5s between ticks;
     // unref'd so a forgotten watchdog can't hold the process open.
-    const watchdog = idleMs
-      ? setInterval(
-          () => {
-            if (settled && !adopted) return;
-            if (Date.now() - lastActivityAt >= idleMs) stall();
-          },
-          Math.max(100, Math.min(5_000, Math.floor(idleMs / 4))),
-        )
-      : undefined;
+    const watchdog =
+      idleMs > 0
+        ? setInterval(
+            () => {
+              if (settled && !adopted) return;
+              if (openToolRuns.size > 0) return; // a tool is executing — silence is expected
+              if (Date.now() - lastActivityAt >= idleMs) stall();
+            },
+            Math.max(100, Math.min(5_000, Math.floor(idleMs / 4))),
+          )
+        : undefined;
     watchdog?.unref?.();
 
     const onAbort = () => {
@@ -896,7 +957,12 @@ By default the call blocks until the subagent finishes — waiting on a tool cal
       const agent = resolveAgentDef(list, params);
       // Adoption is wired only when a registry is present; without one the
       // tool waits synchronously exactly as before.
-      const options: RunChildOptions = { timeoutMs: parseTimeoutMs(process.env), onUpdate, signal };
+      const options: RunChildOptions = {
+        timeoutMs: parseTimeoutMs(process.env),
+        idleTimeoutMs: parseIdleTimeoutMs(process.env),
+        onUpdate,
+        signal,
+      };
       if (registry) {
         options.adoptAfterMs = params.background ? 0 : parseBgAfterMs(process.env);
         options.onAdopted = (handle: AdoptedHandle<ChildRun>) =>
@@ -970,11 +1036,12 @@ By default the call blocks until every subagent finishes — waiting on a tool c
     async execute(_id, params, signal, _onUpdate, ctx) {
       const list = loadAgents(agentsDir);
       const timeoutMs = parseTimeoutMs(process.env);
+      const idleTimeoutMs = parseIdleTimeoutMs(process.env);
       const sessionDir = ctx?.sessionManager?.getSessionDir();
       const results = await runWithLimit(
         params.tasks.map((t) => () => {
           const agent = resolveAgentDef(list, t);
-          const options: RunChildOptions = { timeoutMs, signal };
+          const options: RunChildOptions = { timeoutMs, idleTimeoutMs, signal };
           if (registry) {
             options.adoptAfterMs = t.background ? 0 : parseBgAfterMs(process.env);
             options.onAdopted = (handle: AdoptedHandle<ChildRun>) =>

@@ -99,7 +99,9 @@ async function judgeFindings(
   // heuristic, not die with E2BIG on an oversized argv.
   const ask = async (fs: Finding[], is: GoldenIssue[]) => {
     const task = fitTask(() => judgeTask(fs, is), "").task;
-    return runChild(judgeAgent(), task, judgeModel, { timeoutMs: 5 * 60_000 });
+    // idleTimeoutMs: 0 — one tool-less LLM call; the timeout is the budget and
+    // askWithRetry already covers transient dead requests.
+    return runChild(judgeAgent(), task, judgeModel, { timeoutMs: 5 * 60_000, idleTimeoutMs: 0 });
   };
   try {
     let tokens = 0;

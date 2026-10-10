@@ -92,10 +92,11 @@ export interface ReviewConfig {
   maxChildren: number;
   /** Per-child timeout. */
   timeoutMs: number;
-  /** Kill a child whose stdout falls silent this long — a dead LLM request
-   * otherwise hangs until `timeoutMs` (the backstop, not the detector).
-   * Undefined disables the watchdog (the 0-env convention). */
-  idleTimeoutMs: number | undefined;
+  /** Kill a child that has waited on its LLM this long without an event —
+   * a dead request otherwise hangs until `timeoutMs` (the backstop, not the
+   * detector). Tool executions are exempt (see RunChildOptions.idleTimeoutMs).
+   * 0 disables the watchdog. */
+  idleTimeoutMs: number;
   /** Model override for all stages. */
   model?: string;
   /** Model override for the verify stage only (wins over `model`). */
@@ -124,17 +125,20 @@ function clampInt(raw: unknown, fallback: number, min: number, max: number): num
 
 /** Parse PI_REVIEW_* knobs; invalid values fall back to documented defaults. */
 export function parseReviewConfig(env: NodeJS.ProcessEnv): ReviewConfig {
+  // 5m of silence while waiting on the LLM means the request died, not that
+  // it is slow — kill and retry instead of waiting 20m. Any numeric zero
+  // disables (the sibling-knob convention); blank keeps the default.
+  const idleRaw = env.PI_REVIEW_IDLE_TIMEOUT_MS?.trim();
+  const idleTimeoutMs = !idleRaw
+    ? 5 * 60_000
+    : Number(idleRaw) === 0
+      ? 0
+      : clampInt(env.PI_REVIEW_IDLE_TIMEOUT_MS, 5 * 60_000, 10_000, 6 * 60 * 60_000);
   return {
     chunkChars: clampInt(env.PI_REVIEW_CHUNK_CHARS, 96_000, 8_000, 512_000),
     maxChildren: clampInt(env.PI_REVIEW_MAX_CHILDREN, 8, 1, 32),
     timeoutMs: clampInt(env.PI_REVIEW_TIMEOUT_MS, 20 * 60_000, 10_000, 6 * 60 * 60_000),
-    // 5m of absolute stdout silence from a streaming child means the request
-    // died, not that it is slow — kill and retry instead of waiting 20m. "0"
-    // disables (the sibling-knob convention); blank keeps the default.
-    idleTimeoutMs:
-      env.PI_REVIEW_IDLE_TIMEOUT_MS?.trim() === "0"
-        ? undefined
-        : clampInt(env.PI_REVIEW_IDLE_TIMEOUT_MS, 5 * 60_000, 10_000, 6 * 60 * 60_000),
+    idleTimeoutMs,
     model: env.PI_REVIEW_MODEL?.trim() || DEFAULT_REVIEW_MODEL,
     verifyModel: env.PI_REVIEW_VERIFY_MODEL?.trim() || undefined,
     checkCmd: env.PI_REVIEW_CHECK_CMD?.trim() ?? "",

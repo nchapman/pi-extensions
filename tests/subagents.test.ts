@@ -16,7 +16,10 @@ import {
   isValidCommandName,
   loadAgents,
   parseConcurrency,
+  parseIdleTimeoutMs,
   parseTimeoutMs,
+  resolveIdleTimeoutMs,
+  DEFAULT_IDLE_TIMEOUT_MS,
   refLabel,
   registerCommandsForAgents,
   registerSubagentCommands,
@@ -57,6 +60,18 @@ const USAGE = (over: Partial<ChildUsage> = {}): ChildUsage => ({
 const usageLine = (usage: ChildUsage): string => JSON.stringify({ type: "message_update", usage });
 const assistantLine = (text: string): string =>
   JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }] } });
+/** Child-side tool lifecycle events — the signal the idle watchdog suspends on. */
+const toolStartLine = (id: string) =>
+  JSON.stringify({ type: "tool_execution_start", toolCallId: id, toolName: "bash", args: { command: "ls" } });
+const toolEndLine = (id: string) =>
+  JSON.stringify({
+    type: "tool_execution_end",
+    toolCallId: id,
+    toolName: "bash",
+    result: { content: [] },
+    isError: false,
+  });
+const assistantStartLine = () => JSON.stringify({ type: "message_start", message: { role: "assistant", content: [] } });
 /** A complete assistant message_end line, the shape runChild parses for final text. */
 const jsonLine = assistantLine;
 
@@ -292,6 +307,29 @@ describe("env parsing", () => {
     expect(parseTimeoutMs({ PI_SUBAGENT_TIMEOUT_MS: "1500" })).toBe(1500);
     expect(parseConcurrency({ PI_SUBAGENT_CONCURRENCY: "2" })).toBe(2);
     expect(parseConcurrency({ PI_SUBAGENT_CONCURRENCY: "2.9" })).toBe(2);
+  });
+
+  it("idle watchdog: 5m default, explicit 0 disables, garbage keeps the default", () => {
+    expect(parseIdleTimeoutMs({})).toBe(DEFAULT_IDLE_TIMEOUT_MS);
+    expect(DEFAULT_IDLE_TIMEOUT_MS).toBe(5 * 60_000);
+    expect(parseIdleTimeoutMs({ PI_SUBAGENT_IDLE_TIMEOUT_MS: "0" })).toBe(0);
+    expect(parseIdleTimeoutMs({ PI_SUBAGENT_IDLE_TIMEOUT_MS: " 0 " })).toBe(0);
+    // Any numerically-zero spelling disables — string equality alone would
+    // leave "0.0"/"00" with the watchdog silently on.
+    expect(parseIdleTimeoutMs({ PI_SUBAGENT_IDLE_TIMEOUT_MS: "0.0" })).toBe(0);
+    expect(parseIdleTimeoutMs({ PI_SUBAGENT_IDLE_TIMEOUT_MS: "00" })).toBe(0);
+    expect(parseIdleTimeoutMs({ PI_SUBAGENT_IDLE_TIMEOUT_MS: "+0" })).toBe(0);
+    expect(parseIdleTimeoutMs({ PI_SUBAGENT_IDLE_TIMEOUT_MS: "" })).toBe(DEFAULT_IDLE_TIMEOUT_MS);
+    expect(parseIdleTimeoutMs({ PI_SUBAGENT_IDLE_TIMEOUT_MS: "abc" })).toBe(DEFAULT_IDLE_TIMEOUT_MS);
+    expect(parseIdleTimeoutMs({ PI_SUBAGENT_IDLE_TIMEOUT_MS: "-5" })).toBe(DEFAULT_IDLE_TIMEOUT_MS);
+    expect(parseIdleTimeoutMs({ PI_SUBAGENT_IDLE_TIMEOUT_MS: "1500" })).toBe(1500);
+    expect(parseIdleTimeoutMs({ PI_SUBAGENT_IDLE_TIMEOUT_MS: "2.9" })).toBe(2.9);
+  });
+
+  it("resolveIdleTimeoutMs: omitted keeps the default on, explicit 0 disables, explicit value wins", () => {
+    expect(resolveIdleTimeoutMs({})).toBe(DEFAULT_IDLE_TIMEOUT_MS);
+    expect(resolveIdleTimeoutMs({ idleTimeoutMs: 0 })).toBe(0);
+    expect(resolveIdleTimeoutMs({ idleTimeoutMs: 1500 })).toBe(1500);
   });
 });
 
@@ -580,6 +618,106 @@ describe("runChild", () => {
     await expect(promise).resolves.toEqual({ adopted: true, id: "t-1" });
     const err = (await handle!.completion.catch((e: unknown) => e)) as Error;
     expect(isStalledError(err)).toBe(true);
+    expect(child.killed).toBe(true);
+  });
+
+  it("stands down while a tool executes: a quiet long tool run is not a stall", async () => {
+    const child = fakeChild();
+    const promise = runChild(AGENT, "task", undefined, { timeoutMs: 5000, idleTimeoutMs: 60 }, () => child);
+    child.stdoutEmit(`${toolStartLine("call_1")}\n`);
+    // Quiet well past the 60ms window while the "tool" runs — a long build
+    // emits nothing between start and end, and the watchdog must read that
+    // as healthy work, not a dead request. Post-fix this cannot kill at any
+    // timing; the sleep only makes the pre-fix stall deterministic.
+    await new Promise((r) => setTimeout(r, 300));
+    child.stdoutEmit(`${toolEndLine("call_1")}\n`);
+    child.stdoutEmit(`${assistantLine("done")}\n`);
+    child.close(0);
+    await expect(promise).resolves.toMatchObject({ text: "done" });
+    expect(child.killed).toBe(false);
+  });
+
+  it("re-arms once the last tool ends: silence waiting on the LLM still stalls", async () => {
+    const child = fakeChild();
+    const promise = runChild(AGENT, "task", undefined, { timeoutMs: 5000, idleTimeoutMs: 60 }, () => child);
+    child.stdoutEmit(`${toolStartLine("call_1")}\n`);
+    child.stdoutEmit(`${toolEndLine("call_1")}\n`);
+    const err = (await promise.catch((e: unknown) => e)) as Error;
+    expect(isStalledError(err)).toBe(true);
+    expect(err.message).toMatch(/stalled: no output for \d+s \(request likely dead\)/);
+    expect(child.killed).toBe(true);
+  });
+
+  it("counts parallel tool executions: stood down until the last one ends", async () => {
+    const child = fakeChild();
+    const promise = runChild(AGENT, "task", undefined, { timeoutMs: 5000, idleTimeoutMs: 60 }, () => child);
+    child.stdoutEmit(`${toolStartLine("call_1")}\n`);
+    child.stdoutEmit(`${toolStartLine("call_2")}\n`);
+    await new Promise((r) => setTimeout(r, 150));
+    child.stdoutEmit(`${toolEndLine("call_1")}\n`);
+    await new Promise((r) => setTimeout(r, 150)); // one execution still outstanding
+    child.stdoutEmit(`${toolEndLine("call_2")}\n`);
+    child.stdoutEmit(`${assistantLine("done")}\n`);
+    child.close(0);
+    await expect(promise).resolves.toMatchObject({ text: "done" });
+    expect(child.killed).toBe(false);
+  });
+
+  it("ignores an unmatched end: a stray end before a real run does not re-arm the watchdog mid-tool", async () => {
+    const child = fakeChild();
+    const promise = runChild(AGENT, "task", undefined, { timeoutMs: 5000, idleTimeoutMs: 60 }, () => child);
+    // A chunk discarded by the stdout cap can drop lines, and streams can
+    // repeat or reorder an end. An unmatched end must be a no-op (it deletes
+    // an absent id), not corrupt the phase — otherwise the next real tool run
+    // would be judged as an LLM wait and killed mid-tool.
+    child.stdoutEmit(`${toolEndLine("ghost")}\n`);
+    child.stdoutEmit(`${toolStartLine("call_1")}\n`);
+    await new Promise((r) => setTimeout(r, 300));
+    child.stdoutEmit(`${toolEndLine("call_1")}\n`);
+    child.stdoutEmit(`${assistantLine("done")}\n`);
+    child.close(0);
+    await expect(promise).resolves.toMatchObject({ text: "done" });
+    expect(child.killed).toBe(false);
+  });
+
+  it("heals a lost tool end at the next assistant message_start: the LLM wait is judged again", async () => {
+    const child = fakeChild();
+    const promise = runChild(AGENT, "task", undefined, { timeoutMs: 5000, idleTimeoutMs: 60 }, () => child);
+    // The end line never arrives (e.g. a >1MiB tool result made its own end
+    // line exceed the stdout cap). The next assistant message_start proves
+    // the turn's tools all finished — the open run must be healed, not latched,
+    // or a dead request after it would burn the whole hard timeout.
+    child.stdoutEmit(`${toolStartLine("call_1")}\n`);
+    child.stdoutEmit(`${assistantStartLine()}\n`);
+    const err = (await promise.catch((e: unknown) => e)) as Error;
+    expect(isStalledError(err)).toBe(true);
+    expect(child.killed).toBe(true);
+  });
+
+  it("re-arms when the stdout cap discards data: the lost lines cannot latch the stand-down", async () => {
+    const child = fakeChild();
+    const promise = runChild(AGENT, "task", undefined, { timeoutMs: 5000, idleTimeoutMs: 60 }, () => child);
+    child.stdoutEmit(`${toolStartLine("call_1")}\n`);
+    // A single >1MiB no-newline chunk trips the cap and is discarded whole —
+    // exactly how a huge tool result loses its own end event. The discard
+    // must re-arm the watchdog (fail toward detection), so the silence after
+    // it stalls instead of latching the stand-down for the rest of the run.
+    child.stdoutEmit("x".repeat(1024 * 1024 + 1));
+    const err = (await promise.catch((e: unknown) => e)) as Error;
+    expect(isStalledError(err)).toBe(true);
+    expect(child.killed).toBe(true);
+  });
+
+  it("a tool that never ends falls to the hard timeout, not the stall error", async () => {
+    const child = fakeChild();
+    // Hard timeout well inside the idle window: a wedged tool (the end event
+    // never comes) is the hard timeout's case — the watchdog must stand down
+    // for the whole run.
+    const promise = runChild(AGENT, "task", undefined, { timeoutMs: 60, idleTimeoutMs: 5000 }, () => child);
+    child.stdoutEmit(`${toolStartLine("call_1")}\n`);
+    const err = (await promise.catch((e: unknown) => e)) as Error;
+    expect(err.message).toMatch(/timed out/);
+    expect(isStalledError(err)).toBe(false);
     expect(child.killed).toBe(true);
   });
 
@@ -1048,6 +1186,45 @@ describe("registerSubagentTools with a registry", () => {
       expect(tool.description).toContain("even mid-run");
       expect(tool.description).toContain("sleep or poll");
       expect((tool.promptGuidelines ?? []).join("\n")).toContain("sleep or poll");
+    }
+  });
+
+  it("kills a dead request through the idle watchdog, wiring env → tool → child", async () => {
+    const children: FakeChild[] = [];
+    const { pi, tools } = makePi();
+    registerSubagentTools(pi, mkdtempSync(join(tmpdir(), "agents-")), silentSpawn(children), undefined, undefined);
+    process.env.PI_SUBAGENT_IDLE_TIMEOUT_MS = "25";
+    process.env.PI_SUBAGENT_TIMEOUT_MS = "5000";
+    try {
+      await expect(tools.get("subagent")!.execute("1", { task: "t" }, undefined, undefined, undefined)).rejects.toThrow(
+        /stalled: no output for \d+s \(request likely dead\)/,
+      );
+      expect(children[0].killed).toBe(true);
+    } finally {
+      delete process.env.PI_SUBAGENT_IDLE_TIMEOUT_MS;
+      delete process.env.PI_SUBAGENT_TIMEOUT_MS;
+    }
+  });
+
+  it("surfaces a stall as a per-task ERROR section in the batch tool", async () => {
+    const children: FakeChild[] = [];
+    const { pi, tools } = makePi();
+    registerSubagentTools(pi, mkdtempSync(join(tmpdir(), "agents-")), silentSpawn(children), undefined, undefined);
+    process.env.PI_SUBAGENT_IDLE_TIMEOUT_MS = "25";
+    process.env.PI_SUBAGENT_TIMEOUT_MS = "5000";
+    try {
+      const result = (await tools
+        .get("subagents")!
+        .execute("1", { tasks: [{ task: "t" }] }, undefined, undefined, undefined)) as {
+        content: Array<{ type: string; text: string }>;
+      };
+      const body = result.content[0].text;
+      expect(body).toContain("### generic");
+      expect(body).toMatch(/ERROR: .*stalled: no output for \d+s/);
+      expect(children[0].killed).toBe(true);
+    } finally {
+      delete process.env.PI_SUBAGENT_IDLE_TIMEOUT_MS;
+      delete process.env.PI_SUBAGENT_TIMEOUT_MS;
     }
   });
 
