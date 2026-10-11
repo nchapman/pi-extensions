@@ -26,8 +26,14 @@
  *   (correctness first) and the report discloses the coverage.
  * - Stage 2 (verify): one adversarial subagent re-traces every merged
  *   candidate against the diff and repo; only evidence-backed findings
- *   survive. This stage is why finders can be aggressive (Greptile v3:
- *   self-challenging raises precision, it doesn't just cost tokens).
+ *   survive. Rejection requires a mechanism refutation (premise wrong, guard
+ *   prevents it, trigger unreachable, convention-compliant, not a defect) —
+ *   scope doubt ("predates this change") may only downgrade, never reject:
+ *   the A/B on code-review-bench showed mechanism rejections were 10/10
+ *   correct noise kills while the one scope-based rejection was the only
+ *   true positive lost. This stage is why finders can be aggressive
+ *   (Greptile v3: self-challenging raises precision, it doesn't just cost
+ *   tokens).
  * - Stage 3 (report): deterministic dedupe (worst severity wins — a merged
  *   verdict is never less alarming than its inputs), severity ordering, a
  *   single markdown report delivered to the caller as a follow-up message.
@@ -708,8 +714,8 @@ export function verifyAgent(): AgentDef {
 For each candidate, re-trace the claim yourself: open the code, follow the callers and guards, and decide whether the stated triggering conditions actually produce the stated consequence. Behavior claims need file:line evidence you have seen — not inference from naming.
 
 - confirmed: you traced a concrete path where it goes wrong (or it is a clear guideline violation with a concrete consequence).
-- rejected: the claim is wrong, guarded elsewhere, pre-existing with no aggravation from this change, or pure preference/fabrication.
-- downgraded: the issue is real but the severity overstates realistic impact; provide the corrected severity.
+- rejected: only a mechanism refutation — you traced the code and the claim itself fails. The premise is factually wrong, a guard prevents the stated consequence, the trigger cannot arise from this code, the pattern matches the repo's own convention, or the finding is not a defect at all (test-coverage request, style preference, fabrication).
+- downgraded: the issue is real but the severity overstates realistic impact; provide the corrected severity. Scope doubt lives here: when your only concern is that the problem may predate this change or the diff merely passes it by, downgrade with that reason — a mechanism you could not refute must never be removed on a scope call.
 
 ${EVIDENCE_RULES}
 
