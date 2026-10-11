@@ -1,6 +1,10 @@
 /**
  * Embed client — the parent-side handle to the embed worker child.
  *
+ * The worker runs under a real JS runtime resolved by `resolveWorkerRuntime`:
+ * stock pi's own interpreter (Node/Bun), or a PATH/managed node when the
+ * agent itself is an ahead-of-time binary (pi-bolt) that cannot run scripts.
+ *
  * Owns the child's lifecycle and the JSONL protocol. Every request is
  * fail-open: timeouts, child death, and protocol errors resolve `undefined`
  * (never reject, never throw) so recall's search path degrades to lexical
@@ -16,6 +20,8 @@
  */
 
 import { spawn } from "node:child_process";
+import { accessSync, constants } from "node:fs";
+import { basename, delimiter, join } from "node:path";
 import { EMBED_DIMS } from "./vecstore";
 
 /** The slice of ChildProcess the client touches — injectable for tests. */
@@ -33,10 +39,70 @@ export const EMBED_MODEL = "jinaai/jina-embeddings-v5-text-nano-retrieval";
 const QUERY_PREFIX = "Query: ";
 const DOC_PREFIX = "Document: ";
 
+/**
+ * Resolve the interpreter that runs the embed worker (standalone TypeScript,
+ * no relative imports — by design). Under stock pi, `process.execPath` *is* a
+ * real JS runtime (Node via pi's managed launcher, or Bun) and runs it
+ * directly. Under an ahead-of-time agent binary such as pi-bolt, `execPath`
+ * is the agent itself, which has no script mode — so a runtime is found:
+ * PATH `node` first, then stock pi's managed node (present whenever stock pi
+ * is installed alongside), then PATH `bun`. Nothing resolves → `execPath`,
+ * preserving the old behavior in unknown environments; that spawn fails and
+ * the client fails open (one notice, lexical-only search). `PI_RECALL_WORKER_BIN`
+ * overrides the whole chain (it must run TS: node ≥ 22.18 or bun).
+ *
+ * Deliberate cut: the first *existing* candidate wins without probing that it
+ * can run TypeScript — probing means executing an unknown binary, and a wrong
+ * pick already fails open to lexical search with `PI_RECALL_WORKER_BIN` as the
+ * pin. Order is therefore trust-ordered (PATH before pi's managed node) and a
+ * present-but-too-old PATH node is the documented failure to avoid.
+ */
+export function resolveWorkerRuntime(
+  env: NodeJS.ProcessEnv,
+  execPath: string,
+  exists: (file: string) => boolean,
+): string {
+  const override = env.PI_RECALL_WORKER_BIN?.trim();
+  if (override) return override;
+  const base = basename(execPath)
+    .toLowerCase()
+    .replace(/\.exe$/, "");
+  if (base === "node" || base === "bun") return execPath;
+  const fromPath = (name: string): string | undefined => {
+    for (const dir of (env.PATH ?? "").split(delimiter)) {
+      // An empty or "." PATH segment means the cwd — never an implicit spawn
+      // source (a planted `node` in the working tree must not run the worker).
+      if (!dir || dir === ".") continue;
+      for (const candidate of [join(dir, name), join(dir, `${name}.exe`)]) {
+        if (exists(candidate)) return candidate;
+      }
+    }
+    return undefined;
+  };
+  const node = fromPath("node");
+  if (node) return node;
+  // Stock pi's installer keeps its own Node here even when the shell has none.
+  const dataHome = env.XDG_DATA_HOME?.trim() || (env.HOME ? join(env.HOME, ".local", "share") : undefined);
+  const managed = dataHome ? join(dataHome, "pi-node", "current", "bin", "node") : undefined;
+  if (managed && exists(managed)) return managed;
+  return fromPath("bun") ?? execPath;
+}
+
 export type SpawnFn = (workerPath: string, env: NodeJS.ProcessEnv) => WorkerChild;
 
 const defaultSpawn: SpawnFn = (workerPath, env) => {
-  const child = spawn(process.execPath, [workerPath], { env, stdio: ["pipe", "pipe", "pipe"] });
+  // X_OK, not mere existence: a non-executable `node` in PATH would spawn,
+  // fail EACCES, and burn a start attempt against a candidate that was never usable.
+  const executable = (file: string) => {
+    try {
+      accessSync(file, constants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const command = resolveWorkerRuntime(env, process.execPath, executable);
+  const child = spawn(command, [workerPath], { env, stdio: ["pipe", "pipe", "pipe"] });
   // Streams emit async errors (EPIPE when the child dies mid-write); an
   // unhandled 'error' would crash the host. The exit handler owns reporting.
   child.stdin.on("error", () => {});

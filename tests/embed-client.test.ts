@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { EmbedClient, type SpawnFn, type WorkerChild } from "../lib/embed-client";
+import { EmbedClient, type SpawnFn, type WorkerChild, resolveWorkerRuntime } from "../lib/embed-client";
 import { EMBED_DIMS } from "../lib/vecstore";
 
 class FakeChild implements WorkerChild {
@@ -447,5 +447,83 @@ describe("wrong-width replies surface, fail open", () => {
     expect(await client.query("t")).toBeUndefined();
     expect(notices.some((n) => n.includes("8-wide"))).toBe(true);
     client.dispose();
+  });
+});
+
+describe("resolveWorkerRuntime", () => {
+  // The worker is standalone TypeScript that must run under a real JS runtime.
+  // Under stock pi, process.execPath *is* that runtime (Node or Bun). Under
+  // an ahead-of-time agent binary (pi-bolt) it is the agent itself, which has
+  // no script mode — resolution must find node/bun elsewhere.
+  const bolt = "/Users/x/.pi-bolt/npm/0.8.4/pi-bolt-darwin-arm64/pi-bin";
+  const found = (paths: string[]) => (file: string) => paths.includes(file);
+
+  it("prefers PI_RECALL_WORKER_BIN over everything else", () => {
+    const env = { PATH: "/a", PI_RECALL_WORKER_BIN: "/custom/node" } as NodeJS.ProcessEnv;
+    expect(resolveWorkerRuntime(env, "/opt/mise/bin/node", found(["/custom/node"]))).toBe("/custom/node");
+  });
+
+  it("uses execPath when it is node or bun (stock pi runs on Node), even with a PATH node available", () => {
+    const env = { PATH: "/a" } as NodeJS.ProcessEnv;
+    // The PATH candidate exists but must lose to the parent's own runtime —
+    // this is the branch stock pi takes on every start.
+    expect(resolveWorkerRuntime(env, "/usr/local/bin/bun", found(["/a/node"]))).toBe("/usr/local/bin/bun");
+    expect(resolveWorkerRuntime(env, "/opt/mise/bin/node", found(["/a/node"]))).toBe("/opt/mise/bin/node");
+  });
+
+  it("strips .exe when deciding whether execPath is a runtime", () => {
+    const env = { PATH: "/a" } as NodeJS.ProcessEnv;
+    // POSIX basename applies, so the .exe strip is what makes this a runtime.
+    expect(resolveWorkerRuntime(env, "/usr/local/bin/node.exe", found(["/a/node"]))).toBe("/usr/local/bin/node.exe");
+  });
+
+  it("never treats a win32-style path as a runtime on POSIX — it resolves from PATH instead", () => {
+    const env = { PATH: "/hit", HOME: "/home/x" } as NodeJS.ProcessEnv;
+    expect(resolveWorkerRuntime(env, "C:\\node\\node.exe", found(["/hit/node"]))).toBe("/hit/node");
+  });
+
+  it("under an agent binary, resolves node from PATH (first hit wins)", () => {
+    const env = { PATH: "/missing:/hit", HOME: "/home/x" } as NodeJS.ProcessEnv;
+    expect(resolveWorkerRuntime(env, bolt, found(["/hit/node"]))).toBe("/hit/node");
+  });
+
+  it("skips empty PATH segments — cwd is never probed", () => {
+    const env = { PATH: "::/hit::", HOME: "/home/x" } as NodeJS.ProcessEnv;
+    // "node" (what an empty segment would probe) is present in `found` on
+    // purpose: deleting the guard must fail this test, not fall through.
+    expect(resolveWorkerRuntime(env, bolt, found(["node", "/hit/node"]))).toBe("/hit/node");
+  });
+
+  it("skips a literal '.' PATH segment — a planted node in the cwd must not run the worker", () => {
+    const env = { PATH: ".:/hit", HOME: "/home/x" } as NodeJS.ProcessEnv;
+    // exists("node") must never be probed; only the absolute /hit candidate counts.
+    expect(resolveWorkerRuntime(env, bolt, found(["node", "/hit/node"]))).toBe("/hit/node");
+  });
+
+  it("falls back to stock pi's managed node when PATH has no runtime", () => {
+    const env = { PATH: "/missing", HOME: "/home/x" } as NodeJS.ProcessEnv;
+    const managed = "/home/x/.local/share/pi-node/current/bin/node";
+    expect(resolveWorkerRuntime(env, bolt, found([managed]))).toBe(managed);
+  });
+
+  it("honors XDG_DATA_HOME for the managed pi-node lookup", () => {
+    const env = { PATH: "/missing", HOME: "/home/x", XDG_DATA_HOME: "/xdg" } as NodeJS.ProcessEnv;
+    const managed = "/xdg/pi-node/current/bin/node";
+    expect(resolveWorkerRuntime(env, bolt, found([managed]))).toBe(managed);
+  });
+
+  it("tries bun on PATH before giving up", () => {
+    const env = { PATH: "/missing:/hit" } as NodeJS.ProcessEnv;
+    expect(resolveWorkerRuntime(env, bolt, found(["/hit/bun"]))).toBe("/hit/bun");
+  });
+
+  it("falls back to execPath when nothing resolves — spawn fails open, lexical search remains", () => {
+    const env = { PATH: "/missing", HOME: "/home/x" } as NodeJS.ProcessEnv;
+    expect(resolveWorkerRuntime(env, bolt, found([]))).toBe(bolt);
+  });
+
+  it("treats a whitespace PI_RECALL_WORKER_BIN as unset", () => {
+    const env = { PATH: "/a", PI_RECALL_WORKER_BIN: "  " } as NodeJS.ProcessEnv;
+    expect(resolveWorkerRuntime(env, "/opt/mise/bin/node", found([]))).toBe("/opt/mise/bin/node");
   });
 });

@@ -1,7 +1,7 @@
 import { spawn as nodeSpawn } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, basename } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -36,6 +36,26 @@ const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000;
  * single stdout event is a dead request, not a slow one — exported so tests
  * and docs pin the contract. Tool executions are exempt (see runChild). */
 export const DEFAULT_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+
+/**
+ * The binary child agents run as. Children must match the parent's agent
+ * binary: a pi-bolt parent spawning PATH `pi` would run every subagent on
+ * stock pi — correct, but slower to start and a different runtime to compare
+ * against — so when the parent executable is pi-bolt itself (`pi-bin` beside
+ * the macOS launcher, or the `pi-bolt` wrapper), the child command is that
+ * same executable. `PI_SUBAGENT_BIN` overrides both (path to any pi-compatible
+ * binary). Detection is basename-only on purpose: a substring match would
+ * misfire on a node/bun living under a directory named like pi-bolt.
+ */
+export function resolveChildCommand(env: NodeJS.ProcessEnv, execPath: string): string {
+  const override = env.PI_SUBAGENT_BIN?.trim();
+  if (override) return override;
+  const base = basename(execPath)
+    .toLowerCase()
+    .replace(/\.exe$/, "");
+  if (base === "pi-bin" || base === "pi-bolt") return execPath;
+  return "pi";
+}
 const DEFAULT_CONCURRENCY = 4;
 const STDERR_TAIL_MAX = 8 * 1024;
 const STDOUT_BUF_MAX = 1024 * 1024;
@@ -551,9 +571,13 @@ export function runChild(
     // only requests again after every tool of the turn has finished) or when
     // the stdout cap discards data — both fail toward detection, never away.
     const openToolRuns = new Set<string>();
-    const child = spawnFn("pi", buildChildArgs(agent, task, model, options.thinking), {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    const child = spawnFn(
+      resolveChildCommand(process.env, process.execPath),
+      buildChildArgs(agent, task, model, options.thinking),
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
     let stdoutBuf = "";
     let stderrBuf = "";
     let lastText = "";

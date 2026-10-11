@@ -18,6 +18,7 @@ import {
   parseConcurrency,
   parseIdleTimeoutMs,
   parseTimeoutMs,
+  resolveChildCommand,
   resolveIdleTimeoutMs,
   DEFAULT_IDLE_TIMEOUT_MS,
   refLabel,
@@ -2324,5 +2325,29 @@ describe("renderSubagentResult", () => {
     const text = renderSubagentResult("x".repeat(200), { agent: "r" }, DONE, THEME as never);
     expect(text).toContain("...");
     expect(text.length).toBeLessThanOrEqual("done (r) — ".length + 100);
+  });
+});
+
+describe("resolveChildCommand", () => {
+  const bolt = "/Users/x/.pi-bolt/npm/0.8.4/pi-bolt-darwin-arm64/pi-bin";
+
+  it("defaults to 'pi' from PATH under a plain runtime (stock pi on Node)", () => {
+    expect(resolveChildCommand({} as NodeJS.ProcessEnv, "/opt/mise/bin/node")).toBe("pi");
+  });
+
+  it("follows a pi-bolt parent so children match the parent binary", () => {
+    expect(resolveChildCommand({} as NodeJS.ProcessEnv, bolt)).toBe(bolt);
+  });
+
+  it("matches the pi-bolt npm wrapper name too", () => {
+    expect(resolveChildCommand({} as NodeJS.ProcessEnv, "/usr/local/bin/pi-bolt")).toBe("/usr/local/bin/pi-bolt");
+  });
+
+  it("PI_SUBAGENT_BIN wins over both defaults", () => {
+    expect(resolveChildCommand({ PI_SUBAGENT_BIN: "/custom/pi" } as NodeJS.ProcessEnv, bolt)).toBe("/custom/pi");
+  });
+
+  it("treats a whitespace PI_SUBAGENT_BIN as unset", () => {
+    expect(resolveChildCommand({ PI_SUBAGENT_BIN: "  " } as NodeJS.ProcessEnv, bolt)).toBe(bolt);
   });
 });
