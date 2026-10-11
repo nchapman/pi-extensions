@@ -3,7 +3,12 @@ import { spawn } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createTaskRegistry, publishSharedTaskRegistry } from "../lib/superbash";
 import {
-  buildSshCommandArgs,
+  buildSshExecArgs,
+  buildRemoteScript,
+  buildPrologueLauncher,
+  parsePidMarkerLine,
+  pidMarkerPrefix,
+  buildKillScript,
   canonicalTargetKey,
   createSshBashOperations,
   defaultControlDir,
@@ -130,7 +135,7 @@ describe("canonicalTargetKey / destinationArg / describeConnection", () => {
   });
 });
 
-describe("buildSshCommandArgs", () => {
+describe("buildSshExecArgs", () => {
   const opts = {
     controlDir: "/tmp/cm",
     idleSecs: 600,
@@ -138,8 +143,8 @@ describe("buildSshCommandArgs", () => {
     strictHostKeyChecking: "accept-new" as const,
   };
 
-  it("builds the multiplexing argv with the command as one element", () => {
-    const args = buildSshCommandArgs(parseSshTarget("root@1.2.3.4", 13839).target!, "kill -9 5387; sleep 2", opts);
+  it("builds the multiplexing argv ending in `dest sh -s` — command never in argv", () => {
+    const args = buildSshExecArgs(parseSshTarget("root@1.2.3.4", 13839).target!, opts);
     // Multiplexing + non-interactive auth + bounded connect + TOFU host keys.
     for (const flag of ["BatchMode=yes", "ControlMaster=auto", "ControlPersist=600", "ConnectTimeout=20"]) {
       expect(args).toContain(flag);
@@ -147,23 +152,23 @@ describe("buildSshCommandArgs", () => {
     expect(args).toContain(`ControlPath=${opts.controlDir}/cm-%C`);
     expect(args).toContain("-p");
     expect(args[args.indexOf("-p") + 1]).toBe("13839");
-    // Destination and the whole command as the final two argv elements —
-    // argv-spawned, so no local quoting can mangle the command.
+    // Destination plus the launcher; the command itself arrives on stdin,
+    // so no ssh-option injection surface exists at all.
     expect(args[args.length - 2]).toBe("root@1.2.3.4");
-    expect(args[args.length - 1]).toBe("kill -9 5387; sleep 2");
+    expect(args[args.length - 1]).toBe("sh -s");
   });
 
   it("expands ~ in identity paths (no local shell to do it) and omits absent options", () => {
-    const withKey = buildSshCommandArgs(parseSshTarget("box", undefined, "~/keys/id_ed25519").target!, "uptime", opts);
+    const withKey = buildSshExecArgs(parseSshTarget("box", undefined, "~/keys/id_ed25519").target!, opts);
     expect(withKey).toContain("-i");
     expect(withKey[withKey.indexOf("-i") + 1]).toMatch(/^\/.*\/keys\/id_ed25519$/);
     expect(withKey).not.toContain("-p");
-    const bare = buildSshCommandArgs(parseSshTarget("box").target!, "uptime", opts);
+    const bare = buildSshExecArgs(parseSshTarget("box").target!, opts);
     expect(bare).not.toContain("-i");
   });
 
   it("carries the idle and connect-timeout knobs", () => {
-    const args = buildSshCommandArgs(parseSshTarget("box").target!, "uptime", {
+    const args = buildSshExecArgs(parseSshTarget("box").target!, {
       ...opts,
       idleSecs: 60,
       connectTimeoutSecs: 5,
@@ -173,12 +178,53 @@ describe("buildSshCommandArgs", () => {
   });
 
   it("carries the host-key policy", () => {
-    const strict = buildSshCommandArgs(parseSshTarget("box").target!, "uptime", {
+    const strict = buildSshExecArgs(parseSshTarget("box").target!, {
       ...opts,
       strictHostKeyChecking: "yes",
     });
     expect(strict).toContain("StrictHostKeyChecking=yes");
     expect(strict).not.toContain("StrictHostKeyChecking=accept-new");
+  });
+});
+
+describe("remote script + kill script", () => {
+  it("builds the prologue launcher: POSIX marker emission, then the login shell", () => {
+    const launcher = buildPrologueLauncher("n0nce");
+    // Single-quoted payload (literal in fish/bash/zsh/dash alike); the
+    // marker comes from POSIX sh ($$/$PPID), then exec keeps the pid while
+    // switching to the login shell, which reads the command from stdin.
+    expect(launcher).toBe(`sh -c 'echo "__PI_SSH_n0nce:$$:$PPID"; exec \${SHELL:-/bin/sh}'`);
+  });
+
+  it("builds the stdin script: the command verbatim, nothing else", () => {
+    expect(buildRemoteScript("kill -9 5387; sleep 2")).toBe("kill -9 5387; sleep 2\n");
+  });
+
+  it("parses only the exact nonce-qualified marker line", () => {
+    expect(parsePidMarkerLine("__PI_SSH_n0nce:4242:4241", "n0nce")).toEqual({ shPid: 4242, pgid: 4241 });
+    expect(parsePidMarkerLine("__PI_SSH_other:4242:4241", "n0nce")).toBeUndefined();
+    expect(parsePidMarkerLine("__PI_SSH_n0nce:4242:4241:9", "n0nce")).toBeUndefined();
+    expect(parsePidMarkerLine("__PI_SSH_n0nce:x:y", "n0nce")).toBeUndefined();
+    expect(parsePidMarkerLine("Wed Nov 5", "n0nce")).toBeUndefined();
+    expect(pidMarkerPrefix("n0nce")).toBe("__PI_SSH_n0nce:");
+  });
+
+  it("builds a kill script that group-kills the session, with a leader-checked fallback", () => {
+    const script = buildKillScript({ shPid: 4242, pgid: 4241 });
+    expect(script).toContain(`ps -o sid= -p 4241`);
+    expect(script).toContain(`kill -9 -4241`);
+    expect(script).toContain(`pkill -9 -P 4242`);
+    expect(script).toContain(`kill -9 4242`);
+    // Structure, not just literals: the group kill sits in the leader-check
+    // branch, the per-pid fallback in the else branch.
+    const leaderCheck = script.indexOf("ps -o sid= -p 4241");
+    const groupKill = script.indexOf("kill -9 -4241");
+    const elseBranch = script.indexOf("else");
+    const fallback = script.indexOf("pkill -9 -P 4242");
+    expect(leaderCheck).toBeLessThan(groupKill);
+    expect(groupKill).toBeLessThan(elseBranch);
+    expect(elseBranch).toBeLessThan(fallback);
+    expect(script.endsWith("exit 0\n")).toBe(true);
   });
 });
 
@@ -189,6 +235,23 @@ class FakeSshChild implements SshProcess {
   closeHandlers: ((code: number | null, signal: NodeJS.Signals | null) => void)[] = [];
   errorHandlers: ((err: Error) => void)[] = [];
   kills: NodeJS.Signals[] = [];
+  stdinChunks: string[] = [];
+  stdinEnded = false;
+  stdinErrorHandlers: ((err: Error) => void)[] = [];
+  stdin = {
+    write: (data: string | Buffer) => {
+      this.stdinChunks.push(String(data));
+    },
+    end: () => {
+      this.stdinEnded = true;
+    },
+    on: (_event: "error", cb: (err: Error) => void) => {
+      this.stdinErrorHandlers.push(cb);
+    },
+  };
+  emitStdinError(err: Error) {
+    for (const h of this.stdinErrorHandlers) h(err);
+  }
   stdout = {
     on: (_event: "data", cb: (chunk: Buffer) => void) => {
       this.stdoutHandlers.push(cb);
@@ -251,6 +314,175 @@ describe("createSshBashOperations", () => {
     f.children[0].close(0);
     await expect(p).resolves.toEqual({ exitCode: 0 });
     expect(chunks.join("")).toBe("Wed deprecation notice\nNov 5\n");
+  });
+
+  it("feeds the script on stdin and strips the pid marker from output", async () => {
+    const f = fakeSpawn();
+    const ops = createSshBashOperations(target, { ...OPS, spawnFn: f.spawnFn });
+    const chunks: string[] = [];
+    const p = ops.exec("date", "/cwd", { onData: (b) => chunks.push(b.toString()) });
+    await new Promise((r) => setImmediate(r));
+    // stdin carries the command only; argv carries the prologue launcher.
+    expect(f.children[0].stdinChunks.join("")).toBe("date\n");
+    expect(f.children[0].stdinEnded).toBe(true);
+    expect(f.commands[0].args).not.toContain("date");
+    const launcher = f.commands[0].args[f.commands[0].args.length - 1];
+    expect(launcher).toMatch(/^sh -c 'echo "__PI_SSH_[a-z0-9]+:\$\$:\$PPID"; exec /);
+    // Recover the per-call nonce from the launcher and speak the marker back.
+    const nonce = /__PI_SSH_([a-z0-9]+):/.exec(launcher)![1];
+    f.children[0].emitStdout(`__PI_SSH_${nonce}:4242:4241\n`);
+    f.children[0].emitStdout("Wed Nov 5\n");
+    f.children[0].close(0);
+    await expect(p).resolves.toEqual({ exitCode: 0 });
+    expect(chunks.join("")).toBe("Wed Nov 5\n");
+  });
+
+  it("passes a counterfeit marker (wrong nonce) through as plain output", async () => {
+    const f = fakeSpawn();
+    const ops = createSshBashOperations(target, { ...OPS, spawnFn: f.spawnFn });
+    const chunks: string[] = [];
+    const p = ops.exec("cat banner", "/cwd", { onData: (b) => chunks.push(b.toString()) });
+    await new Promise((r) => setImmediate(r));
+    f.children[0].emitStdout("__PI_SSH_deadbeef:1:1\n");
+    f.children[0].close(0);
+    await expect(p).resolves.toEqual({ exitCode: 0 });
+    expect(chunks.join("")).toBe("__PI_SSH_deadbeef:1:1\n");
+  });
+
+  it("strips a marker that arrives after a banner line — the sweep stays armed", async () => {
+    const f = fakeSpawn();
+    const ops = createSshBashOperations(target, { ...OPS, spawnFn: f.spawnFn });
+    const chunks: string[] = [];
+    const p = ops.exec("longjob", "/cwd", { onData: (b) => chunks.push(b.toString()) });
+    await new Promise((r) => setImmediate(r));
+    const nonce = /__PI_SSH_([a-z0-9]+):/.exec(f.commands[0].args.at(-1)!)![1];
+    f.children[0].emitStdout("Welcome to banner\n"); // sshrc/motd bytes precede the script
+    f.children[0].emitStdout(`__PI_SSH_${nonce}:4242:4241\n`);
+    f.children[0].emitStdout("working\n");
+    f.children[0].close(0);
+    await expect(p).resolves.toEqual({ exitCode: 0 });
+    expect(chunks.join("")).toBe("Welcome to banner\nworking\n");
+  });
+
+  it("leaves a marker-looking fragment mid-line untouched", async () => {
+    const f = fakeSpawn();
+    const ops = createSshBashOperations(target, { ...OPS, spawnFn: f.spawnFn });
+    const chunks: string[] = [];
+    const p = ops.exec("cat log", "/cwd", { onData: (b) => chunks.push(b.toString()) });
+    await new Promise((r) => setImmediate(r));
+    const nonce = /__PI_SSH_([a-z0-9]+):/.exec(f.commands[0].args.at(-1)!)![1];
+    f.children[0].emitStdout(`noise __PI_SSH_${nonce}:1:2 more noise\n`);
+    f.children[0].close(0);
+    await expect(p).resolves.toEqual({ exitCode: 0 });
+    expect(chunks.join("")).toBe(`noise __PI_SSH_${nonce}:1:2 more noise\n`);
+  });
+
+  it("tolerates a stdin EPIPE after an early client death (no crash, settles via close)", async () => {
+    const f = fakeSpawn();
+    const ops = createSshBashOperations(target, { ...OPS, spawnFn: f.spawnFn });
+    const p = ops.exec("date", "/cwd", { onData: () => {} });
+    await new Promise((r) => setImmediate(r));
+    f.children[0].emitStdinError(Object.assign(new Error("EPIPE"), { code: "EPIPE" }));
+    f.children[0].emitStderr("ssh: connect refused\n");
+    f.children[0].close(255);
+    await expect(p).rejects.toThrow("ssh:");
+  });
+
+  it("sweeps the remote process group on abort over the still-live master", async () => {
+    const f = fakeSpawn();
+    const ops = createSshBashOperations(target, { ...OPS, spawnFn: f.spawnFn });
+    const controller = new AbortController();
+    const p = ops.exec("sleep 100", "/cwd", { onData: () => {}, signal: controller.signal });
+    await new Promise((r) => setImmediate(r));
+    const nonce = /__PI_SSH_([a-z0-9]+):/.exec(f.commands[0].args.at(-1)!)![1];
+    f.children[0].emitStdout(`__PI_SSH_${nonce}:4242:4241\n`);
+    controller.abort();
+    expect(f.children[0].kills).toContain("SIGTERM");
+    // Second multiplexed spawn: the kill script, group kill by session id.
+    await vi.waitFor(() => expect(f.children).toHaveLength(2));
+    expect(f.commands[1].args.at(-1)).toBe("sh -s");
+    expect(f.children[1].stdinChunks.join("")).toContain("kill -9 -4241");
+    f.children[0].close(null, "SIGTERM");
+    await expect(p).rejects.toThrow("aborted");
+  });
+
+  it("swallows a sweep child error — the abort still settles cleanly", async () => {
+    const f = fakeSpawn();
+    const ops = createSshBashOperations(target, { ...OPS, spawnFn: f.spawnFn });
+    const controller = new AbortController();
+    const p = ops.exec("sleep 100", "/cwd", { onData: () => {}, signal: controller.signal });
+    await new Promise((r) => setImmediate(r));
+    const nonce = /__PI_SSH_([a-z0-9]+):/.exec(f.commands[0].args.at(-1)!)![1];
+    f.children[0].emitStdout(`__PI_SSH_${nonce}:4242:4241\n`);
+    controller.abort();
+    await vi.waitFor(() => expect(f.children).toHaveLength(2));
+    f.children[1].errorHandlers[0](new Error("spawn sweep failed")); // must be swallowed
+    f.children[1].emitStdinError(new Error("EPIPE"));
+    f.children[0].close(null, "SIGTERM");
+    await expect(p).rejects.toThrow("aborted");
+  });
+
+  it("SIGKILLs a wedged sweep client after its 5s bound", async () => {
+    vi.useFakeTimers();
+    try {
+      const f = fakeSpawn();
+      const ops = createSshBashOperations(target, { ...OPS, spawnFn: f.spawnFn });
+      const controller = new AbortController();
+      const p = ops.exec("sleep 100", "/cwd", { onData: () => {}, signal: controller.signal });
+      await vi.advanceTimersByTimeAsync(0);
+      const nonce = /__PI_SSH_([a-z0-9]+):/.exec(f.commands[0].args.at(-1)!)![1];
+      f.children[0].emitStdout(`__PI_SSH_${nonce}:4242:4241\n`);
+      controller.abort();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(f.children).toHaveLength(2);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(f.children[1].kills).toContain("SIGKILL");
+      f.children[0].close(null, "SIGTERM");
+      await expect(p).rejects.toThrow("aborted");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("sends the sweep as plain sh -s over the same multiplexing options", async () => {
+    const f = fakeSpawn();
+    const ops = createSshBashOperations(target, { ...OPS, spawnFn: f.spawnFn });
+    const controller = new AbortController();
+    const p = ops.exec("sleep 100", "/cwd", { onData: () => {}, signal: controller.signal });
+    await new Promise((r) => setImmediate(r));
+    const nonce = /__PI_SSH_([a-z0-9]+):/.exec(f.commands[0].args.at(-1)!)![1];
+    f.children[0].emitStdout(`__PI_SSH_${nonce}:4242:4241\n`);
+    controller.abort();
+    await vi.waitFor(() => expect(f.children).toHaveLength(2));
+    expect(f.commands[1].args.at(-1)).toBe("sh -s"); // POSIX sh regardless of login shell
+    expect(f.commands[1].args).toContain("ControlMaster=auto");
+    f.children[0].close(null, "SIGTERM");
+    await expect(p).rejects.toThrow("aborted");
+  });
+
+  it("aborts before the marker arrives spawn no sweep — nothing is addressable yet", async () => {
+    const f = fakeSpawn();
+    const ops = createSshBashOperations(target, { ...OPS, spawnFn: f.spawnFn });
+    const controller = new AbortController();
+    const p = ops.exec("sleep 100", "/cwd", { onData: () => {}, signal: controller.signal });
+    await new Promise((r) => setImmediate(r));
+    controller.abort(); // no stdout ever emitted: no pids known
+    f.children[0].close(null, "SIGTERM");
+    await expect(p).rejects.toThrow("aborted");
+    expect(f.children).toHaveLength(1);
+  });
+
+  it("sweeps the remote process group on timeout too", async () => {
+    const f = fakeSpawn();
+    const ops = createSshBashOperations(target, { ...OPS, spawnFn: f.spawnFn });
+    const p = ops.exec("sleep 100", "/cwd", { onData: () => {}, timeout: 0.05 });
+    const nonce = /__PI_SSH_([a-z0-9]+):/.exec(f.commands[0].args.at(-1)!)![1];
+    f.children[0].emitStdout(`__PI_SSH_${nonce}:4242:4241\n`);
+    await vi.waitFor(() => expect(f.children[0].kills).toContain("SIGTERM"), { timeout: 2_000 });
+    await vi.waitFor(() => expect(f.children).toHaveLength(2));
+    expect(f.children[1].stdinChunks.join("")).toContain("kill -9 -4241");
+    f.children[0].close(null, "SIGTERM");
+    await expect(p).rejects.toThrow("timeout:0.05");
   });
 
   it("reports exit 255 as a connection failure carrying ssh's stderr", async () => {
@@ -340,7 +572,7 @@ describe("createSshBashOperations", () => {
       probe.on("close", () => resolve(true));
     });
     if (!haveSsh) return ctx.skip(); // visible skip, never a silent pass
-    const options = buildSshCommandArgs(target, "uptime", OPS).slice(0, -2); // drop dest + command
+    const options = buildSshExecArgs(target, OPS).slice(0, -2); // drop dest + launcher
     const args = ["-G", ...options, "localhost"];
     const result = await new Promise<{ code: number | null; text: string }>((resolve) => {
       const child = spawn("ssh", args);

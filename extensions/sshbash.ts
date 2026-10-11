@@ -21,11 +21,18 @@
  *   it is always reported as a connection failure carrying ssh's stderr (the
  *   ssh man page reserves 255 — a remote command that happens to exit 255 is
  *   indistinguishable and documented as lost to this rule).
- * - remote commands run in the login directory through the remote shell;
- *   there is no remote cwd — the command itself cds, like agents writing raw
- *   ssh today. Kills are local: task_kill/timeout terminate the local ssh
- *   client, which closes the channel and normally ends the remote command —
- *   but a fully detached remote process can survive. No remote tree kill.
+ * - remote commands run in the login directory under the login shell's own
+ *   dialect — a POSIX prologue (`sh -c 'echo marker; exec ${SHELL:-/bin/sh}'`)
+ *   emits the pid marker, then execs the login shell, which reads the
+ *   command from stdin; argv never carries user text (no ssh-option or
+ *   login-shell quoting surface at all). The marker makes the call's remote
+ *   process group addressable, so kills are remote-aware: task_kill/timeout
+ *   terminate the local client and then best-effort group-SIGKILL the remote
+ *   tree over the still-live master — OpenSSH gives each exec channel its
+ *   own session, so the kill cannot cross channels. A kill racing the
+ *   prologue (during connect) has nothing addressable yet and falls back to
+ *   channel-close semantics; fish famously shrugs at HUP, which is why the
+ *   sweep kills by pgid instead.
  * - connection ids: each distinct destination (user@host:port — exactly what
  *   %C multiplexes on) gets a session-scoped handle ssh-1, ssh-2 …; the tool
  *   result names it, and later calls may pass it as target instead of
@@ -186,8 +193,14 @@ export interface SshExecOptions {
   strictHostKeyChecking: "yes" | "accept-new" | "no";
 }
 
-/** Full ssh argv for one remote command (argv-spawned: no local quoting). */
-export function buildSshCommandArgs(target: SshTarget, command: string, opts: SshExecOptions): string[] {
+/**
+ * Full ssh argv for one remote script run. `launcher` is the command string
+ * the remote login shell parses — the prologue launcher for exec calls, or
+ * the default `sh -s` for internal sweeps that must run POSIX sh. argv never
+ * carries user text: no ssh-option injection surface, and the command itself
+ * arrives on stdin.
+ */
+export function buildSshExecArgs(target: SshTarget, opts: SshExecOptions, launcher = "sh -s"): string[] {
   const args = [
     "-o",
     "BatchMode=yes",
@@ -206,12 +219,70 @@ export function buildSshCommandArgs(target: SshTarget, command: string, opts: Ss
   ];
   if (target.port !== undefined) args.push("-p", String(target.port));
   if (target.key) args.push("-i", expandHome(target.key));
-  args.push(destinationArg(target), command);
+  args.push(destinationArg(target), launcher);
   return args;
+}
+
+/** First stdout line of every remote script: makes the call's processes addressable. */
+export function pidMarkerPrefix(nonce: string): string {
+  return `__PI_SSH_${nonce}:`;
+}
+
+/**
+ * The launcher every exec sends as the remote command string. It must parse
+ * in every login shell's dialect, so the payload rides in single quotes
+ * (literal in fish/bash/zsh/dash alike) and runs under POSIX sh: emit the
+ * nonce marker (sh has $$/$PPID; the login shell may not — fish has neither),
+ * then exec the login shell, which reads the command from stdin. exec keeps
+ * the pid, so the marker's pid is the very shell running the command, and
+ * $PPID is the per-channel login shell — the session's process-group leader.
+ */
+export function buildPrologueLauncher(nonce: string): string {
+  return `sh -c 'echo "${pidMarkerPrefix(nonce)}$$:$PPID"; exec \${SHELL:-/bin/sh}'`;
+}
+
+/** The stdin script the exec'd login shell reads: the command, verbatim. */
+export function buildRemoteScript(command: string): string {
+  return `${command}\n`;
+}
+
+/** Parse the intercepted first line; anything else is user output. */
+export function parsePidMarkerLine(line: string, nonce: string): { shPid: number; pgid: number } | undefined {
+  const prefix = pidMarkerPrefix(nonce);
+  if (!line.startsWith(prefix)) return undefined;
+  const match = /^(\d+):(\d+)$/.exec(line.slice(prefix.length));
+  return match ? { shPid: Number(match[1]), pgid: Number(match[2]) } : undefined;
+}
+
+/**
+ * Best-effort remote kill, run over the still-live master as sh -s stdin.
+ * The leader check confirms the captured pgid is a session leader (true on
+ * OpenSSH sshd, where each exec channel gets its own session) before a
+ * group kill (plain `kill -9 -PGID` — dash's builtin rejects bash's `--`);
+ * otherwise fall back to the script shell and its children. Pids are
+ * digits from our own regex — no injection surface.
+ */
+export function buildKillScript(pids: { shPid: number; pgid: number }): string {
+  return [
+    `if [ "$(ps -o sid= -p ${pids.pgid} 2>/dev/null | tr -d ' ')" = "${pids.pgid}" ]; then`,
+    `  kill -9 -${pids.pgid} 2>/dev/null`,
+    "else",
+    `  pkill -9 -P ${pids.shPid} 2>/dev/null; kill -9 ${pids.shPid} 2>/dev/null`,
+    "fi",
+    "exit 0",
+    "",
+  ].join("\n");
 }
 
 /** The child-process boundary, as narrow as the operations need it. */
 export interface SshProcess {
+  stdin: {
+    write(data: string | Buffer): unknown;
+    end(): unknown;
+    // EPIPE (client died before reading the script) arrives HERE, not via
+    // the child's error event — an unlistened stream error would crash pi.
+    on(event: "error", cb: (err: Error) => void): void;
+  };
   stdout: { on(event: "data", cb: (chunk: Buffer) => void): void };
   stderr: { on(event: "data", cb: (chunk: Buffer) => void): void };
   on(event: "close", cb: (code: number | null, signal: NodeJS.Signals | null) => void): void;
@@ -221,7 +292,7 @@ export interface SshProcess {
 export type SshSpawn = (command: string, args: string[]) => SshProcess;
 
 const defaultSpawn: SshSpawn = (command, args) =>
-  spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] }) as unknown as SshProcess;
+  spawn(command, args, { stdio: ["pipe", "pipe", "pipe"] }) as unknown as SshProcess;
 
 /** Control sockets for this pi agent dir — exclusively ours. */
 export function defaultControlDir(): string {
@@ -272,12 +343,19 @@ export function createSshBashOperations(
           }
           dirEnsured = true;
         }
-        const args = buildSshCommandArgs(target, command, {
-          controlDir,
-          idleSecs,
-          connectTimeoutSecs,
-          strictHostKeyChecking,
-        });
+        // Per-call nonce: user output starting with a similar line can
+        // neither counterfeit the marker nor poison the kill pids.
+        const markerNonce = Math.random().toString(36).slice(2, 10);
+        const args = buildSshExecArgs(
+          target,
+          {
+            controlDir,
+            idleSecs,
+            connectTimeoutSecs,
+            strictHostKeyChecking,
+          },
+          buildPrologueLauncher(markerNonce),
+        );
         let child: SshProcess;
         try {
           child = spawnFn("ssh", args);
@@ -285,10 +363,65 @@ export function createSshBashOperations(
           reject(new Error(e instanceof Error ? e.message : String(e)));
           return;
         }
+        // EPIPE (client died before reading the script, e.g. a refused
+        // connection) surfaces on stdin's error stream — swallow it and let
+        // the child's close/error events settle the call.
+        child.stdin.on("error", () => {});
+        try {
+          child.stdin.write(buildRemoteScript(command));
+          child.stdin.end();
+        } catch {
+          // client died instantly — close/error will settle the call
+        }
         let settled = false;
         let aborted = false;
         let timedOut = false;
         let stderrTail = Buffer.alloc(0);
+        let remotePids: { shPid: number; pgid: number } | undefined;
+        // Marker hunting: the nonce marker can only start at a line boundary
+        // and holds only bytes that could still be it — everything else
+        // streams through immediately (no output reordering). The hunt never
+        // disarms: a banner line before the marker (motd, sshrc, zshenv)
+        // must not silently kill the kill path or leak the marker.
+        const markerPrefix = pidMarkerPrefix(markerNonce);
+        let atLineStart = true;
+        let candidate: Buffer | undefined;
+        const handleStdout = (chunk: Buffer) => {
+          const buf = candidate ? Buffer.concat([candidate, chunk]) : chunk;
+          candidate = undefined;
+          let rest = buf;
+          while (rest.length) {
+            const text = rest.toString("utf8");
+            const couldBeMarker = atLineStart && (markerPrefix.startsWith(text) || text.startsWith(markerPrefix));
+            if (couldBeMarker) {
+              const nl = rest.indexOf(0x0a);
+              if (nl === -1) {
+                if (rest.length <= 256) return void (candidate = rest); // wait for the line
+                atLineStart = rest[rest.length - 1] === 0x0a;
+                return onData(rest); // absurd non-line: stop holding
+              }
+              const line = rest.subarray(0, nl);
+              const parsed = parsePidMarkerLine(line.toString("utf8"), markerNonce);
+              if (parsed) {
+                remotePids = parsed; // marker stripped: kill path armed
+              } else {
+                onData(Buffer.concat([line, Buffer.from("\n")]));
+              }
+              rest = rest.subarray(nl + 1);
+              atLineStart = true;
+              continue;
+            }
+            const nl = rest.indexOf(0x0a);
+            if (nl === -1) {
+              atLineStart = false;
+              return onData(rest);
+            }
+            onData(rest.subarray(0, nl + 1));
+            rest = rest.subarray(nl + 1);
+            atLineStart = true;
+          }
+        };
+        child.stdout.on("data", handleStdout);
         let killTimer: ReturnType<typeof setTimeout> | undefined;
         let escalationTimer: ReturnType<typeof setTimeout> | undefined;
         const onAbort = () => {
@@ -303,14 +436,45 @@ export function createSshBashOperations(
           if (escalationTimer) clearTimeout(escalationTimer);
           settle();
         };
-        // Local kill only: the client closing ends the channel, which
-        // normally ends the remote command. Escalate past a wedged client.
+        // Kill the local client (channel close normally ends the remote
+        // command), escalate past a wedged one, and — once the prologue has
+        // made the call addressable — sweep the remote process group over
+        // the still-live master. Best-effort: nothing waits on the sweep.
+        const sweepRemote = () => {
+          if (!remotePids) return;
+          try {
+            const sweep = spawnFn(
+              "ssh",
+              buildSshExecArgs(target, {
+                controlDir,
+                idleSecs,
+                connectTimeoutSecs,
+                strictHostKeyChecking,
+              }),
+            );
+            const sweepTimer = setTimeout(() => {
+              try {
+                sweep.kill("SIGKILL");
+              } catch {
+                // already gone
+              }
+            }, 5_000);
+            sweep.on("close", () => clearTimeout(sweepTimer));
+            sweep.on("error", () => {}); // swallowed — best effort by design
+            sweep.stdin.on("error", () => {});
+            sweep.stdin.write(buildKillScript(remotePids));
+            sweep.stdin.end();
+          } catch {
+            // best effort: the local kill already happened
+          }
+        };
         const killClient = () => {
           try {
             child.kill("SIGTERM");
           } catch {
             // already gone — close will fire
           }
+          sweepRemote();
           escalationTimer = setTimeout(() => {
             try {
               child.kill("SIGKILL");
@@ -319,7 +483,6 @@ export function createSshBashOperations(
             }
           }, 2_000);
         };
-        child.stdout.on("data", onData);
         child.stderr.on("data", (chunk) => {
           stderrTail = Buffer.concat([stderrTail, chunk]).subarray(-STDERR_TAIL_CAP);
           onData(chunk);
@@ -425,7 +588,7 @@ export function registerSshBashExtension(
     label: "SSH bash",
     description: `Execute a shell command on a remote machine over SSH and get stdout/stderr. The connection is reused across calls (OpenSSH multiplexing): the first call to a destination pays the full handshake; later calls connect in milliseconds without re-authenticating. The command runs through the remote shell in the login directory — cd yourself as needed. Prefer this over bash with a raw ssh command for any remote machine.
 target: user@host, host, an ~/.ssh/config alias, ssh://user@host:port, or a connection id (ssh-N) named in an earlier result; port and key refine it. Auth must be non-interactive (identity file, ssh-agent, or ssh config) — there are no password prompts; a destination that cannot authenticate fails fast with ssh's error.
-wait and timeout behave exactly like the bash tool: inline (default) blocks until the command finishes; auto blocks ~2m then moves to the background; background returns a task id immediately and the result (exit status, duration, output tail) arrives as your next message — end your turn instead of sleeping or polling. Killing a task ends the local ssh client and normally the remote command too; a fully detached remote process can survive.`,
+wait and timeout behave exactly like the bash tool: inline (default) blocks until the command finishes; auto blocks ~2m then moves to the background; background returns a task id immediately and the result (exit status, duration, output tail) arrives as your next message — end your turn instead of sleeping or polling. Killing a task terminates the remote process group (SIGKILL by session id, over the still-open connection) — reliable even under remote shells that ignore HUP.`,
     promptSnippet: "Execute commands on a remote machine over SSH",
     promptGuidelines: [
       "Use ssh_bash (not bash + raw ssh) for remote machines: connections are multiplexed so repeated calls are cheap. Later calls can pass target: the connection id (ssh-1) an earlier result named.",
