@@ -72,6 +72,7 @@ import {
   type BashOperations,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import type { TSchema } from "typebox";
 
 /** Budget (chars for replies, bytes for command output) that rides inline in the wake message. */
 export const WAKE_TEXT_CAP = 4_000;
@@ -578,6 +579,19 @@ interface ToolCtx {
 
 export type BashWaitMode = "inline" | "auto" | "background";
 
+/** The unified bash shape plus any params a sibling tool adds (ssh_bash's
+ * target/port/key): values of the extras are the extension's to validate. */
+export type BashToolCallParams = { command: string; timeout?: number; wait?: BashWaitMode } & Record<string, unknown>;
+
+/** Per-call provisioning from a `prepare` hook: the operations this call runs
+ * through, an optional inline executor over them, and the one-line task name
+ * for the registry and wakes (default: the command head). */
+export interface BashCallContext {
+  operations: BashOperations;
+  inline?: BashInlineExecutor;
+  head?: string;
+}
+
 export interface BashToolResult extends AgentToolResult {
   details: { kind: "bash"; mode: BashWaitMode; id?: string };
 }
@@ -601,7 +615,7 @@ const UPDATE_THROTTLE_MS = 100;
  * resume.
  */
 export function createBashTool(
-  registry: TaskRegistry,
+  registry: TaskRegistry | (() => TaskRegistry | undefined),
   opts: {
     operations?: BashOperations;
     /** Inline executor; defaults to pi's own bash tool. */
@@ -609,6 +623,18 @@ export function createBashTool(
     /** Auto-promote window in ms; a function is called per invocation so env changes apply without a reload. */
     waitMs?: number | (() => number);
     now?: () => number;
+    /** Tool identity overrides for sibling tools built on the same core
+     * (ssh_bash); the default is the built-in-replacing `bash`. */
+    name?: string;
+    label?: string;
+    description?: string;
+    promptSnippet?: string;
+    promptGuidelines?: string[];
+    /** Extra parameter schemas merged into the tool's parameters. */
+    extraParams?: Record<string, TSchema>;
+    /** Per-call provisioning (ssh_bash resolves the target into operations
+     * and a task head); when given it replaces the static operations/inline. */
+    prepare?: (params: BashToolCallParams) => BashCallContext;
   } = {},
 ) {
   const operations = opts.operations ?? createLocalBashOperations();
@@ -630,14 +656,31 @@ export function createBashTool(
         onUpdate as never,
         ctx as never,
       ) as unknown as Promise<InlineResult>);
+  // The inline executor for prepare-based tools that don't supply one: pi's
+  // own bash definition over this call's operations, so streaming, truncation,
+  // and structured output stay identical to the built-in bash tool.
+  const inlineFromOps = (ops: BashOperations): BashInlineExecutor => {
+    const def = createBashToolDefinition(process.cwd(), { operations: ops });
+    return (toolCallId, params, signal, onUpdate, ctx) =>
+      def.execute(
+        toolCallId,
+        params as never,
+        signal,
+        onUpdate as never,
+        ctx as never,
+      ) as unknown as Promise<InlineResult>;
+  };
+  const name = opts.name ?? "bash";
   return {
-    name: "bash",
-    label: "bash",
-    description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first); when truncated, the full output is saved to a file whose path the result includes.
+    name,
+    label: opts.label ?? name,
+    description:
+      opts.description ??
+      `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first); when truncated, the full output is saved to a file whose path the result includes.
 wait: "inline" (default) blocks until the command finishes and returns its output — waiting on a tool call costs nothing, so this is the normal choice; pass a timeout to bound a command you're unsure about. wait: "auto" blocks up to ~${formatDuration(descWindowMs)} — a command that finishes in time returns its output inline, one that doesn't move to the background and return a task id (t-xxxxx). "background" returns a task id immediately — for work you'll do other things while it runs. A backgrounded command's result (exit status, duration, output tail) is delivered to you automatically as your next message, even mid-run — if you have nothing else to do, end your turn and the wake re-engages you; never sleep or poll to wait. Peek at a running task with task <id> only when its new output would change what you do; stop it with task_kill.
 Timeout is in seconds, optional, no default — a command without a timeout runs until it finishes or is killed (0 also means no timeout).`,
-    promptSnippet: "Execute bash commands (ls, grep, find, etc.)",
-    promptGuidelines: [
+    promptSnippet: opts.promptSnippet ?? "Execute bash commands (ls, grep, find, etc.)",
+    promptGuidelines: opts.promptGuidelines ?? [
       "Default to plain blocking (inline): waiting on a tool call costs nothing. Use wait: background for long-running work (builds, test suites, migrations) you have other work to do alongside; wait: auto only when you want a bounded block before backgrounding.",
       "Background results are delivered to you automatically as your next message, even mid-run — if you have nothing else to do, end your turn; the wake re-engages you. Never sleep or poll to wait.",
       "Peek at a running task with task <id> only when new output would change what you do; otherwise end your turn and let the completion wake re-engage you. Stop a task with task_kill.",
@@ -655,10 +698,11 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
           description: `inline (default): block and return output. auto: block up to ~${formatDuration(descWindowMs)}, then move to the background. background: return a task id immediately.`,
         }),
       ),
+      ...(opts.extraParams ?? {}),
     }),
     async execute(
       toolCallId: string,
-      params: { command: string; timeout?: number; wait?: BashWaitMode },
+      params: BashToolCallParams,
       signal: AbortSignal | undefined,
       onUpdate: BashOnUpdate | undefined,
       ctx: ToolCtx | undefined,
@@ -685,10 +729,17 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
         }
         timeoutSecs = params.timeout;
       }
+      // Per-call provisioning: a prepare hook (sibling tools) supplies the
+      // operations this call runs through, an inline executor over them, and
+      // the task head that names the command in the registry, wakes, and the
+      // backgrounded notice. Without one, the static factories stand.
+      const prep = opts.prepare?.(params) ?? { operations, inline: runInline };
+      const inlineExec = prep.inline ?? (opts.prepare ? inlineFromOps(prep.operations) : runInline);
+      const taskHead = prep.head ?? bashCommandHead(command);
       // Inline is the built-in, byte for byte: no task, no wake, no log.
       if (mode === "inline") {
         try {
-          const result = await runInline(toolCallId, { command, timeout: timeoutSecs }, signal, onUpdate, ctx);
+          const result = await inlineExec(toolCallId, { command, timeout: timeoutSecs }, signal, onUpdate, ctx);
           return {
             ...result,
             details: { kind: "bash", mode, ...(result.details as Record<string, unknown> | undefined) },
@@ -696,6 +747,13 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
         } catch (e) {
           return error(e instanceof Error ? e.message : String(e));
         }
+      }
+      // A lazy registry (sibling tools read the session's shared registry per
+      // call) may be absent; inline already ran above, so only the background
+      // legs need it, and the error says exactly which mode still works.
+      const reg = typeof registry === "function" ? registry() : registry;
+      if (!reg) {
+        return error(`${name}: background execution unavailable (no task registry); use wait: "inline"`);
       }
       const cwd = ctx?.cwd ?? process.cwd();
       // pi's bash tool validates the working directory up front with a clear
@@ -795,8 +853,8 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
           emitOutputUpdate();
         }, delay);
       };
-      const id = registry.adopt({
-        name: bashCommandHead(command),
+      const id = reg.adopt({
+        name: taskHead,
         kind: "bash",
         // Check-in wakes read the log from their own offset, so each wake
         // carries the output that appeared since the last look — the wake is
@@ -833,7 +891,7 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
       const onData = (data: Buffer) => {
         // A killed or settled task is done: ignore late chunks so a delayed
         // pipe read can't resurrect the log (or grow the tail) after teardown.
-        if (!registry.isRunning(id) || data.length === 0) return;
+        if (!reg.isRunning(id) || data.length === 0) return;
         tail = Buffer.concat([tail, data]).subarray(-BASH_TAIL_CAP);
         if (logStream) logStream.write(data);
         scheduleOutputUpdate();
@@ -850,7 +908,7 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
         void closeLog();
         // A task killed by task_kill/shutdown completes (and would compose its
         // wake) as a no-op — guard before composing so it leaves nothing behind.
-        if (!registry.isRunning(id)) return;
+        if (!reg.isRunning(id)) return;
         if (promoted) {
           const output = tail.toString("utf8");
           const display = truncateTail(output, { maxLines: DEFAULT_MAX_LINES, maxBytes: WAKE_TEXT_CAP });
@@ -860,11 +918,11 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
                 ? "[… truncated — could not save the full output …]"
                 : `[… truncated — full output: ${logPath} …]`
               : undefined;
-          registry.complete(id, {
+          reg.complete(id, {
             ok,
             status,
             text: formatBashWake({
-              command,
+              command: taskHead,
               id,
               status,
               durationMs: now() - startedAt,
@@ -875,7 +933,7 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
         } else {
           // Settled inside the auto window: the tool result carries the output,
           // so record the outcome without a duplicate wake.
-          registry.complete(id, { ok, status, text: status, wake: false });
+          reg.complete(id, { ok, status, text: status, wake: false });
         }
       };
       const settleFromError = (error: unknown) => {
@@ -889,7 +947,7 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
       try {
         // pi's local ops take the timeout in seconds; the tree kill on
         // timeout/abort and the #5303-safe wait live inside ops.exec.
-        execPromise = operations.exec(command, cwd, {
+        execPromise = prep.operations.exec(command, cwd, {
           onData,
           signal: controller.signal,
           timeout: timeoutSecs,
@@ -903,7 +961,7 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
         content: [
           {
             type: "text",
-            text: `Backgrounded (${id}): ${bashCommandHead(command)}
+            text: `Backgrounded (${id}): ${taskHead}
 The command keeps running in the background. When it exits, the exit status, duration, and output tail are delivered to you automatically as your next message — even mid-run. If you have nothing else to do, end your turn: the wake re-engages you, so waiting is never your job. Never sleep or poll to wait, and don't arm a check-in just to wait — the result arrives on its own. Peek at it with task ${id}; stop it with task_kill ${id}. Any timeout you passed still applies.`,
           },
         ],

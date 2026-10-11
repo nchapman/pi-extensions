@@ -4,6 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import {
   BASH_TAIL_CAP,
   bashCommandHead,
@@ -1117,6 +1118,116 @@ describe("createBashTool", () => {
       const result = await d.tool.execute("1", { command: "x", wait: "inline" }, undefined, undefined, CTX);
       expect(result.isError).toBe(true);
       expect(textOf(result)).toBe("Command timed out after 10 seconds");
+    });
+  });
+
+  describe("parameterization (sibling tools)", () => {
+    // The ssh_bash shape: a renamed tool with extra params, per-call operations,
+    // and a task head that names the connection — the default bash behavior is
+    // pinned by the tests above; this block pins only the parameterization.
+    it("applies name, label, description, prompt overrides, and extra params", () => {
+      const d = toolDeps();
+      const tool = createBashTool(d.registry, {
+        operations: fakeBashOps(),
+        name: "ssh_bash",
+        description: "custom description",
+        promptSnippet: "Run remote commands",
+        promptGuidelines: ["remote guideline"],
+        extraParams: { target: Type.String({ description: "user@host" }) },
+      });
+      expect(tool.name).toBe("ssh_bash");
+      expect(tool.label).toBe("ssh_bash");
+      expect(tool.description).toBe("custom description");
+      expect(tool.promptSnippet).toBe("Run remote commands");
+      expect(tool.promptGuidelines).toEqual(["remote guideline"]);
+      expect(Object.keys(tool.parameters.properties)).toEqual(
+        expect.arrayContaining(["command", "timeout", "wait", "target"]),
+      );
+    });
+
+    it("runs background calls through prepare's operations and names tasks with the head", async () => {
+      const d = toolDeps();
+      const ops = fakeBashOps();
+      const seen: Array<Record<string, unknown>> = [];
+      const tool = createBashTool(d.registry, {
+        name: "ssh_bash",
+        prepare: (params) => {
+          seen.push(params);
+          return { operations: ops, head: `[ssh-1] ${String(params.command)}` };
+        },
+      });
+      const result = await tool.execute(
+        "1",
+        { command: "uptime", target: "root@gpu-box", wait: "background" } as never,
+        undefined,
+        undefined,
+        CTX,
+      );
+      expect(seen[0]).toMatchObject({ command: "uptime", target: "root@gpu-box" });
+      expect(ops.last?.command).toBe("uptime");
+      expect(d.registry.running()[0]).toMatchObject({ name: "[ssh-1] uptime", kind: "bash" });
+      expect(textOf(result)).toContain("Backgrounded");
+      ops.emit("load average: 1.5");
+      await ops.exit(0);
+      const wake = d.sendUserMessage.mock.calls[0][0] as string;
+      expect(wake).toContain("— [ssh-1] uptime");
+    });
+
+    it("routes inline calls through prepare's inline executor", async () => {
+      const d = toolDeps();
+      const calls: string[] = [];
+      const tool = createBashTool(d.registry, {
+        name: "ssh_bash",
+        prepare: () => ({
+          operations: fakeBashOps(),
+          inline: async (_id, params) => {
+            calls.push(params.command);
+            return { content: [{ type: "text", text: `ran ${params.command}` }] } as never;
+          },
+        }),
+      });
+      const result = await tool.execute("1", { command: "date", target: "box" } as never, undefined, undefined, CTX);
+      expect(calls).toEqual(["date"]);
+      expect(textOf(result)).toBe("ran date");
+    });
+
+    it("rejects background modes when a lazy registry resolves to nothing, while inline still runs", async () => {
+      const inlineCalls: string[] = [];
+      const tool = createBashTool(() => undefined, {
+        name: "ssh_bash",
+        prepare: () => ({
+          operations: fakeBashOps(),
+          inline: async (_id, params) => {
+            inlineCalls.push(params.command);
+            return { content: [{ type: "text", text: "ok" }] } as never;
+          },
+        }),
+      });
+      const inline = await tool.execute("1", { command: "date" } as never, undefined, undefined, CTX);
+      expect(inlineCalls).toEqual(["date"]);
+      expect(inline.isError).toBeUndefined();
+      const blocked = await tool.execute(
+        "1",
+        { command: "date", wait: "background" } as never,
+        undefined,
+        undefined,
+        CTX,
+      );
+      expect(blocked.isError).toBe(true);
+      expect(textOf(blocked)).toContain('use wait: "inline"');
+    });
+
+    it("reads a lazy registry per call for background adoption", async () => {
+      const d1 = toolDeps();
+      const d2 = toolDeps();
+      const ops = fakeBashOps();
+      let current = d1.registry;
+      const tool = createBashTool(() => current, { name: "ssh_bash", prepare: () => ({ operations: ops }) });
+      await tool.execute("1", { command: "one", wait: "background" } as never, undefined, undefined, CTX);
+      current = d2.registry;
+      await tool.execute("2", { command: "two", wait: "background" } as never, undefined, undefined, CTX);
+      expect(d1.registry.running().map((t) => t.name)).toEqual(["one"]);
+      expect(d2.registry.running().map((t) => t.name)).toEqual(["two"]);
     });
   });
 });
