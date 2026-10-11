@@ -29,6 +29,9 @@ import {
   renderSubagentsCall,
   resolveAgentDef,
   resolveChildModel,
+  resolveChildThinking,
+  isValidThinkingLevel,
+  THINKING_LEVELS,
   runChild,
   runWithLimit,
   splitFrontmatter,
@@ -365,6 +368,11 @@ describe("buildChildArgs", () => {
   it("prefers caller model over agent model and adds thinking", () => {
     const args = buildChildArgs({ ...AGENT, model: "agent-model", thinking: "high" }, "t", "caller-model");
     expect(args[args.indexOf("--model") + 1]).toBe("caller-model");
+    // thinking: call param wins, agent level is the fallback, no pin = no flag
+    expect(args[args.indexOf("--thinking") + 1]).toBe("high");
+    const pinned = buildChildArgs({ ...AGENT, thinking: "high" }, "t", undefined, "off");
+    expect(pinned[pinned.indexOf("--thinking") + 1]).toBe("off");
+    expect(buildChildArgs(AGENT, "t")).not.toContain("--thinking");
     expect(args[args.indexOf("--thinking") + 1]).toBe("high");
   });
 });
@@ -385,6 +393,31 @@ describe("resolveChildModel", () => {
     // A partial session model cannot form provider/id — never emit a bogus flag.
     expect(resolveChildModel(undefined, undefined, { id: "glm-5.3" })).toBeUndefined();
     expect(resolveChildModel(undefined, undefined, { provider: "zai" })).toBeUndefined();
+  });
+
+  describe("agentFromText thinking", () => {
+    it("accepts a valid level and rejects a typo loudly", () => {
+      const ok = agentFromText("---\nthinking: high\n---\nbody", "fallback");
+      expect(ok.thinking).toBe("high");
+      expect(() => agentFromText("---\nthinking: ultra\n---\nbody", "fallback")).toThrow(
+        'agent fallback: invalid thinking "ultra"',
+      );
+    });
+  });
+
+  describe("resolveChildThinking", () => {
+    it("prefers the call param, then the agent definition, then the session level", () => {
+      expect(resolveChildThinking("off", "high", "medium")).toBe("off");
+      expect(resolveChildThinking(undefined, "high", "medium")).toBe("high");
+      expect(resolveChildThinking(undefined, undefined, "medium")).toBe("medium");
+      expect(resolveChildThinking(undefined, undefined, undefined)).toBeUndefined();
+    });
+
+    it("validates against pi's closed set of levels", () => {
+      for (const level of THINKING_LEVELS) expect(isValidThinkingLevel(level)).toBe(true);
+      expect(isValidThinkingLevel("ultra")).toBe(false);
+      expect(isValidThinkingLevel("HIGH")).toBe(false);
+    });
   });
 });
 
@@ -1712,6 +1745,47 @@ describe("registerSubagentTools", () => {
     calls.length = 0;
     await tools.get("subagent")!.execute("1", { task: "t" });
     expect(calls[0].includes("--model")).toBe(false);
+  });
+
+  it("children inherit the session's thinking level, and the param overrides", async () => {
+    const calls: string[][] = [];
+    const { pi, tools } = makePi();
+    registerSubagentTools(
+      pi as never,
+      mkdtempSync(join(tmpdir(), "agents-")),
+      spawnReturning([jsonLine("done")], calls),
+    );
+    const ctx = { model: { provider: "zai", id: "glm-5.3" }, thinkingLevel: "medium" };
+    await tools.get("subagent")!.execute("1", { task: "t" }, undefined, undefined, ctx);
+    expect(calls[0][calls[0].indexOf("--thinking") + 1]).toBe("medium");
+
+    calls.length = 0;
+    await tools.get("subagent")!.execute("1", { task: "t", thinking: "off" }, undefined, undefined, ctx);
+    expect(calls[0][calls[0].indexOf("--thinking") + 1]).toBe("off");
+
+    // No session level and no pins: no flag, the child model's default applies.
+    calls.length = 0;
+    await tools.get("subagent")!.execute("1", { task: "t" }, undefined, undefined, {
+      model: { provider: "zai", id: "glm-5.3" },
+    });
+    expect(calls[0].includes("--thinking")).toBe(false);
+  });
+
+  it("rejects an unknown thinking level with a clear error", async () => {
+    const calls: string[][] = [];
+    const { pi, tools } = makePi();
+    registerSubagentTools(
+      pi as never,
+      mkdtempSync(join(tmpdir(), "agents-")),
+      spawnReturning([jsonLine("done")], calls),
+    );
+    const result = (await tools.get("subagent")!.execute("1", { task: "t", thinking: "ultra" })) as {
+      isError?: boolean;
+      content: Array<{ text: string }>;
+    };
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('Invalid thinking "ultra"');
+    expect(calls).toHaveLength(0); // never spawns on a bad level
   });
 
   it("batch children inherit the parent chat's model per task", async () => {

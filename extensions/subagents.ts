@@ -165,13 +165,20 @@ export function resolveTools(fm: Record<string, unknown>): string[] {
 export function agentFromText(text: string, fallbackName: string): AgentDef {
   const { fm, body } = splitFrontmatter(text);
   const name = typeof fm.name === "string" && fm.name ? fm.name : fallbackName;
+  const thinking = typeof fm.thinking === "string" && fm.thinking ? fm.thinking : undefined;
+  // A typo'd level would silently clamp to a default in the child — a
+  // quiet quality drop. Fail at load instead (named files are skipped with
+  // a warning; inline agent_md errors back to the caller).
+  if (thinking !== undefined && !isValidThinkingLevel(thinking)) {
+    throw new Error(`agent ${name}: invalid thinking "${thinking}" — must be one of ${THINKING_LEVELS.join("|")}`);
+  }
   return {
     name,
     description: typeof fm.description === "string" ? fm.description : "",
     instructions: body,
     tools: resolveTools(fm),
     model: typeof fm.model === "string" && fm.model ? fm.model : undefined,
-    thinking: typeof fm.thinking === "string" && fm.thinking ? fm.thinking : undefined,
+    thinking,
   };
 }
 
@@ -286,6 +293,10 @@ export interface RunChildOptions {
   idleTimeoutMs?: number;
   onUpdate?: (partial: AgentToolResult) => void;
   signal?: AbortSignal;
+  /** Thinking level for the child (off…max). Resolved by the caller from
+   * call param > agent definition > parent session; kept here rather than a
+   * positional so runChild's signature stays stable. */
+  thinking?: string;
   /** Soft threshold in ms: hand the still-running child to onAdopted instead of waiting.
    * Undefined (default) blocks to completion — the anti-churn default; only
    * background: true or PI_SUBAGENT_BG_AFTER_MS opts into adoption. */
@@ -323,7 +334,30 @@ export function resolveChildModel(
   return typeof provider === "string" && typeof id === "string" ? `${provider}/${id}` : undefined;
 }
 
-export function buildChildArgs(agent: AgentDef, task: string, model?: string): string[] {
+/** pi's closed set of thinking levels (pi --help). Exported so tests and
+ * agent-file authors can pin the contract. */
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
+export function isValidThinkingLevel(level: string): boolean {
+  return (THINKING_LEVELS as readonly string[]).includes(level);
+}
+
+/** Mirror of resolveChildModel: the call's thinking param first, then the
+ * agent definition's level, then the parent session's — children match the
+ * speed/quality point of the conversation that asked for the work unless
+ * pinned otherwise. Pi clamps unsupported levels per model, so an inherited
+ * level is safe even when the child runs a different model. */
+export function resolveChildThinking(
+  param: string | undefined,
+  agentThinking: string | undefined,
+  sessionThinking: string | undefined,
+): string | undefined {
+  if (param) return param;
+  if (agentThinking) return agentThinking;
+  return sessionThinking;
+}
+
+export function buildChildArgs(agent: AgentDef, task: string, model?: string, thinking?: string): string[] {
   const args = [
     "-p",
     "--mode",
@@ -340,7 +374,8 @@ export function buildChildArgs(agent: AgentDef, task: string, model?: string): s
   ];
   const effectiveModel = model ?? agent.model;
   if (effectiveModel) args.push("--model", effectiveModel);
-  if (agent.thinking) args.push("--thinking", agent.thinking);
+  const effectiveThinking = thinking ?? agent.thinking;
+  if (effectiveThinking) args.push("--thinking", effectiveThinking);
   args.push("--", task);
   return args;
 }
@@ -517,7 +552,9 @@ export function runChild(
     // only requests again after every tool of the turn has finished) or when
     // the stdout cap discards data — both fail toward detection, never away.
     const openToolRuns = new Set<string>();
-    const child = spawnFn("pi", buildChildArgs(agent, task, model), { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawnFn("pi", buildChildArgs(agent, task, model, options.thinking), {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
     let stdoutBuf = "";
     let stderrBuf = "";
     let lastText = "";
@@ -873,6 +910,11 @@ const modelField = Type.Optional(
       "Model override (provider/id). Defaults to the agent definition's model, then the parent chat's current model.",
   }),
 );
+const thinkingField = Type.Optional(
+  Type.String({
+    description: `Thinking level (${THINKING_LEVELS.join("|")}) — adjust speed/quality on the fly: off for fast mechanical runs, high for hard ones. Defaults to the agent definition's level, then the parent session's.`,
+  }),
+);
 const backgroundField = Type.Optional(
   Type.Boolean({
     description:
@@ -889,6 +931,7 @@ const taskItem = Type.Object({
   ),
   task: taskField,
   model: modelField,
+  thinking: thinkingField,
   background: backgroundField,
 });
 
@@ -957,11 +1000,24 @@ By default the call blocks until the subagent finishes — waiting on a tool cal
       const agent = resolveAgentDef(list, params);
       // Adoption is wired only when a registry is present; without one the
       // tool waits synchronously exactly as before.
+      if (params.thinking !== undefined && !isValidThinkingLevel(params.thinking)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Invalid thinking "${params.thinking}" — must be one of ${THINKING_LEVELS.join("|")}.`,
+            },
+          ],
+          details: { kind: "subagent" },
+          isError: true,
+        };
+      }
       const options: RunChildOptions = {
         timeoutMs: parseTimeoutMs(process.env),
         idleTimeoutMs: parseIdleTimeoutMs(process.env),
         onUpdate,
         signal,
+        thinking: resolveChildThinking(params.thinking, agent.thinking, ctx?.thinkingLevel),
       };
       if (registry) {
         options.adoptAfterMs = params.background ? 0 : parseBgAfterMs(process.env);
@@ -1037,11 +1093,30 @@ By default the call blocks until every subagent finishes — waiting on a tool c
       const list = loadAgents(agentsDir);
       const timeoutMs = parseTimeoutMs(process.env);
       const idleTimeoutMs = parseIdleTimeoutMs(process.env);
+      for (const t of params.tasks) {
+        if (t.thinking !== undefined && !isValidThinkingLevel(t.thinking)) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Invalid thinking "${t.thinking}" for task ${t.task.slice(0, 40)} — must be one of ${THINKING_LEVELS.join("|")}.`,
+              },
+            ],
+            details: { kind: "subagents" },
+            isError: true,
+          };
+        }
+      }
       const sessionDir = ctx?.sessionManager?.getSessionDir();
       const results = await runWithLimit(
         params.tasks.map((t) => () => {
           const agent = resolveAgentDef(list, t);
-          const options: RunChildOptions = { timeoutMs, idleTimeoutMs, signal };
+          const options: RunChildOptions = {
+            timeoutMs,
+            idleTimeoutMs,
+            signal,
+            thinking: resolveChildThinking(t.thinking, agent.thinking, ctx?.thinkingLevel),
+          };
           if (registry) {
             options.adoptAfterMs = t.background ? 0 : parseBgAfterMs(process.env);
             options.onAdopted = (handle: AdoptedHandle<ChildRun>) =>
