@@ -379,20 +379,19 @@ describe("buildChildArgs", () => {
 
 describe("resolveChildModel", () => {
   it("inherits the parent chat's model when nothing pins one", () => {
-    expect(resolveChildModel(undefined, undefined, { provider: "zai", id: "glm-5.3" })).toBe("zai/glm-5.3");
+    expect(resolveChildModel(undefined, { provider: "zai", id: "glm-5.3" })).toBe("zai/glm-5.3");
   });
 
   it("the tool call's model param outranks the agent definition, which outranks the session", () => {
     const session = { provider: "zai", id: "glm-5.3" };
-    expect(resolveChildModel("param-model", "agent-model", session)).toBe("param-model");
-    expect(resolveChildModel(undefined, "agent-model", session)).toBe("agent-model");
+    expect(resolveChildModel("agent-model", session)).toBe("agent-model");
   });
 
   it("falls back to pi's default when no model is resolvable", () => {
-    expect(resolveChildModel(undefined, undefined, undefined)).toBeUndefined();
+    expect(resolveChildModel(undefined, undefined)).toBeUndefined();
     // A partial session model cannot form provider/id — never emit a bogus flag.
-    expect(resolveChildModel(undefined, undefined, { id: "glm-5.3" })).toBeUndefined();
-    expect(resolveChildModel(undefined, undefined, { provider: "zai" })).toBeUndefined();
+    expect(resolveChildModel(undefined, { id: "glm-5.3" })).toBeUndefined();
+    expect(resolveChildModel(undefined, { provider: "zai" })).toBeUndefined();
   });
 
   describe("agentFromText thinking", () => {
@@ -406,11 +405,10 @@ describe("resolveChildModel", () => {
   });
 
   describe("resolveChildThinking", () => {
-    it("prefers the call param, then the agent definition, then the session level", () => {
-      expect(resolveChildThinking("off", "high", "medium")).toBe("off");
-      expect(resolveChildThinking(undefined, "high", "medium")).toBe("high");
-      expect(resolveChildThinking(undefined, undefined, "medium")).toBe("medium");
-      expect(resolveChildThinking(undefined, undefined, undefined)).toBeUndefined();
+    it("prefers the call param, then the agent definition, then the low default", () => {
+      expect(resolveChildThinking("off", "high")).toBe("off");
+      expect(resolveChildThinking(undefined, "high")).toBe("high");
+      expect(resolveChildThinking(undefined, undefined)).toBe("low");
     });
 
     it("validates against pi's closed set of levels", () => {
@@ -1725,7 +1723,7 @@ describe("registerSubagentTools", () => {
     expect(result.usage).toEqual(USAGE({ output: 40, totalTokens: 140 }));
   });
 
-  it("children inherit the parent chat's model, and the param still overrides", async () => {
+  it("children inherit the parent chat's model unless the agent file pins one", async () => {
     const calls: string[][] = [];
     const { pi, tools } = makePi();
     registerSubagentTools(
@@ -1737,17 +1735,13 @@ describe("registerSubagentTools", () => {
     await tools.get("subagent")!.execute("1", { task: "t" }, undefined, undefined, ctx);
     expect(calls[0][calls[0].indexOf("--model") + 1]).toBe("zai/glm-5.3");
 
-    calls.length = 0;
-    await tools.get("subagent")!.execute("1", { task: "t", model: "yeti/other" }, undefined, undefined, ctx);
-    expect(calls[0][calls[0].indexOf("--model") + 1]).toBe("yeti/other");
-
     // No session model (ctx absent) and no pins: no --model flag, pi's default applies.
     calls.length = 0;
     await tools.get("subagent")!.execute("1", { task: "t" });
     expect(calls[0].includes("--model")).toBe(false);
   });
 
-  it("children inherit the session's thinking level, and the param overrides", async () => {
+  it("children default to low thinking; param and agent file override it", async () => {
     const calls: string[][] = [];
     const { pi, tools } = makePi();
     registerSubagentTools(
@@ -1755,20 +1749,21 @@ describe("registerSubagentTools", () => {
       mkdtempSync(join(tmpdir(), "agents-")),
       spawnReturning([jsonLine("done")], calls),
     );
-    const ctx = { model: { provider: "zai", id: "glm-5.3" }, thinkingLevel: "medium" };
+    const ctx = { model: { provider: "zai", id: "glm-5.3" }, thinkingLevel: "high" };
+    // An unpinned run floors at low even when the parent session is on high.
     await tools.get("subagent")!.execute("1", { task: "t" }, undefined, undefined, ctx);
-    expect(calls[0][calls[0].indexOf("--thinking") + 1]).toBe("medium");
+    expect(calls[0][calls[0].indexOf("--thinking") + 1]).toBe("low");
 
     calls.length = 0;
     await tools.get("subagent")!.execute("1", { task: "t", thinking: "off" }, undefined, undefined, ctx);
     expect(calls[0][calls[0].indexOf("--thinking") + 1]).toBe("off");
 
-    // No session level and no pins: no flag, the child model's default applies.
     calls.length = 0;
-    await tools.get("subagent")!.execute("1", { task: "t" }, undefined, undefined, {
-      model: { provider: "zai", id: "glm-5.3" },
-    });
-    expect(calls[0].includes("--thinking")).toBe(false);
+    await tools
+      .get("subagents")!
+      .execute("1", { tasks: [{ task: "a", thinking: "high" }, { task: "b" }] }, undefined, undefined, ctx);
+    expect(calls[0][calls[0].indexOf("--thinking") + 1]).toBe("high");
+    expect(calls[1][calls[1].indexOf("--thinking") + 1]).toBe("low");
   });
 
   it("rejects an unknown thinking level with a clear error", async () => {
@@ -1797,12 +1792,10 @@ describe("registerSubagentTools", () => {
       spawnReturning([jsonLine("done")], calls),
     );
     const ctx = { model: { provider: "yeti", id: "ornith-1.5" } };
-    await tools
-      .get("subagents")!
-      .execute("1", { tasks: [{ task: "a" }, { task: "b", model: "zai/glm-5.3" }] }, undefined, undefined, ctx);
+    await tools.get("subagents")!.execute("1", { tasks: [{ task: "a" }, { task: "b" }] }, undefined, undefined, ctx);
     expect(calls).toHaveLength(2);
     expect(calls[0][calls[0].indexOf("--model") + 1]).toBe("yeti/ornith-1.5");
-    expect(calls[1][calls[1].indexOf("--model") + 1]).toBe("zai/glm-5.3");
+    expect(calls[1][calls[1].indexOf("--model") + 1]).toBe("yeti/ornith-1.5");
   });
 
   it("omits usage when no child reported any", async () => {

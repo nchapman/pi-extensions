@@ -317,17 +317,18 @@ export function isStalledError(reason: unknown): boolean {
 }
 
 /**
- * Children inherit the parent chat's model unless something more explicit pins
- * one: the tool call's model param first, then the agent definition's model.
- * Without inheritance a child falls back to pi's global default — a different
- * (and possibly metered) model than the conversation that asked for the work.
+ * Children run on the agent definition's model when it pins one, else inherit
+ * the parent chat's. Without inheritance a child falls back to pi's global
+ * default — a different (and possibly metered) model than the conversation
+ * that asked for the work. Deliberately not a per-call param: the caller has
+ * no model catalogue in context and would be guessing at provider ids; model
+ * choice belongs to the human-authored agent file (or the session), while
+ * thinking — a closed, enumerable set — is the dial agents can reason about.
  */
 export function resolveChildModel(
-  param: string | undefined,
   agentModel: string | undefined,
   sessionModel: { provider?: string; id?: string } | null | undefined,
 ): string | undefined {
-  if (param) return param;
   if (agentModel) return agentModel;
   const provider = sessionModel?.provider;
   const id = sessionModel?.id;
@@ -342,19 +343,17 @@ export function isValidThinkingLevel(level: string): boolean {
   return (THINKING_LEVELS as readonly string[]).includes(level);
 }
 
-/** Mirror of resolveChildModel: the call's thinking param first, then the
- * agent definition's level, then the parent session's — children match the
- * speed/quality point of the conversation that asked for the work unless
- * pinned otherwise. Pi clamps unsupported levels per model, so an inherited
+/** Default thinking for delegated runs: focused subagent tasks rarely need
+ * more than low, and a floor beats both copying a parent that happens to be
+ * on high (every child slow) and leaving pi's per-model default (often off).
+ * Raise it per call or in the agent file when the work is hard. */
+export const DEFAULT_SUBAGENT_THINKING = "low";
+
+/** The call's thinking param first, then the agent definition's level, then
+ * the low default. Pi clamps unsupported levels per model, so the resolved
  * level is safe even when the child runs a different model. */
-export function resolveChildThinking(
-  param: string | undefined,
-  agentThinking: string | undefined,
-  sessionThinking: string | undefined,
-): string | undefined {
-  if (param) return param;
-  if (agentThinking) return agentThinking;
-  return sessionThinking;
+export function resolveChildThinking(param: string | undefined, agentThinking: string | undefined): string {
+  return param ?? agentThinking ?? DEFAULT_SUBAGENT_THINKING;
 }
 
 export function buildChildArgs(agent: AgentDef, task: string, model?: string, thinking?: string): string[] {
@@ -904,15 +903,9 @@ function reuseText(context: { lastComponent?: unknown } | undefined): Text {
 }
 
 const taskField = Type.String({ description: "The task to delegate, with full context" });
-const modelField = Type.Optional(
-  Type.String({
-    description:
-      "Model override (provider/id). Defaults to the agent definition's model, then the parent chat's current model.",
-  }),
-);
 const thinkingField = Type.Optional(
   Type.String({
-    description: `Thinking level (${THINKING_LEVELS.join("|")}) — adjust speed/quality on the fly: off for fast mechanical runs, high for hard ones. Defaults to the agent definition's level, then the parent session's.`,
+    description: `Thinking level (${THINKING_LEVELS.join("|")}) — adjust speed/quality on the fly: off for fast mechanical runs, high for hard ones. Defaults to the agent definition's level, then ${DEFAULT_SUBAGENT_THINKING}.`,
   }),
 );
 const backgroundField = Type.Optional(
@@ -926,11 +919,10 @@ const taskItem = Type.Object({
   agent_md: Type.Optional(
     Type.String({
       description:
-        "Inline agent definition: markdown with optional frontmatter (name, description, tools, model, thinking) followed by the system prompt. Takes precedence over the generic default. Provide either agent or agent_md, not both.",
+        "Inline agent definition: markdown with optional frontmatter (name, description, tools, thinking) followed by the system prompt. Takes precedence over the generic default. Provide either agent or agent_md, not both.",
     }),
   ),
   task: taskField,
-  model: modelField,
   thinking: thinkingField,
   background: backgroundField,
 });
@@ -1017,20 +1009,14 @@ By default the call blocks until the subagent finishes — waiting on a tool cal
         idleTimeoutMs: parseIdleTimeoutMs(process.env),
         onUpdate,
         signal,
-        thinking: resolveChildThinking(params.thinking, agent.thinking, ctx?.thinkingLevel),
+        thinking: resolveChildThinking(params.thinking, agent.thinking),
       };
       if (registry) {
         options.adoptAfterMs = params.background ? 0 : parseBgAfterMs(process.env);
         options.onAdopted = (handle: AdoptedHandle<ChildRun>) =>
           adoptSubagentTask(registry, agent.name, handle, ctx?.sessionManager?.getSessionDir());
       }
-      const run = await runChild(
-        agent,
-        params.task,
-        resolveChildModel(params.model, agent.model, ctx?.model),
-        options,
-        spawnFn,
-      );
+      const run = await runChild(agent, params.task, resolveChildModel(agent.model, ctx?.model), options, spawnFn);
       if ("adopted" in run) {
         return {
           content: [{ type: "text", text: backgroundedNotice(agent.name, run.id) }],
@@ -1115,14 +1101,14 @@ By default the call blocks until every subagent finishes — waiting on a tool c
             timeoutMs,
             idleTimeoutMs,
             signal,
-            thinking: resolveChildThinking(t.thinking, agent.thinking, ctx?.thinkingLevel),
+            thinking: resolveChildThinking(t.thinking, agent.thinking),
           };
           if (registry) {
             options.adoptAfterMs = t.background ? 0 : parseBgAfterMs(process.env);
             options.onAdopted = (handle: AdoptedHandle<ChildRun>) =>
               adoptSubagentTask(registry, agent.name, handle, sessionDir);
           }
-          return runChild(agent, t.task, resolveChildModel(t.model, agent.model, ctx?.model), options, spawnFn);
+          return runChild(agent, t.task, resolveChildModel(agent.model, ctx?.model), options, spawnFn);
         }),
         parseConcurrency(process.env),
       );

@@ -941,7 +941,7 @@ export function createLlmSettleJudge(deps: LlmSettleJudgeDeps = {}): SettleJudge
   const timeoutMs = deps.timeoutMs ?? GOAL_JUDGE_TIMEOUT_MS_DEFAULT;
   return {
     async assess(goal, ctx) {
-      const model = deps.model ?? resolveChildModel(undefined, undefined, deps.sessionModel?.());
+      const model = deps.model ?? resolveChildModel(undefined, deps.sessionModel?.());
       const run = await childRunner(
         SETTLE_JUDGE_AGENT,
         buildSettleJudgeTask(goal, ctx),
@@ -1051,7 +1051,7 @@ export function createLlmSettleTriage(deps: LlmSettleJudgeDeps = {}): SettleTria
   const timeoutMs = deps.timeoutMs ?? GOAL_TRIAGE_TIMEOUT_MS_DEFAULT;
   return {
     async triage(goal, ctx) {
-      const model = deps.model ?? resolveChildModel(undefined, undefined, deps.sessionModel?.());
+      const model = deps.model ?? resolveChildModel(undefined, deps.sessionModel?.());
       const run = await childRunner(
         SETTLE_TRIAGE_AGENT,
         buildTriageTask(goal, ctx),

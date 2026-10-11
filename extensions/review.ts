@@ -1558,7 +1558,7 @@ export async function runReview(opts: {
         runChild(
           agent,
           task,
-          resolveChildModel(config.model, agent.model, deps.sessionModel),
+          resolveChildModel(config.model ?? agent.model, deps.sessionModel),
           { timeoutMs: config.timeoutMs, idleTimeoutMs: config.idleTimeoutMs, signal },
           deps.spawnFn,
         ),
@@ -1611,7 +1611,7 @@ export async function runReview(opts: {
         runChild(
           vAgent,
           vTask,
-          resolveChildModel(config.verifyModel ?? config.model, vAgent.model, deps.sessionModel),
+          resolveChildModel(config.verifyModel ?? config.model ?? vAgent.model, deps.sessionModel),
           { timeoutMs: config.timeoutMs, idleTimeoutMs: config.idleTimeoutMs, signal },
           deps.spawnFn,
         ),
