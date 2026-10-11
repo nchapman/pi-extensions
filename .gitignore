@@ -4,3 +4,4 @@ coverage/
 
 # eval artifacts
 scripts/eval/results/
+.pi/
