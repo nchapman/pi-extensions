@@ -27,7 +27,7 @@
  *   `task <id>` reads new output from the task's log since the last check (an
  *   in-memory byte offset; the first check shows the tail), and `task_remind`
  *   arms at most one one-shot timer per task (re-arm replaces; omitting
- *   in_ms cancels) whose fire is dropped when the task already settled — the
+ *   in_secs cancels) whose fire is dropped when the task already settled — the
  *   completion wake already delivered the result, so a heartbeat could only
  *   burn turns on silence
  * - full replies over the wake cap are stashed beside the session at
@@ -1286,7 +1286,7 @@ The task stops immediately and its result never arrives. Ids come from bash (wai
 
 /**
  * The check-in lever: at most one one-shot timer per running task (re-arm
- * replaces, omitting in_ms cancels). The fire is dropped when the task has
+ * replaces, omitting in_secs cancels). The fire is dropped when the task has
  * settled — the completion wake already delivered the result, so a reminder
  * could only burn a turn on stale news.
  */
@@ -1295,7 +1295,7 @@ export function createTaskRemindTool(registry: TaskRegistry, opts: { now?: () =>
   return {
     name: "task_remind",
     label: "Schedule task check-in",
-    description: `Schedule a one-shot check-in on a running background task (t-xxxxx): after in_ms, a wake message reports that it is still running, with elapsed time and your note. If the task settles first, the check-in is dropped — the completion wake already carries the result. Re-arming replaces the pending check-in for that task; omit in_ms to cancel it.
+    description: `Schedule a one-shot check-in on a running background task (t-xxxxx): after in_secs, a wake message reports that it is still running, with elapsed time and your note. If the task settles first, the check-in is dropped — the completion wake already carries the result. Re-arming replaces the pending check-in for that task; omit in_secs to cancel it.
 Use this only for long, uncertain runs where a status ping would change what you do — never to wait for a result you'll receive anyway (for that, end your turn; the completion wake is automatic). The fit is work with a go/no-go point: watchers, dev servers, migrations past a deadline you'd abandon.`,
     promptSnippet: "Schedule a check-in on a background task",
     promptGuidelines: [
@@ -1303,9 +1303,9 @@ Use this only for long, uncertain runs where a status ping would change what you
     ],
     parameters: Type.Object({
       id: Type.String({ description: "Task id to check in on, e.g. t-1134z8v" }),
-      in_ms: Type.Optional(
+      in_secs: Type.Optional(
         Type.Number({
-          description: "Delay in milliseconds. Omit to cancel the pending check-in for this task.",
+          description: "Delay in seconds (fractional ok). Omit to cancel the pending check-in for this task.",
         }),
       ),
       note: Type.Optional(
@@ -1317,13 +1317,13 @@ Use this only for long, uncertain runs where a status ping would change what you
     }),
     async execute(
       _id: string,
-      params: { id: string; in_ms?: number; note?: string },
+      params: { id: string; in_secs?: number; note?: string },
       _signal: AbortSignal | undefined,
       _onUpdate: undefined,
       _ctx: unknown,
     ): Promise<{
       content: { type: "text"; text: string }[];
-      details: { kind: "task_remind"; id: string; in_ms?: number };
+      details: { kind: "task_remind"; id: string; in_secs?: number };
       isError?: boolean;
     }> {
       const id = params.id?.trim();
@@ -1334,7 +1334,7 @@ Use this only for long, uncertain runs where a status ping would change what you
           isError: true,
         };
       }
-      if (params.in_ms === undefined) {
+      if (params.in_secs === undefined) {
         const cancelled = registry.cancelReminder(id);
         if (!cancelled) {
           return {
@@ -1348,19 +1348,22 @@ Use this only for long, uncertain runs where a status ping would change what you
           details: { kind: "task_remind", id: id ?? "" },
         };
       }
-      if (!Number.isInteger(params.in_ms) || params.in_ms < 1 || params.in_ms > MAX_TIMEOUT_MS) {
+      // Agent-facing time is seconds (matching bash/ssh_bash timeouts); ms
+      // stays the internal unit so timers and caps need no conversion layers.
+      const MAX_REMIND_SECS = Math.floor(MAX_TIMEOUT_MS / 1_000);
+      if (!Number.isFinite(params.in_secs) || params.in_secs <= 0 || params.in_secs > MAX_REMIND_SECS) {
         return {
           content: [
             {
               type: "text",
-              text: `Invalid in_ms: must be a whole number of milliseconds up to ${MAX_TIMEOUT_MS} (about 24 days).`,
+              text: `Invalid in_secs: must be a number of seconds (fractional ok) up to ${MAX_REMIND_SECS} (about 24 days).`,
             },
           ],
           details: { kind: "task_remind", id: id ?? "" },
           isError: true,
         };
       }
-      const ms = params.in_ms;
+      const ms = params.in_secs * 1_000;
       const note = params.note?.trim() || undefined;
       const prev = registry.reminderFor(id); // shown below: silent re-arming hides cadence escalation
       if (!registry.remind(id, ms, note)) {
@@ -1385,7 +1388,7 @@ Use this only for long, uncertain runs where a status ping would change what you
             text: `Check-in set for ${id} in ${formatDuration(ms)}${prev ? ` (replacing the earlier check-in, was in ${formatDuration(prev.ms)})` : ""}${note ? ` — ${note}` : ""}; you'll be woken with its status if it is still running. This is not a way to wait: if you have nothing else to do, end your turn — the completion or check-in wake re-engages you either way.`,
           },
         ],
-        details: { kind: "task_remind", id: id ?? "", in_ms: ms },
+        details: { kind: "task_remind", id: id ?? "", in_secs: params.in_secs },
       };
     },
   };

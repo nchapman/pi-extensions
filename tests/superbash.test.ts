@@ -1378,32 +1378,32 @@ describe("createTaskRemindTool", () => {
     const id = d.registry.adopt({ name: "a", kind: "bash", kill: () => undefined });
     const result = await d.tool.execute(
       "1",
-      { id, in_ms: 300_000, note: "check the build" },
+      { id, in_secs: 300, note: "check the build" },
       undefined,
       undefined,
       undefined,
     );
     expect(textOf(result)).toContain(`Check-in set for ${id} in 5m — check the build`);
     expect(textOf(result)).toContain("not a way to wait");
-    expect(result.details).toMatchObject({ kind: "task_remind", in_ms: 300_000 });
+    expect(result.details).toMatchObject({ kind: "task_remind", in_secs: 300 });
     expect(d.registry.reminderFor(id)).toEqual({ ms: 300_000, note: "check the build" });
   });
 
   it("re-arming replaces the pending check-in and says so", async () => {
     const d = remindDeps();
     const id = d.registry.adopt({ name: "a", kind: "bash", kill: () => undefined });
-    const first = await d.tool.execute("1", { id, in_ms: 1000 }, undefined, undefined, undefined);
+    const first = await d.tool.execute("1", { id, in_secs: 1 }, undefined, undefined, undefined);
     expect(textOf(first)).not.toContain("replacing");
-    const second = await d.tool.execute("2", { id, in_ms: 2000 }, undefined, undefined, undefined);
+    const second = await d.tool.execute("2", { id, in_secs: 2 }, undefined, undefined, undefined);
     expect(textOf(second)).toContain("replacing the earlier check-in, was in 1s");
     expect(d.timers[0].cancelled).toBe(true);
     expect(d.registry.reminderFor(id)).toEqual({ ms: 2000, note: undefined });
   });
 
-  it("cancels the pending check-in when in_ms is omitted", async () => {
+  it("cancels the pending check-in when in_secs is omitted", async () => {
     const d = remindDeps();
     const id = d.registry.adopt({ name: "a", kind: "bash", kill: () => undefined });
-    await d.tool.execute("1", { id, in_ms: 1000 }, undefined, undefined, undefined);
+    await d.tool.execute("1", { id, in_secs: 1 }, undefined, undefined, undefined);
     const result = await d.tool.execute("2", { id }, undefined, undefined, undefined);
     expect(textOf(result)).toContain(`Cancelled the pending check-in for ${id}`);
     expect(d.registry.reminderFor(id)).toBeUndefined();
@@ -1421,7 +1421,7 @@ describe("createTaskRemindTool", () => {
   it("refuses unknown ids with the running list", async () => {
     const d = remindDeps();
     const id = d.registry.adopt({ name: "a", kind: "bash", kill: () => undefined });
-    const result = await d.tool.execute("1", { id: "t-nope", in_ms: 1000 }, undefined, undefined, undefined);
+    const result = await d.tool.execute("1", { id: "t-nope", in_secs: 1 }, undefined, undefined, undefined);
     expect(result.isError).toBe(true);
     expect(textOf(result)).toContain("the task is not running");
     expect(textOf(result)).toContain(`${id} (bash,`);
@@ -1431,18 +1431,19 @@ describe("createTaskRemindTool", () => {
     const d = remindDeps();
     const id = d.registry.adopt({ name: "a", kind: "bash", kill: () => undefined });
     d.registry.complete(id, { ok: true, text: "done", wake: false });
-    const result = await d.tool.execute("1", { id, in_ms: 1000 }, undefined, undefined, undefined);
+    const result = await d.tool.execute("1", { id, in_secs: 1 }, undefined, undefined, undefined);
     expect(result.isError).toBe(true);
     expect(textOf(result)).toContain("the task is not running");
   });
 
-  it("rejects invalid in_ms values", async () => {
+  it("rejects invalid in_secs values", async () => {
     const d = remindDeps();
     const id = d.registry.adopt({ name: "a", kind: "bash", kill: () => undefined });
-    for (const bad of [0, -5, 1.5, 1e12]) {
-      const result = await d.tool.execute("1", { id, in_ms: bad }, undefined, undefined, undefined);
-      expect(result.isError, `in_ms=${bad}`).toBe(true);
-      expect(textOf(result)).toContain("Invalid in_ms");
+    // fractional seconds are fine now; zero/negative/non-finite/over-cap are not
+    for (const bad of [0, -5, NaN, 2_500_000]) {
+      const result = await d.tool.execute("1", { id, in_secs: bad }, undefined, undefined, undefined);
+      expect(result.isError, `in_secs=${bad}`).toBe(true);
+      expect(textOf(result)).toContain("Invalid in_secs");
     }
     expect(d.registry.reminderFor(id)).toBeUndefined();
   });
@@ -1450,7 +1451,7 @@ describe("createTaskRemindTool", () => {
   it("fires the wake with the task's status when it is still running", async () => {
     const d = remindDeps();
     const id = d.registry.adopt({ name: "a", kind: "bash", kill: () => undefined });
-    await d.tool.execute("1", { id, in_ms: 300_000, note: "check the build" }, undefined, undefined, undefined);
+    await d.tool.execute("1", { id, in_secs: 300, note: "check the build" }, undefined, undefined, undefined);
     d.timers[0].fn();
     expect(d.sendUserMessage).toHaveBeenCalledTimes(1);
     expect(d.sendUserMessage).toHaveBeenCalledWith(
@@ -1462,7 +1463,7 @@ describe("createTaskRemindTool", () => {
   it("drops the check-in when the task settled first", async () => {
     const d = remindDeps();
     const id = d.registry.adopt({ name: "a", kind: "bash", kill: () => undefined });
-    await d.tool.execute("1", { id, in_ms: 300_000 }, undefined, undefined, undefined);
+    await d.tool.execute("1", { id, in_secs: 300 }, undefined, undefined, undefined);
     d.registry.complete(id, { ok: true, text: "done", wake: false });
     d.timers[0].fn(); // stray fire after settlement
     expect(d.sendUserMessage).not.toHaveBeenCalled();
