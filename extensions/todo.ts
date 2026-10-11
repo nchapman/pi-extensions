@@ -3,9 +3,11 @@
  *
  * Design (mirrors Claude Code's TodoWrite / Codex's update_plan):
  * - One `todo` tool; every call sends the FULL list and replaces the old one
- * - Statuses: pending | in_progress | completed | cancelled, at most one
- *   in_progress — structurally invalid lists are rejected with the current
- *   state so the model self-corrects in one retry
+ * - Statuses: pending | in_progress | completed | cancelled; parallel work
+ *   may keep several items in_progress at once (backgrounded tasks) — while
+ *   more than one is active the result carries a one-line note nudging the
+ *   model to resolve them. Structurally invalid lists are rejected with the
+ *   current state so the model self-corrects in one retry
  * - Updates that drop unfinished items are accepted with a note naming them:
  *   deliberate restructuring (reword, split, abandon) stays friction-free
  *   while accidental drops remain visible
@@ -84,7 +86,8 @@ const TodoParams = Type.Object({
       status: Type.Union(
         TODO_STATUSES.map((s) => Type.Literal(s)),
         {
-          description: "At most one item may be in_progress",
+          description:
+            "Parallel in_progress items are allowed (e.g. backgrounded work); mark each completed or cancelled as it finishes",
         },
       ),
     }),
@@ -109,13 +112,6 @@ export function validateTodoList(input: unknown): { todos: TodoItem[]; error?: s
     }
     todos.push({ content: item.content.trim(), status: item.status as TodoStatus });
   }
-  const active = todos.filter((t) => t.status === "in_progress");
-  if (active.length > 1) {
-    return {
-      todos: [],
-      error: `at most one todo may be in_progress (found ${active.length}); finish or cancel items before starting new ones`,
-    };
-  }
   if (todos.length > MAX_TODOS) {
     return {
       todos: [],
@@ -132,14 +128,15 @@ export function validateTodoList(input: unknown): { todos: TodoItem[]; error?: s
 export interface TodoProgress {
   resolved: number;
   total: number;
-  active?: TodoItem;
+  /** Every in_progress item — parallel work may hold several at once. */
+  active: TodoItem[];
 }
 
 export function summarizeTodos(todos: TodoItem[]): TodoProgress {
   return {
     resolved: todos.filter((t) => t.status === "completed" || t.status === "cancelled").length,
     total: todos.length,
-    active: todos.find((t) => t.status === "in_progress"),
+    active: todos.filter((t) => t.status === "in_progress"),
   };
 }
 
@@ -156,6 +153,13 @@ export function droppedUnfinishedItems(previous: TodoItem[], next: TodoItem[]): 
 
 function clip(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+/** First active item plus a count of the rest — collapsed rows stay one line
+ * while parallel in_progress items remain visible. */
+function activeSummary(active: TodoItem[]): string {
+  const [first, ...rest] = active;
+  return rest.length > 0 ? `${clip(first.content, 57)} +${rest.length}` : clip(first.content, 60);
 }
 
 /** Plain-text checklist for tool results (the model reads content, not details). */
@@ -194,7 +198,7 @@ export function renderTodoCall(args: { todos?: unknown }, theme: Pick<Theme, "fg
   const todos = (args.todos as unknown[]).filter(isTodoItem);
   const p = summarizeTodos(todos);
   let text = theme.fg("toolTitle", theme.bold("todo ")) + theme.fg("accent", `${p.resolved}/${p.total}`);
-  if (p.active) text += theme.fg("dim", ` — ${clip(p.active.content, 60)}`);
+  if (p.active.length > 0) text += theme.fg("dim", ` — ${activeSummary(p.active)}`);
   else {
     const nextItem = todos.find((t) => t.status === "pending");
     if (nextItem) text += theme.fg("dim", ` — next: ${clip(nextItem.content, 55)}`);
@@ -262,7 +266,7 @@ export function renderTodoResult(
   if (ch?.started.length) parts.push(theme.fg("accent", `▸ ${clipNames(ch.started, max)}`));
   if (ch?.added.length) parts.push(theme.fg("muted", `+ ${clipNames(ch.added, max)}`));
   if (ch?.cancelled.length) parts.push(theme.fg("dim", `✗ ${clipNames(ch.cancelled, max)}`));
-  if (parts.length === 0 && p.active) parts.push(theme.fg("accent", `▸ ${clip(p.active.content, 60)}`));
+  if (parts.length === 0 && p.active.length > 0) parts.push(theme.fg("accent", `▸ ${activeSummary(p.active)}`));
   if (allDone) parts.push(theme.fg("dim", "all resolved"));
 
   let text = theme.fg(allDone ? "success" : "muted", `${p.resolved}/${p.total}`);
@@ -484,7 +488,7 @@ export function registerTodoTool(pi: ExtensionAPI): void {
     name: TODO_TOOL_NAME,
     label: "Todo",
     description:
-      "Record a plan that must outlive the context window. Use for work that will span many tool calls or a likely compaction (multi-file changes, long test/fix loops, migrations), or when the user asks for a plan or visible progress. Skip it when a few tool calls and thinking suffice — do not use it to organize your own thoughts. Send the FULL list on every call (it replaces the previous list); update when items resolve, batching several changes per call; at most one item may be in_progress. Items match by exact text; if an update drops unfinished items, the result names them — re-add if unintended, otherwise ignore the note (that was a reword, split, or abandonment).",
+      "Record a plan that must outlive the context window. Use for work that will span many tool calls or a likely compaction (multi-file changes, long test/fix loops, migrations), or when the user asks for a plan or visible progress. Skip it when a few tool calls and thinking suffice — do not use it to organize your own thoughts. Send the FULL list on every call (it replaces the previous list); update when items resolve, batching several changes per call; several items may be in_progress at once for parallel work — mark each completed or cancelled as it finishes (the result notes while more than one is active). Items match by exact text; if an update drops unfinished items, the result names them — re-add if unintended, otherwise ignore the note (that was a reword, split, or abandonment).",
     parameters: TodoParams,
     async execute(_id, params) {
       const { todos: next, error } = validateTodoList(params.todos);
@@ -503,12 +507,21 @@ export function registerTodoTool(pi: ExtensionAPI): void {
       pi.appendEntry(TODO_STATE_TYPE, { todos: todos.map((t) => ({ ...t })) });
       turnsSinceUpdate = 0;
       compactedSinceUpdate = false;
-      const note =
-        dropped.length > 0
-          ? `Note: dropped unfinished item(s): ${dropped.map((t) => `"${t.content}"`).join(", ")}. Re-add them if unintended; otherwise ignore this note.\n`
-          : "";
+      // Level-triggered, like the drop note: fires on every update that still
+      // holds parallel in_progress items, and stops the moment they resolve.
+      const notes: string[] = [];
+      if (dropped.length > 0)
+        notes.push(
+          `Note: dropped unfinished item(s): ${dropped.map((t) => `"${t.content}"`).join(", ")}. Re-add them if unintended; otherwise ignore this note.`,
+        );
+      const activeCount = todos.filter((t) => t.status === "in_progress").length;
+      if (activeCount > 1)
+        notes.push(
+          `Note: ${activeCount} items are in_progress — mark each completed or cancelled as it finishes so the plan stays current.`,
+        );
+      const prefix = notes.length > 0 ? `${notes.join("\n")}\n` : "";
       return {
-        content: [{ type: "text", text: note + renderPlainList(todos) }],
+        content: [{ type: "text", text: prefix + renderPlainList(todos) }],
         details: { todos: [...todos], changes } as TodoDetails,
       };
     },

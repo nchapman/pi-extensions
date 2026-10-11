@@ -107,9 +107,10 @@ describe("validateTodoList", () => {
     expect(todos).toEqual([]);
   });
 
-  it("rejects more than one in_progress item", () => {
-    const { error } = validateTodoList([item("a", "in_progress"), item("b", "in_progress")]);
-    expect(error).toContain("at most one todo may be in_progress");
+  it("accepts parallel in_progress items", () => {
+    const { todos, error } = validateTodoList([item("a", "in_progress"), item("b", "in_progress")]);
+    expect(error).toBeUndefined();
+    expect(todos).toHaveLength(2);
   });
 
   it("rejects invalid statuses", () => {
@@ -146,7 +147,12 @@ describe("validateTodoList", () => {
 describe("summarizeTodos", () => {
   it("counts completed and cancelled items as resolved", () => {
     const todos = [item("a", "completed"), item("b", "in_progress"), item("c"), item("d", "cancelled")];
-    expect(summarizeTodos(todos)).toEqual({ resolved: 2, total: 4, active: item("b", "in_progress") });
+    expect(summarizeTodos(todos)).toEqual({ resolved: 2, total: 4, active: [item("b", "in_progress")] });
+  });
+
+  it("collects every in_progress item, not just the first", () => {
+    const todos = [item("a", "in_progress"), item("b", "in_progress"), item("c")];
+    expect(summarizeTodos(todos).active).toEqual([item("a", "in_progress"), item("b", "in_progress")]);
   });
 });
 
@@ -197,6 +203,12 @@ describe("renderTodoCall", () => {
   it("shows the first pending item as next when nothing is active", () => {
     const text = renderTodoCall({ todos: [item("a", "completed"), item("fix review", "pending")] }, THEME);
     expect(text).toContain("next: fix review");
+  });
+
+  it("counts parallel active items in the collapsed row", () => {
+    const text = renderTodoCall({ todos: [item("a", "in_progress"), item("b", "in_progress"), item("c")] }, THEME);
+    expect(text).toContain("a");
+    expect(text).toContain("+1");
   });
 
   it("marks a fully resolved list", () => {
@@ -259,6 +271,13 @@ describe("renderTodoResult", () => {
     const todos = [item("a", "completed"), item("b", "in_progress")];
     const text = renderTodoResult({ todos }, { expanded: false }, THEME);
     expect(text).toContain("1/2 ▸ b");
+  });
+
+  it("falls back to the first active item plus a count for parallel work", () => {
+    const todos = [item("a", "in_progress"), item("b", "in_progress")];
+    const text = renderTodoResult({ todos }, { expanded: false }, THEME);
+    expect(text).toContain("▸ a");
+    expect(text).toContain("+1");
   });
 
   it("shows the full checklist when expanded", () => {
@@ -391,6 +410,48 @@ describe("registerTodoTool", () => {
     expect(result.details.changes).toEqual({ completed: ["a"], started: [], added: [], cancelled: [] });
   });
 
+  it("accepts parallel in_progress items, noting them until they resolve", async () => {
+    const { pi, tools } = makePi();
+    registerTodoTool(pi);
+    const tool = tools.get(TODO_TOOL_NAME)!;
+
+    const parallel = (await tool.execute("1", {
+      todos: [item("review api", "in_progress"), item("write tests", "in_progress")],
+    })) as { content: Array<{ type: string; text: string }>; details: TodoDetails };
+    expect(parallel.details.error).toBeUndefined();
+    expect(parallel.details.todos).toHaveLength(2);
+    expect(parallel.content[0].text).toContain("2 items are in_progress");
+    expect(parallel.content[0].text).toContain("completed or cancelled");
+
+    // The note persists while the parallel state does.
+    const still = (await tool.execute("2", {
+      todos: [item("review api", "in_progress"), item("write tests", "in_progress"), item("docs")],
+    })) as { content: Array<{ type: string; text: string }> };
+    expect(still.content[0].text).toContain("2 items are in_progress");
+
+    // And disappears once a single item is active again.
+    const settled = (await tool.execute("3", {
+      todos: [item("review api", "completed"), item("write tests", "in_progress"), item("docs")],
+    })) as { content: Array<{ type: string; text: string }> };
+    expect(settled.content[0].text).not.toContain("items are in_progress");
+  });
+
+  it("carries the drop note and the parallel note together, on separate lines", async () => {
+    const { pi, tools } = makePi();
+    registerTodoTool(pi);
+    const tool = tools.get(TODO_TOOL_NAME)!;
+    await tool.execute("1", { todos: [item("refactor auth", "in_progress")] });
+
+    // Split the item into two parallel sub-tasks, starting both at once.
+    const result = (await tool.execute("2", {
+      todos: [item("extract validator", "in_progress"), item("update call sites", "in_progress")],
+    })) as { content: Array<{ type: string; text: string }> };
+    const [dropNote, parallelNote, ...list] = result.content[0].text.split("\n");
+    expect(dropNote).toContain('dropped unfinished item(s): "refactor auth"');
+    expect(parallelNote).toContain("2 items are in_progress");
+    expect(list[0]).toBe("0/2 resolved");
+  });
+
   it("rejects invalid lists but returns the current state", async () => {
     const { pi, tools } = makePi();
     registerTodoTool(pi);
@@ -398,7 +459,7 @@ describe("registerTodoTool", () => {
 
     await tool.execute("1", { todos: [item("a", "in_progress")] });
     const result = (await tool.execute("2", {
-      todos: [item("a", "in_progress"), item("b", "in_progress")],
+      todos: [{ content: "b", status: "finished" }],
     })) as { content: Array<{ type: string; text: string }>; details: TodoDetails };
 
     expect(result.content[0].text).toContain("Error:");
@@ -455,7 +516,7 @@ describe("registerTodoTool", () => {
 
     // A rejected update reports the current (reconstructed) state unchanged.
     const result = (await tools.get(TODO_TOOL_NAME)!.execute("1", {
-      todos: [item("x", "in_progress"), item("y", "in_progress")],
+      todos: [{ content: "x", status: "wat" }],
     })) as { details: TodoDetails };
     expect(result.details.todos).toEqual([item("new", "completed")]);
   });
@@ -467,7 +528,7 @@ describe("registerTodoTool", () => {
     fire(events, "session_tree", sessionCtx([[item("branched")]]));
 
     const result = (await tools.get(TODO_TOOL_NAME)!.execute("1", {
-      todos: [item("x", "in_progress"), item("y", "in_progress")],
+      todos: [{ content: "x", status: "wat" }],
     })) as { details: TodoDetails };
     expect(result.details.todos).toEqual([item("branched")]);
   });
@@ -755,7 +816,7 @@ describe("registerTodoTool", () => {
 
     for (let i = 0; i < REMINDER_MIN_TURNS - 1; i++) fire(events, "before_agent_start");
     // A rejected update must not count as keeping the plan current.
-    await tools.get(TODO_TOOL_NAME)!.execute("2", { todos: [item("a", "in_progress"), item("b", "in_progress")] });
+    await tools.get(TODO_TOOL_NAME)!.execute("2", { todos: [{ content: "a", status: "wat" }] });
     const reminder = fire(events, "before_agent_start") as { message: { content: string } };
     expect(reminder.message.content).toContain("[>] a");
   });
