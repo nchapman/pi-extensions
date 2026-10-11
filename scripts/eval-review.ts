@@ -16,6 +16,15 @@
  *   EVAL_REJUDGE=path re-judge an existing run JSONL with the current judge
  *                     (no finder re-spend; writes <path>-rejudged.jsonl) —
  *                     judge changes iterate against frozen findings
+ *   EVAL_VERIFY_REPLAY=path  replay the verify stage over a frozen (verify-off)
+ *                     run's findings — a paired on/off A/B: the frozen findings
+ *                     ARE the candidates the verifier would have seen, so
+ *                     recall/noise deltas are attributable to verification
+ *                     alone, at ~1/5 the cost of a second full run. Survivors
+ *                     are re-judged (default: the frozen run's judge model);
+ *                     writes <path>-verified.jsonl. The verify model follows
+ *                     PI_REVIEW_VERIFY_MODEL/PI_REVIEW_MODEL — the same
+ *                     resolution as /review.
  *
  * Spawns real pi children (finders, verifier, judge) — never part of npm test.
  * Results flush incrementally to scripts/eval/results/run-<ts>.jsonl (one line
@@ -30,17 +39,25 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { defaultSpawn, runChild } from "../extensions/subagents";
+import { defaultSpawn, resolveChildModel, runChild, type ChildUsage } from "../extensions/subagents";
 import {
+  applyVerdicts,
   DEFAULT_REVIEW_MODEL,
   fitTask,
   parseReviewConfig,
+  parseVerdicts,
   runReview,
+  verifyAgent,
+  verifyTask,
+  withStallRetry,
   type Finding,
   type ReviewConfig,
   type ReviewDeps,
+  type Verdict,
+  type VerifiedBundle,
 } from "../extensions/review";
 import {
+  aggregateVerify,
   computeMetrics,
   heuristicMatches,
   judgeAgent,
@@ -48,12 +65,16 @@ import {
   leftovers,
   loadBench,
   parseJudge,
+  rebuildVerifyDiff,
   renderSummary,
+  renderVerifyCompare,
   sampleFixtures,
   sectionForFixture,
+  verifyRowStats,
   type GoldenIssue,
   type JudgeAudit,
   type PrResult,
+  type VerifyReplayRow,
 } from "./eval-common";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -72,6 +93,11 @@ const ONLY = env.EVAL_ONLY?.trim()
   : [];
 const JUDGE_MODEL = env.EVAL_JUDGE_MODEL?.trim() || undefined;
 const REJUDGE = env.EVAL_REJUDGE?.trim() || "";
+/** Replay the verify stage over a frozen run's findings (paired on/off A/B —
+ * see the header). Points at a run JSONL; its sibling .json meta supplies the
+ * frozen run's judge model so before/after matching differs only by the
+ * findings, not by the judge. */
+const VERIFY_REPLAY = env.EVAL_VERIFY_REPLAY?.trim() || "";
 /** PRs reviewed concurrently (1 = today's serial default; 2 halves wall time
  * at flat token cost — bounded to 3 so a stuck provider can't fan out wildly). */
 const CONCURRENCY = Math.max(1, Math.min(3, Number(env.EVAL_CONCURRENCY ?? 1) || 1));
@@ -181,7 +207,7 @@ function effectiveModel(): string {
 }
 
 describe("eval: review pipeline on code-review-bench", () => {
-  it.skipIf(!!REJUDGE)(
+  it.skipIf(!!REJUDGE || !!VERIFY_REPLAY)(
     "reviews the sampled PRs and scores against golden issues",
     { timeout: 24 * 60 * 60_000 },
     async () => {
@@ -328,6 +354,9 @@ describe("eval: review pipeline on code-review-bench", () => {
               seed: SEED,
               judge: JUDGE,
               model,
+              // Attribution: a PI_REVIEW_VERIFY=1 run must be distinguishable
+              // from a verify-off one in the results file.
+              verify: config.verify,
               judgeModel: judgeModel ?? "(pi global default)",
               date: new Date().toISOString(),
             },
@@ -399,6 +428,144 @@ describe("eval: review pipeline on code-review-bench", () => {
       }
       console.log(`\nrecall: ${beforeCaught} → ${afterCaught} of ${issueTotal}`);
       expect(afterCaught).toBeGreaterThanOrEqual(0);
+    },
+  );
+
+  // Verify A/B mode: the verify stage replayed over a frozen verify-off run's
+  // findings — the frozen-inputs discipline of REJUDGE applied to the pipeline
+  // stage it measures. Finders never re-run: the frozen findings ARE the
+  // candidates the verifier would have seen, so recall/noise deltas are
+  // attributable to verification alone. Fail-open is preserved row by row (a
+  // dead verifier leaves findings unchanged and is disclosed as fail-open).
+  it.skipIf(!VERIFY_REPLAY)(
+    "replays the verify stage over a frozen run's findings",
+    { timeout: 24 * 60 * 60_000 },
+    async () => {
+      type Row = Omit<PrResult, "caught"> & { caught: [number, number][] } & { judge?: JudgeAudit };
+      const rows = readFileSync(VERIFY_REPLAY, "utf8")
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as Row);
+      const byUrl = new Map(loadBench(DATA_DIR).map((f) => [f.prUrl, f]));
+      // Judge consistency: default to the model the frozen run was judged
+      // with (sibling .json meta), so before/after matching differs only by
+      // the findings, not by the judge.
+      let judgeModel = JUDGE_MODEL;
+      if (!judgeModel) {
+        try {
+          const meta = JSON.parse(readFileSync(VERIFY_REPLAY.replace(/\.jsonl$/, ".json"), "utf8")).meta;
+          judgeModel = meta?.judgeModel && meta.judgeModel !== "(pi global default)" ? meta.judgeModel : undefined;
+        } catch {
+          // no sibling meta — fall back to the finders' model
+        }
+      }
+      const config = parseReviewConfig({ ...env, PI_REVIEW_STATE: "0" });
+      const vAgent = verifyAgent();
+      // Same model resolution as runReview's verify stage.
+      const verifyModel = resolveChildModel(config.verifyModel ?? config.model ?? vAgent.model, null);
+      console.log(
+        `verify replay: ${rows.length} PRs from ${VERIFY_REPLAY}, verify model=${verifyModel ?? "(pi global default)"}, judge model=${judgeModel ?? "(pi global default)"}`,
+      );
+      const outPath = `${VERIFY_REPLAY.replace(/\.jsonl$/, "")}-verified.jsonl`;
+      const before: PrResult[] = [];
+      const after: PrResult[] = [];
+      const replayRows: VerifyReplayRow[] = [];
+
+      for (const row of rows) {
+        const key = row.prUrl.replace(/\/$/, "").split("/").slice(-2).join("/");
+        const fixture = byUrl.get(row.prUrl);
+        if (!fixture) throw new Error(`verify replay: no fixture diff for ${row.prUrl}`);
+        const caughtBefore = new Map(row.caught);
+        const candidates = row.findings.map((f) => ({
+          ...f,
+          recommendation: f.recommendation ?? undefined,
+        })) as Finding[];
+        before.push({ ...row, caught: caughtBefore });
+
+        // Eval fidelity: guidelines/priors/check output are all empty in this
+        // harness (empty root, PI_REVIEW_STATE=0, no check cmd) — the verify
+        // stage sees exactly what it saw in the frozen run's world.
+        let bundle: VerifiedBundle = { findings: candidates, rejected: [], unverified: false };
+        let verdicts: Verdict[] | null = null;
+        let verifyUsage: ChildUsage | undefined;
+        let verifyMs = 0;
+        if (candidates.length > 0) {
+          const { task } = fitTask(
+            (diff) => verifyTask({ diffText: diff, guidelines: "", checkOutput: "", priorFindings: "", candidates }),
+            rebuildVerifyDiff(fixture.diff),
+          );
+          const startedAt = Date.now();
+          try {
+            const run = await withStallRetry(
+              { label: `verifier ${key}`, notify: (message) => console.log(`  [${key}] ${message}`) },
+              () =>
+                runChild(vAgent, task, verifyModel, {
+                  timeoutMs: config.timeoutMs,
+                  idleTimeoutMs: config.idleTimeoutMs,
+                }),
+            );
+            if ("adopted" in run) throw new Error("verifier child was adopted, not run");
+            verifyUsage = run.usage;
+            verdicts = parseVerdicts(run.text);
+            bundle = applyVerdicts(candidates, verdicts);
+          } catch (err) {
+            // Pipeline semantics: a failed verifier fails open — findings stand,
+            // labeled unverified. The replay records the row as fail-open.
+            console.log(`  [${key}] verifier failed (${err instanceof Error ? err.message : String(err)}) — fail open`);
+            bundle = { findings: candidates, rejected: [], unverified: true };
+          }
+          verifyMs = Date.now() - startedAt;
+        }
+        const capped = bundle.findings.slice(0, config.maxFindings);
+        const judged = await judgeFindings(capped, row.issues, judgeModel, key);
+        const stats = verifyRowStats(candidates, verdicts, bundle.rejected, new Set(row.caught.map(([, fi]) => fi)));
+        after.push({
+          ...row,
+          findings: capped,
+          caught: judged.caught,
+          matcher: judged.matcher,
+          judge: judged.audit,
+          // After-side spend = frozen run + verify stage + fresh judge; wall
+          // time adds verify only (judge time is already inside the frozen
+          // figure — the verify stage line below is the decision number).
+          totalTokens: (row.totalTokens ?? 0) + (verifyUsage?.totalTokens ?? 0) + (judged.tokens ?? 0),
+          cost: (row.cost ?? 0) + (verifyUsage?.cost.total ?? 0) + (judged.cost ?? 0),
+          durationMs: row.durationMs + verifyMs,
+        });
+        const replayRow: VerifyReplayRow = {
+          prUrl: row.prUrl,
+          ...stats,
+          tokens: verifyUsage?.totalTokens,
+          cost: verifyUsage?.cost.total,
+          durationMs: verifyMs,
+        };
+        replayRows.push(replayRow);
+        console.log(
+          `  ${key}: ${stats.rejected} rejected (${stats.rejectedMatched} golden-matched), ${stats.downgraded} downgraded — findings ${row.findings.length} → ${capped.length}${stats.unverified ? " [FAIL OPEN]" : ""}`,
+        );
+        appendFileSync(
+          outPath,
+          JSON.stringify({
+            prUrl: row.prUrl,
+            stats: replayRow,
+            verdicts,
+            before: { findings: row.findings.length, caught: [...caughtBefore.entries()] },
+            after: {
+              findings: capped.length,
+              caught: [...judged.caught.entries()],
+              matcher: judged.matcher,
+              judge: judged.audit,
+            },
+          }) + "\n",
+        );
+      }
+
+      const metricsBefore = computeMetrics(before);
+      const metricsAfter = computeMetrics(after);
+      console.log("\n=== verify A/B — stage replayed over frozen findings ===");
+      console.log(renderVerifyCompare(metricsBefore, metricsAfter, aggregateVerify(replayRows)));
+      console.log(`\nresults: ${outPath}`);
+      expect(after.length).toBeGreaterThan(0);
     },
   );
 });

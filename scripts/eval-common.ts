@@ -21,7 +21,8 @@
 import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import type { AgentDef } from "../extensions/subagents";
-import type { DiffSection, Finding } from "../extensions/review";
+import { isExcludedPath, splitDiffFiles } from "../extensions/review";
+import type { DiffSection, Finding, Verdict } from "../extensions/review";
 
 export interface GoldenIssue {
   pr_url: string;
@@ -380,4 +381,166 @@ export function renderSummary(metrics: EvalMetrics): string {
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Verify replay: paired A/B over a frozen run's findings
+// ---------------------------------------------------------------------------
+
+/** The diff text the verifier sees in production: non-excluded per-file
+ * blocks joined — exactly runReview's verify input. Pure so the replay's
+ * fidelity to the pipeline is testable (the replay must not feed the verifier
+ * anything the pipeline wouldn't). */
+export function rebuildVerifyDiff(rawDiff: string): string {
+  return splitDiffFiles(rawDiff)
+    .filter((f) => !isExcludedPath(f.path))
+    .map((f) => f.text)
+    .join("\n");
+}
+
+export interface VerifyRowStats {
+  candidates: number;
+  confirmed: number;
+  downgraded: number;
+  rejected: number;
+  /** Rejected candidates the frozen run's judge had matched to a golden issue
+   * — recall damage attributable to verification, independent of the
+   * after-judge (which can only confirm it). */
+  rejectedMatched: number;
+  /** Candidates no in-range verdict covered (verifier skipped or missed ids). */
+  noVerdict: number;
+  /** Verifier produced no usable verdicts — the pipeline's fail-open row. */
+  unverified: boolean;
+}
+
+/** Tally one replayed PR from the raw pieces: the candidates as sent, the
+ * verdicts parsed from the verifier's output, the rejected list applyVerdicts
+ * returned (its findings are the same references as the candidates, so
+ * identity maps back to indices), and the frozen run's judge matches (finding
+ * indices). Zero candidates means verify never ran — not a failure. */
+export function verifyRowStats(
+  candidates: Finding[],
+  verdicts: Verdict[] | null,
+  rejected: Array<{ finding: Finding }>,
+  matchedFindingIdx: Set<number>,
+): VerifyRowStats {
+  const zero = {
+    candidates: candidates.length,
+    confirmed: 0,
+    downgraded: 0,
+    rejected: 0,
+    rejectedMatched: 0,
+    noVerdict: 0,
+    unverified: false,
+  };
+  if (candidates.length === 0 || verdicts === null) {
+    return { ...zero, noVerdict: candidates.length, unverified: candidates.length > 0 };
+  }
+  // Last in-range verdict per id wins — applyVerdicts' byId semantics — so a
+  // duplicated id cannot double-count a verdict.
+  const byId = new Map<number, Verdict>();
+  for (const v of verdicts) if (v.id >= 1 && v.id <= candidates.length) byId.set(v.id, v);
+  let confirmed = 0;
+  let downgraded = 0;
+  for (const v of byId.values()) {
+    if (v.verdict === "confirmed") confirmed++;
+    else if (v.verdict === "downgraded") downgraded++;
+  }
+  // Rejected comes from the applied bundle (authoritative), identity-mapped
+  // back to candidate indices for the recall-damage count.
+  let rejectedMatched = 0;
+  for (const r of rejected) {
+    if (matchedFindingIdx.has(candidates.indexOf(r.finding))) rejectedMatched++;
+  }
+  return {
+    ...zero,
+    confirmed,
+    downgraded,
+    rejected: rejected.length,
+    rejectedMatched,
+    noVerdict: candidates.length - byId.size,
+  };
+}
+
+/** One replayed PR row plus its verify-stage spend (verifier child only —
+ * judge spend stays in the PrResult it belongs to). */
+export interface VerifyReplayRow extends VerifyRowStats {
+  prUrl: string;
+  tokens?: number;
+  cost?: number;
+  durationMs: number;
+}
+
+export interface VerifyAggregate {
+  prs: number;
+  /** Rows where the verifier was unusable — the pipeline fails open there. */
+  failOpen: number;
+  candidates: number;
+  confirmed: number;
+  downgraded: number;
+  rejected: number;
+  rejectedMatched: number;
+  noVerdict: number;
+  verifyTokens?: number;
+  verifyCost?: number;
+  verifyDurationMs: number;
+}
+
+export function aggregateVerify(rows: VerifyReplayRow[]): VerifyAggregate {
+  const agg: VerifyAggregate = {
+    prs: 0,
+    failOpen: 0,
+    candidates: 0,
+    confirmed: 0,
+    downgraded: 0,
+    rejected: 0,
+    rejectedMatched: 0,
+    noVerdict: 0,
+    verifyDurationMs: 0,
+  };
+  for (const r of rows) {
+    agg.prs++;
+    if (r.unverified) agg.failOpen++;
+    agg.candidates += r.candidates;
+    agg.confirmed += r.confirmed;
+    agg.downgraded += r.downgraded;
+    agg.rejected += r.rejected;
+    agg.rejectedMatched += r.rejectedMatched;
+    agg.noVerdict += r.noVerdict;
+    agg.verifyDurationMs += r.durationMs;
+    if (r.tokens !== undefined) agg.verifyTokens = (agg.verifyTokens ?? 0) + r.tokens;
+    if (r.cost !== undefined) agg.verifyCost = (agg.verifyCost ?? 0) + r.cost;
+  }
+  return agg;
+}
+
+/** Side-by-side of the frozen (verify-off) metrics and the post-verify
+ * metrics, with the verify stage's own spend — the on/off decision on one
+ * screen. Wall/token percentages compare the verify stage against the frozen
+ * run's totals (which include its judge; disclosed approximation). */
+export function renderVerifyCompare(before: EvalMetrics, after: EvalMetrics, agg: VerifyAggregate): string {
+  const pct = (x: number) => `${(x * 100).toFixed(1)}%`;
+  const prs = Math.max(1, agg.prs);
+  const verdicted = agg.confirmed + agg.downgraded + agg.rejected;
+  const wallPct = before.durationMs > 0 ? `+${Math.round((agg.verifyDurationMs / before.durationMs) * 100)}% wall` : "";
+  const tokPct =
+    before.totalTokens && agg.verifyTokens
+      ? `+${Math.round((agg.verifyTokens / before.totalTokens) * 100)}% tokens`
+      : "";
+  const spend = [
+    `+${Math.round(agg.verifyDurationMs / prs / 1000)}s/PR`,
+    agg.verifyTokens !== undefined ? `+${Math.round(agg.verifyTokens / prs / 1000)}k tokens/PR` : "",
+    agg.verifyCost !== undefined ? `+$${(agg.verifyCost / prs).toFixed(3)}/PR` : "",
+  ]
+    .filter(Boolean)
+    .join(", ");
+  return [
+    `PRs:               ${agg.prs}${agg.failOpen ? ` (${agg.failOpen} fail-open row(s) — findings unchanged)` : ""}`,
+    `Verdicts:          ${verdicted} verdicted — ${agg.confirmed} confirmed, ${agg.downgraded} downgraded, ${agg.rejected} rejected (${agg.rejectedMatched} had matched a golden issue); ${agg.noVerdict} no verdict`,
+    `Recall:            ${pct(before.recall)} → ${pct(after.recall)} (${before.issuesCaught}/${before.issuesTotal} → ${after.issuesCaught}/${after.issuesTotal})`,
+    `  Critical/High:   ${pct(before.recallCriticalHigh)} → ${pct(after.recallCriticalHigh)}`,
+    `  Medium/Low:      ${pct(before.recallMediumLow)} → ${pct(after.recallMediumLow)}`,
+    `Findings per PR:   ${before.findingsPerPr.toFixed(1)} → ${after.findingsPerPr.toFixed(1)} (unmatched: ${before.unmatchedPerPr.toFixed(1)} → ${after.unmatchedPerPr.toFixed(1)} — noise proxy)`,
+    `Verify stage:      ${spend}${wallPct || tokPct ? ` (${[wallPct, tokPct].filter(Boolean).join(", ")} vs the frozen run)` : ""}`,
+  ].join("\n");
 }

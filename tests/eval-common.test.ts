@@ -2,8 +2,10 @@ import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import type { Finding } from "../extensions/review";
+import { applyVerdicts, parseVerdicts } from "../extensions/review";
+import type { Finding, Verdict } from "../extensions/review";
 import {
+  aggregateVerify,
   computeMetrics,
   heuristicMatches,
   judgeTask,
@@ -12,10 +14,14 @@ import {
   parseJudge,
   prKeyFromUrl,
   loadBench,
+  rebuildVerifyDiff,
   renderSummary,
+  renderVerifyCompare,
   sampleFixtures,
+  verifyRowStats,
   type GoldenIssue,
   type PrResult,
+  type VerifyReplayRow,
 } from "../scripts/eval-common";
 
 const issue = (over: Partial<GoldenIssue> = {}): GoldenIssue => ({
@@ -185,5 +191,170 @@ describe("computeMetrics + renderSummary", () => {
     const m = computeMetrics([]);
     expect(m.recall).toBe(0);
     expect(() => renderSummary(m)).not.toThrow();
+  });
+});
+
+describe("verify replay helpers", () => {
+  const fileDiff = (p: string, body: string) =>
+    [`diff --git a/${p} b/${p}`, `--- a/${p}`, `+++ b/${p}`, "@@ -1 +1 @@", body].join("\n");
+
+  it("rebuildVerifyDiff mirrors the pipeline's verify input: exclusion applied, file blocks joined", () => {
+    const raw = [
+      "junk before the first header is dropped",
+      fileDiff("src/a.ts", "-x\n+y"),
+      fileDiff("package-lock.json", "-1\n+2"),
+      fileDiff("src/b.ts", "-y\n+z"),
+    ].join("\n");
+    expect(rebuildVerifyDiff(raw)).toBe(`${fileDiff("src/a.ts", "-x\n+y")}\n${fileDiff("src/b.ts", "-y\n+z")}`);
+    expect(rebuildVerifyDiff("")).toBe("");
+  });
+
+  it("verifyRowStats tallies verdicts by applyVerdicts semantics and attributes recall damage", () => {
+    const a = finding({ title: "A" });
+    const b = finding({ title: "B" });
+    const c = finding({ title: "C" });
+    const verdicts = parseVerdicts(
+      "```json\n[" +
+        '{"id":1,"verdict":"confirmed","reason":"traced"},' +
+        '{"id":2,"verdict":"downgraded","severity":"suggestion","reason":"overstated"},' +
+        '{"id":3,"verdict":"rejected","reason":"guarded elsewhere"}]\n```',
+    ) as Verdict[];
+    const bundle = applyVerdicts([a, b, c], verdicts);
+    // candidate 3 (index 2) was golden-matched in the frozen run
+    const stats = verifyRowStats([a, b, c], verdicts, bundle.rejected, new Set([2]));
+    expect(stats).toEqual({
+      candidates: 3,
+      confirmed: 1,
+      downgraded: 1,
+      rejected: 1,
+      rejectedMatched: 1,
+      noVerdict: 0,
+      unverified: false,
+    });
+  });
+
+  it("verifyRowStats: duplicated ids last-wins, out-of-range ids count as no verdict, null means fail-open", () => {
+    const a = finding({ title: "A" });
+    const b = finding({ title: "B" });
+    const dup = parseVerdicts(
+      "```json\n[" +
+        '{"id":1,"verdict":"confirmed","reason":"x"},' +
+        '{"id":1,"verdict":"rejected","reason":"second verdict wins"},' +
+        '{"id":9,"verdict":"rejected","reason":"hallucinated id"}]\n```',
+    ) as Verdict[];
+    const bundle = applyVerdicts([a, b], dup);
+    expect(verifyRowStats([a, b], dup, bundle.rejected, new Set())).toMatchObject({
+      confirmed: 0,
+      downgraded: 0,
+      rejected: 1, // candidate 1 only — the id:9 verdict was out of range
+      noVerdict: 1, // candidate 2
+      unverified: false,
+    });
+    // unparseable verifier output: fail-open, everything stands
+    expect(verifyRowStats([a, b], null, [], new Set())).toMatchObject({
+      candidates: 2,
+      unverified: true,
+      noVerdict: 2,
+    });
+    // zero candidates: verify never ran — not a failure
+    expect(verifyRowStats([], null, [], new Set())).toEqual({
+      candidates: 0,
+      confirmed: 0,
+      downgraded: 0,
+      rejected: 0,
+      rejectedMatched: 0,
+      noVerdict: 0,
+      unverified: false,
+    });
+  });
+
+  it("aggregates replay rows and renders the paired before/after table", () => {
+    const rows: VerifyReplayRow[] = [
+      {
+        prUrl: "u1",
+        candidates: 3,
+        confirmed: 2,
+        downgraded: 1,
+        rejected: 0,
+        rejectedMatched: 0,
+        noVerdict: 0,
+        unverified: false,
+        tokens: 100_000,
+        cost: 0.02,
+        durationMs: 120_000,
+      },
+      {
+        prUrl: "u2",
+        candidates: 2,
+        confirmed: 0,
+        downgraded: 0,
+        rejected: 2,
+        rejectedMatched: 1,
+        noVerdict: 0,
+        unverified: false,
+        tokens: 80_000,
+        cost: 0.01,
+        durationMs: 100_000,
+      },
+    ];
+    const agg = aggregateVerify(rows);
+    expect(agg).toMatchObject({
+      prs: 2,
+      failOpen: 0,
+      candidates: 5,
+      confirmed: 2,
+      downgraded: 1,
+      rejected: 2,
+      rejectedMatched: 1,
+      verifyTokens: 180_000,
+      verifyCost: 0.03,
+      verifyDurationMs: 220_000,
+    });
+    const before = computeMetrics([
+      {
+        prUrl: "u1",
+        issues: [issue()],
+        findings: [finding()],
+        caught: new Map([[1, 0]]),
+        matcher: "judge",
+        durationMs: 200_000,
+        totalTokens: 400_000,
+      },
+    ]);
+    const after = computeMetrics([
+      {
+        prUrl: "u1",
+        issues: [issue()],
+        findings: [],
+        caught: new Map(),
+        matcher: "judge",
+        durationMs: 320_000,
+        totalTokens: 500_000,
+      },
+    ]);
+    const text = renderVerifyCompare(before, after, agg);
+    expect(text).toContain("Recall:            100.0% → 0.0% (1/1 → 0/1)");
+    expect(text).toContain("1 had matched a golden issue");
+    expect(text).toContain("+110s/PR, +90k tokens/PR, +$0.015/PR");
+    expect(text).not.toContain("fail-open");
+  });
+
+  it("discloses fail-open rows in the compare table", () => {
+    const agg = aggregateVerify([
+      {
+        prUrl: "u",
+        candidates: 1,
+        confirmed: 0,
+        downgraded: 0,
+        rejected: 0,
+        rejectedMatched: 0,
+        noVerdict: 1,
+        unverified: true,
+        durationMs: 5_000,
+      },
+    ]);
+    expect(agg.failOpen).toBe(1);
+    const metrics = computeMetrics([]);
+    expect(renderVerifyCompare(metrics, metrics, agg)).toContain("1 fail-open row(s)");
   });
 });
