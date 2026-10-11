@@ -125,7 +125,7 @@ export interface ReviewConfig {
   verifyModel?: string;
   /** Read-only command whose output feeds verification ("" disables). */
   checkCmd: string;
-  /** Verification stage on/off (PI_REVIEW_VERIFY=1 opts in; off by default). */
+  /** Verification stage on/off (on by default; PI_REVIEW_VERIFY=0 opts out). */
   verify: boolean;
   /** Maximum findings in the final report. */
   maxFindings: number;
@@ -166,9 +166,16 @@ export function parseReviewConfig(env: NodeJS.ProcessEnv): ReviewConfig {
     model: env.PI_REVIEW_MODEL?.trim() || DEFAULT_REVIEW_MODEL,
     verifyModel: env.PI_REVIEW_VERIFY_MODEL?.trim() || undefined,
     checkCmd: env.PI_REVIEW_CHECK_CMD?.trim() ?? "",
-    // Verification off by default: the A/B on 20 PRs showed it costs ~half the
-    // wall time and buys no recall; opt back in with PI_REVIEW_VERIFY=1.
-    verify: ["1", "true", "on"].includes(String(env.PI_REVIEW_VERIFY ?? "").toLowerCase()),
+    // Verification on by default: the mechanism-only verifier (rejections
+    // require refuting the claim itself; scope doubt downgrades) measured
+    // zero verifier kills with noise cut 3.1→1.0 findings/PR at +70% wall/
+    // +39% tokens in the paired code-review-bench A/B — worth the tail on
+    // every review. Opt out with PI_REVIEW_VERIFY=0 (false/off also honored).
+    verify: !["0", "false", "off"].includes(
+      String(env.PI_REVIEW_VERIFY ?? "1")
+        .trim()
+        .toLowerCase(),
+    ),
     maxFindings: clampInt(env.PI_REVIEW_MAX_FINDINGS, 25, 1, 100),
     priorChars: clampInt(env.PI_REVIEW_PRIOR_CHARS, 8_000, 0, 32_000),
     persist: String(env.PI_REVIEW_STATE ?? "1") !== "0",
@@ -992,7 +999,7 @@ export function planFinderRuns(
 /** Render the final markdown report. */
 export function renderReport(opts: {
   targetLabel: string;
-  /** Verification deliberately off (default) — disclosed, not silent. */
+  /** Verification opted out via PI_REVIEW_VERIFY=0 — disclosed, not silent. */
   verifySkipped?: boolean;
   reviewedFiles: string[];
   /** Files in chunks no finder covered (child cap or failures) — disclosed, never listed as reviewed. */
@@ -1542,6 +1549,10 @@ export async function runReview(opts: {
     `Reviewing ${files.length} file(s) in ${chunks.length} chunk(s) with ${runs.length} finder run(s)…`,
     "info",
   );
+  // Per-finder progress: the wave is parallel and otherwise silent for its
+  // whole duration — with verification on by default the tail is longer
+  // still, so each finder landing is the user's signal the review is moving.
+  let finderDone = 0;
   const findResults = await runWithLimit(
     runs.map((run) => () => {
       const lens = lenses.get(run.lens)!;
@@ -1560,7 +1571,8 @@ export async function runReview(opts: {
           }),
         chunkText(run.chunk),
       );
-      return withStallRetry({ label: `finder ${run.lens}/${run.chunk}`, notify: deps.notify, signal }, () =>
+      const label = `finder ${run.lens}/${run.chunk}`;
+      return withStallRetry({ label, notify: deps.notify, signal }, () =>
         runChild(
           agent,
           task,
@@ -1568,6 +1580,16 @@ export async function runReview(opts: {
           { timeoutMs: config.timeoutMs, idleTimeoutMs: config.idleTimeoutMs, signal },
           deps.spawnFn,
         ),
+      ).then(
+        (r) => {
+          const outcome = "adopted" in r ? "backgrounded" : `${parseFindings(r.text, run.lens).length} finding(s)`;
+          deps.notify(`${label} done (${++finderDone}/${runs.length}): ${outcome}`, "info");
+          return r;
+        },
+        (err: unknown) => {
+          deps.notify(`${label} failed (${++finderDone}/${runs.length})`, "warning");
+          throw err;
+        },
       );
     }),
     Math.min(config.concurrency, runs.length) || 1,
@@ -1784,7 +1806,7 @@ export function registerReview(pi: ExtensionAPI, deps?: Partial<ReviewDeps>): vo
     name: "review",
     label: "Review",
     description:
-      "Run the multi-lens code-review pipeline (correctness, security, robustness, tests finders over a diff, then a deterministic merge) on local changes. Use it to review your own work before committing or when asked to review changes. target defaults to commits ahead of upstream plus uncommitted and untracked work; 'staged', 'tree' (uncommitted only), a ref like 'main', or a range like 'HEAD~3..HEAD' override. Returns one line per finding (severity, location, title); the full report with details and recommendations is written to .pi/review/<callId>.md (path included in the result) — read it for any finding you act on.",
+      "Run the multi-lens code-review pipeline (correctness, security, robustness, tests finders over a diff, adversarial verification of the merged candidates, then a deterministic merge) on local changes. Use it to review your own work before committing or when asked to review changes. target defaults to commits ahead of upstream plus uncommitted and untracked work; 'staged', 'tree' (uncommitted only), a ref like 'main', or a range like 'HEAD~3..HEAD' override. Returns one line per finding (severity, location, title); the full report with details and recommendations is written to .pi/review/<callId>.md (path included in the result) — read it for any finding you act on.",
     promptSnippet:
       "review — run the multi-lens review pipeline on a diff (default: ahead of upstream + working tree; or 'staged', 'tree', a ref, 'a..b'); returns compact findings, full report on disk",
     parameters: Type.Object({

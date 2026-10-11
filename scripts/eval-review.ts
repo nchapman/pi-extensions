@@ -17,7 +17,8 @@
  *                     (no finder re-spend; writes <path>-rejudged.jsonl) —
  *                     judge changes iterate against frozen findings
  *   EVAL_VERIFY_REPLAY=path  replay the verify stage over a frozen (verify-off)
- *                     run's findings — a paired on/off A/B: the frozen findings
+ *                     run's findings (record the baseline with
+ *                     PI_REVIEW_VERIFY=0 — verification is on by default) — a paired on/off A/B: the frozen findings
  *                     ARE the candidates the verifier would have seen, so
  *                     recall/noise deltas are attributable to verification
  *                     alone, at ~1/5 the cost of a second full run. Survivors
@@ -449,15 +450,25 @@ describe("eval: review pipeline on code-review-bench", () => {
       const byUrl = new Map(loadBench(DATA_DIR).map((f) => [f.prUrl, f]));
       // Judge consistency: default to the model the frozen run was judged
       // with (sibling .json meta), so before/after matching differs only by
-      // the findings, not by the judge.
+      // the findings, not by the judge. The same meta guards the baseline:
+      // a verify-on run's findings have already been through the verifier, so
+      // replaying over them re-confirms nearly everything and reads as
+      // "verification buys nothing" — the exact inverse of the truth.
       let judgeModel = JUDGE_MODEL;
+      let meta: { verify?: boolean; judgeModel?: string } | undefined;
+      try {
+        meta = JSON.parse(readFileSync(VERIFY_REPLAY.replace(/\.jsonl$/, ".json"), "utf8")).meta;
+      } catch {
+        // no sibling meta — fall back to the finders' model below
+      }
+      if (meta?.verify === true) {
+        throw new Error("verify replay: frozen run was verify-on — record the baseline with PI_REVIEW_VERIFY=0");
+      }
+      if (meta && meta.verify === undefined) {
+        console.log("verify replay: baseline predates the verify meta field — assuming verify-off (the old default)");
+      }
       if (!judgeModel) {
-        try {
-          const meta = JSON.parse(readFileSync(VERIFY_REPLAY.replace(/\.jsonl$/, ".json"), "utf8")).meta;
-          judgeModel = meta?.judgeModel && meta.judgeModel !== "(pi global default)" ? meta.judgeModel : undefined;
-        } catch {
-          // no sibling meta — fall back to the finders' model
-        }
+        judgeModel = meta?.judgeModel && meta.judgeModel !== "(pi global default)" ? meta.judgeModel : undefined;
       }
       const config = parseReviewConfig({ ...env, PI_REVIEW_STATE: "0" });
       const vAgent = verifyAgent();

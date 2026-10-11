@@ -245,6 +245,44 @@ describe("attachments", () => {
     expect(sliceAttachment("a\nb", [])).toBeNull(); // nothing to anchor on
   });
 
+  it("reports per-finder progress as the wave completes, and failures are named", async () => {
+    const notes: Array<{ message: string; level: string }> = [];
+    // Security lens exits nonzero: its completion line must say failed, not done.
+    const spawn = ((_c: string, args: string[], _o: unknown) => {
+      const task = String(args[args.lastIndexOf("--") + 1] ?? "");
+      return childWithMessage("[]", task.includes("Code review: Security") ? 1 : 0);
+    }) as SpawnFn;
+    const git = gitFor([
+      { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: "/repo\n", stderr: "" } },
+      {
+        match: (a) => a[a.length - 1] === "HEAD",
+        result: { code: 0, stdout: SAMPLE_DIFF, stderr: "" },
+      },
+    ]);
+    await runReview({
+      cwd: "/repo",
+      config: CONFIG({ verify: false }),
+      target: { kind: "uncommitted" },
+      deps: emptyDeps({
+        git,
+        spawnFn: spawn,
+        notify: (message: string, level: "info" | "warning" | "error") => notes.push({ message, level }),
+      }) as never,
+    });
+    const done = notes.filter((n) => /finder \S+ done \(/.test(n.message));
+    const failed = notes.filter((n) => /finder \S+ failed \(/.test(n.message));
+    expect(done).toHaveLength(3); // one chunk × four lenses, security failed
+    expect(failed).toHaveLength(1);
+    // Completion order across the parallel wave is nondeterministic — only the
+    // numbering's presence and range are the contract.
+    expect(failed[0].message).toMatch(/finder security\/0 failed \(\d\/4\)/);
+    expect(failed[0].level).toBe("warning");
+    expect(done.every((n) => n.level === "info" && n.message.includes("0 finding(s)"))).toBe(true);
+    // every completion is numbered, so progress is visible mid-wave
+    const nums = [...done, ...failed].map((n) => n.message.match(/\((\d)\/4\)/)?.[1]).sort();
+    expect(nums).toEqual(["1", "2", "3", "4"]);
+  });
+
   it("attaches changed files' current contents to every finder task", async () => {
     const spawn = fakeSpawn(() => "[]");
     const reads: string[] = [];
@@ -504,9 +542,9 @@ describe("parseReviewConfig", () => {
     expect(gaps).toContain("Coverage gaps: 1 file(s) unreviewed, 1 finder error(s).");
   });
 
-  it("defaults without env (verification off, the measured config)", () => {
+  it("defaults without env (verification on, the measured config)", () => {
     const c = parseReviewConfig({});
-    expect(c.verify).toBe(false);
+    expect(c.verify).toBe(true);
     expect(c.chunkChars).toBe(96_000);
     expect(c.attachChars).toBe(64_000);
     expect(c.maxChildren).toBe(8);
@@ -544,10 +582,14 @@ describe("parseReviewConfig", () => {
     expect(c.persist).toBe(false);
   });
 
-  it("falls back on garbage", () => {
+  it("falls back on garbage; verify opts out on 0/false/off", () => {
     const c = parseReviewConfig({ PI_REVIEW_VERIFY: "banana", PI_REVIEW_CHUNK_CHARS: "banana" });
-    expect(c.verify).toBe(false);
+    expect(c.verify).toBe(true); // garbage keeps the on-by-default
     expect(c.chunkChars).toBe(96_000);
+    for (const off of ["0", "false", "off", " 0 "]) {
+      expect(parseReviewConfig({ PI_REVIEW_VERIFY: off }).verify).toBe(false);
+    }
+    expect(parseReviewConfig({ PI_REVIEW_VERIFY: "1" }).verify).toBe(true);
   });
 
   it("treats blank env values as unset, not zero", () => {
@@ -1229,13 +1271,16 @@ describe("review tool", () => {
 });
 
 describe("runReview", () => {
-  it("parses the verify opt-in knob (off by default)", () => {
-    expect(parseReviewConfig({}).verify).toBe(false);
+  it("parses the verify opt-out knob (on by default)", () => {
+    expect(parseReviewConfig({}).verify).toBe(true);
     expect(parseReviewConfig({ PI_REVIEW_VERIFY: "1" }).verify).toBe(true);
     expect(parseReviewConfig({ PI_REVIEW_VERIFY: "true" }).verify).toBe(true);
     expect(parseReviewConfig({ PI_REVIEW_VERIFY: "0" }).verify).toBe(false);
-    expect(parseReviewConfig({ PI_REVIEW_VERIFY: "" }).verify).toBe(false);
-    expect(parseReviewConfig({ PI_REVIEW_VERIFY: "garbage" }).verify).toBe(false);
+    expect(parseReviewConfig({ PI_REVIEW_VERIFY: "false" }).verify).toBe(false);
+    // Blank and garbage keep the on-by-default (sibling-knob convention:
+    // unset/invalid falls to the default, only explicit opt-outs disable).
+    expect(parseReviewConfig({ PI_REVIEW_VERIFY: "" }).verify).toBe(true);
+    expect(parseReviewConfig({ PI_REVIEW_VERIFY: "garbage" }).verify).toBe(true);
   });
 
   it("skips verification when the knob is off and discloses it in the report", async () => {
