@@ -71,6 +71,7 @@ import {
   renderVerifyCompare,
   sampleFixtures,
   sectionForFixture,
+  verifyBaselineGate,
   verifyRowStats,
   type GoldenIssue,
   type JudgeAudit,
@@ -461,12 +462,9 @@ describe("eval: review pipeline on code-review-bench", () => {
       } catch {
         // no sibling meta — fall back to the finders' model below
       }
-      if (meta?.verify === true) {
-        throw new Error("verify replay: frozen run was verify-on — record the baseline with PI_REVIEW_VERIFY=0");
-      }
-      if (meta && meta.verify === undefined) {
-        console.log("verify replay: baseline predates the verify meta field — assuming verify-off (the old default)");
-      }
+      const gate = verifyBaselineGate(meta);
+      if (gate.fatal) throw new Error(`verify replay: ${gate.fatal}`);
+      if (gate.warn) console.log(`verify replay: ${gate.warn}`);
       if (!judgeModel) {
         judgeModel = meta?.judgeModel && meta.judgeModel !== "(pi global default)" ? meta.judgeModel : undefined;
       }

@@ -1340,6 +1340,7 @@ describe("runReview", () => {
     const big = `+${"x".repeat(9_000)}`;
     const multi = `diff --git a/src/big1.ts b/src/big1.ts\n@@ -0,0 +1 @@\n${big}\ndiff --git a/src/big2.ts b/src/big2.ts\n@@ -0,0 +1 @@\n${big}\n`;
     const controller = new AbortController();
+    const notes: Array<{ message: string; level: string }> = [];
     const spawn = fakeSpawn(() => {
       controller.abort();
       return "[]";
@@ -1353,12 +1354,18 @@ describe("runReview", () => {
         cwd: "/repo",
         config: CONFIG({ chunkChars: 8_000 }),
         target: { kind: "default" },
-        deps: emptyDeps({ git, spawnFn: spawn }) as never,
+        deps: emptyDeps({
+          git,
+          spawnFn: spawn,
+          notify: (message: string, level: "info" | "warning" | "error") => notes.push({ message, level }),
+        }) as never,
         signal: controller.signal,
       }),
     ).rejects.toThrow("review aborted");
     // first batch of four spawned; the queued four never did
     expect(spawn.tasks.length).toBeLessThan(8);
+    // the user's own cancel is not a finder failure — no 'failed' warnings fire
+    expect(notes.filter((n) => /finder \S+ failed \(/.test(n.message))).toEqual([]);
   });
 
   it("runs find → verify → report over the default target and persists state", async () => {

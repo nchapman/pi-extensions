@@ -18,6 +18,7 @@ import {
   renderSummary,
   renderVerifyCompare,
   sampleFixtures,
+  verifyBaselineGate,
   verifyRowStats,
   type GoldenIssue,
   type PrResult,
@@ -356,5 +357,16 @@ describe("verify replay helpers", () => {
     expect(agg.failOpen).toBe(1);
     const metrics = computeMetrics([]);
     expect(renderVerifyCompare(metrics, metrics, agg)).toContain("1 fail-open row(s)");
+  });
+
+  it("verifyBaselineGate: verify-on and meta-less baselines are fatal, pre-meta warns, verify-off is clean", () => {
+    // verify-on: already-verified findings would silently invert the A/B
+    expect(verifyBaselineGate({ verify: true }).fatal).toContain("verify-on");
+    // interrupted run: .jsonl flushed per-PR but .json never written — the
+    // likely verify-on case under the new default, and previously silent
+    expect(verifyBaselineGate(undefined).fatal).toContain("verify state unknown");
+    // runs recorded before the verify meta field existed (verify-off era)
+    expect(verifyBaselineGate({}).warn).toContain("assuming verify-off");
+    expect(verifyBaselineGate({ verify: false })).toEqual({});
   });
 });

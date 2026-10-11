@@ -1587,7 +1587,10 @@ export async function runReview(opts: {
           return r;
         },
         (err: unknown) => {
-          deps.notify(`${label} failed (${++finderDone}/${runs.length})`, "warning");
+          // A cancelled review rejects its in-flight children — that is the
+          // user's own Esc, not a finder failure; the abort surfaces through
+          // runReview's own path. withStallRetry uses the same check.
+          if (!signal?.aborted) deps.notify(`${label} failed (${++finderDone}/${runs.length})`, "warning");
           throw err;
         },
       );

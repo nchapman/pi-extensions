@@ -514,6 +514,30 @@ export function aggregateVerify(rows: VerifyReplayRow[]): VerifyAggregate {
   return agg;
 }
 
+/** Replay-baseline gate: a verify-on (or unknowable) baseline must not be
+ * replayed — the A/B would silently invert (already-verified findings
+ * re-confirm and read as "verification buys nothing"). Fatal means refuse to
+ * run; warn means proceed with a disclosure; empty is a clean verify-off
+ * baseline. Pure so the triage is pinned by tests. */
+export function verifyBaselineGate(meta: { verify?: boolean } | undefined): {
+  fatal?: string;
+  warn?: string;
+} {
+  if (meta?.verify === true) {
+    return { fatal: "frozen run was verify-on — record the baseline with PI_REVIEW_VERIFY=0" };
+  }
+  if (!meta) {
+    return {
+      fatal:
+        "no sibling .json meta for the frozen run — verify state unknown (interrupted run?); re-record the baseline with PI_REVIEW_VERIFY=0",
+    };
+  }
+  if (meta.verify === undefined) {
+    return { warn: "baseline predates the verify meta field — assuming verify-off (the old default)" };
+  }
+  return {};
+}
+
 /** Side-by-side of the frozen (verify-off) metrics and the post-verify
  * metrics, with the verify stage's own spend — the on/off decision on one
  * screen. Wall/token percentages compare the verify stage against the frozen
