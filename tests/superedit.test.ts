@@ -815,6 +815,139 @@ describe("not-found diagnostics", () => {
     expect(err).toContain("check the diff above for typos or drifted text");
   });
 
+  describe("adversarial inputs", () => {
+    it("folds fullwidth and combining-character forms on the normalized tier", () => {
+      // NFKC folds fullwidth Latin to ASCII and composes combining marks, so
+      // both must reach the normalized tier — forgiving where Unicode says
+      // the bytes are equivalent.
+      const r1 = apply("ABC def\n", [{ oldText: "ＡＢＣ def", newText: "X" }]);
+      expect(r1.applied[0]).toMatchObject({ tier: "normalized", occurrences: 1 });
+      expect(r1.newContent).toBe("X\n");
+      const r2 = apply("caf\u00e9 au lait\n", [{ oldText: "cafe\u0301 au lait", newText: "X" }]);
+      expect(r2.applied[0]).toMatchObject({ tier: "normalized", occurrences: 1 });
+      expect(r2.newContent).toBe("X\n");
+    });
+
+    it("refuses a homoglyph but still points at its line", () => {
+      // Cyrillic \u0430 is visually identical to Latin a and survives NFKC —
+      // it must not match, yet the line should be located for the model.
+      const content = "the cat sat on the mat\nnothing else here\n";
+      const err = applyError(content, [{ oldText: "the c\u0430t sat on the mat", newText: "X" }]);
+      expect(err).toContain("Could not find");
+      expect(err).toContain("Closest region");
+      expect(err).toContain("the cat sat on the mat");
+    });
+
+    it("refuses zero-width and bidi injections without crashing", () => {
+      // ZWJ/ZWSP and the RTL override survive NFKC: no match, clean error.
+      const content = "plain line one\nplain line two\n";
+      for (const poison of ["plai\u200Dn", "plai\u200Bn", "plai\u202En"]) {
+        const err = applyError(content, [{ oldText: `${poison} line one`, newText: "X" }]);
+        expect(err).toContain("Could not find");
+        expect(err.length).toBeLessThan(4000);
+      }
+    });
+
+    it("handles an empty file and a BOM-only file cleanly", async () => {
+      expect(applyError("", [{ oldText: "x", newText: "y" }])).toContain("the file is empty");
+      expect(applyError("just one line\n", [{ oldText: "x", newText: "y" }])).toContain("file has 1 line");
+      const fs = fakeFs({ "/w/f.rs": "\uFEFF" });
+      const tool = createSuperEditTool(CWD, { operations: fs.ops });
+      await expect(
+        tool.execute("1", { path: "f.rs", edits: [{ oldText: "x", newText: "y" }] }, undefined, undefined, {
+          cwd: CWD,
+        } as never),
+      ).rejects.toThrow("the file is empty");
+      expect(fs.read("/w/f.rs")).toBe("\uFEFF"); // nothing written through the failure
+    });
+
+    it("applies the elastic tier to a CRLF file and restores CRLF", async () => {
+      const { text, read } = await runEdit(
+        { "f.rs": "    alpha\r\n    beta\r\n" },
+        { path: "f.rs", edits: [{ oldText: "alpha\nbeta", newText: "alpha\nbeta two" }] },
+      );
+      expect(text).toContain("indentation flexibility");
+      expect(read("/w/f.rs")).toBe("    alpha\r\n    beta two\r\n");
+    });
+
+    it("never leaks CRLF from CRLF-sent edits into an LF file", async () => {
+      const { read } = await runEdit(
+        { "f.rs": "alpha\nbeta\n" },
+        {
+          path: "f.rs",
+          edits: [{ oldText: "alpha\r\nbeta\r\n", newText: "first\r\nsecond\r\n" }],
+        },
+      );
+      expect(read("/w/f.rs")).toBe("first\nsecond\n"); // separators follow the file, not the edit
+    });
+
+    it("carries a three-edit transitive chain in one call", () => {
+      const r = apply("a\nb\nc\n", [
+        { oldText: "a", newText: "ab" },
+        { oldText: "ab\nb", newText: "z" },
+        { oldText: "z", newText: "zz" },
+      ]);
+      expect(r.applied).toHaveLength(3);
+      expect(r.newContent).toBe("zz\nc\n");
+    });
+
+    it("refuses a net-zero edit chain instead of writing identical bytes", async () => {
+      // b → z → b is legitimate str.replace behavior at apply time; the
+      // tool-level gate must catch that the call as a whole changed nothing.
+      const fs = fakeFs({ "/w/f.rs": "a\nb\nc\n" });
+      const tool = createSuperEditTool(CWD, { operations: fs.ops });
+      await expect(
+        tool.execute(
+          "1",
+          {
+            path: "f.rs",
+            edits: [
+              { oldText: "b", newText: "z" },
+              { oldText: "z", newText: "b" },
+            ],
+          },
+          undefined,
+          undefined,
+          { cwd: CWD } as never,
+        ),
+      ).rejects.toThrow("No changes made");
+      expect(fs.read("/w/f.rs")).toBe("a\nb\nc\n");
+    });
+
+    it("bounds absurd occurrence values without pretending they are valid", () => {
+      // 1e21 and 2**53 are float-representable integers: they pass the
+      // positive-integer check and must fail as out-of-range, listing sites.
+      for (const huge of [1e21, 2 ** 53]) {
+        const err = applyError("a\na\n", [{ oldText: "a", newText: "b", occurrence: huge }]);
+        expect(err).toContain("only 2 match(es) exist");
+        expect(err).toContain("f.rs:1");
+        expect(err).toContain("f.rs:2");
+      }
+      for (const bad of [Infinity, NaN]) {
+        expect(applyError("a\na\n", [{ oldText: "a", newText: "b", occurrence: bad }])).toContain("positive integer");
+      }
+    });
+
+    it("bounds diagnostics for a giant single line", () => {
+      // One 100KB line with a drifted head: the closest-region diff slices
+      // both sides to 100 columns, so the error cannot flood context.
+      const giant = "x".repeat(100_000);
+      const err = applyError(`${giant}HEAD TAIL\n`, [{ oldText: `${giant}HEAD TELL`, newText: "X" }]);
+      expect(err).toContain("Closest region");
+      expect(err.length).toBeLessThan(4000);
+      expect(err).not.toContain("TAIL"); // the un-sliced tail never appears
+    });
+
+    it("bounds the multi-match site listing for giant lines", () => {
+      const line = `${"y".repeat(5_000)}END`;
+      const content = Array.from({ length: 7 }, () => line).join("\n") + "\n";
+      const err = applyError(content, [{ oldText: line, newText: "X" }]);
+      expect(err).toContain("Found 7 matches");
+      expect(err).toContain("\u2026and 2 more");
+      expect(err.length).toBeLessThan(3000);
+    });
+  });
+
   it("stays honest for oldText longer than the file", () => {
     const long = Array.from({ length: 50 }, (_, i) => `line ${i}`).join("\n");
     const err = applyError("tiny\n", [{ oldText: long, newText: "x" }]);

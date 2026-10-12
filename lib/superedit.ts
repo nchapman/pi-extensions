@@ -860,8 +860,11 @@ function notFoundError(
     );
   }
   return new Error(
-    `Could not find ${name} in ${path}, and no region looks similar (file has ${getLines(current).length} lines). ` +
-      `Re-read ${path} around where you expect this text and copy the exact bytes into oldText.`,
+    `Could not find ${name} in ${path}, and no region looks similar (${
+      current.length === 0
+        ? "the file is empty"
+        : `file has ${getLines(current).length} line${getLines(current).length === 1 ? "" : "s"}`
+    }). ` + `Re-read ${path} around where you expect this text and copy the exact bytes into oldText.`,
   );
 }
 
