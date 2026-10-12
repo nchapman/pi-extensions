@@ -124,6 +124,7 @@ import { spawn } from "node:child_process";
 import { Type } from "typebox";
 import { getSharedTaskRegistry, type BgTask } from "../lib/superbash";
 import { scanCustomState } from "../lib/branchstate";
+import { emitGoalCompleted } from "../lib/goal-events";
 import { resolveChildModel, runChild, type AgentDef, type ChildRun, type SpawnFn } from "./subagents";
 import type {
   AgentToolResult,
@@ -2803,6 +2804,17 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         goal = { ...goal, status: "complete" };
         persistGoalState();
         clearFooter();
+        // Lifecycle gossip for out-of-band consumers (pushover et al.): fired
+        // after the state change is durable, never awaited, and safe with zero
+        // listeners — see lib/goal-events.ts for the contract.
+        emitGoalCompleted({
+          id: goal.id,
+          objective: goal.objective,
+          summary: summary.trim(),
+          criteriaCount: effectiveCriteria(goal).length,
+          cwd: process.cwd(),
+          at: Date.now(),
+        });
         // A completion does NOT re-arm the budget: the structural gate is
         // presence-only (no judge in v1), so a self-certifying model could
         // otherwise fake `complete` to farm fresh auto-continuations. The budget
