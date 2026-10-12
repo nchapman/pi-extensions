@@ -75,7 +75,22 @@ function fire(
 ) {
   const handler = events.get(name);
   if (!handler) throw new Error(`no handler registered for ${name}`);
-  return handler(event ?? { type: name }, ctx);
+  const body = event ?? (name === "before_agent_start" ? userTurn() : { type: name });
+  return handler(body, ctx);
+}
+
+/** An ordinary user-driven turn — the "user" variant of the 1.2.0 union. */
+function userTurn(): Record<string, unknown> {
+  return { type: "before_agent_start", messageType: "user", prompt: "continue" };
+}
+
+/** A superbash wake re-engaging the agent — the "custom" variant of the union. */
+function wakeTurn(text: string): Record<string, unknown> {
+  return {
+    type: "before_agent_start",
+    messageType: "custom",
+    message: { customType: "superbash.wake", content: text, display: false },
+  };
 }
 
 function sessionCtx(todosSnapshots: Array<TodoItem[]>): ExtensionContext {
@@ -664,9 +679,7 @@ describe("registerTodoTool", () => {
     // progress (counter stays 2); under a reset-to-zero implementation the
     // final assertion would need two extra turns and fail.
     for (let i = 0; i < 2; i++) {
-      expect(
-        fire(events, "before_agent_start", undefined, { type: "before_agent_start", prompt: "continue" }),
-      ).toBeUndefined();
+      expect(fire(events, "before_agent_start", undefined, userTurn())).toBeUndefined();
     }
 
     // A backgrounded task re-engages the agent with machine-written wakes
@@ -678,23 +691,15 @@ describe("registerTodoTool", () => {
       formatSubagentWake("reviewer", "t-1134z8v", { ok: true, durationMs: 300_000, text: "done" }),
     ];
     for (let i = 0; i < REMINDER_MIN_TURNS * 3; i++) {
-      const wake = wakes[i % wakes.length];
-      expect(
-        fire(events, "before_agent_start", undefined, { type: "before_agent_start", prompt: wake }),
-      ).toBeUndefined();
+      expect(fire(events, "before_agent_start", undefined, wakeTurn(wakes[i % wakes.length]))).toBeUndefined();
     }
 
     // With the two pre-wake turns preserved, one quiet turn remains before
     // the threshold; the turn after that must remind.
     for (let i = 0; i < REMINDER_MIN_TURNS - 2 - 1; i++) {
-      expect(
-        fire(events, "before_agent_start", undefined, { type: "before_agent_start", prompt: "continue" }),
-      ).toBeUndefined();
+      expect(fire(events, "before_agent_start", undefined, userTurn())).toBeUndefined();
     }
-    const reminder = fire(events, "before_agent_start", undefined, {
-      type: "before_agent_start",
-      prompt: "continue",
-    }) as {
+    const reminder = fire(events, "before_agent_start", undefined, userTurn()) as {
       message: { content: string };
     };
     expect(reminder.message.content).toContain("[>] a");

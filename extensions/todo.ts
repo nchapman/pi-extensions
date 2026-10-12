@@ -469,7 +469,18 @@ export function registerTodoTool(pi: ExtensionAPI): void {
     // resetting) the counter keeps genuine neglect detectable on the next
     // agent-driven turn, while a compaction below still reminds on a wake —
     // the plan vanished there and the model needs it back to act on the wake.
-    if (!isWakeMessage(event.prompt)) turnsSinceUpdate++;
+    // Wakes arrive as custom triggerTurn messages; a user prompt (which could
+    // still echo a wake's text) arrives as the "user" variant. Wakes are
+    // always plain-string content — the array branch is just type safety.
+    const raw = event.messageType === "user" ? event.prompt : event.message.content;
+    const startText =
+      typeof raw === "string"
+        ? raw
+        : raw
+            .filter((c) => c.type === "text")
+            .map((c) => c.text)
+            .join("\n");
+    if (!isWakeMessage(startText)) turnsSinceUpdate++;
     const p = summarizeTodos(todos);
     if (!shouldRemind({ unfinished: p.resolved < p.total, turnsSinceUpdate, compactedSinceUpdate })) return;
     // Consume the trigger so the reminder fires once, not every turn.
