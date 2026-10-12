@@ -802,6 +802,19 @@ describe("not-found diagnostics", () => {
     expect(err).toContain("file has 3 lines");
   });
 
+  it("points at the file line containing a drifted sentence (dice alone collapses on length skew)", () => {
+    const long =
+      "BOM and line endings round-trip exactly like the built-in. The whole search runs under one comparison budget, so neither a huge nor a massively repetitive file can wedge it.";
+    const content = `# intro\n${long}\n# outro\n`;
+    // One word changed ("precisely" for "exactly") inside a 170-char line:
+    // oldText is 59 chars, so dice maxes near 0.25 — containment carries it.
+    const oldText = "BOM and line endings round-trip precisely like the built-in.";
+    const err = applyError(content, [{ oldText, newText: "x" }]);
+    expect(err).toContain("Closest region (found by fuzzy similarity): lines 2–2");
+    expect(err).toContain("precisely like the built-in");
+    expect(err).toContain("check the diff above for typos or drifted text");
+  });
+
   it("stays honest for oldText longer than the file", () => {
     const long = Array.from({ length: 50 }, (_, i) => `line ${i}`).join("\n");
     const err = applyError("tiny\n", [{ oldText: long, newText: "x" }]);

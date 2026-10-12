@@ -991,7 +991,11 @@ function diagnose(oldText: string, content: string): Diagnosis {
   }
 
   // Similarity seed: no line matches exactly, so find the most similar line
-  // and align its window. Covers typo'd or drifted oldText.
+  // and align its window. Covers typo'd or drifted oldText — scored by dice,
+  // or by containment for substantive lines, since a sentence pasted out of a
+  // long file line is near-fully contained in it while dice sees only the
+  // length mismatch. Short lines use dice alone: a 3-word fragment is trivially
+  // "contained" in many lines, so containment would point anywhere.
   const probeIdxs: number[] = [];
   for (let i = 0; i < k && probeIdxs.length < 4; i++) {
     if (oldKeys[i] !== "") probeIdxs.push(i);
@@ -999,10 +1003,14 @@ function diagnose(oldText: string, content: string): Diagnosis {
   let bestSeed: { sim: number; contentIdx: number; oldIdx: number } | null = null;
   for (const a of probeIdxs) {
     const grams = bigrams(oldKeys[a]);
+    const substantive = oldKeys[a].length >= 20;
     for (let j = 0; j < contentKeys.length; j++) {
       if (contentKeys[j] === "") continue;
       if (!spend(contentKeys[j].length)) break; // bigram cost tracks line length
-      const sim = dice(grams, bigrams(contentKeys[j]));
+      const fileGrams = bigrams(contentKeys[j]);
+      const sim = substantive
+        ? Math.max(dice(grams, fileGrams), containment(grams, fileGrams))
+        : dice(grams, fileGrams);
       if (sim > 0 && (bestSeed === null || sim > bestSeed.sim)) bestSeed = { sim, contentIdx: j, oldIdx: a };
     }
   }
@@ -1068,6 +1076,18 @@ function dice(a: Set<string>, b: Set<string>): number {
     if (b.has(g)) shared++;
   }
   return (2 * shared) / (a.size + b.size);
+}
+
+/** Fraction of a's bigrams present in b. Length-skew tolerant: a drifted
+ * sentence inside a much longer file line scores ~1 here, where dice — which
+ * penalizes the size mismatch — collapses. */
+function containment(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0) return 0;
+  let shared = 0;
+  for (const g of a) {
+    if (b.has(g)) shared++;
+  }
+  return shared / a.size;
 }
 
 /** Render the closest-region diagnostic: a capped, line-numbered diff plus whitespace notes. */
