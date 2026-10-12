@@ -13,6 +13,7 @@
  * read — only the status matters.
  */
 import { onGoalCompleted, type GoalCompletedEvent } from "../lib/goal-events";
+import { basename } from "node:path";
 
 const PUSHOVER_ENDPOINT = "https://api.pushover.net/1/messages.json";
 const PUSHOVER_TIMEOUT_MS = 10_000;
@@ -33,12 +34,15 @@ export function parsePushoverConfig(env: NodeJS.ProcessEnv): PushoverConfig | nu
   return { token, user };
 }
 
-/** Compose the notification. Pure, so tests pin exactly what a phone sees. */
+/** Compose the notification. Pure, so tests pin exactly what a phone sees.
+ * The title leads with the project name (cwd basename): a lock screen shows
+ * the title, and parallel sessions need to know which project finished. */
 export function formatPushoverMessage(event: GoalCompletedEvent): { title: string; message: string } {
   const clip = (s: string, max: number) => (s.length <= max ? s : `${s.slice(0, max - 1)}…`);
   const objective = clip(event.objective, 80);
+  const project = basename(event.cwd) || event.cwd;
   return {
-    title: clip(`Goal #${event.id} complete: ${objective}`, MAX_TITLE),
+    title: clip(`${project} · Goal #${event.id} complete: ${objective}`, MAX_TITLE),
     message: clip(
       `${event.summary || event.objective}\n${event.criteriaCount} ${event.criteriaCount === 1 ? "criterion" : "criteria"} · ${event.cwd}`,
       MAX_MESSAGE,

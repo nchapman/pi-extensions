@@ -30,12 +30,17 @@ describe("parsePushoverConfig", () => {
 });
 
 describe("formatPushoverMessage", () => {
-  it("puts the id, objective, summary, and project in the notification", () => {
+  it("leads the title with the project, keeps summary and full cwd in the body", () => {
     const { title, message } = formatPushoverMessage(event);
-    expect(title).toContain("Goal #7 complete: make the build green");
+    expect(title).toBe("proj · Goal #7 complete: make the build green");
     expect(message).toContain("fixed the flaky test");
     expect(message).toContain("3 criteria");
     expect(message).toContain("/Users/x/proj");
+  });
+
+  it("falls back to the full cwd as the project name when the basename is empty", () => {
+    const { title } = formatPushoverMessage({ ...event, cwd: "/" });
+    expect(title).toContain("/ · Goal #7");
   });
 
   it("falls back to the objective when the summary is empty", () => {
