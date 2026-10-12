@@ -41,8 +41,9 @@ export function formatPushoverMessage(event: GoalCompletedEvent): { title: strin
   const clip = (s: string, max: number) => (s.length <= max ? s : `${s.slice(0, max - 1)}…`);
   const objective = clip(event.objective, 80);
   const project = basename(event.cwd) || event.cwd;
+  const prefix = project ? `${project} · ` : "";
   return {
-    title: clip(`${project} · Goal #${event.id} complete: ${objective}`, MAX_TITLE),
+    title: clip(`${prefix}Goal #${event.id} complete: ${objective}`, MAX_TITLE),
     message: clip(
       `${event.summary || event.objective}\n${event.criteriaCount} ${event.criteriaCount === 1 ? "criterion" : "criteria"} · ${event.cwd}`,
       MAX_MESSAGE,

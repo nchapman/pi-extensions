@@ -38,9 +38,11 @@ describe("formatPushoverMessage", () => {
     expect(message).toContain("/Users/x/proj");
   });
 
-  it("falls back to the full cwd as the project name when the basename is empty", () => {
-    const { title } = formatPushoverMessage({ ...event, cwd: "/" });
-    expect(title).toContain("/ · Goal #7");
+  it("omits the project prefix cleanly when the cwd has no basename", () => {
+    // Empty string is the only cwd where basename() returns "" and the raw
+    // fallback runs — the title must not start with a dangling separator.
+    const { title } = formatPushoverMessage({ ...event, cwd: "" });
+    expect(title).toBe("Goal #7 complete: make the build green");
   });
 
   it("falls back to the objective when the summary is empty", () => {
