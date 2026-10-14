@@ -29,6 +29,13 @@ export interface Goal {
   criteria: string[];
   status: GoalStatus;
   blockedReason?: string;
+  /** The park decision packet, present exactly when the loop parked this
+   * goal through a judge-mediated Stop (an accepted `blocked` request today;
+   * premise/budget/work-appears-complete flavors arrive with the merged
+   * judge). A plain status write never sets it — the packet is what an
+   * out-of-band channel (pushover) needs: the case, the typed flavor, what a
+   * resume requires, and the spend it cost to learn this. */
+  park?: ParkPacket;
   /**
    * Optional measurable check: a shell command that prints the measured state
    * (coverage %, test summary) and exits 0 only when the objective is met. The
@@ -39,6 +46,56 @@ export interface Goal {
   verify?: string;
   /** Wall-clock ms at which the goal was set; the footer shows elapsed time from here. */
   startedAt: number;
+}
+
+export type GoalParkFlavor = "impasse" | "premise" | "budget" | "work-appears-complete";
+export type GoalResumeRequirement = "goal-change" | "spend" | "evidence";
+
+const PARK_FLAVORS = ["impasse", "premise", "budget", "work-appears-complete"] as const;
+const RESUME_REQUIREMENTS = ["goal-change", "spend", "evidence"] as const;
+
+/** The decision packet a park emits (also rides the GoalParked event). Free
+ * text is bounded at construction; these guards only check shape. */
+export interface ParkPacket {
+  flavor: GoalParkFlavor;
+  /** The case, free text — the agent's claim or the judge's basis. */
+  caseText: string;
+  resumeRequires: GoalResumeRequirement;
+  /** Cumulative spend at park time, ms. */
+  spendMs: number;
+  /** The second opinion was unavailable — the park rests on the request alone. */
+  unverified?: boolean;
+}
+
+/** What un-parking requires, by flavor: an impasse needs new evidence of a
+ * path, a contradicted premise needs a changed goal, an exhausted budget
+ * needs more spend. (work-appears-complete does not park.) */
+export function parkResumeRequires(flavor: GoalParkFlavor): GoalResumeRequirement {
+  if (flavor === "premise") return "goal-change";
+  if (flavor === "budget") return "spend";
+  return "evidence";
+}
+
+/** Free-text cap for the packet's case: bounded at construction — the packet
+ * persists, rides events, and reaches out-of-band channels; none of them
+ * should inherit an unbounded model claim. */
+export const MAX_PARK_CASE_CHARS = 1_000;
+
+export function isParkPacket(p: unknown): p is ParkPacket {
+  const packet = p as Partial<ParkPacket> | null;
+  if (!packet || typeof packet !== "object") return false;
+  return (
+    typeof packet.flavor === "string" &&
+    PARK_FLAVORS.includes(packet.flavor as (typeof PARK_FLAVORS)[number]) &&
+    typeof packet.caseText === "string" &&
+    packet.caseText.length > 0 &&
+    typeof packet.resumeRequires === "string" &&
+    RESUME_REQUIREMENTS.includes(packet.resumeRequires as (typeof RESUME_REQUIREMENTS)[number]) &&
+    typeof packet.spendMs === "number" &&
+    Number.isFinite(packet.spendMs) &&
+    packet.spendMs >= 0 &&
+    (packet.unverified === undefined || typeof packet.unverified === "boolean")
+  );
 }
 
 /** Render data carried by goal tool results (durable state lives in goal.state
@@ -90,6 +147,9 @@ export function isGoal(g: unknown): g is Goal {
     typeof goal.status === "string" &&
     GOAL_STATUSES.includes(goal.status as GoalStatus) &&
     (goal.verify === undefined || typeof goal.verify === "string") &&
+    // park is optional (legacy goals predate it) but must be a valid packet
+    // when present — a malformed one would lie to every resume path.
+    (goal.park === undefined || isParkPacket(goal.park)) &&
     typeof goal.startedAt === "number" &&
     Number.isFinite(goal.startedAt)
   );

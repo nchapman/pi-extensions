@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   createPushoverNotifier,
+  createPushoverParkNotifier,
   formatPushoverMessage,
+  formatPushoverParkMessage,
   parsePushoverConfig,
   type PushoverConfig,
 } from "../extensions/pushover";
-import type { GoalCompletedEvent } from "../lib/goal-events";
+import type { GoalCompletedEvent, GoalParkedEvent } from "../lib/goal-events";
 
 const event: GoalCompletedEvent = {
   id: 7,
@@ -102,5 +104,67 @@ describe("createPushoverNotifier", () => {
     createPushoverNotifier(config, { fetchFn: badStatus, log })(event);
     await new Promise((r) => setTimeout(r, 0));
     expect(lines).toEqual([expect.stringContaining("HTTP 502")]);
+  });
+});
+
+const parkedEvent: GoalParkedEvent = {
+  id: 9,
+  objective: "migrate the db",
+  flavor: "impasse",
+  reason: "the provider API lacks the capability",
+  resumeRequires: "evidence",
+  spendMs: 42 * 60_000,
+  cwd: "/Users/x/proj",
+  at: 1_700_000_000_000,
+};
+
+describe("formatPushoverParkMessage", () => {
+  it("leads the title with the ask and names the flavor, spend, and recovery", () => {
+    const { title, message } = formatPushoverParkMessage(parkedEvent);
+    expect(title).toContain("proj");
+    expect(title).toContain("Goal #9");
+    expect(title).toContain("needs new evidence");
+    expect(title).not.toContain("unverified");
+    expect(message).toContain("migrate the db");
+    expect(message).toContain("provider API lacks the capability");
+    expect(message).toContain("impasse");
+    expect(message).toContain("42m");
+    expect(message).toContain("/goal resume");
+  });
+  it("marks unverified parks — the push must not imply scrutiny happened", () => {
+    const { title } = formatPushoverParkMessage({ ...parkedEvent, unverified: true });
+    expect(title).toContain("unverified");
+  });
+  it("maps every resumeRequires to a human ask", () => {
+    expect(formatPushoverParkMessage({ ...parkedEvent, resumeRequires: "goal-change" }).title).toContain(
+      "needs a new goal",
+    );
+    expect(formatPushoverParkMessage({ ...parkedEvent, resumeRequires: "spend" }).title).toContain("needs more budget");
+  });
+  it("clips giant text at the transport caps", () => {
+    const giant = formatPushoverParkMessage({
+      ...parkedEvent,
+      objective: "o".repeat(5_000),
+      reason: "r".repeat(5_000),
+    });
+    expect(giant.title.length).toBeLessThanOrEqual(250);
+    expect(giant.message.length).toBeLessThanOrEqual(1_024);
+  });
+});
+
+describe("createPushoverParkNotifier", () => {
+  const config: PushoverConfig = { token: "tok", user: "usr" };
+
+  it("POSTs the park packet fire-and-forget, never throwing", async () => {
+    const calls: { url: string; init: RequestInit }[] = [];
+    const fetchFn = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(_url), init: init ?? {} });
+      return new Response(null, { status: 200 });
+    }) as typeof fetch;
+    createPushoverParkNotifier(config, { fetchFn })(parkedEvent);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(calls).toHaveLength(1);
+    const body = calls[0].init.body as URLSearchParams;
+    expect(body.get("title")).toContain("Goal #9");
   });
 });

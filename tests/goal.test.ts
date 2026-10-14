@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { onGoalParked, type GoalParkedEvent } from "../lib/goal-events";
 import { createTaskRegistry, getSharedTaskRegistry, publishSharedTaskRegistry, type BgTask } from "../lib/superbash";
 import {
   checkCompletion,
@@ -28,6 +29,8 @@ import {
   parseJudgeModel,
   parseJudgeTimeoutMs,
   parseSettleVerdict,
+  parseImpasseVerdict,
+  buildImpasseTask,
   parseTriageVerdict,
   parseTriageTimeoutMs,
   buildTriageTask,
@@ -51,6 +54,8 @@ import {
   renderGoalReminder,
   runVerify,
   scanGoalState,
+  isParkPacket,
+  parkResumeRequires,
   validateCriteria,
   validateObjective,
   validateVerify,
@@ -417,6 +422,102 @@ describe("milestone judge — configuration", () => {
     expect(parseJudgeTimeoutMs("30000")).toBe(30_000);
     expect(parseJudgeTimeoutMs("0")).toBe(GOAL_JUDGE_TIMEOUT_MS_DEFAULT);
     expect(parseJudgeTimeoutMs("not-a-number")).toBe(GOAL_JUDGE_TIMEOUT_MS_DEFAULT);
+  });
+});
+
+describe("parseImpasseVerdict", () => {
+  it("parses a clean boolean impasse with reason", () => {
+    expect(parseImpasseVerdict('{"impasse":true,"reason":"upstream API lacks the capability"}')).toEqual({
+      impasse: true,
+      reason: "upstream API lacks the capability",
+    });
+    expect(parseImpasseVerdict('{"impasse":false}')).toEqual({ impasse: false });
+  });
+  it("normalizes string booleans — common child-model drift", () => {
+    expect(parseImpasseVerdict('{"impause":"YES"}'.replace("impause", "impasse"))).toEqual({ impasse: true });
+    expect(parseImpasseVerdict('{"impasse":"False","reason":"levers remain"}')).toEqual({
+      impasse: false,
+      reason: "levers remain",
+    });
+  });
+  it("finds the verdict in prose or fences and clips the reason", () => {
+    const long = "x".repeat(2000);
+    expect(parseImpasseVerdict(`Assessment:\n\`\`\`json\n{"impasse":true,"reason":"${long}"}\n\`\`\``)).toEqual({
+      impasse: true,
+      reason: `${long.slice(0, 599)}…`,
+    });
+  });
+  it("returns no opinion for junk or missing impasse fields", () => {
+    expect(parseImpasseVerdict("I think it is a wall.")).toBeUndefined();
+    expect(parseImpasseVerdict('{"reason":"no impasse key"}')).toBeUndefined();
+    expect(parseImpasseVerdict('{"impasse":"maybe"}')).toBeUndefined();
+    expect(parseImpasseVerdict("")).toBeUndefined();
+  });
+});
+
+describe("buildImpasseTask", () => {
+  it("carries the claim as untrusted, the goal, and the loop position", () => {
+    const task = buildImpasseTask(
+      goal({ objective: "migrate db" }),
+      { workDigest: "d", continuation: 3, maxContinuations: 10 },
+      "cannot connect",
+    );
+    expect(task).toContain("migrate db");
+    expect(task).toContain("cannot connect");
+    expect(task).toContain("untrusted — scrutinize");
+    expect(task).toContain("3/10");
+  });
+  it("the default judge's child carries the impasse standard (F2 as prompt invariants)", async () => {
+    let sawAgentInstructions = "";
+    let sawTask = "";
+    const judge = createLlmSettleJudge({
+      runChildFn: async (agent, task) => {
+        sawAgentInstructions = String(agent.instructions);
+        sawTask = task;
+        return { text: '{"impause":true}'.replace("impause", "impasse") };
+      },
+    });
+    const v = await judge.assessBlocked!(goal(), { workDigest: "", continuation: 1, maxContinuations: 5 }, "wall");
+    expect(v).toEqual({ impasse: true });
+    expect(sawAgentInstructions).toContain("two measured datapoints");
+    expect(sawAgentInstructions).toContain("MECHANISMS refuted");
+    expect(sawAgentInstructions).toContain("COMPONENT impossibility");
+    expect(sawTask).toContain("wall");
+  });
+});
+
+describe("park packet guards and mappings", () => {
+  it("isParkPacket accepts valid packets and rejects malformed ones", () => {
+    const ok = { flavor: "impasse", caseText: "x", resumeRequires: "evidence", spendMs: 5 };
+    expect(isParkPacket(ok)).toBe(true);
+    expect(isParkPacket({ ...ok, unverified: true })).toBe(true);
+    expect(isParkPacket({ ...ok, flavor: "vibe" })).toBe(false);
+    expect(isParkPacket({ ...ok, resumeRequires: "more-cowbell" })).toBe(false);
+    expect(isParkPacket({ ...ok, caseText: "" })).toBe(false);
+    expect(isParkPacket({ ...ok, spendMs: -1 })).toBe(false);
+    expect(isParkPacket({ ...ok, spendMs: Number.NaN })).toBe(false);
+    expect(isParkPacket(null)).toBe(false);
+  });
+  it("resumeRequires maps by flavor — premise needs a new goal, budget needs spend, impasse needs evidence", () => {
+    expect(parkResumeRequires("premise")).toBe("goal-change");
+    expect(parkResumeRequires("budget")).toBe("spend");
+    expect(parkResumeRequires("impasse")).toBe("evidence");
+  });
+  it("a goal with a park packet survives the state scan (persistence round-trip)", () => {
+    const g = goal({ status: "blocked", blockedReason: "wall" });
+    g.park = {
+      flavor: "premise",
+      caseText: "the premise was wrong",
+      resumeRequires: "goal-change",
+      spendMs: 42,
+      unverified: true,
+    };
+    const scanned = scanGoalState([goalState(g)]);
+    expect(scanned.goal?.park).toEqual(g.park);
+    // A malformed packet drops the goal — never a lying packet on a live goal.
+    const bad = goal({ status: "blocked" }) as unknown as { park: unknown };
+    bad.park = { flavor: "nope" };
+    expect(scanGoalState([goalState(bad as never)]).goal).toBeNull();
   });
 });
 
@@ -2594,9 +2695,189 @@ describe("registerGoalTool", () => {
     expect(ok.details.goal!.status).toBe("complete");
   });
 
+  it("an aborted impasse check changes nothing — no park, no event", async () => {
+    // Esc during the (up-to-180s) judge call must not park: the abort is the
+    // user cancelling the call, and swallowing it as "judge errored" would
+    // both persist the park and fire the phone notification the abort was
+    // trying to prevent.
+    const { pi, tools } = makePi();
+    const controller = new AbortController();
+    registerGoalTool(pi, {
+      settleJudge: {
+        assess: () => undefined,
+        assessBlocked: (_g, ctx) =>
+          new Promise((_resolve, reject) => {
+            ctx.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+          }),
+      },
+    });
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    await tool.execute("1", { action: "set", objective: "migrate db" });
+    const parked: GoalParkedEvent[] = [];
+    const off = onGoalParked("test-abort", (e) => parked.push(e));
+    try {
+      const pending = tool.execute("2", { action: "blocked", goalId: 1, reason: "wall" }, controller.signal);
+      controller.abort();
+      const r = (await pending) as { content: Array<{ text: string }>; details: GoalDetails };
+      expect(r.content[0].text).toContain("NOT blocked");
+      expect(r.content[0].text).toContain("aborted");
+      expect(r.details.goal?.status).toBe("active");
+      expect(r.details.goal?.park).toBeUndefined();
+      expect(parked).toHaveLength(0);
+    } finally {
+      off();
+    }
+  });
+
+  it("a pause landing mid-impasse-check wins — the user's action is not overwritten", async () => {
+    const { pi, tools, commands } = makePi();
+    let releaseJudge: (() => void) | undefined;
+    registerGoalTool(pi, {
+      settleJudge: {
+        assess: () => undefined,
+        assessBlocked: async () => {
+          await new Promise<void>((resolve) => (releaseJudge = resolve));
+          return undefined;
+        },
+      },
+    });
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    await tool.execute("1", { action: "set", objective: "migrate db" });
+    const ui = { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() };
+    const parked: GoalParkedEvent[] = [];
+    const off = onGoalParked("test-pause-wins", (e) => parked.push(e));
+    try {
+      const pending = tool.execute("2", { action: "blocked", goalId: 1, reason: "wall" });
+      await commands.get("goal")!.handler("pause", { mode: "headless", ui });
+      releaseJudge!();
+      const r = (await pending) as { content: Array<{ text: string }>; details: GoalDetails };
+      expect(r.content[0].text).toContain("NOT blocked");
+      expect(r.details.goal?.status).toBe("paused");
+      expect(r.details.goal?.park).toBeUndefined();
+      expect(parked).toHaveLength(0);
+    } finally {
+      off();
+    }
+  });
+
+  it("a rejected impasse keeps the goal active and steers on the judge's basis", async () => {
+    const { pi, tools } = makePi();
+    const assessBlocked = vi.fn(async (_g: unknown, _c: unknown, claim: string) => ({
+      impasse: false,
+      reason: "two levers untried in the digest: " + claim,
+    }));
+    registerGoalTool(pi, { settleJudge: { assess: () => undefined, assessBlocked } });
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    await tool.execute("1", { action: "set", objective: "migrate db" });
+    const parked: unknown[] = [];
+    const off = onGoalParked("test-reject", (e) => parked.push(e));
+    try {
+      const r = (await tool.execute("2", {
+        action: "blocked",
+        goalId: 1,
+        reason: "the migration tool cannot connect",
+      })) as { content: Array<{ text: string }>; details: GoalDetails };
+      expect(r.content[0].text).toContain("NOT blocked");
+      expect(r.content[0].text).toContain("two levers untried");
+      expect(r.details.goal?.status).toBe("active");
+      expect(r.details.goal?.park).toBeUndefined();
+      expect(parked).toHaveLength(0); // no event — nothing parked
+      expect(assessBlocked).toHaveBeenCalledTimes(1);
+      expect(assessBlocked.mock.calls[0][2]).toBe("the migration tool cannot connect"); // the claim
+    } finally {
+      off();
+    }
+  });
+
+  it("a concurred impasse parks with a typed packet and emits GoalParked", async () => {
+    const { pi, tools } = makePi();
+    registerGoalTool(pi, {
+      settleJudge: {
+        assess: () => undefined,
+        assessBlocked: async () => ({ impasse: true, reason: "API lacks the capability" }),
+      },
+    });
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    await tool.execute("1", { action: "set", objective: "migrate db" });
+    const parked: GoalParkedEvent[] = [];
+    const off = onGoalParked("test-park", (e) => parked.push(e));
+    try {
+      const r = (await tool.execute("2", { action: "blocked", goalId: 1, reason: "needs prod credentials" })) as {
+        content: Array<{ text: string }>;
+        details: GoalDetails;
+      };
+      const g = r.details.goal!;
+      expect(g.status).toBe("blocked");
+      expect(g.park?.flavor).toBe("impasse");
+      expect(g.park?.resumeRequires).toBe("evidence");
+      expect(g.park?.spendMs).toBeGreaterThanOrEqual(0);
+      expect(g.park?.unverified).toBeUndefined();
+      expect(g.park?.caseText).toContain("API lacks the capability");
+      expect(r.content[0].text).toContain("Decision packet");
+      expect(parked).toHaveLength(1);
+      expect(parked[0]).toMatchObject({ id: 1, flavor: "impasse", resumeRequires: "evidence" });
+      expect(parked[0].unverified).toBeUndefined();
+    } finally {
+      off();
+    }
+  });
+
+  it("a dead or absent impasse judge still parks — flagged unverified, never a forced grind", async () => {
+    const { pi, tools } = makePi();
+    registerGoalTool(pi, {
+      settleJudge: {
+        assess: () => undefined,
+        assessBlocked: async () => {
+          throw new Error("judge child timed out");
+        },
+      },
+    });
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    await tool.execute("1", { action: "set", objective: "migrate db" });
+    const parked: GoalParkedEvent[] = [];
+    const off = onGoalParked("test-dead", (e) => parked.push(e));
+    try {
+      const r = (await tool.execute("2", { action: "blocked", goalId: 1, reason: "needs prod credentials" })) as {
+        content: Array<{ text: string }>;
+        details: GoalDetails;
+      };
+      expect(r.details.goal?.park?.unverified).toBe(true);
+      expect(r.content[0].text).toContain("judge errored");
+      expect(parked[0]?.unverified).toBe(true);
+    } finally {
+      off();
+    }
+  });
+
+  it("/goal resume un-parks a parked goal, clears the packet, and re-arms the loop", async () => {
+    const { pi, tools, commands } = makePi();
+    registerGoalTool(pi, { settleJudge: { assess: () => undefined } });
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    await tool.execute("1", { action: "set", objective: "migrate db" });
+    const blocked = (await tool.execute("2", { action: "blocked", goalId: 1, reason: "needs prod credentials" })) as {
+      details: GoalDetails;
+    };
+    expect(blocked.details.goal?.park).toBeDefined();
+    const ui = { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() };
+    await commands.get("goal")!.handler("resume", { mode: "headless", ui });
+    expect(ui.notify).toHaveBeenCalledWith(expect.stringContaining("re-armed"));
+    // Active again: a complete call proceeds past the status guard (it fails
+    // on evidence, not "not active") — proof the resume took.
+    const complete = (await tool.execute("3", {
+      action: "complete",
+      goalId: 1,
+      summary: "done",
+      evidence: ["migrated"],
+    })) as { content: Array<{ text: string }>; details: GoalDetails };
+    expect(complete.content[0].text).not.toContain("not active");
+    expect(complete.details.goal?.park).toBeUndefined();
+  });
+
   it("blocks a goal with a reason and rejects blocking a stale or non-active goal", async () => {
     const { pi, tools } = makePi();
-    registerGoalTool(pi);
+    // No assessBlocked on the fixture judge: the blocked action parks
+    // unverified without spawning the real LLM second opinion.
+    registerGoalTool(pi, { settleJudge: { assess: () => undefined } });
     const tool = tools.get(GOAL_TOOL_NAME)!;
     await tool.execute("1", { action: "set", objective: "migrate db" });
 
@@ -2706,7 +2987,7 @@ describe("registerGoalTool", () => {
 
   it("does not re-arm a reminder on compaction for a non-active goal", async () => {
     const { pi, tools, events } = makePi();
-    registerGoalTool(pi);
+    registerGoalTool(pi, { settleJudge: { assess: () => undefined } });
     const tool = tools.get(GOAL_TOOL_NAME)!;
     await tool.execute("1", { action: "set", objective: "ship it" });
     await tool.execute("2", { action: "blocked", goalId: 1, reason: "stuck" });
@@ -4217,7 +4498,7 @@ describe("registerGoalTool", () => {
     const { pi, tools, events } = makePi();
     const setStatus = vi.fn();
     const uiCtx = { ui: { notify: vi.fn(), setStatus, setWidget: vi.fn() } } as unknown as ExtensionContext;
-    registerGoalTool(pi);
+    registerGoalTool(pi, { settleJudge: { assess: () => undefined } });
     fire(events, "session_start", {
       sessionManager: { getBranch: () => [] },
       ui: uiCtx.ui,
@@ -4573,7 +4854,7 @@ describe("registerGoalTool", () => {
       // next set behaves exactly as it would without the reload (previously
       // the derived latch poisoned the new goal's state entry).
       const { pi, tools, entries } = makePi();
-      registerGoalTool(pi, { verifyRunner: async () => failVerify });
+      registerGoalTool(pi, { verifyRunner: async () => failVerify, settleJudge: { assess: () => undefined } });
       await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "first", verify: "npm test" });
       await tools.get(GOAL_TOOL_NAME)!.execute("2", {
         action: "blocked",
@@ -4601,7 +4882,7 @@ describe("registerGoalTool", () => {
 
     it("blocked and complete survive a reload as terminal states", async () => {
       const { pi, tools, entries } = makePi();
-      registerGoalTool(pi, { verifyRunner: async () => failVerify });
+      registerGoalTool(pi, { verifyRunner: async () => failVerify, settleJudge: { assess: () => undefined } });
       await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
       await tools.get(GOAL_TOOL_NAME)!.execute("2", {
         action: "blocked",

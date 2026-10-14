@@ -1,5 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
-import { emitGoalCompleted, onGoalCompleted, type GoalCompletedEvent } from "../lib/goal-events";
+import {
+  emitGoalCompleted,
+  emitGoalParked,
+  onGoalCompleted,
+  onGoalParked,
+  type GoalCompletedEvent,
+  type GoalParkedEvent,
+} from "../lib/goal-events";
 
 const event: GoalCompletedEvent = {
   id: 3,
@@ -76,5 +83,62 @@ describe("goal-events", () => {
     copyA.emitGoalCompleted(event);
     expect(seen).toEqual([event]);
     off();
+  });
+});
+
+describe("goal parked events", () => {
+  const park: GoalParkedEvent = {
+    id: 3,
+    objective: "ship it",
+    flavor: "impasse",
+    reason: "no credentials",
+    resumeRequires: "evidence",
+    spendMs: 1_000,
+    cwd: "/p",
+    at: 1,
+  };
+  it("delivers to every listener and isolates throwers", () => {
+    const good: GoalParkedEvent[] = [];
+    const offBad = onGoalParked("bad", () => {
+      throw new Error("consumer bug");
+    });
+    const off = onGoalParked("a", (e) => good.push(e));
+    try {
+      expect(() => emitGoalParked(park)).not.toThrow();
+      expect(good).toEqual([park]);
+    } finally {
+      off();
+      offBad();
+    }
+  });
+  it("unsubscribes idempotently and only its own listener", () => {
+    const seen: GoalParkedEvent[] = [];
+    const off1 = onGoalParked("one", (e) => {
+      seen.push(e);
+    });
+    const listener2 = (e: GoalParkedEvent): void => {
+      seen.push(e);
+    };
+    const off2 = onGoalParked("two", listener2);
+    off2();
+    off2(); // double-off is a no-op
+    emitGoalParked(park);
+    off1();
+    emitGoalParked(park);
+    expect(seen).toEqual([park]);
+  });
+  it("owner re-registration replaces, not stacks", () => {
+    const seen: GoalParkedEvent[] = [];
+    const offA = onGoalParked("owner", (e) => seen.push(e));
+    offA();
+    const offB = onGoalParked("owner", (e) => {
+      seen.push({ ...e, flavor: "premise" });
+    });
+    try {
+      emitGoalParked(park);
+      expect(seen).toEqual([{ ...park, flavor: "premise" }]);
+    } finally {
+      offB();
+    }
   });
 });

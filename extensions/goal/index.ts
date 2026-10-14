@@ -163,7 +163,7 @@ import {
 import type { VerifyResult, VerifyRunner } from "./verify";
 import { capVerifyOutput, liveCheckAborts, runVerify } from "./verify";
 import { GOAL_KILL_KEY, listenForTerminalInput } from "./input";
-import type { Goal, GoalBranchEntry, GoalDetails, GoalLoopState } from "./state";
+import type { Goal, GoalBranchEntry, GoalDetails, GoalLoopState, ParkPacket } from "./state";
 import {
   GOAL_CHECK_TYPE,
   GOAL_PAUSED_STEER_TYPE,
@@ -183,6 +183,7 @@ import {
   validateVerify,
 } from "./completion";
 import type {
+  ImpasseVerdict,
   JudgeChildRunner,
   MilestoneKind,
   ProgressJudge,
@@ -210,6 +211,8 @@ import {
   parseTriageTimeoutMs,
 } from "./judge";
 import { renderCheckPrompt, renderGoalReminder, renderMilestonePrompt, renderTriagePrompt } from "./prompts";
+import { parkResumeRequires, MAX_PARK_CASE_CHARS } from "./state";
+import { emitGoalParked } from "../../lib/goal-events";
 import type { GoalCheckDetails } from "./render";
 import {
   CheckSpinnerComponent,
@@ -302,6 +305,11 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
   // Captured from the latest ctx (session_start / session_tree / agent_before_settle)
   // so the goal tool handlers (which get no ctx) can still update the footer.
   let uiRef: ExtensionContext["ui"] | undefined;
+  // Session branch accessor captured from event contexts (the tool's execute
+  // has no ctx): at worst it is the outgoing session's branch — the digest it
+  // feeds is advisory judge input, and the replacement session's own events
+  // re-capture it.
+  let branchRef: { getBranch(): unknown[] } | undefined;
   const maxContinuations = options.maxContinuations ?? parseMaxContinuations(process.env[GOAL_MAX_CONTINUATIONS_ENV]);
   const maxTurnsPerRun = options.maxTurnsPerRun ?? parseMaxTurnsPerRun(process.env[GOAL_MAX_TURNS_PER_RUN_ENV]);
   const maxProgressResets =
@@ -471,6 +479,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
   const adoptBranchState = (ctx: ExtensionContext) => {
     if (ctx.ui) uiRef = ctx.ui;
     sessionModelRef = ctx.model;
+    if (ctx.sessionManager) branchRef = ctx.sessionManager;
     const {
       goal: g,
       sessionStopped,
@@ -1313,7 +1322,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     name: GOAL_TOOL_NAME,
     label: "Goal",
     description:
-      'Track a single high-level objective that must be finished and verified. Use it to commit to a goal and to gate its completion: set a goal (optionally with checkable criteria and a `verify` check, e.g. `npm test` or a coverage report, that prints the measured state and exits 0 only when the objective is met — the extension runs it at the end of every turn, reads the output to see what is still missing, and re-engages you to close the gaps, so it must genuinely exit 0, not just be claimed), then work toward it, then call it again with action "complete" and per-criterion evidence (evidence[i] proves criteria[i]) — a free-text \'done\' without proof is rejected, as is a summary that names a failure. Call it with action "blocked" only for a true impasse. Do not use it to organize steps (that is the todo tool) or for work that finishes in a couple of tool calls.',
+      'Track a single high-level objective that must be finished and verified. Use it to commit to a goal and to gate its completion: set a goal (optionally with checkable criteria and a `verify` check, e.g. `npm test` or a coverage report, that prints the measured state and exits 0 only when the objective is met — the extension runs it at the end of every turn, reads the output to see what is still missing, and re-engages you to close the gaps, so it must genuinely exit 0, not just be claimed), then work toward it, then call it again with action "complete" and per-criterion evidence (evidence[i] proves criteria[i]) — a free-text \'done\' without proof is rejected, as is a summary that names a failure. Call it with action "blocked" only for a true impasse — a second-opinion judge scrutinizes the claim (2+ clean-window measured datapoints, the mechanism refuted, component impossibility rather than lever exhaustion), and an unmet standard keeps the goal active. Do not use it to organize steps (that is the todo tool) or for work that finishes in a couple of tool calls.',
     parameters: GoalParams,
     defaultActive: false,
     executionMode: "sequential",
@@ -1518,10 +1527,102 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         const r = "reason must be non-empty";
         return finish(goal, `Goal NOT blocked: ${r}`, r);
       }
-      goal = { ...goal, status: "blocked", blockedReason: reason };
+      // A REQUEST, not an action: the agent's own history is premature bail
+      // (F2 — it parked on difficulty that later work solved), so the claim
+      // gets a second opinion behind the judge seam. Failure table BY CALLER:
+      //   verdict impasse=false → NOT blocked, stay active, steer on the basis;
+      //   verdict impasse=true  → park, flavor "impasse", packet + event;
+      //   judge absent / no opinion / throw → park anyway, packet flagged
+      //   unverified — a dead judge must never force a grind (nor silently
+      //   veto the agent's own read of its work).
+      // (A rejected request becoming a reframe-or-contested-park rides the
+      // pivot counter, which arrives with slice 3; until then rejection
+      // simply keeps the goal active.)
+      const targetId = goal.id;
+      let impasse: ImpasseVerdict | undefined;
+      let impasseError = "";
+      if (settleJudge?.assessBlocked) {
+        try {
+          impasse = await settleJudge.assessBlocked(
+            goal,
+            {
+              workDigest: buildWorkDigest((branchRef?.getBranch() ?? []) as GoalBranchEntry[]),
+              continuation: continuations + 1,
+              maxContinuations,
+              ...(signal ? { signal } : {}),
+            },
+            reason,
+          );
+        } catch (e) {
+          impasseError = e instanceof Error ? e.message : String(e);
+        }
+      }
+      // Post-await guards, mirroring the settle handler's ("the drains change
+      // state after this handler's guards ran"): the judge can take minutes,
+      // and a pause/stop/shutdown that landed mid-assessment must not be
+      // overwritten by this park — nor fire its out-of-band notification.
+      // An abort (Esc) is the user cancelling THIS call: nothing changed.
+      if (signal?.aborted) {
+        return finish(goal, "Goal NOT blocked: the impasse check was aborted — nothing changed.", "aborted");
+      }
+      if (shuttingDown || stopped || !goal || goal.status !== "active" || goal.id !== targetId) {
+        const now = goal ? `goal is now ${stopped ? "stopped" : goal.status}` : "goal is gone";
+        return finish(
+          goal,
+          `Goal NOT blocked: ${now} while the impasse check ran — the user's action wins; nothing parked.`,
+          "state changed during check",
+        );
+      }
+      if (impasse !== undefined && !impasse.impasse) {
+        const basis = impasse.reason ? ` — ${impasse.reason}` : "";
+        const r = "impasse standard not met";
+        return finish(
+          goal,
+          `Goal NOT blocked: the impasse judge rejected the claim${basis}. ` +
+            "The goal stays ACTIVE. Either keep working the remaining levers or produce measured evidence of the wall: 2+ clean-window datapoints of the blocking state, the refuted mechanism, and why the wall is component-impossibility rather than lever-exhaustion.",
+          r,
+        );
+      }
+      const unverified = impasse === undefined;
+      const judgeNote = unverified
+        ? impasseError
+          ? ` (impasse judge errored: ${impasseError}; park rests on the request alone)`
+          : " (no impasse judge available; park rests on the request alone)"
+        : " (impasse judge concurred)";
+      const caseText = unverified ? reason : `${reason} — judge: ${impasse!.reason ?? "concurred"}`;
+      const park: ParkPacket = {
+        flavor: "impasse",
+        caseText: clip(caseText, MAX_PARK_CASE_CHARS),
+        resumeRequires: parkResumeRequires("impasse"),
+        spendMs: accruedGoalSpendMs(),
+        ...(unverified ? { unverified: true } : {}),
+      };
+      goal = { ...goal, status: "blocked", blockedReason: reason, park };
+      // Deliberately NO loop latch: an agent-initiated blocked is terminal by
+      // status (the same guards that hold for complete stop the checks), and a
+      // derived-or-explicit latch here would poison a later set after reload
+      // (pinned by the "derives no latch" regression). The judge-verdict Stop
+      // — which parks the latch because its goal stays ACTIVE — arrives with
+      // the merged judge.
       persistGoalState();
       clearFooter();
-      return finish(goal, `Goal #${goal.id} blocked: ${reason}`);
+      emitGoalParked({
+        id: goal.id,
+        objective: goal.objective,
+        flavor: park.flavor,
+        reason: park.caseText,
+        resumeRequires: park.resumeRequires,
+        spendMs: park.spendMs,
+        cwd: process.cwd(),
+        at: Date.now(),
+        ...(unverified ? { unverified: true } : {}),
+      });
+      return finish(
+        goal,
+        `Goal #${goal.id} parked as blocked${judgeNote}. ` +
+          `Decision packet — case: ${park.caseText} · flavor: ${park.flavor} · resume requires: ${park.resumeRequires} · spend so far: ${formatElapsed(park.spendMs)}. ` +
+          "Tell the user: the loop is stopped and waiting on them; /goal resume re-arms it once they act on the packet.",
+      );
 
       function finish(state: Goal | null, text: string, error?: string) {
         return {
@@ -1548,7 +1649,10 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
       .map((c, i) => `  ${i + 1}. ${c}`)
       .join("\n");
     const extra = goal.status === "blocked" && goal.blockedReason ? `\nBlocked: ${goal.blockedReason}` : "";
-    return `Goal #${goal.id} (${goal.status}): ${goal.objective}\n${criteria}${extra}`;
+    const park = goal.park
+      ? `\nParked (${goal.park.flavor}${goal.park.unverified ? ", unverified" : ""}) — resume requires: ${goal.park.resumeRequires} · spend: ${formatElapsed(goal.park.spendMs)}`
+      : "";
+    return `Goal #${goal.id} (${goal.status}): ${goal.objective}\n${criteria}${extra}${park}`;
   };
 
   pi.registerCommand("goal", {
@@ -1592,7 +1696,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         // goal would tick its footer forever with a dead loop and no recovery
         // (stop refuses it as already-stopped, resume as not-paused).
         const resumableGoal =
-          goal && (goal.status === "paused" || (goal.status === "active" && stopped)) ? goal : undefined;
+          goal && (goal.status === "paused" || (goal.status === "active" && stopped) || goal.park) ? goal : undefined;
         if (!resumableGoal) {
           ctx.ui.notify("No paused or stopped goal to resume.");
           return;
@@ -1605,7 +1709,13 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         // fresh window). Lifetime numbers, not window — the window is what's
         // being re-granted.
         const lifetime = `${totalContinuations} continuations, ${formatElapsed(accruedSpendMs())} of pursuit`;
-        goal = { ...resumableGoal, status: "active" };
+        // Resuming clears the park packet: the user acted on resumeRequires,
+        // and the goal that continues is active — the packet survives in the
+        // branch history for the trail, not on the live goal.
+        goal =
+          resumableGoal.park && resumableGoal.status === "blocked"
+            ? { ...resumableGoal, status: "active", park: undefined, blockedReason: undefined }
+            : { ...resumableGoal, status: "active" };
         stopped = false;
         resetContinuationBudget();
         persistGoalState(false);

@@ -201,10 +201,11 @@ Net effect: fewer child LLM calls per cycle and one fewer knob than today.
 ## Implementation order (dependency-driven)
 
 1. **Persisted counters + trajectory** (`goal.state` entries: continuations, pivots,
-   spend, `TrajectoryPoint[]`; loud resume). Everything reads this.
+   spend, `TrajectoryPoint[]`; loud resume). Everything reads this. — SHIPPED
 2. **The `blocked`-request path** — the per-caller failure table and the impasse
    second-opinion behind the existing planned judge seam; typed park flavors +
-   `GoalParked` event (pushover already subscribes to the bus pattern).
+   `GoalParked` event (pushover already subscribes to the bus pattern). — SHIPPED
+   (impasse flavor only; premise/budget/work-appears-complete flavors arrive with 4)
 3. **Pivot plumbing** — counter, budget refresh semantics, the procedural reframe
    prompt template (the ladder).
 4. **The merged judge** — one pass with trajectory + feasibility projection; delete

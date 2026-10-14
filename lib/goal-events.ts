@@ -74,3 +74,66 @@ export function emitGoalCompleted(event: GoalCompletedEvent): void {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Goal parked — the loop stopped spending and is waiting on the user
+// ---------------------------------------------------------------------------
+
+/** Why the loop parked. Typed at the event boundary so an out-of-band channel
+ * can say WHAT decision it needs, not just that the run ended. */
+export type ParkFlavor = "impasse" | "premise" | "budget" | "work-appears-complete";
+
+/** What a resume of this park requires — the user-facing action implied by
+ * the flavor. */
+export type ResumeRequirement = "goal-change" | "spend" | "evidence";
+
+export interface GoalParkedEvent {
+  /** The goal's monotonic id. */
+  id: number;
+  objective: string;
+  /** Why: one of the typed park flavors. */
+  flavor: ParkFlavor;
+  /** The case (agent's or judge's) — free text, already clipped by the producer. */
+  reason: string;
+  /** What un-parking requires: goal-change | spend | evidence. */
+  resumeRequires: ResumeRequirement;
+  /** Cumulative wall-clock spend on this goal, epoch-ms accumulated. */
+  spendMs: number;
+  /** Session working directory, so a consumer can say which project parked. */
+  cwd: string;
+  /** Park time, epoch ms. */
+  at: number;
+  /** True when the park rests on an unverifiable request (the judge was
+   * unavailable) — an out-of-band channel should say so, not imply scrutiny. */
+  unverified?: boolean;
+}
+
+type GoalParkedListener = (event: GoalParkedEvent) => void;
+
+// A separate registry per event type: same gossip rules (never awaited,
+// isolated throws, zero listeners normal), independent lifetimes.
+const SHARED_PARKED_KEY = Symbol.for("pi-extensions.goal-events.parked");
+
+function sharedParked(): Map<string, GoalParkedListener> {
+  const globals = globalThis as Record<symbol, Map<string, GoalParkedListener> | undefined>;
+  return (globals[SHARED_PARKED_KEY] ??= new Map());
+}
+
+export function onGoalParked(owner: string, listener: GoalParkedListener): () => void {
+  sharedParked().set(owner, listener);
+  return () => {
+    const listeners = sharedParked();
+    if (listeners.get(owner) === listener) listeners.delete(owner);
+  };
+}
+
+/** Fire a park event. Never throws, never blocks on a listener. */
+export function emitGoalParked(event: GoalParkedEvent): void {
+  for (const listener of [...sharedParked().values()]) {
+    try {
+      listener(event);
+    } catch (error) {
+      console.error(`goal-events: goal-parked listener threw (dropped): ${String(error)}`);
+    }
+  }
+}
