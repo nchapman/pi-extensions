@@ -12,7 +12,7 @@
  * is bounded (10s abort) and fire-and-forget; the response body is never
  * read — only the status matters.
  */
-import { onGoalCompleted, type GoalCompletedEvent } from "../lib/goal-events";
+import { onGoalCompleted, type GoalCompletedEvent } from "../../lib/goal-events";
 import { basename } from "node:path";
 
 const PUSHOVER_ENDPOINT = "https://api.pushover.net/1/messages.json";

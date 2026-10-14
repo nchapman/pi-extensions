@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_COMPACTION_SETTINGS } from "@earendil-works/pi-coding-agent";
@@ -45,6 +46,7 @@ import {
   renderRecallCall,
   renderRecallResult,
   RECALL_TOOL_NAME,
+  EMBED_WORKER_PATH,
   tokenize,
   type RecallConfig,
   type SearchHit,
@@ -1865,6 +1867,12 @@ describe("renderers", () => {
     expect(expanded).toContain("a b c");
     expect(renderRecallResult(undefined, { expanded: false }, theme)).toContain("no matches");
     expect(renderRecallResult({ read: { total: 1234 } }, { expanded: false }, theme)).toContain("1,234 chars");
+  });
+});
+
+describe("embed worker path", () => {
+  it("resolves to the real worker file — a silent miss would degrade every session to lexical-only search", () => {
+    expect(existsSync(EMBED_WORKER_PATH)).toBe(true);
   });
 });
 

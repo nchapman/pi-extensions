@@ -31,8 +31,8 @@
  * - /todos renders the list full-screen in the TUI
  */
 
-import { isWakeMessage } from "../lib/superbash";
-import { scanCustomState } from "../lib/branchstate";
+import { isWakeMessage } from "../../lib/superbash";
+import { scanCustomState } from "../../lib/branchstate";
 import { matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";

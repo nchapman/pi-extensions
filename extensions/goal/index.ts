@@ -233,16 +233,6 @@ export * from "./judge";
 export * from "./prompts";
 export * from "./render";
 
-export * from "./config";
-export * from "./format";
-export * from "./verify";
-export * from "./input";
-export * from "./state";
-export * from "./completion";
-export * from "./judge";
-export * from "./prompts";
-export * from "./render";
-
 export interface RegisterGoalOptions {
   /** Optional semantic judge (Jev-style). v1 leaves this unset; the structural gate is the floor. */
   judge?: GoalJudge;

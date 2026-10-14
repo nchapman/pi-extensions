@@ -54,7 +54,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { Type } from "typebox";
 import type { BashOperations, ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createBashTool, getSharedTaskRegistry, piAgentDir, type BashToolCallParams } from "../lib/superbash";
+import { createBashTool, getSharedTaskRegistry, piAgentDir, type BashToolCallParams } from "../../lib/superbash";
 
 export const SSH_TOOL_NAME = "ssh_bash";
 

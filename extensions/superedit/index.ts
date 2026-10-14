@@ -10,7 +10,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createSuperEditTool, parseAllCap, parseSupereditEnabled } from "../lib/superedit";
+import { createSuperEditTool, parseAllCap, parseSupereditEnabled } from "../../lib/superedit";
 
 export default function (pi: ExtensionAPI) {
   if (!parseSupereditEnabled(process.env)) return;
