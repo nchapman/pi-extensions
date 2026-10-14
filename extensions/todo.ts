@@ -465,22 +465,13 @@ export function registerTodoTool(pi: ExtensionAPI): void {
 
   pi.on("before_agent_start", (event) => {
     // Wake-driven runs are machine starts, not agent work: the plan is
-    // typically blocked on the very task the wake reports. Freezing (not
-    // resetting) the counter keeps genuine neglect detectable on the next
-    // agent-driven turn, while a compaction below still reminds on a wake —
-    // the plan vanished there and the model needs it back to act on the wake.
-    // Wakes arrive as custom triggerTurn messages; a user prompt (which could
-    // still echo a wake's text) arrives as the "user" variant. Wakes are
-    // always plain-string content — the array branch is just type safety.
-    const raw = event.messageType === "user" ? event.prompt : event.message.content;
-    const startText =
-      typeof raw === "string"
-        ? raw
-        : raw
-            .filter((c) => c.type === "text")
-            .map((c) => c.text)
-            .join("\n");
-    if (!isWakeMessage(startText)) turnsSinceUpdate++;
+    // typically blocked on the very task the wake reports. In pi 1.2.0 the
+    // event itself carries that split: it fires only for user-typed prompts
+    // (custom triggerTurn messages — how wakes re-engage — run the agent
+    // without emitting it), so the freeze is structural. What remains is
+    // the echo case: a user prompt quoting a wake's text is still not
+    // neglect, same as before the pin.
+    if (!isWakeMessage(event.prompt)) turnsSinceUpdate++;
     const p = summarizeTodos(todos);
     if (!shouldRemind({ unfinished: p.resolved < p.total, turnsSinceUpdate, compactedSinceUpdate })) return;
     // Consume the trigger so the reminder fires once, not every turn.

@@ -79,18 +79,10 @@ function fire(
   return handler(body, ctx);
 }
 
-/** An ordinary user-driven turn — the "user" variant of the 1.2.0 union. */
-function userTurn(): Record<string, unknown> {
-  return { type: "before_agent_start", messageType: "user", prompt: "continue" };
-}
-
-/** A superbash wake re-engaging the agent — the "custom" variant of the union. */
-function wakeTurn(text: string): Record<string, unknown> {
-  return {
-    type: "before_agent_start",
-    messageType: "custom",
-    message: { customType: "superbash.wake", content: text, display: false },
-  };
+/** A user-driven turn — the only variant that exists in pi 1.2.0: the event
+ * fires solely for user-typed prompts. */
+function userTurn(prompt = "continue"): Record<string, unknown> {
+  return { type: "before_agent_start", prompt };
 }
 
 function sessionCtx(todosSnapshots: Array<TodoItem[]>): ExtensionContext {
@@ -684,14 +676,19 @@ describe("registerTodoTool", () => {
 
     // A backgrounded task re-engages the agent with machine-written wakes
     // (check-ins and completions) while the plan is blocked on that task —
-    // those starts are not neglect and must not accumulate toward a reminder.
+    // those starts are not neglect. In pi 1.2.0 they never reach this
+    // boundary at all (custom triggerTurn messages run the agent without
+    // emitting before_agent_start), so the freeze is structural; what this
+    // pins is the surviving guard: a user prompt ECHOING a wake's text must
+    // not count either, and the pre-wake count survives (a reset-to-zero
+    // implementation would fail the final arithmetic).
     const wakes = [
       formatReminderWake({ id: "t-1134z8v", name: "build", kind: "bash", state: "running", startedAt: 0 }, 300_000),
       formatBashWake({ command: "npm test", id: "t-1134z8v", status: "exited 0", durationMs: 300_000, output: "ok" }),
       formatSubagentWake("reviewer", "t-1134z8v", { ok: true, durationMs: 300_000, text: "done" }),
     ];
     for (let i = 0; i < REMINDER_MIN_TURNS * 3; i++) {
-      expect(fire(events, "before_agent_start", undefined, wakeTurn(wakes[i % wakes.length]))).toBeUndefined();
+      expect(fire(events, "before_agent_start", undefined, userTurn(wakes[i % wakes.length]))).toBeUndefined();
     }
 
     // With the two pre-wake turns preserved, one quiet turn remains before
