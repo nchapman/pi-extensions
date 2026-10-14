@@ -221,3 +221,44 @@ Net effect: fewer child LLM calls per cycle and one fewer knob than today.
 - The untrusted-digest framing and clip caps on judge free text ride along unchanged;
   free-text Stop reasons widen the laundering surface, so the typed fields carry the
   routing and the prose stays clipped.
+
+## Slice 4 execution plan (the one remaining item)
+
+Slices 1–3 are shipped (see Implementation order). Slice 4 is a rewrite of the
+`agent_before_settle` handler (~512 lines in extensions/goal/index.ts) plus
+judge.ts restructure; ~110 test references touch the seams being deleted.
+Suggested sub-commits, each independently green:
+
+1. **Feasibility projection, pure and additive** (`judge.ts` or a new
+   `projection.ts`): `projectCompletion(trajectory, budgetRemainingMs)` →
+   `"projects-complete" | "cannot-close-by-budget" | "insufficient-data"`.
+   Input: the persisted trajectory tail (capped verify outputs) + spend
+   remaining. Tests first; no wiring.
+2. **Typed park flavors for the system stops**: premise (contradiction
+   detected) and budget (breaker) park paths emitting `GoalParked` with the
+   right flavor/resumeRequires; work-appears-complete re-engages ONCE with
+   "call complete with per-criterion evidence" instead of parking. The
+   ParkPacket/GoalParkedEvent unions already carry all four flavors.
+3. **Merged verdict machine**: extend `SettleVerdict` to the design's
+   vocabulary — Continue (may carry `reframe: true`, consuming a pivot via the
+   slice-3 refresh), Stop (flavor + resumeRequires; parks the LOOP LATCH
+   `stopped=true` WITHOUT writing goal.status), Complete. Trajectory +
+   projection handed to the judge to cite; flat label offered only at ≥2
+   measured points.
+4. **The deletions, in the same motion**: `SettleTriage` +
+   `createLlmSettleTriage` + `buildTriageTask` + `parseTriageVerdict` +
+   `PI_GOAL_TRIAGE*` envs; `ProgressJudge` + `defaultProgressJudge` +
+   `PI_GOAL_MAX_PROGRESS_RESETS` + `resetsUsed`/`maxProgressResets` (keep
+   `resetsUsed` in the loop-state type one release for state-file
+   compatibility, ignored). Rewrite the ~110 test references: triage tests
+   become merged-verdict tests; progress-judge cap tests become
+   budget-flavor park tests.
+5. **Settle-time pivot consumption**: a Continue-with-reframe at a routine
+   settle consumes a pivot exactly like the blocked-rejection path (slice 3's
+   `pivotsUsed`/window-refresh logic), reusing `renderReframePrompt`.
+
+Failure table (already half-built in the blocked handler) completes here:
+routine settle judge-dead → Continue plain (fail-open, exists); breaker
+(budget/cap) → deterministic Stop regardless of judge health, packet notes
+judge-unavailable; judge Stop at a routine settle → latch-park + packet +
+`GoalParked` (pushover already subscribes).
