@@ -28,6 +28,10 @@ Pi loads the TypeScript in this directory directly; there is no build step. The 
 | [`superedit`](extensions/superedit.ts)             | replaces `edit`                                                                     | The forgiving-matcher edit tool: a three-tier ladder (exact bytes → pi's Unicode/whitespace normalization → whole-line match with a uniform indent shift), sequential edits that each see the previous ones (the python `str.replace` semantics, so chained edits work), `occurrence` disambiguation for duplicate matches, and diagnostic failures — not-found shows the closest region as a line-numbered diff; multiple matches list up to five sites, then "...and N more". See [superedit](#superedit).                                      |
 | [`pushover`](extensions/pushover.ts)               | nothing (event listener)                                                            | Phone notifications when a goal completes, via [Pushover](https://pushover.net). Zero model surface: it subscribes to the typed completion event in `lib/goal-events.ts` (the producer-owned contract — never another extension's tool I/O shapes) and fires a bounded fire-and-forget POST. Inert without `PI_PUSHOVER_TOKEN`/`PI_PUSHOVER_USER`; every path fails open. See [pushover](#pushover).                                      |
 
+## Design docs
+
+Deeper design work lives in [`docs/`](docs/). Start with [`docs/goal-loop-design.md`](docs/goal-loop-design.md) — the goal loop's next control architecture (one spending question, gated stops, pivots), written from the post-mortem of a 26-hour autonomous campaign that both ground on for hours and bailed prematurely.
+
 ## superedit
 
 The `edit` tool this package registers replaces pi's built-in by name (the same cut as superbash's `bash`), for one reason: agents kept working around the built-in with `python3 - <<EOF` + `str.replace` scripts whenever an `oldText` didn't match byte-for-byte or matched twice. superedit keeps every correctness guarantee and removes the dead ends:
