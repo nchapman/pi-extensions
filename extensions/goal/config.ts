@@ -20,6 +20,28 @@ export function parseMaxContinuations(raw: string | undefined): number {
 }
 
 /**
+ * Per-goal cap on system-granted pivots (PI_GOAL_MAX_PIVOTS). A pivot is the
+ * one refresh of the continuation window the SYSTEM grants on its own — the
+ * procedural reframe after a flat or a rejected impasse claim. Default 1:
+ * exactly one bounded bet on non-linearity per goal. 0 restores the no-pivot
+ * behavior exactly (every flat/refused reframe parks instead).
+ */
+export const GOAL_MAX_PIVOTS_DEFAULT = 1;
+export const GOAL_MAX_PIVOTS_ENV = "PI_GOAL_MAX_PIVOTS";
+
+/**
+ * Parse PI_GOAL_MAX_PIVOTS: invalid values (non-numeric, negative, absurdly
+ * large) fall back to the default — fail-open, no throw. 0 is a valid,
+ * meaningful setting (pivots off).
+ */
+export function parseMaxPivots(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return GOAL_MAX_PIVOTS_DEFAULT;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0 || n > 100) return GOAL_MAX_PIVOTS_DEFAULT;
+  return n;
+}
+
+/**
  * Per-run turn bound (PI_GOAL_MAX_TURNS_PER_RUN): after this many turns in a
  * single run, steer the model to settle. A stuck model can loop tool calls
  * inside one run without ever settling, so the settle-cap alone can't catch it —

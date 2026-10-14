@@ -7,6 +7,28 @@ import type { VerifyResult } from "./verify";
 import type { MilestoneKind } from "./judge";
 import { effectiveCriteria } from "./completion";
 
+/** The procedural reframe — the pivot's mandate. EVIDENCE to produce, never
+ * a tactical instruction (never WHICH lever or optimization): the ladder's
+ * three rungs are ordered so each one either generates the data that breaks
+ * the flat/refuted claim or enumerates exactly what a fresh approach must
+ * beat. A reframe consumes one pivot; this text is the whole value received. */
+export function renderReframePrompt(goal: Goal, basis: string, pivot: number, maxPivots: number): string {
+  const lines = [
+    `REFRAME (pivot ${pivot}/${maxPivots}) — goal #${goal.id} continues under the same objective and the same criteria.`,
+    `Objective: ${goal.objective}`,
+    `Basis: ${JSON.stringify(basis)}`, // JSON.stringify keeps judge-derived text from re-opening the prompt's line structure
+    "",
+    "Produce evidence this turn, in this order:",
+    "1. CLEAN RE-MEASURE: re-run the goal's check against a clean window — no in-flight edits, no stale builds, nothing else running that could contaminate the result — and record the measured state of every UNMET criterion.",
+    "2. WALL COMPONENTS: enumerate the specific components of the blocking wall and, for each, what the reference implementation, spec, or working system does where yours does not.",
+    "3. FRESH LEVERS: propose a new lever list ordered by expected gap closure — approaches not yet tried, not harder versions of tried ones.",
+    "",
+    "This is a mandate to produce evidence, not a decision to stop: the spend budget, met criteria, and trajectory baseline all carry over unchanged — the new epoch is judged against the same gap.",
+    "If the wall genuinely holds after the re-measure, request blocked again with the datapoints; the next refusal parks with your case on record.",
+  ];
+  return lines.join("\n");
+}
+
 /** Plain reminder re-injected as a one-shot custom message when a compaction hid the goal. */
 export function renderGoalReminder(goal: Goal): string {
   const lines = [`GOAL REMINDER — active goal #${goal.id}:`, goal.objective, ""];

@@ -207,7 +207,7 @@ Net effect: fewer child LLM calls per cycle and one fewer knob than today.
    `GoalParked` event (pushover already subscribes to the bus pattern). — SHIPPED
    (impasse flavor only; premise/budget/work-appears-complete flavors arrive with 4)
 3. **Pivot plumbing** — counter, budget refresh semantics, the procedural reframe
-   prompt template (the ladder).
+   prompt template (the ladder). — SHIPPED
 4. **The merged judge** — one pass with trajectory + feasibility projection; delete
    the triage child and the `ProgressJudge` seam + knob in the same motion.
 

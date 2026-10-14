@@ -199,6 +199,10 @@ export interface GoalLoopState {
   totalContinuations: number;
   spendMs: number;
   goalSpendMs?: number;
+  /** Pivots consumed this goal (PI_GOAL_MAX_PIVOTS budget). Optional — legacy
+   * entries predate it — but validated: a NaN here would arm a fresh pivot
+   * every settle after reload. */
+  pivotsUsed?: number;
   trajectory: string[];
 }
 
@@ -228,6 +232,12 @@ export function isGoalLoopState(l: unknown): l is GoalLoopState {
   if (
     s.goalSpendMs !== undefined &&
     !(typeof s.goalSpendMs === "number" && Number.isFinite(s.goalSpendMs) && s.goalSpendMs >= 0)
+  )
+    return false;
+  // pivotsUsed: same optionality, same reasoning (see the interface).
+  if (
+    s.pivotsUsed !== undefined &&
+    !(typeof s.pivotsUsed === "number" && Number.isInteger(s.pivotsUsed) && s.pivotsUsed >= 0)
   )
     return false;
   return (

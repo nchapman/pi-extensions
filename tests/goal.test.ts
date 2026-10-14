@@ -23,6 +23,7 @@ import {
   parseMaxContinuations,
   parseMaxProgressResets,
   parseMaxTurnsPerRun,
+  parseMaxPivots,
   recordBudgetOutput,
   parseVerifyTimeoutMs,
   parseJudgeEnabled,
@@ -38,6 +39,7 @@ import {
   renderTriagePrompt,
   buildWorkDigest,
   buildSettleJudgeTask,
+  renderReframePrompt,
   renderMilestonePrompt,
   createLlmSettleJudge,
   GOAL_JUDGE_DEFAULT,
@@ -72,6 +74,7 @@ import {
   registerGoalTool,
   formatElapsed,
   GOAL_CHECK_TYPE,
+  GOAL_STATE_TYPE,
   VERIFY_TIMEOUT_MS_DEFAULT,
 } from "../extensions/goal";
 
@@ -2761,7 +2764,7 @@ describe("registerGoalTool", () => {
   });
 
   it("a rejected impasse keeps the goal active and steers on the judge's basis", async () => {
-    const { pi, tools } = makePi();
+    const { pi, tools, entries } = makePi();
     const assessBlocked = vi.fn(async (_g: unknown, _c: unknown, claim: string) => ({
       impasse: false,
       reason: "two levers untried in the digest: " + claim,
@@ -2777,13 +2780,21 @@ describe("registerGoalTool", () => {
         goalId: 1,
         reason: "the migration tool cannot connect",
       })) as { content: Array<{ text: string }>; details: GoalDetails };
-      expect(r.content[0].text).toContain("NOT blocked");
+      // Default pivots (1): rejection → reframe, not a plain refusal.
+      expect(r.content[0].text).toContain("REFRAME (pivot 1/1)");
       expect(r.content[0].text).toContain("two levers untried");
+      expect(r.content[0].text).toContain("CLEAN RE-MEASURE");
       expect(r.details.goal?.status).toBe("active");
       expect(r.details.goal?.park).toBeUndefined();
       expect(parked).toHaveLength(0); // no event — nothing parked
       expect(assessBlocked).toHaveBeenCalledTimes(1);
       expect(assessBlocked.mock.calls[0][2]).toBe("the migration tool cannot connect"); // the claim
+      // The pivot refresh: window zeroed, pivot consumed, spend carries over.
+      const state = entries.filter((e) => e.customType === GOAL_STATE_TYPE).at(-1)?.data as {
+        loop?: { pivotsUsed?: number; continuations?: number; spendMs?: number };
+      };
+      expect(state.loop?.pivotsUsed).toBe(1);
+      expect(state.loop?.continuations).toBe(0);
     } finally {
       off();
     }
@@ -2871,6 +2882,145 @@ describe("registerGoalTool", () => {
     })) as { content: Array<{ text: string }>; details: GoalDetails };
     expect(complete.content[0].text).not.toContain("not active");
     expect(complete.details.goal?.park).toBeUndefined();
+  });
+
+  it("a second rejection with no pivots left parks with the contested case on record", async () => {
+    const { pi, tools } = makePi();
+    registerGoalTool(pi, {
+      settleJudge: {
+        assess: () => undefined,
+        assessBlocked: async () => ({ impasse: false, reason: "levers remain" }),
+      },
+    });
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    await tool.execute("1", { action: "set", objective: "migrate db" });
+    const parked: GoalParkedEvent[] = [];
+    const off = onGoalParked("test-contested", (e) => parked.push(e));
+    try {
+      // First rejection consumes the default 1 pivot → reframe.
+      const first = (await tool.execute("2", { action: "blocked", goalId: 1, reason: "cannot connect" })) as {
+        content: Array<{ text: string }>;
+      };
+      expect(first.content[0].text).toContain("REFRAME");
+      // Second rejection: no pivot remains → contested park, both sides recorded.
+      const second = (await tool.execute("3", { action: "blocked", goalId: 1, reason: "still cannot connect" })) as {
+        content: Array<{ text: string }>;
+        details: GoalDetails;
+      };
+      expect(second.content[0].text).toContain("CONTESTED");
+      const g = second.details.goal!;
+      expect(g.status).toBe("blocked");
+      expect(g.park?.caseText).toContain("agent: still cannot connect");
+      expect(g.park?.caseText).toContain("judge rejected: levers remain");
+      expect(g.park?.unverified).toBeUndefined(); // the judge SPOKE here
+      expect(parked).toHaveLength(1);
+    } finally {
+      off();
+    }
+  });
+
+  it("maxPivots=0 restores the no-pivot behavior: every rejection parks contested", async () => {
+    const { pi, tools } = makePi();
+    registerGoalTool(pi, {
+      maxPivots: 0,
+      settleJudge: {
+        assess: () => undefined,
+        assessBlocked: async () => ({ impasse: false, reason: "levers remain" }),
+      },
+    });
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    await tool.execute("1", { action: "set", objective: "migrate db" });
+    const r = (await tool.execute("2", { action: "blocked", goalId: 1, reason: "cannot connect" })) as {
+      content: Array<{ text: string }>;
+      details: GoalDetails;
+    };
+    expect(r.content[0].text).toContain("CONTESTED");
+    expect(r.details.goal?.status).toBe("blocked");
+  });
+
+  it("pivotsUsed survives a reload (no fresh pivot after restart)", async () => {
+    const verdicts = [async () => ({ impasse: false, reason: "no" }), async () => ({ impasse: false, reason: "no" })];
+    const { pi, tools, commands, events, entries } = makePi();
+    registerGoalTool(pi, {
+      settleJudge: { assess: () => undefined, assessBlocked: () => verdicts[0]() },
+    });
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    await tool.execute("1", { action: "set", objective: "migrate db" });
+    // Consume the default 1 pivot via a rejected blocked request.
+    const reframed = (await tool.execute("2", { action: "blocked", goalId: 1, reason: "wall" })) as {
+      content: Array<{ text: string }>;
+    };
+    expect(reframed.content[0].text).toContain("REFRAME");
+    // Reload from the appended entries: the reframe's pivot accounting must
+    // carry — a zeroed pivotsUsed would arm a free second pivot per reload,
+    // and this rejection would reframe again instead of parking contested.
+    const fresh = makePi();
+    registerGoalTool(fresh.pi, {
+      settleJudge: { assess: () => undefined, assessBlocked: () => verdicts[1]() },
+    });
+    fire(fresh.events, "session_start", {
+      ...sessionCtx(entries),
+      ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() },
+    });
+    const after = (await fresh.tools
+      .get(GOAL_TOOL_NAME)!
+      .execute("3", { action: "blocked", goalId: 1, reason: "wall again" })) as {
+      content: Array<{ text: string }>;
+      details: GoalDetails;
+    };
+    expect(after.content[0].text).toContain("CONTESTED");
+    expect(after.details.goal?.status).toBe("blocked");
+    void commands;
+    void events;
+  });
+
+  it("the pivot refresh zeroes the window but carries lifetime accounting (the non-reset contract)", async () => {
+    const { pi, tools, events, entries } = makePi();
+    registerGoalTool(pi, {
+      verifyRunner: async () => failVerify,
+      settleJudge: { assess: () => undefined, assessBlocked: async () => ({ impasse: false, reason: "no" }) },
+    });
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    const ctx = {
+      ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() },
+      sessionManager: { getBranch: () => [] },
+    } as unknown as ExtensionContext;
+    await tool.execute("1", { action: "set", objective: "migrate db", verify: "npm test" });
+    await fire(events, "agent_before_settle", ctx); // measured
+    await fire(events, "agent_before_settle", ctx); // measured again
+    const r = (await tool.execute("2", { action: "blocked", goalId: 1, reason: "wall" })) as {
+      content: Array<{ text: string }>;
+    };
+    expect(r.content[0].text).toContain("REFRAME");
+    const state = entries.filter((e) => e.customType === GOAL_STATE_TYPE).at(-1)?.data as {
+      loop?: { pivotsUsed?: number; continuations?: number; totalContinuations?: number; spendMs?: number };
+    };
+    expect(state.loop?.pivotsUsed).toBe(1);
+    expect(state.loop?.continuations).toBe(0); // the window is what a pivot refreshes
+    expect(state.loop?.totalContinuations).toBeGreaterThanOrEqual(2); // lifetime carried
+    expect(state.loop?.spendMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it("the pivot budget is per goal: a fresh set re-arms it", async () => {
+    const { pi, tools } = makePi();
+    registerGoalTool(pi, {
+      settleJudge: { assess: () => undefined, assessBlocked: async () => ({ impasse: false, reason: "no" }) },
+    });
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    await tool.execute("1", { action: "set", objective: "first goal" });
+    const consumed = (await tool.execute("2", { action: "blocked", goalId: 1, reason: "wall" })) as {
+      content: Array<{ text: string }>;
+    };
+    expect(consumed.content[0].text).toContain("REFRAME (pivot 1/1)"); // budget spent
+    // A NEW goal must not inherit the predecessor's consumed pivots — the bet
+    // was on THAT goal's non-linearity, not this one's.
+    await tool.execute("3", { action: "set", objective: "second goal" });
+    const fresh = (await tool.execute("4", { action: "blocked", goalId: 2, reason: "wall" })) as {
+      content: Array<{ text: string }>;
+      details: GoalDetails;
+    };
+    expect(fresh.content[0].text).toContain("REFRAME (pivot 1/1)");
+    expect(fresh.details.goal?.status).toBe("active");
   });
 
   it("blocks a goal with a reason and rejects blocking a stale or non-active goal", async () => {
@@ -5052,5 +5202,50 @@ describe("registerGoalTool", () => {
     expect(component!.render(80).join("\n")).toContain("ship it");
     component!.handleInput("\x1b");
     expect(closed).toBe(true);
+  });
+});
+
+describe("parseMaxPivots", () => {
+  it("defaults to 1 — exactly one bounded bet on non-linearity per goal", () => {
+    expect(parseMaxPivots(undefined)).toBe(1);
+    expect(parseMaxPivots("")).toBe(1);
+    expect(parseMaxPivots("   ")).toBe(1);
+  });
+  it("0 is valid and meaningful: pivots off, today's behavior exactly", () => {
+    expect(parseMaxPivots("0")).toBe(0);
+  });
+  it("accepts explicit values and falls back to the default on invalid ones", () => {
+    expect(parseMaxPivots("3")).toBe(3);
+    expect(parseMaxPivots("x")).toBe(1);
+    expect(parseMaxPivots("-1")).toBe(1);
+    expect(parseMaxPivots("1.5")).toBe(1);
+    expect(parseMaxPivots("1000")).toBe(1);
+  });
+});
+
+describe("renderReframePrompt", () => {
+  it("mandates the evidence ladder — never a tactical instruction", () => {
+    const p = renderReframePrompt(goal({ objective: "migrate db" }), "flat for 2 measured settles", 1, 1);
+    expect(p).toContain("REFRAME (pivot 1/1)");
+    expect(p).toContain("flat for 2 measured settles");
+    expect(p).toContain("migrate db");
+    // The three rungs, in order.
+    expect(p.indexOf("1. CLEAN RE-MEASURE")).toBeLessThan(p.indexOf("2. WALL COMPONENTS"));
+    expect(p.indexOf("2. WALL COMPONENTS")).toBeLessThan(p.indexOf("3. FRESH LEVERS"));
+    expect(p).toContain("mandate to produce evidence, not a decision to stop");
+    // The non-reset contract, stated to the agent.
+    expect(p).toContain("carry over unchanged");
+  });
+});
+
+describe("pivot accounting in the loop state", () => {
+  it("isGoalLoopState accepts integer pivotsUsed and rejects poisoned values", () => {
+    const base = { continuations: 0, resetsUsed: 0, totalContinuations: 0, spendMs: 0, trajectory: [] };
+    expect(isGoalLoopState({ ...base, pivotsUsed: 2 })).toBe(true);
+    expect(isGoalLoopState({ ...base })).toBe(true); // optional — legacy entries
+    expect(isGoalLoopState({ ...base, pivotsUsed: -1 })).toBe(false);
+    expect(isGoalLoopState({ ...base, pivotsUsed: 1.5 })).toBe(false);
+    expect(isGoalLoopState({ ...base, pivotsUsed: Number.NaN })).toBe(false);
+    expect(isGoalLoopState({ ...base, pivotsUsed: "1" })).toBe(false);
   });
 });

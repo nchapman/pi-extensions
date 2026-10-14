@@ -152,12 +152,14 @@ import {
   GOAL_MAX_CONTINUATIONS_ENV,
   GOAL_MAX_PROGRESS_RESETS_ENV,
   GOAL_MAX_TURNS_PER_RUN_ENV,
+  GOAL_MAX_PIVOTS_ENV,
   GOAL_TOOL_NAME,
   VERIFY_TIMEOUT_ENV,
   parseCheckEvery,
   parseMaxContinuations,
   parseMaxProgressResets,
   parseMaxTurnsPerRun,
+  parseMaxPivots,
   parseVerifyTimeoutMs,
 } from "./config";
 import type { VerifyResult, VerifyRunner } from "./verify";
@@ -210,7 +212,13 @@ import {
   parseJudgeTimeoutMs,
   parseTriageTimeoutMs,
 } from "./judge";
-import { renderCheckPrompt, renderGoalReminder, renderMilestonePrompt, renderTriagePrompt } from "./prompts";
+import {
+  renderCheckPrompt,
+  renderGoalReminder,
+  renderMilestonePrompt,
+  renderReframePrompt,
+  renderTriagePrompt,
+} from "./prompts";
 import { parkResumeRequires, MAX_PARK_CASE_CHARS } from "./state";
 import { emitGoalParked } from "../../lib/goal-events";
 import type { GoalCheckDetails } from "./render";
@@ -259,6 +267,9 @@ export interface RegisterGoalOptions {
   /** Per-run turn bound before steering a settle. Defaults to
    *  PI_GOAL_MAX_TURNS_PER_RUN, then GOAL_MAX_TURNS_PER_RUN_DEFAULT. */
   maxTurnsPerRun?: number;
+  /** Cap on system-granted pivots per goal (the procedural reframe). Defaults
+   *  to PI_GOAL_MAX_PIVOTS, then 1; 0 disables pivots entirely. */
+  maxPivots?: number;
   /** Verifier run on `complete` (and prefetched on `set`). Inject a fake in tests. */
   verifyRunner?: VerifyRunner;
   /** Settle judge for verify-less (milestone) goals: decides
@@ -312,6 +323,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
   let branchRef: { getBranch(): unknown[] } | undefined;
   const maxContinuations = options.maxContinuations ?? parseMaxContinuations(process.env[GOAL_MAX_CONTINUATIONS_ENV]);
   const maxTurnsPerRun = options.maxTurnsPerRun ?? parseMaxTurnsPerRun(process.env[GOAL_MAX_TURNS_PER_RUN_ENV]);
+  const maxPivots = options.maxPivots ?? parseMaxPivots(process.env[GOAL_MAX_PIVOTS_ENV]);
   const maxProgressResets =
     options.maxProgressResets ?? parseMaxProgressResets(process.env[GOAL_MAX_PROGRESS_RESETS_ENV]);
   const progressJudge: ProgressJudge = options.progressJudge ?? { assess: defaultProgressJudge };
@@ -355,6 +367,10 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
   // the evidence the progress judge reads at the cap. Cleared with the budget.
   let budgetOutputs: string[] = [];
   let resetsUsed = 0;
+  // Pivots consumed this goal (PI_GOAL_MAX_PIVOTS). A pivot refreshes ONLY
+  // the continuation window — never spend, never met criteria, never the
+  // trajectory baseline: the new epoch is judged against the same gap.
+  let pivotsUsed = 0;
   // Lifetime accounting (per session, crosses goals): every auto-continuation
   // ever granted, and wall-clock pursuit time. Monotonic — never reset by the
   // budget re-arm — so a loud resume can say what the goal has truly consumed.
@@ -466,6 +482,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     return {
       continuations,
       resetsUsed,
+      pivotsUsed,
       totalContinuations,
       spendMs: Math.max(0, accruedSpendMs()),
       goalSpendMs: Math.max(0, accruedGoalSpendMs()),
@@ -504,6 +521,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     // and the evidence window carry over.
     continuations = loop?.continuations ?? 0;
     resetsUsed = loop?.resetsUsed ?? 0;
+    pivotsUsed = loop?.pivotsUsed ?? 0;
     totalContinuations = loop?.totalContinuations ?? 0;
     spendMs = loop?.spendMs ?? 0;
     // Legacy entries predate the per-goal clock — the lifetime spend is the
@@ -594,6 +612,9 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     // running tick first, else it lands in the new goal's first entry.
     foldSpend();
     goalSpendMs = 0;
+    // A pivot budget is per goal too: a fresh objective must not inherit the
+    // predecessor's consumed pivots — the bet was on THAT goal's non-linearity.
+    pivotsUsed = 0;
     // Scope the judge's evidence to THIS goal: a window mixing goal A's outputs
     // with goal B's would let a re-set with any differently-printing verify buy
     // a "progressing" reset without moving the current goal. Clearing only the
@@ -1541,28 +1562,51 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
       const targetId = goal.id;
       let impasse: ImpasseVerdict | undefined;
       let impasseError = "";
-      if (settleJudge?.assessBlocked) {
-        try {
-          impasse = await settleJudge.assessBlocked(
-            goal,
-            {
-              workDigest: buildWorkDigest((branchRef?.getBranch() ?? []) as GoalBranchEntry[]),
-              continuation: continuations + 1,
-              maxContinuations,
-              ...(signal ? { signal } : {}),
-            },
-            reason,
-          );
-        } catch (e) {
-          impasseError = e instanceof Error ? e.message : String(e);
-        }
+      // Raced like every sibling boundary: an injected judge that ignores the
+      // signal must not wedge the tool call until its own (possibly absent)
+      // timeout, and the /goal pause|stop drains must be able to cancel it.
+      // Tied to the same drains as the settle judges — nothing outlives the
+      // boundary that owned it.
+      const judgeKill = new AbortController();
+      const judgeDrain = () => judgeKill.abort();
+      liveCheckAborts.add(judgeDrain);
+      const judgeSignal = AbortSignal.any([...(signal ? [signal] : []), judgeKill.signal]);
+      try {
+        const killed = new Promise<null>((resolve) => {
+          const onAbort = () => resolve(null);
+          if (judgeSignal.aborted) {
+            onAbort();
+            return;
+          }
+          judgeSignal.addEventListener("abort", onAbort, { once: true });
+        });
+        const assessed = (async () => {
+          if (!settleJudge?.assessBlocked) return;
+          try {
+            impasse = await settleJudge.assessBlocked(
+              goal,
+              {
+                workDigest: buildWorkDigest((branchRef?.getBranch() ?? []) as GoalBranchEntry[]),
+                continuation: continuations + 1,
+                maxContinuations,
+                signal: judgeSignal,
+              },
+              reason,
+            );
+          } catch (e) {
+            impasseError = e instanceof Error ? e.message : String(e);
+          }
+        })();
+        await Promise.race([assessed, killed]);
+      } finally {
+        liveCheckAborts.delete(judgeDrain);
       }
       // Post-await guards, mirroring the settle handler's ("the drains change
       // state after this handler's guards ran"): the judge can take minutes,
       // and a pause/stop/shutdown that landed mid-assessment must not be
       // overwritten by this park — nor fire its out-of-band notification.
       // An abort (Esc) is the user cancelling THIS call: nothing changed.
-      if (signal?.aborted) {
+      if (judgeSignal.aborted) {
         return finish(goal, "Goal NOT blocked: the impasse check was aborted — nothing changed.", "aborted");
       }
       if (shuttingDown || stopped || !goal || goal.status !== "active" || goal.id !== targetId) {
@@ -1574,13 +1618,50 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         );
       }
       if (impasse !== undefined && !impasse.impasse) {
-        const basis = impasse.reason ? ` — ${impasse.reason}` : "";
-        const r = "impasse standard not met";
+        const basis = impasse.reason ?? "the impasse standard was not met";
+        // Rejected → reframe if a pivot remains, else park with the contested
+        // case (the initiator rule: the judge alone never stops a run — a
+        // false rejection burns one bounded pivot, whose first rung — the
+        // clean re-measure — generates exactly the data that corrects it).
+        if (pivotsUsed < maxPivots) {
+          pivotsUsed += 1;
+          // The pivot refresh: ONLY the continuation window. Spend, met
+          // criteria, resets, measured state, and the trajectory baseline all
+          // carry over — the new epoch is judged against the same gap.
+          continuations = 0;
+          persistGoalState();
+          return finish(
+            goal,
+            `${renderReframePrompt(goal, `blocked request rejected — ${basis}`, pivotsUsed, maxPivots)}\n\nThe goal stays ACTIVE; the reframe is a mandate to produce evidence, not a decision to stop.`,
+            "reframed",
+          );
+        }
+        const contested = clip(
+          `CONTESTED — agent: ${reason} · judge rejected: ${basis}. Parked with the contested case: no pivots remained for a reframe.`,
+          MAX_PARK_CASE_CHARS,
+        );
+        const park: ParkPacket = {
+          flavor: "impasse",
+          caseText: contested,
+          resumeRequires: parkResumeRequires("impasse"),
+          spendMs: accruedGoalSpendMs(),
+        };
+        goal = { ...goal, status: "blocked", blockedReason: reason, park };
+        persistGoalState();
+        clearFooter();
+        emitGoalParked({
+          id: goal.id,
+          objective: goal.objective,
+          flavor: park.flavor,
+          reason: park.caseText,
+          resumeRequires: park.resumeRequires,
+          spendMs: park.spendMs,
+          cwd: process.cwd(),
+          at: Date.now(),
+        });
         return finish(
           goal,
-          `Goal NOT blocked: the impasse judge rejected the claim${basis}. ` +
-            "The goal stays ACTIVE. Either keep working the remaining levers or produce measured evidence of the wall: 2+ clean-window datapoints of the blocking state, the refuted mechanism, and why the wall is component-impossibility rather than lever-exhaustion.",
-          r,
+          `Goal #${goal.id} parked with the CONTESTED case (no pivots remained). Decision packet — case: ${contested} · resume requires: ${park.resumeRequires} · spend so far: ${formatElapsed(park.spendMs)}. Tell the user both sides are on record; /goal resume re-arms it.`,
         );
       }
       const unverified = impasse === undefined;
