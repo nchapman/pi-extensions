@@ -104,6 +104,68 @@ describe("EmbedClient", () => {
     expect(spawned).toBe(1); // exactly one child for the whole session
   });
 
+  it("reset() re-arms a disposed client for a session replacement — start and requests work again", async () => {
+    // /new, /resume, or a fork in the same process fires session_shutdown
+    // (dispose — terminal) then session_start on the replacement. Without
+    // reset, the re-arm silently no-oped and semantic search stayed dead for
+    // the rest of the process.
+    let spawned = 0;
+    const children: FakeChild[] = [];
+    const spawnFn: SpawnFn = () => {
+      spawned++;
+      const child = new FakeChild();
+      children.push(child);
+      return child;
+    };
+    const client = new EmbedClient({
+      workerPath: "/virtual/embed-worker.ts",
+      dtype: "q8",
+      modelDir: "/virtual/models",
+      spawnFn,
+      queryTimeoutMs: 50,
+    });
+    expect(client.start()).toBe(true);
+    client.dispose();
+    expect(client.start()).toBe(false); // terminal until reset
+    client.reset();
+    expect(client.start()).toBe(true); // resurrected for the replacement session
+    // The respawned worker serves requests.
+    const responder = children[1];
+    const origWrite = responder.stdin.write.bind(responder.stdin);
+    responder.stdin.write = (data: string) => {
+      origWrite(data);
+      const op = JSON.parse(data.trim()) as { op: string; id: number };
+      if (op.op === "query")
+        responder.emitLine(JSON.stringify({ ev: "query", id: op.id, vector: new Array(EMBED_DIMS).fill(0.2) }));
+      return true;
+    };
+    const v = await client.query("replacement session");
+    expect(v).toBeInstanceOf(Float32Array);
+    expect(spawned).toBe(2);
+  });
+
+  it("reset() also re-arms a given-up client (attempt budget restored)", () => {
+    // Spawn fails every attempt of the first start() (the retry recursion
+    // exhausts the budget in one call); after reset, the spawn succeeds and
+    // the fresh budget lets the replacement session get a worker.
+    let spawnFailures = 2;
+    const child = new FakeChild();
+    const client = new EmbedClient({
+      workerPath: "/virtual/embed-worker.ts",
+      dtype: "q8",
+      modelDir: "/virtual/models",
+      spawnFn: () => {
+        if (spawnFailures-- > 0) throw new Error("no worker");
+        return child;
+      },
+      maxStartAttempts: 2,
+    });
+    expect(client.start()).toBe(false); // budget exhausted, given up
+    expect(client.start()).toBe(false); // refuses while given up
+    client.reset();
+    expect(client.start()).toBe(true); // fresh budget for the new session
+  });
+
   it("round-trips embed items", async () => {
     const child = new FakeChild();
     const client = makeClient(child);

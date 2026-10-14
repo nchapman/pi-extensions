@@ -156,6 +156,8 @@ export interface EmbedSeam {
   kill(): void;
   /** Terminal: kill AND refuse every later request (no lazy respawn). */
   dispose(): void;
+  /** Session-replacement re-arm: clear dispose/give-up and restore the spawn budget. */
+  reset(): void;
 }
 
 /**

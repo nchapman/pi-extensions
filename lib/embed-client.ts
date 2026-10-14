@@ -272,6 +272,20 @@ export class EmbedClient {
     this.kill();
   }
 
+  /** Re-arm for a session replacement (/new, /resume, fork in the same
+   * process): dispose() is terminal for the session that shut down, but the
+   * replacement's session_start legitimately resurrects the client — kill()
+   * alone would leave the disposed/given-up flags blocking start() forever,
+   * silently degrading every later session to lexical-only search. Also
+   * restores the start-attempt budget: the new session deserves a fresh
+   * worker even if the old one's spawn loop had given up. */
+  reset(): void {
+    this.disposed = false;
+    this.givenUp = false;
+    this.startAttempts = 0;
+    this.kill();
+  }
+
   /** Stop the worker and settle everything in flight. Idempotent. */
   kill(): void {
     if (this.idleTimer !== null) {

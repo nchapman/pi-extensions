@@ -1184,6 +1184,7 @@ function fakeEmbedSeam(overrides: { queryVector?: Float32Array } = {}) {
   const calls = {
     started: 0,
     killed: 0,
+    resets: 0,
     queries: [] as string[],
     embeds: [] as Array<Array<{ key: string; text: string }>>,
   };
@@ -1191,18 +1192,24 @@ function fakeEmbedSeam(overrides: { queryVector?: Float32Array } = {}) {
     calls,
     state,
     get available() {
-      return true;
+      return !state.disposed;
     },
     start: () => {
+      // The real client refuses to start once disposed — the fake must model
+      // that terminality or tests go green through states production can't
+      // reach (the dispose-vs-rearm bug hid here).
+      if (state.disposed) return false;
       calls.started++;
       state.running = true;
       return true;
     },
     async query(text: string) {
+      if (state.disposed) return undefined;
       calls.queries.push(text);
       return state.failQuery ? undefined : state.queryVector;
     },
     async embed(items: readonly { key: string; text: string }[]) {
+      if (state.disposed) return undefined;
       calls.embeds.push([...items]);
       return state.failEmbed ? undefined : items.map((item) => ({ key: item.key, vector: vec(1) }));
     },
@@ -1217,8 +1224,15 @@ function fakeEmbedSeam(overrides: { queryVector?: Float32Array } = {}) {
       state.running = false;
       calls.killed++;
     },
+    reset: () => {
+      calls.resets++;
+      state.disposed = false;
+      if (!state.running) return;
+      state.running = false;
+      calls.killed++;
+    },
   };
-  return seam as unknown as EmbedSeam & { calls: typeof calls; state: typeof state };
+  return seam as unknown as EmbedSeam & { calls: typeof calls & { resets: number }; state: typeof state };
 }
 
 function fakeVectorStore(seed: Array<{ key: string; vector: Float32Array }> = []) {
@@ -1461,7 +1475,7 @@ describe("embedding catch-up wiring", () => {
     const store = fakeVectorStore(seed);
     const embed = fakeEmbedSeam();
     const openedFiles: string[] = [];
-    const { pi, events } = makePi();
+    const { pi, events, tools } = makePi();
     registerRecallTool(pi, { ...CONFIG, embedEnabled: true, ...configOverrides } as RecallConfig, reader, {
       embed,
       openStore: async (file) => {
@@ -1469,7 +1483,7 @@ describe("embedding catch-up wiring", () => {
         return store;
       },
     });
-    return { events, store, embed, openedFiles };
+    return { events, store, embed, openedFiles, tools };
   }
 
   it("session_start opens the store, starts the worker, and embeds archived chunks", async () => {
@@ -1485,6 +1499,34 @@ describe("embedding catch-up wiring", () => {
     expect(store.calls.added).toHaveLength(embed.calls.embeds[0].length);
     expect(embed.calls.embeds[0].some((i) => i.key === firstKey(semantic))).toBe(true);
     expect(embed.calls.embeds[0].some((i) => i.key === firstKey(lexical))).toBe(true);
+  });
+
+  it("a replacement session after session_shutdown re-arms semantic search (dispose is per-session, not per-process)", async () => {
+    // /new, /resume, or a fork fires session_shutdown then session_start in
+    // the same process. dispose() is terminal on the real client, so the
+    // old kill+start re-arm silently no-oped and every later session ran
+    // lexical-only. session_start must reset() the seam.
+    const first = hybridCtx();
+    const { events, embed, tools } = catchUpSetup();
+    await fire(events, "session_start", first.ctx);
+    await flush();
+    expect(embed.calls.embeds.length).toBeGreaterThan(0);
+    await fire(events, "session_shutdown");
+    expect(embed.state.disposed).toBe(true);
+    const second = hybridCtx();
+    await fire(events, "session_start", second.ctx);
+    await flush();
+    expect(embed.calls.resets).toBeGreaterThanOrEqual(1); // re-armed, not kill+start no-op
+    expect(embed.state.disposed).toBe(false);
+    // The replacement session actually searches semantically: the query
+    // round-trip happens and the store stays live.
+    const result = (await tools
+      .get(RECALL_TOOL_NAME)!
+      .execute("t", { description: "curl up asleep" }, undefined, undefined, second.ctx)) as {
+      content: Array<{ text: string }>;
+    };
+    expect(result.content[0].text).toContain("Fluffy");
+    expect(embed.calls.queries.length).toBeGreaterThan(0);
   });
 
   it("a settle after everything is cached embeds nothing new", async () => {

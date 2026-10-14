@@ -543,10 +543,13 @@ export function registerRecallTool(
       try {
         // A session replacement (new/resume/fork) in the same process must not
         // leak the previous session's store handle or worker — shutdown
-        // normally did this, belt and braces if it did not.
+        // normally did this, belt and braces if it did not. reset, not kill:
+        // the prior shutdown disposed the client terminally for that session,
+        // and only reset() can resurrect it for the replacement (kill+start
+        // would silently no-op on the disposed flags → lexical-only forever).
         const previous = vectorSupport;
         vectorSupport = null;
-        embed.kill();
+        embed.reset();
         await previous?.store.close();
         const store = await openStore(path.join(sm.getSessionDir(), "recall-vectors.bin"));
         vectorSupport = { store, embed };
