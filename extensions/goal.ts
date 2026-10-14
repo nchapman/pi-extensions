@@ -104,9 +104,13 @@
  *   maxContinuations × (maxProgressResets + 1). The
  *   model's set/complete/blocked actions never reset
  *   either (a stuck model can't farm fresh turns by re-setting or faking a
- *   completion); both re-arm only on a resumed session or when the user starts a
- *   goal via /goal, and /goal stop halts the loop (persisted — a reload cannot
- *   resurrect a stopped goal)
+ *   completion); the budget re-arms only when the user resumes or starts a
+ *   goal via /goal — and the full loop accounting (window counters, lifetime
+ *   continuations, pursuit spend, the judge's trajectory tail) persists in
+ *   goal.state and is RESTORED on reload/rewind, so a reload mid-budget no
+ *   longer re-grants it silently (the warp3090 F1 trap); /goal resume
+ *   re-authorizes loudly, showing the lifetime numbers first, and /goal stop
+ *   halts the loop (persisted — a reload cannot resurrect a stopped goal)
  * - a before_agent_start reminder re-injects the objective + criteria when a
  *   compaction hid it (summaries never carry the goal); a compaction mid-turn
  *   additionally re-injects immediately by steering the in-progress run (no new
@@ -291,8 +295,9 @@ export type VerifyRunner = (
   opts: { timeoutMs?: number; cwd?: string; signal?: AbortSignal },
 ) => Promise<VerifyResult>;
 
+const VERIFY_TRUNCATION_PREFIX = "…(truncated) ";
 function capVerifyOutput(s: string, n = MAX_VERIFY_OUTPUT): string {
-  return s.length > n ? `…(truncated) ${s.slice(-n)}` : s;
+  return s.length > n ? `${VERIFY_TRUNCATION_PREFIX}${s.slice(-n)}` : s;
 }
 
 /** Abort closures for checks currently running at the settle boundary — the
@@ -554,7 +559,11 @@ export const MAX_BUDGET_OUTPUTS = 32;
  * plus the most recent tail — enough signal without unbounded memory.
  */
 export function recordBudgetOutput(outputs: string[], output: string): string[] {
-  outputs.push(output);
+  // Cap at record time with the SAME transform the persisted trajectory uses
+  // (the verify cap): the live window and the restored one must stay
+  // like-for-like, or a reload flips plateaus to "progressing" (or the
+  // reverse) as a clipping artifact.
+  outputs.push(capVerifyOutput(output));
   if (outputs.length > MAX_BUDGET_OUTPUTS) outputs.splice(1, 1);
   return outputs;
 }
@@ -1269,8 +1278,8 @@ export function formatElapsed(ms: number): string {
  * footer is plain text throughout). The objective lives in the /goal view and
  * the turn-end prompt; the footer is an ambient indicator and stays short so
  * other footer segments keep their room. */
-export function renderGoalFooter(goal: Goal, now: number): string {
-  return `goal · ${formatElapsed(now - goal.startedAt)}`;
+export function renderGoalFooter(spendMs: number): string {
+  return `goal · ${formatElapsed(spendMs)}`;
 }
 
 /** Widget key for the animated goal-check spinner shown above the editor. */
@@ -1618,7 +1627,7 @@ class GoalStatusComponent {
 }
 
 /** Loose entry shape so the scan accepts both SessionEntry[] and test doubles. */
-type GoalBranchEntry = {
+export type GoalBranchEntry = {
   type?: string;
   customType?: unknown;
   data?: unknown;
@@ -1636,17 +1645,84 @@ export const GOAL_STATE_TYPE = "goal.state";
 /** Data carried by goal.state entries. `stopped` is the session loop latch —
  * written explicitly when it must not be derived from the goal status (a
  * model `set` while the loop is stopped persists an ACTIVE goal + stopped:
- * true, the warp3090 trap shape). */
+ * true, the warp3090 trap shape). `loop` is the persisted loop accounting:
+ * without it, every reload re-granted a fresh continuation budget — the F1
+ * trap (a pause/resume or plain reload mid-run reset the counters silently). */
 export interface GoalStateData {
   goal: Goal | null;
   stopped?: boolean;
+  loop?: GoalLoopState;
+}
+
+/** Persisted loop accounting. Window counters (continuations, resetsUsed)
+ * face the caps and re-arm only on deliberate user engagement; the budget
+ * window's stable strings ride along as `trajectory` — the judge-side memory
+ * that survives reloads and compactions. totalContinuations and spendMs are
+ * lifetime and monotonic per session (they cross goals): the loud numbers a
+ * resume must show before re-authorizing spend. goalSpendMs is the per-goal
+ * view the ambient footer shows (a fresh goal must not inherit its
+ * predecessor's hours); optional because early entries predate it — the
+ * restore falls back to spendMs, exact for the single-goal sessions that
+ * dominate. */
+export interface GoalLoopState {
+  continuations: number;
+  resetsUsed: number;
+  totalContinuations: number;
+  spendMs: number;
+  goalSpendMs?: number;
+  trajectory: string[];
+}
+
+/** Trajectory tail kept per goal.state entry — enough for the progress
+ * judge's first-vs-last diff to survive a reload, small enough that a
+ * per-settle accounting write stays cheap. The entry cap IS the verify cap
+ * (same constant, same tail-preserving formula): a smaller or differently-
+ * shaped cap would let the live window and the persisted trajectory diverge,
+ * flipping a plateau to "progressing" (or the reverse) as a clipping
+ * artifact, and would cut the judge's resolution below what the verify path
+ * itself delivers. */
+export const MAX_PERSISTED_TRAJECTORY = 8;
+export const MAX_PERSISTED_TRAJECTORY_CHARS = MAX_VERIFY_OUTPUT;
+
+export function isGoalLoopState(l: unknown): l is GoalLoopState {
+  const s = l as Partial<GoalLoopState> | null;
+  if (!s || typeof s !== "object") return false;
+  if (
+    ![s.continuations, s.resetsUsed, s.totalContinuations, s.spendMs].every(
+      (n) => typeof n === "number" && Number.isFinite(n) && n >= 0,
+    )
+  )
+    return false;
+  // goalSpendMs is optional (legacy entries predate it) but not exempt: a
+  // non-number would NaN-poison the next persist and silently flip the footer
+  // to the lifetime clock.
+  if (
+    s.goalSpendMs !== undefined &&
+    !(typeof s.goalSpendMs === "number" && Number.isFinite(s.goalSpendMs) && s.goalSpendMs >= 0)
+  )
+    return false;
+  return (
+    Array.isArray(s.trajectory) &&
+    s.trajectory.length <= MAX_PERSISTED_TRAJECTORY &&
+    // Element length too: restored windows feed the judge prompt, and session
+    // files are editable — the read side must bound what the write side bounds
+    // (a capped entry carries the truncation prefix beyond the raw cap).
+    s.trajectory.every(
+      (t) => typeof t === "string" && t.length <= MAX_PERSISTED_TRAJECTORY_CHARS + VERIFY_TRUNCATION_PREFIX.length,
+    )
+  );
 }
 
 function isGoalStateData(d: unknown): d is GoalStateData {
   const data = d as Partial<GoalStateData> | null;
   if (!data || typeof data !== "object") return false;
   if (data.goal !== null && !isGoal(data.goal)) return false;
-  return data.stopped === undefined || typeof data.stopped === "boolean";
+  if (data.stopped !== undefined && typeof data.stopped !== "boolean") return false;
+  // The loop field never vetoes the entry, in ANY shape (absent, legacy-valid,
+  // null, corrupt): a rejected entry would silently discard its goal AND its
+  // stop latch — the F1 failure mode, restyled. scanGoalState sanitizes the
+  // accounting separately; here the goal and latch are all that matter.
+  return true;
 }
 
 /** Derive the loop latch from a state entry: an explicit flag wins.
@@ -1668,9 +1744,16 @@ export function scanGoalState(branch: GoalBranchEntry[]): {
   goal: Goal | null;
   sessionStopped: boolean | undefined;
   hiddenByCompaction: boolean;
+  /** The newest entry carried a `loop` that failed validation: the entry
+   * survives, but its accounting was dropped (the budget restarts at full). */
+  loopDropped: boolean;
+  loop: GoalLoopState | undefined;
 } {
   const { data, index: lastIndex } = scanCustomState(branch, GOAL_STATE_TYPE, isGoalStateData);
   const goal = data?.goal ?? null;
+  // Sanitize the accounting here (not in isGoalStateData, which must not veto
+  // an entry over its loop): a malformed loop adopts as no accounting — the
+  // budget degrades to a fresh window, but the goal and its latch survive.
   // Only an explicit latch from a real entry counts; undefined = derive from
   // the goal status (no state entry on this branch at all).
   const sessionStopped = data ? stoppedFromState(data) : undefined;
@@ -1693,7 +1776,16 @@ export function scanGoalState(branch: GoalBranchEntry[]): {
           typeof entry.customType === "string" &&
           (entry.customType === GOAL_REMINDER_TYPE || entry.customType === GOAL_CHECK_TYPE),
       );
-  return { goal, sessionStopped, hiddenByCompaction };
+  return {
+    goal,
+    sessionStopped,
+    hiddenByCompaction,
+    loop: data?.loop !== undefined && isGoalLoopState(data.loop) ? data.loop : undefined,
+    // Present-but-invalid accounting: the entry survives (goal + latch are
+    // load-bearing), but the consumer must be able to warn that the budget
+    // silently restarted instead of reading the zeroed counters as "fresh".
+    loopDropped: data?.loop !== undefined && !isGoalLoopState(data.loop),
+  };
 }
 
 /** Newest goal recorded on the session branch, or null. */
@@ -1705,7 +1797,12 @@ export interface RegisterGoalOptions {
   /** Optional semantic judge (Jev-style). v1 leaves this unset; the structural gate is the floor. */
   judge?: GoalJudge;
   /** Optional progress judge consulted at the continuation cap. Defaults to the
-   *  deterministic defaultProgressJudge (verify output changed ⇒ progressing). */
+   *  deterministic defaultProgressJudge (verify output changed ⇒ progressing).
+   *  CONTRACT: the live window holds up to MAX_BUDGET_OUTPUTS (32) entries,
+   *  but a RELOADED window restores only the persisted tail (baseline + last
+   *  MAX_PERSISTED_TRAJECTORY−1 = 7). Judges must treat anything beyond
+   *  first-vs-last as advisory — deciding on the middle of the window makes
+   *  the cap verdict reload-dependent. */
   progressJudge?: ProgressJudge;
   /** Cap on judge-approved budget resets at the continuation cap. Defaults to
    *  PI_GOAL_MAX_PROGRESS_RESETS, then GOAL_MAX_PROGRESS_RESETS_DEFAULT. */
@@ -1810,6 +1907,20 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
   // the evidence the progress judge reads at the cap. Cleared with the budget.
   let budgetOutputs: string[] = [];
   let resetsUsed = 0;
+  // Lifetime accounting (per session, crosses goals): every auto-continuation
+  // ever granted, and wall-clock pursuit time. Monotonic — never reset by the
+  // budget re-arm — so a loud resume can say what the goal has truly consumed.
+  let totalContinuations = 0;
+  let spendMs = 0;
+  // Per-goal pursuit clock feeding the footer: a NEW goal must not inherit
+  // its predecessor's hours. Lifetime spendMs stays untouched for the loud
+  // resume/restore lines; this one resets in setGoal.
+  let goalSpendMs = 0;
+  // Dedup memo for persistGoalState — the last appended goal.state payload.
+  let lastPersistedJson: string | undefined;
+  // Ticking pursuit clock: set only while the loop is actually armed (active
+  // goal, latch up). Paused conversations and halted loops accrue nothing.
+  let armedAt: number | undefined;
   const checkEvery = options.checkEvery ?? parseCheckEvery(process.env[GOAL_CHECK_EVERY_ENV]);
   // Last verify result + how many continuations ago it ran. With checkEvery > 1
   // most turns reuse it instead of re-running an expensive verify. The same
@@ -1851,7 +1962,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
             ? // An active-but-latched goal must not look like live work: the
               // ticking clock read as pursuit during the warp3090 incident.
               "goal · halted — /goal resume re-arms"
-            : renderGoalFooter(goal, Date.now()),
+            : renderGoalFooter(accruedGoalSpendMs()),
       );
     } else if (goal && goal.status === "paused") {
       // No elapsed while paused: startedAt never freezes, so a ticking clock
@@ -1875,6 +1986,46 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     lastJudgeRemaining = [];
     lastJudgeReason = undefined;
     parkedForTasks = false; // a re-armed loop re-announces its next park
+    // Lifetime counters (totalContinuations, spendMs) deliberately survive the
+    // re-arm: the window is what the user re-authorizes, not the history.
+  };
+
+  const pursuitArmed = () => !!goal && goal.status === "active" && !stopped;
+  const accruedSpendMs = () => spendMs + (armedAt !== undefined ? Date.now() - armedAt : 0);
+  const accruedGoalSpendMs = () => goalSpendMs + (armedAt !== undefined ? Date.now() - armedAt : 0);
+  // Fold the ticking clock into the durable total at every persist — keeps
+  // ticking while armed, stops (and clears) when pursuit is down. Centralizing
+  // it here means no state-change site can forget the clock.
+  const foldSpend = () => {
+    if (armedAt !== undefined) {
+      // Math.max: wall clocks are not monotonic (NTP, VM adjustments) — a
+      // backwards step must never drive the total negative, where it would
+      // poison the persisted accounting.
+      const delta = Math.max(0, Date.now() - armedAt);
+      spendMs += delta;
+      goalSpendMs += delta;
+      armedAt = pursuitArmed() ? Date.now() : undefined;
+    } else if (pursuitArmed()) {
+      armedAt = Date.now();
+    }
+  };
+  const currentLoopState = (): GoalLoopState => {
+    // The budget window's FIRST entry is its baseline — recordBudgetOutput
+    // never evicts index 0, because the progress judge diffs first-vs-last.
+    // Persist [baseline + tail] so a restored window keeps that comparison;
+    // a tail-only slice would quietly change the cap decision across a reload.
+    const rest = budgetOutputs.slice(1).map((t) => capVerifyOutput(t));
+    return {
+      continuations,
+      resetsUsed,
+      totalContinuations,
+      spendMs: Math.max(0, accruedSpendMs()),
+      goalSpendMs: Math.max(0, accruedGoalSpendMs()),
+      trajectory:
+        budgetOutputs.length === 0
+          ? []
+          : [capVerifyOutput(budgetOutputs[0]), ...rest.slice(-(MAX_PERSISTED_TRAJECTORY - 1))],
+    };
   };
 
   const adoptBranchState = (ctx: ExtensionContext) => {
@@ -1884,13 +2035,33 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
       goal: g,
       sessionStopped,
       hiddenByCompaction,
+      loop,
+      loopDropped,
     } = scanGoalState(ctx.sessionManager.getBranch() as GoalBranchEntry[]);
     goal = g;
     if (g) goalSeq = g.id;
+    // The dedup memo is per-branch: an adoption may have rewound to a branch
+    // whose newest entry differs from our last in-process write — a stale
+    // memo could then suppress a required durable write (rewind + resume
+    // reproducing a byte-identical payload while the branch still records
+    // the old latch).
+    lastPersistedJson = undefined;
     compactedSinceUpdate = hiddenByCompaction;
-    continuations = 0;
-    budgetOutputs = [];
-    resetsUsed = 0;
+    // Restore the loop accounting, don't re-grant it: the budget window,
+    // lifetime totals, and the judge's trajectory tail live in goal.state, so
+    // a reload mid-budget resumes where it left off (F1: the silent zeroing
+    // here was the budget reset the warp3090 run walked through). Measured
+    // state is still re-established by the next check — only the accounting
+    // and the evidence window carry over.
+    continuations = loop?.continuations ?? 0;
+    resetsUsed = loop?.resetsUsed ?? 0;
+    totalContinuations = loop?.totalContinuations ?? 0;
+    spendMs = loop?.spendMs ?? 0;
+    // Legacy entries predate the per-goal clock — the lifetime spend is the
+    // exact value for the single-goal sessions that dominate, and the best
+    // available estimate otherwise.
+    goalSpendMs = loop?.goalSpendMs ?? loop?.spendMs ?? 0;
+    budgetOutputs = loop ? [...loop.trajectory] : [];
     lastCheck = undefined;
     lastCheckAge = 0;
     lastCheckKind = undefined;
@@ -1907,6 +2078,10 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     // disarming there would kill the loop for a goal the model sets later in
     // the same session, since a model set never re-arms.
     stopped = sessionStopped ?? false;
+    // The pursuit clock starts iff the adopted branch is live; a re-adopted
+    // mid-budget goal resumes accruing from now (its prior spend arrived via
+    // the restored accounting, not the clock).
+    armedAt = pursuitArmed() ? Date.now() : undefined;
     if (g && g.status !== "complete") activateTool();
     // Adoption loudness for the verify-less trap: an active, un-stopped goal
     // with neither a verify nor a judge ticks the footer from behind a dead
@@ -1917,26 +2092,59 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         `Goal #${g.id} has no verify command and no milestone judge — no auto-check loop; it advances only on your prompts.`,
       );
     }
+    // Loud restore: a mid-budget reload must not read as a fresh start. One
+    // line, only when there is consumed budget to report — the first session_start
+    // of a fresh goal stays quiet.
+    if (g && g.status === "active" && !stopped && (continuations > 0 || spendMs > 0)) {
+      ctx.ui?.notify(
+        `Goal #${g.id} loop restored mid-budget: ${continuations}/${maxContinuations} continuations used ` +
+          `(${totalContinuations} lifetime, ${formatElapsed(spendMs)} of pursuit).`,
+      );
+    }
+    // A present-but-unreadable accounting is the F1 shape wearing a new mask:
+    // the entry (and its latch) survived, but the budget restarted at full —
+    // that re-grant must be said out loud, not inferred from zeroed counters.
+    if (g && g.status === "active" && !stopped && loopDropped) {
+      ctx.ui?.notify(`Goal #${g.id} accounting unreadable — continuation budget restarted at ${maxContinuations}.`);
+    }
     updateFooter();
   };
 
-  // Persist goal + loop latch to the branch: goal.state entries are the single
-  // source of truth across reload/rewind/resume. An explicit stopped flag is
-  // required exactly when memory and goal status disagree (a model set while
-  // the loop is stopped persists an ACTIVE goal that must stay latched).
+  // Persist goal + loop latch AND the loop accounting to the branch:
+  // goal.state entries are the single source of truth across
+  // reload/rewind/resume. An explicit stopped flag is required exactly when
+  // memory and goal status disagree (a model set while the loop is stopped
+  // persists an ACTIVE goal that must stay latched). foldSpend keeps the
+  // pursuit clock honest at every durable write — no site can forget it.
   const persistGoalState = (stoppedFlag?: boolean) => {
-    pi.appendEntry(
-      GOAL_STATE_TYPE,
-      stoppedFlag === undefined
-        ? { goal: goal ? { ...goal } : null }
-        : { goal: goal ? { ...goal } : null, stopped: stoppedFlag },
-    );
+    foldSpend();
+    const payload = {
+      goal: goal ? { ...goal } : null,
+      ...(stoppedFlag !== undefined ? { stopped: stoppedFlag } : {}),
+      loop: currentLoopState(),
+    };
+    // Byte-identical writes are skipped (e.g. a shutdown persist immediately
+    // after a settle persist with no elapsed pursuit): duplicate entries buy
+    // nothing — the scan takes the newest — and each carries the full
+    // trajectory tail. Non-identical per-settle redundancy is accepted:
+    // newest-entry-wins keeps restore O(1); a merge-on-read dedup would trade
+    // that for complexity the two budget bounds already cap.
+    const serialized = JSON.stringify(payload);
+    if (serialized === lastPersistedJson) return;
+    lastPersistedJson = serialized;
+    pi.appendEntry(GOAL_STATE_TYPE, payload);
   };
 
   const setGoal = (objective: string, criteria: string[], verify?: string): Goal => {
     goalSeq += 1;
     goal = { id: goalSeq, objective, criteria, status: "active", startedAt: Date.now(), ...(verify ? { verify } : {}) };
     compactedSinceUpdate = false;
+    // The per-goal pursuit clock starts at zero with the goal — the footer
+    // must answer "how long has THIS goal run", while the lifetime spend
+    // (for loud resumes) crosses goals untouched. Bank the predecessor's
+    // running tick first, else it lands in the new goal's first entry.
+    foldSpend();
+    goalSpendMs = 0;
     // Scope the judge's evidence to THIS goal: a window mixing goal A's outputs
     // with goal B's would let a re-set with any differently-printing verify buy
     // a "progressing" reset without moving the current goal. Clearing only the
@@ -1966,6 +2174,11 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     // (reload does not run session.abort(), so pi would honor the continue).
     shuttingDown = true;
     for (const abort of [...liveCheckAborts]) abort();
+    // Fold the pursuit clock before teardown: without this, everything since
+    // the last persist (up to a whole turn) is lost from the lifetime spend.
+    // The explicit latch mirrors the set-site pattern — an unflagged persist
+    // of an active-but-latched goal would derive `stopped: false` on reload.
+    if (goal && goal.status === "active") persistGoalState(stopped ? true : undefined);
   });
 
   pi.on("session_start", (_event, ctx) => {
@@ -2123,6 +2336,11 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         return false;
       }
       stopped = true;
+      // Persist the latch: without this, a reload after the cap resurrects the
+      // loop (the derived latch reads the last pre-cap entry). The restored
+      // accounting would re-trip the cap at the next settle anyway — persisting
+      // makes the halt immediate and durable instead of eventual.
+      persistGoalState(true);
       const why = verdict?.continueRun
         ? `progress-judge resets exhausted (${resetsUsed}/${maxProgressResets})`
         : verdict
@@ -2284,6 +2502,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
           // of measurements fails the cap judge closed: endless skips must trip
           // the breaker, not launder it.
           continuations += 1;
+          totalContinuations += 1;
           // The cached measurement (if any) aged by this unmeasured turn —
           // a frozen age would keep reporting "just measured" across a long
           // run of skips.
@@ -2313,6 +2532,9 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
             },
             { deliverAs: "followUp" },
           );
+          // Durable accounting per settle: an unexpected reload mid-budget must
+          // restore this turn's consumed continuation, not re-grant it.
+          persistGoalState();
           return { continue: true };
         }
         // "verify" or an error on a calm settle: fall through and measure. A
@@ -2489,6 +2711,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
       lastCheckAge += 1;
     }
     continuations += 1;
+    totalContinuations += 1;
     updateFooter();
     // The budget window needs a STABLE measured state, not prose: the judge's
     // reason rewords itself every turn even at a plateau, so feeding it here
@@ -2531,6 +2754,8 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
       },
       { deliverAs: "followUp" },
     );
+    // Durable accounting per settle (same rationale as the triage path above).
+    persistGoalState();
     return { continue: true };
   });
 
@@ -2730,6 +2955,11 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         // Seed the budget window with the baseline so the judge has a first
         // measured state even for tiny caps (PI_GOAL_MAX_CONTINUATIONS=1).
         recordBudgetOutput(budgetOutputs, pre.output);
+        // Re-persist now that the baseline exists: the pre-verify persist above
+        // guarantees the goal survives an abort, but its trajectory is empty —
+        // without this, a reload before the first settle loses the baseline the
+        // judge's first-vs-last diff depends on.
+        persistGoalState(stopped ? true : undefined);
         const failWhy = pre.spawnError
           ? ` — the check could not run: ${pre.spawnError}`
           : pre.timedOut
@@ -2929,12 +3159,19 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         }
         const wasPaused = resumableGoal.status === "paused";
         // A user resuming is a deliberate engagement: re-arm the continuation
-        // budget, exactly like a user (re)starting a goal.
+        // budget, exactly like a user (re)starting a goal — and say out loud
+        // what the goal has already consumed before re-authorizing more (F1:
+        // the re-arm used to be silent, so a pause/resume quietly bought a
+        // fresh window). Lifetime numbers, not window — the window is what's
+        // being re-granted.
+        const lifetime = `${totalContinuations} continuations, ${formatElapsed(accruedSpendMs())} of pursuit`;
         goal = { ...resumableGoal, status: "active" };
         stopped = false;
-        persistGoalState(false);
         resetContinuationBudget();
-        ctx.ui.notify(`Goal #${goal.id} resumed.`);
+        persistGoalState(false);
+        ctx.ui.notify(
+          `Goal #${goal.id} resumed — lifetime: ${lifetime}; budget re-armed (fresh ${maxContinuations} continuations).`,
+        );
         pi.sendUserMessage(
           wasPaused
             ? `The user paused goal #${goal.id} to have a conversation; that conversation is over and the goal is active again. Continue working toward it — the goal is: ${goal.objective}`
@@ -2981,11 +3218,14 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         // the model's set persists the replacement goal (and its own state).
         goal = goal.status === "paused" ? { ...goal, status: "active" } : goal;
         stopped = false;
-        persistGoalState(false);
       }
       // A user (re)starting a goal re-arms the loop budget — a deliberate
       // engagement, distinct from the model's autonomous set (which can't re-arm).
       resetContinuationBudget();
+      // Persist AFTER the re-arm: an existing goal's entry must carry the fresh
+      // budget, not the consumed one it replaces (a fresh kickoff has no goal
+      // to persist yet — the model's set writes the first entry).
+      if (goal) persistGoalState(false);
       pi.sendUserMessage(
         `Set the goal "${trimmed}" using the goal tool (action "set"). If the objective is measurable, give it a verify command that prints the current state and exits 0 only when the objective is met — the extension re-runs it at the end of every turn and only lets you complete when it passes. If it is milestone-style or otherwise not script-checkable, omit verify — a milestone judge (a second model) assesses progress at each turn end and re-engages you. Then start working toward the goal immediately in this same turn — do not stop after setting it unless the objective itself says to wait — and when it is genuinely met, call the goal tool with action "complete" and per-criterion evidence that cites the real command and its output.`,
         { deliverAs: "followUp" },

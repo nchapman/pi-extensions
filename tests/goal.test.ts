@@ -43,6 +43,9 @@ import {
   renderCheckPrompt,
   renderCheckMessage,
   renderGoalCall,
+  isGoalLoopState,
+  type GoalLoopState,
+  type GoalStateData,
   renderGoalFooter,
   renderGoalResult,
   renderGoalReminder,
@@ -52,6 +55,7 @@ import {
   validateObjective,
   validateVerify,
   type Goal,
+  type GoalBranchEntry,
   type GoalCheckDetails,
   type GoalDetails,
   type ProgressJudge,
@@ -171,12 +175,16 @@ function fire(
 }
 
 /** Build a branch where each snapshot is a goal tool result carrying that goal. */
-function goalState(g: Goal, stopped?: boolean) {
-  return {
-    type: "custom",
-    customType: "goal.state",
-    data: stopped === undefined ? { goal: g } : { goal: g, stopped },
-  };
+function goalState(g: Goal, stopped?: boolean, loop?: GoalLoopState) {
+  const data: GoalStateData =
+    stopped === undefined && loop === undefined
+      ? { goal: g }
+      : {
+          goal: g,
+          ...(stopped !== undefined ? { stopped } : {}),
+          ...(loop !== undefined ? { loop } : {}),
+        };
+  return { type: "custom", customType: "goal.state", data };
 }
 
 function sessionCtx(entries: unknown[]): ExtensionContext {
@@ -375,10 +383,9 @@ describe("formatElapsed", () => {
 });
 
 describe("renderGoalFooter", () => {
-  it("shows presence and elapsed time, without the objective or emoji", () => {
-    const g = goal({ id: 3, objective: "ship it", startedAt: 0 });
-    const footer = renderGoalFooter(g, 252_000); // 4m 12s after start
-    expect(footer).toBe("goal · 4m 12s");
+  it("shows presence and pursuit spend, without the objective or emoji", () => {
+    // Pursuit spend, not wall-since-start: paused conversation time is not spend.
+    expect(renderGoalFooter(252_000)).toBe("goal · 4m 12s");
   });
 });
 
@@ -1303,6 +1310,308 @@ describe("registerGoalTool — settle triage", () => {
     expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
     expect(notify).toHaveBeenCalledWith(expect.stringContaining("still active after 2 auto-continuations"));
     expect(sentCustom).toHaveLength(2); // no third continuation message
+  });
+
+  describe("loop accounting persistence (goal.state)", () => {
+    it("isGoalLoopState rejects malformed accounting", () => {
+      const good: GoalLoopState = {
+        continuations: 1,
+        resetsUsed: 0,
+        totalContinuations: 1,
+        spendMs: 500,
+        trajectory: ["measured A"],
+      };
+      expect(isGoalLoopState(good)).toBe(true);
+      expect(isGoalLoopState(null)).toBe(false);
+      expect(isGoalLoopState({ ...good, continuations: -1 })).toBe(false);
+      expect(isGoalLoopState({ ...good, spendMs: Number.NaN })).toBe(false);
+      expect(isGoalLoopState({ ...good, trajectory: ["a", 3] })).toBe(false);
+      expect(isGoalLoopState({ ...good, trajectory: new Array(9).fill("x") })).toBe(false);
+    });
+
+    it("a reload restores mid-budget accounting instead of re-granting it (F1)", async () => {
+      // First session: burn one continuation of a 2-cap budget. The settle
+      // itself must append durable accounting — an unexpected reload is
+      // exactly the case the entry exists for.
+      const first = makePi();
+      const triage = {
+        triage: async () => ({ action: "continue", reason: "mid-work" }),
+      } satisfies { triage: SettleTriage["triage"] };
+      registerGoalTool(first.pi, {
+        maxContinuations: 2,
+        verifyRunner: async () => failVerify,
+        triage,
+      });
+      await first.tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
+      expect(await fire(first.events, "agent_before_settle", settleCtx())).toEqual({ continue: true }); // 1/2
+      const loopEntry = first.entries.filter((e) => e.customType === "goal.state").at(-1)!.data as GoalStateData;
+      expect(loopEntry.loop?.continuations).toBe(1);
+      expect(loopEntry.loop?.totalContinuations).toBe(1);
+
+      // Reload (fresh registration adopts the first session's branch): the
+      // restored window has ONE continuation left, so a single further settle
+      // reaches the cap — the pre-accounting behavior re-granted a fresh two.
+      const fresh = makePi();
+      const notify = vi.fn();
+      registerGoalTool(fresh.pi, {
+        maxContinuations: 2,
+        verifyRunner: async () => failVerify,
+        triage,
+      });
+      const ctx = settleCtx(notify);
+      fire(fresh.events, "session_start", {
+        ...sessionCtx(first.entries),
+        ui: ctx.ui,
+      });
+      expect(notify).toHaveBeenCalledWith(expect.stringContaining("loop restored mid-budget"));
+      expect(await fire(fresh.events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 2/2
+      expect(await fire(fresh.events, "agent_before_settle", ctx)).toBeUndefined(); // cap
+      expect(notify).toHaveBeenCalledWith(expect.stringContaining("still active after 2 auto-continuations"));
+      // The cap latches durably: the newest entry carries stopped: true, so a
+      // reload after the cap cannot resurrect the loop.
+      const capped = fresh.entries.at(-1)!.data as GoalStateData;
+      expect(capped.stopped).toBe(true);
+    });
+
+    it("pursuit spend accrues while armed, freezes while down, and survives shutdown", async () => {
+      vi.useFakeTimers();
+      try {
+        const { pi, tools, commands, events, entries } = makePi();
+        const ui = { notify: vi.fn(), setStatus: vi.fn() };
+        registerGoalTool(pi, { verifyRunner: async () => failVerify });
+        vi.setSystemTime(1_000_000);
+        await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
+        vi.advanceTimersByTime(600_000); // 10 min of armed pursuit
+        await commands.get("goal")!.handler("pause", { mode: "headless", ui });
+        vi.advanceTimersByTime(3_600_000); // 1 h paused — accrues nothing
+        const atPause = entries.at(-1)!.data as GoalStateData;
+        expect(atPause.loop?.spendMs).toBeGreaterThanOrEqual(600_000);
+        expect(atPause.loop?.spendMs).toBeLessThan(700_000);
+
+        // Resume re-arms the clock; a shutdown mid-pursuit folds the accrual
+        // since the last persist into the final entry (the active-shutdown path).
+        await commands.get("goal")!.handler("resume", { mode: "headless", ui });
+        vi.advanceTimersByTime(300_000); // 5 min armed
+        fire(events, "session_shutdown");
+        const atShutdown = entries.at(-1)!.data as GoalStateData;
+        expect(atShutdown.goal?.status).toBe("active");
+        expect(atShutdown.loop?.spendMs).toBeGreaterThanOrEqual(900_000);
+        expect(atShutdown.loop?.spendMs).toBeLessThan(1_000_000);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("a malformed loop degrades to a fresh window without discarding the entry's goal or latch", async () => {
+      const { pi, events } = makePi();
+      registerGoalTool(pi, { verifyRunner: async () => failVerify });
+      const makeBranch = (loop: unknown) => [
+        {
+          type: "custom",
+          customType: "goal.state",
+          data: {
+            goal: goal({ id: 5, objective: "x", verify: "npm test" }),
+            stopped: true,
+            loop,
+          },
+        },
+      ];
+      // Assert on the scan itself — the settle guard alone cannot discriminate,
+      // because a vetoing validator drops the whole entry (goal included) and
+      // the null-goal guard returns undefined all the same.
+      for (const loop of [{ continuations: -3 }, null, "corrupt"]) {
+        const scanned = scanGoalState(makeBranch(loop) as GoalBranchEntry[]);
+        expect(scanned.goal?.id).toBe(5); // the entry survives, latch and all
+        expect(scanned.sessionStopped).toBe(true);
+        expect(scanned.loop).toBeUndefined(); // only the accounting is dropped
+      }
+      // And behaviorally: the adopted latch keeps the loop down (the user's
+      // stop is not silently undone by a bad accounting field).
+      fire(events, "session_start", {
+        ...sessionCtx(makeBranch({ continuations: -3 })),
+        ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() },
+      });
+      expect(await fire(events, "agent_before_settle", settleCtx())).toBeUndefined();
+    });
+
+    it("a malformed loop on a live goal warns that the budget silently restarted", async () => {
+      const { pi, events } = makePi();
+      registerGoalTool(pi, { verifyRunner: async () => failVerify });
+      const branch = [
+        {
+          type: "custom",
+          customType: "goal.state",
+          data: {
+            goal: goal({ id: 5, objective: "x", verify: "npm test" }),
+            loop: { continuations: -1 }, // unreadable accounting on a LIVE goal
+          },
+        },
+      ];
+      const notify = vi.fn();
+      fire(events, "session_start", {
+        ...sessionCtx(branch),
+        ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() },
+      });
+      // The re-grant is the unavoidable degradation; the silence is not.
+      expect(notify).toHaveBeenCalledWith(
+        expect.stringContaining("accounting unreadable — continuation budget restarted"),
+      );
+    });
+
+    it("the footer clock is per-goal: a new goal does not inherit its predecessor's hours", async () => {
+      vi.useFakeTimers();
+      try {
+        const { pi, tools, events, entries } = makePi();
+        const ui = { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() };
+        registerGoalTool(pi, { verifyRunner: async () => failVerify });
+        vi.setSystemTime(1_000_000);
+        await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "first", verify: "npm test" });
+        vi.advanceTimersByTime(3_600_000); // 1 h of pursuit on goal #1
+        await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "second", verify: "npm test" });
+        // Bind the ui via adoption (the tool path carries no ctx) — the
+        // adopted footer must read goal #2's own clock, not the lifetime hour.
+        fire(events, "session_start", { ...sessionCtx(entries), ui });
+        const footer = ui.setStatus.mock.calls.at(-1)![1] as string;
+        expect(footer).toContain("goal ·");
+        expect(footer).not.toContain("1h"); // fresh clock, not the lifetime one
+        // The lifetime view survives for the loud lines: the newest persisted
+        // entry still carries the full hour.
+        expect(footer).not.toContain("1h 0m");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("the set-time entry persists the baseline measurement", async () => {
+      const { pi, tools, entries } = makePi();
+      registerGoalTool(pi, {
+        verifyRunner: async () => ({ ok: false, exitCode: 1, timedOut: false, output: "baseline state" }),
+      });
+      await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
+      // A reload between set and the first settle must still restore the
+      // judge's first-vs-last baseline — the newest entry carries it.
+      const loop = (entries.filter((e) => e.customType === "goal.state").at(-1)!.data as GoalStateData).loop!;
+      expect(loop.trajectory).toEqual(["baseline state"]);
+    });
+
+    it("a plateau of long verify outputs still reads as a plateau after a reload", async () => {
+      // Regression: the live window used to keep raw output (up to
+      // MAX_VERIFY_OUTPUT) while the persisted trajectory clipped to 2000 —
+      // after a reload the judge diffed clipped-vs-raw, “saw progress”, and
+      // granted a reset the plateau should have denied.
+      const longPlateau = "x".repeat(4300);
+      const first = makePi();
+      registerGoalTool(first.pi, {
+        maxContinuations: 2,
+        verifyRunner: async () => ({ ok: false, exitCode: 1, timedOut: false, output: longPlateau }),
+        triage: { triage: async () => ({ action: "verify", reason: "claims done" }) },
+      });
+      await first.tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
+      expect(await fire(first.events, "agent_before_settle", settleCtx())).toEqual({ continue: true }); // 1/2
+
+      const fresh = makePi();
+      registerGoalTool(fresh.pi, {
+        maxContinuations: 2,
+        verifyRunner: async () => ({ ok: false, exitCode: 1, timedOut: false, output: longPlateau }),
+        triage: { triage: async () => ({ action: "verify", reason: "claims done" }) },
+      });
+      const notify = vi.fn();
+      fire(fresh.events, "session_start", {
+        ...sessionCtx(first.entries),
+        ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() },
+      });
+      // The cap gate runs pre-increment, so reaching 2/2 needs one more settle
+      // than the restored count implies; the NEXT settle trips the cap and
+      // consults the judge on the restored window.
+      expect(await fire(fresh.events, "agent_before_settle", settleCtx())).toEqual({ continue: true }); // 2/2
+      // At the cap the judge must see first === last and stop — not grant a
+      // reset on a clipping artifact.
+      expect(await fire(fresh.events, "agent_before_settle", settleCtx(notify))).toBeUndefined();
+      expect(notify).toHaveBeenCalledWith(expect.stringContaining("still active after 2 auto-continuations"));
+    });
+
+    it("tail-only differences in long verify outputs read as progress, not plateau", async () => {
+      // The verify cap preserves the TAIL because that is where the signal
+      // lives (failing counts, summary lines). A head-preserving trajectory
+      // cap would collapse outputs that differ only past char 2000 into the
+      // same string and stop a genuinely progressing loop at the cap.
+      const { pi, tools, events } = makePi();
+      let n = 0;
+      registerGoalTool(pi, {
+        maxContinuations: 2,
+        verifyRunner: async () => ({ ok: false, exitCode: 1, timedOut: false, output: `${"h".repeat(4300)}-${++n}` }),
+        triage: { triage: async () => ({ action: "verify", reason: "claims done" }) },
+      });
+      const notify = vi.fn();
+      await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
+      expect(await fire(events, "agent_before_settle", settleCtx(notify))).toEqual({ continue: true }); // 1/2
+      expect(await fire(events, "agent_before_settle", settleCtx(notify))).toEqual({ continue: true }); // 2/2
+      // At the cap the judge sees first !== last (the -1/-2/-3 tails) and
+      // grants the reset instead of stopping on a clipping artifact.
+      expect(await fire(events, "agent_before_settle", settleCtx(notify))).toEqual({ continue: true });
+      expect(notify).toHaveBeenCalledWith(expect.stringContaining("still progressing"));
+    });
+
+    it("the persisted trajectory keeps the window baseline the progress judge diffs against", async () => {
+      const { pi, tools, events, entries } = makePi();
+      let n = 0;
+      registerGoalTool(pi, {
+        maxContinuations: 12,
+        verifyRunner: async () => ({ ok: false, exitCode: 1, timedOut: false, output: `out ${++n}` }),
+        triage: { triage: async () => ({ action: "verify", reason: "claims done" }) } satisfies {
+          triage: SettleTriage["triage"];
+        },
+      });
+      await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
+      for (let i = 0; i < 9; i++) {
+        expect(await fire(events, "agent_before_settle", settleCtx())).toEqual({ continue: true });
+      }
+      // [baseline + tail], never a tail-only slice: the restored window must
+      // still diff first-vs-last the way the in-memory window does.
+      const loop = (entries.filter((e) => e.customType === "goal.state").at(-1)!.data as GoalStateData).loop!;
+      expect(loop.trajectory[0]).toBe("out 1"); // the set-time baseline, preserved
+      expect(loop.trajectory.at(-1)).toBe("out 10");
+      expect(loop.trajectory.length).toBeLessThanOrEqual(8);
+    });
+
+    it("legacy entries without accounting adopt with a fresh budget", async () => {
+      const { pi, events, sentCustom } = makePi();
+      registerGoalTool(pi, { verifyRunner: async () => failVerify });
+      fire(events, "session_start", sessionCtx([goalState(goal({ id: 2, objective: "x", verify: "npm test" }))]));
+      expect(await fire(events, "agent_before_settle", settleCtx())).toEqual({ continue: true });
+      const msg = sentCustom[0]!.msg as { details: { continuation: number } };
+      expect(msg.details.continuation).toBe(1); // fresh window, not NaN or restored
+    });
+
+    it("/goal resume re-authorizes loudly: lifetime numbers, then a durable fresh window", async () => {
+      const { pi, commands, events, entries } = makePi();
+      const notify = vi.fn();
+      registerGoalTool(pi, { maxContinuations: 3, verifyRunner: async () => failVerify });
+      const branch = [
+        goalState(goal({ id: 4, objective: "x", verify: "npm test", status: "paused" }), true, {
+          continuations: 2,
+          resetsUsed: 1,
+          totalContinuations: 7,
+          spendMs: 5_000_000,
+          trajectory: ["A", "B"],
+        }),
+      ];
+      fire(events, "session_start", {
+        ...sessionCtx(branch),
+        ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() },
+      });
+      await commands.get("goal")!.handler("resume", { mode: "tui", ui: { notify } });
+      // The loud line: what the goal has consumed (lifetime), then what is
+      // being re-granted (the window) — the resume is an informed decision.
+      expect(notify).toHaveBeenCalledWith(expect.stringContaining("lifetime: 7 continuations, 1h 23m of pursuit"));
+      expect(notify).toHaveBeenCalledWith(expect.stringContaining("fresh 3 continuations"));
+      // Durable: the newest entry carries the re-armed window AND the lifetime.
+      const resumed = entries.at(-1)!.data as GoalStateData;
+      expect(resumed.stopped).toBe(false);
+      expect(resumed.loop?.continuations).toBe(0);
+      expect(resumed.loop?.totalContinuations).toBe(7);
+      expect(resumed.loop?.spendMs).toBeGreaterThanOrEqual(5_000_000);
+    });
   });
 
   it("the default LLM triage is constructed when PI_GOAL_TRIAGE is enabled", async () => {
@@ -3144,7 +3453,7 @@ describe("registerGoalTool", () => {
     expect((sentCustom[0]!.msg as { details: GoalCheckDetails }).details.judge).toBeUndefined();
   });
 
-  it("judge verdicts steer only — goal state and the branch stay untouched by a settle", async () => {
+  it("judge verdicts steer only — a settle writes accounting, never a goal mutation", async () => {
     const { pi, tools, events, entries } = makePi();
     const ctx = {
       ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() },
@@ -3155,7 +3464,7 @@ describe("registerGoalTool", () => {
       maxContinuations: 10,
     });
     await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it" });
-    const entriesAfterSet = entries.length;
+    const goalAtSet = (entries.filter((e) => e.customType === "goal.state").at(-1)!.data as { goal: Goal | null }).goal;
 
     expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
     // Even a "complete" verdict must not mutate the goal or write state —
@@ -3167,7 +3476,15 @@ describe("registerGoalTool", () => {
       evidence: ["x"],
     })) as { details: GoalDetails };
     expect(status.details.error).toContain("stale goal id 999; the current goal is #1");
-    expect(entries.length).toBe(entriesAfterSet); // no goal.state written by the settle
+    // A settle now writes ACCOUNTING (loop counters/spend), but never the
+    // goal: the newest entry carries the identical goal the set wrote — the
+    // model's own complete call is still the single path that changes it.
+    const settleEntry = entries.filter((e) => e.customType === "goal.state").at(-1)!.data as {
+      goal: Goal | null;
+      loop?: { continuations: number };
+    };
+    expect(settleEntry.goal).toEqual(goalAtSet);
+    expect(settleEntry.loop?.continuations).toBe(1);
   });
 
   it("judgeModel and judgeTimeoutMs pin the default judge's child through registration", async () => {
@@ -4035,7 +4352,7 @@ describe("registerGoalTool", () => {
     // Recovery: resume accepts an ACTIVE-but-stopped goal (the old guard only
     // took paused, leaving this state unrecoverable short of a new kickoff).
     await commands.get("goal")!.handler("resume", cmdCtx);
-    expect(notify).toHaveBeenLastCalledWith("Goal #2 resumed.");
+    expect(notify).toHaveBeenLastCalledWith(expect.stringContaining("Goal #2 resumed — lifetime:"));
     expect(await fire(events, "agent_before_settle", settleCtx)).toEqual({ continue: true }); // re-armed
     expect(sentCustom).toHaveLength(2);
   });
@@ -4085,7 +4402,7 @@ describe("registerGoalTool", () => {
       const re = reloadWith(entries);
       expect(await fire(re.fresh.events, "agent_before_settle", re.settleCtx)).toBeUndefined(); // still paused
       await re.fresh.commands.get("goal")!.handler("resume", { mode: "headless", ui: re.settleCtx.ui });
-      expect(re.notify).toHaveBeenLastCalledWith("Goal #1 resumed.");
+      expect(re.notify).toHaveBeenLastCalledWith(expect.stringContaining("Goal #1 resumed — lifetime:"));
       expect(await fire(re.fresh.events, "agent_before_settle", re.settleCtx)).toEqual({ continue: true });
       expect(re.fresh.sentCustom).toHaveLength(1);
     });
