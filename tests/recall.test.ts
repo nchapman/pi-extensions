@@ -751,7 +751,7 @@ describe("buildFileCorpus", () => {
     expect(corpus.chunks[0].text).toContain("token rotation");
     expect(corpus.chunks[0].origin).toBe("foreign");
     expect(corpus.chunks[0].sessionLabel).toContain("Auth rework");
-    expect(corpus.chunks[0].ref).toMatch(/^[0-9a-f]{8}\.1e2d$/);
+    expect(corpus.chunks[0].ref).toMatch(/^[0-9a-f]{8}\.1e2dcafe-aaaa-bbbb-cccc-dddddddddddd$/);
     expect(corpus.entryLines.get(corpus.chunks[0].entryId)).toBe(3);
   });
 
@@ -872,6 +872,37 @@ describe("ProjectCorpusCache", () => {
     const entryId = corpus.chunks[0].entryId;
     expect(cache.locate("1e2d", entryId)).toMatchObject({ corpus, line: 2 });
     expect(cache.locate("beef", entryId)).toBeUndefined();
+  });
+
+  it("a full-session ref wins over an entry-id collision with another session", async () => {
+    // Entry ids are 8 random hex — across a project's cached sessions they
+    // collide (birthday bound), and a 4-char uuidv7 prefix cannot pick the
+    // right file. The ref's session component must be exact for new refs.
+    const line = userLine("the colliding entry");
+    const early = sessionFile({ id: "1e2dcafe-aaaa-bbbb-cccc-dddddddddddd", entries: [line] });
+    const late = sessionFile({ id: "1e2dbeef-aaaa-bbbb-cccc-dddddddddddd", entries: [line] });
+    const { reader, dir } = fakeReader([early, late]); // insertion order favors `early`
+    const cache = new ProjectCorpusCache(reader, 64 * 1024 * 1024);
+    await cache.refresh(dir, undefined);
+    const entryId = JSON.parse(line).id;
+    const located = cache.locate("1e2dbeef-aaaa-bbbb-cccc-dddddddddddd", entryId);
+    expect(located?.corpus.sessionId).toBe("1e2dbeef-aaaa-bbbb-cccc-dddddddddddd");
+  });
+
+  it("a legacy 4-char ref with a collision resolves to the earliest session, deterministically", async () => {
+    // Refs minted before the full-id format carry only the ~50-day uuidv7
+    // bucket; when the entry id collides across that bucket the information
+    // to pick the right file simply is not there. Pick the origin (smallest
+    // session id = earliest by uuidv7 time order) so every call agrees.
+    const line = userLine("the colliding entry");
+    const early = sessionFile({ id: "1e2daaaa-bbbb-cccc-dddddddddddd", entries: [line] });
+    const late = sessionFile({ id: "1e2dffff-bbbb-cccc-dddddddddddd", entries: [line] });
+    const { reader, dir } = fakeReader([late, early]); // insertion order favors `late`
+    const cache = new ProjectCorpusCache(reader, 64 * 1024 * 1024);
+    await cache.refresh(dir, undefined);
+    const entryId = JSON.parse(line).id;
+    const located = cache.locate("1e2d", entryId);
+    expect(located?.corpus.sessionId).toBe("1e2daaaa-bbbb-cccc-dddddddddddd");
   });
 });
 

@@ -220,7 +220,12 @@ export interface RecallChunk {
 
 function makeRef(entryId: string, origin: "current" | "foreign", sessionId: string): string {
   if (origin === "current") return entryId;
-  return `${entryId}.${sessionId.slice(0, 4)}`;
+  // Full session id, not a short prefix: a uuidv7 prefix is a ~50-day
+  // timestamp bucket shared by every session in the project, and entry ids
+  // are only 8 random hex — their cross-session birthday collisions need the
+  // session component to actually discriminate. Legacy 4-char refs still
+  // parse and locate (prefix path below).
+  return `${entryId}.${sessionId}`;
 }
 
 /** Parse a ref back into its locating parts; undefined when malformed. */

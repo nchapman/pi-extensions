@@ -191,13 +191,21 @@ export class ProjectCorpusCache {
   }
 
   /** Locate a foreign entry's raw line for read mode. */
-  locate(refSessionShort: string, entryId: string): { corpus: FileCorpus; line: number } | undefined {
+  locate(refSession: string, entryId: string): { corpus: FileCorpus; line: number } | undefined {
+    // Full session ids (new refs) match exactly; short prefixes (legacy refs
+    // minted before the full-id format) fall back to startsWith. When several
+    // corpora hold the same entry id — a birthday collision the ref can no
+    // longer distinguish, only the legacy path can hit this — resolve to the
+    // earliest session (smallest uuidv7 sorts first) so every call agrees.
+    const full = refSession.length > 4;
+    let best: { corpus: FileCorpus; line: number } | undefined;
     for (const corpus of this.files.values()) {
-      if (!corpus.sessionId.startsWith(refSessionShort)) continue;
+      if (full ? corpus.sessionId !== refSession : !corpus.sessionId.startsWith(refSession)) continue;
       const line = corpus.entryLines.get(entryId);
-      if (line !== undefined) return { corpus, line };
+      if (line === undefined) continue;
+      if (best === undefined || corpus.sessionId < best.corpus.sessionId) best = { corpus, line };
     }
-    return undefined;
+    return best;
   }
 
   /** Read one entry line from a cached file through the injected reader. */
