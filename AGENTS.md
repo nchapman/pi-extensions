@@ -17,7 +17,8 @@ npm run test:coverage  # vitest with V8 coverage report
 
 ## Layout
 
-- `extensions/*.ts` — one file per extension; every file here is auto-registered via `pi.extensions` in `package.json` (cross-extension imports exist — e.g. `recall.ts` imports plan rendering from `todo.ts`, so vendoring one file can pull in another)
+- `extensions/*.ts` — one file per small extension; every file here is auto-registered via `pi.extensions` in `package.json` (cross-extension imports exist — e.g. `recall.ts` imports plan rendering from `todo.ts`, so vendoring one file can pull in another)
+- `extensions/<name>/` — the directory form for a larger extension: `index.ts` is the entry pi loads (a subdirectory with an `index.ts` registers as ONE extension; sibling modules are never loaded separately), pure layers are factored into sibling modules (see `extensions/goal/` for the pattern: `config`/`format`/`input`/`verify`/`state`/`completion`/`judge`/`prompts`/`render` below the wiring in `index.ts`, which re-exports the module surfaces so `import … from "../extensions/<name>"` keeps working). Prefer promoting a file extension to this shape when it outgrows ~1,000 lines
 - `lib/` — shared core modules (e.g. the task registry) imported by extensions and tests alike
 - `tests/*.test.ts` — one vitest suite per module/extension; keep new tests in the matching file
 
