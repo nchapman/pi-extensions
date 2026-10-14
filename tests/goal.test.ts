@@ -24,6 +24,8 @@ import {
   parseMaxProgressResets,
   parseMaxTurnsPerRun,
   parseMaxPivots,
+  projectCompletion,
+  extractMetrics,
   recordBudgetOutput,
   parseVerifyTimeoutMs,
   parseJudgeEnabled,
@@ -5247,5 +5249,89 @@ describe("pivot accounting in the loop state", () => {
     expect(isGoalLoopState({ ...base, pivotsUsed: 1.5 })).toBe(false);
     expect(isGoalLoopState({ ...base, pivotsUsed: Number.NaN })).toBe(false);
     expect(isGoalLoopState({ ...base, pivotsUsed: "1" })).toBe(false);
+  });
+});
+
+describe("extractMetrics", () => {
+  it("reads failure-family counts, pass counts, and keyword-anchored percents", () => {
+    const m = extractMetrics("Tests: 120 passed, 7 failed\nCoverage: 72.3% overall");
+    const by = Object.fromEntries(m.map((x) => [x.name, x.value]));
+    expect(by).toEqual({ failed: 7, passed: 120, percent: 72.3 });
+  });
+  it("skips a bare percent with no polarity keyword — never guesses", () => {
+    expect(extractMetrics("12% of things")).toEqual([]);
+  });
+  it("takes the first match per family and tolerates surrounding noise", () => {
+    const m = extractMetrics(" Suites: 3 failed, 1 failed (retried)\n branch coverage 64%");
+    const by = Object.fromEntries(m.map((x) => [x.name, x.value]));
+    expect(by).toEqual({ failed: 3, percent: 64 });
+  });
+});
+
+describe("projectCompletion", () => {
+  const t = (...outputs: string[]) => outputs;
+  it("needs two comparable points — one point or no metrics is insufficient", () => {
+    expect(projectCompletion({ trajectory: t("7 failed"), continuationsUsed: 3, continuationsRemaining: 10 })).toBe(
+      "insufficient-data",
+    );
+    expect(
+      projectCompletion({ trajectory: t("all good", "all good"), continuationsUsed: 3, continuationsRemaining: 10 }),
+    ).toBe("insufficient-data");
+  });
+  it("flat with an open gap is the F1 signature: cannot close", () => {
+    // Same failure count across the window: rate 0, gap 7, no budget closes it.
+    expect(
+      projectCompletion({
+        trajectory: t("7 failed, 120 passed", "7 failed, 120 passed"),
+        continuationsUsed: 6,
+        continuationsRemaining: 4,
+      }),
+    ).toBe("cannot-close-by-budget");
+  });
+  it("closing at the observed rate within budget projects complete", () => {
+    // 10 → 6 failures over 4 continuations: rate 1/continuation, gap 6,
+    // remaining 10 → projects to -4.
+    expect(
+      projectCompletion({
+        trajectory: t("10 failed", "6 failed"),
+        continuationsUsed: 4,
+        continuationsRemaining: 10,
+      }),
+    ).toBe("projects-complete");
+  });
+  it("improving but too slowly is still cannot-close", () => {
+    // 10 → 9 over 9 continuations: rate ~0.11, gap 9, remaining 9 → 9 + 1 < 0 target miss.
+    expect(
+      projectCompletion({ trajectory: t("10 failed", "9 failed"), continuationsUsed: 9, continuationsRemaining: 9 }),
+    ).toBe("cannot-close-by-budget");
+  });
+  it("coverage closes at 100: 72→78 at 1.5/cont with 20 left projects complete", () => {
+    expect(
+      projectCompletion({
+        trajectory: t("coverage 72.0%", "coverage 78.0%"),
+        continuationsUsed: 4,
+        continuationsRemaining: 20,
+      }),
+    ).toBe("projects-complete");
+  });
+  it("zero remaining budget with any open gap cannot close", () => {
+    expect(
+      projectCompletion({ trajectory: t("10 failed", "5 failed"), continuationsUsed: 5, continuationsRemaining: 0 }),
+    ).toBe("cannot-close-by-budget");
+  });
+  it("an already-closed metric imposes no constraint", () => {
+    expect(
+      projectCompletion({ trajectory: t("3 failed", "0 failed"), continuationsUsed: 3, continuationsRemaining: 0 }),
+    ).toBe("projects-complete");
+  });
+  it("a metric that vanishes between prints leaves no basis — but other metrics still project", () => {
+    // 'failed' disappears in the last output; 'remaining' alone decides.
+    expect(
+      projectCompletion({
+        trajectory: t("4 failed, 9 remaining", "9 remaining"),
+        continuationsUsed: 4,
+        continuationsRemaining: 2,
+      }),
+    ).toBe("cannot-close-by-budget");
   });
 });

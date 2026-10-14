@@ -235,6 +235,7 @@ import {
 import { clip, formatElapsed } from "./format";
 
 export * from "./config";
+export * from "./projection";
 export * from "./format";
 export * from "./verify";
 export * from "./input";
