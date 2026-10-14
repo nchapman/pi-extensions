@@ -104,8 +104,53 @@ export function validateCriteria(raw: unknown): { criteria: string[]; error?: st
 }
 
 const MAX_VERIFY_CHARS = 500;
-/** Commands that always exit 0 regardless of code state — a model can't prove anything with them. */
-const NOOP_VERIFY = new Set(["true", ":", "exit 0"]);
+
+/** A command segment that provably always exits 0 on its own — nothing can be
+ * verified with it. Deliberately conservative: only shapes whose exit status
+ * cannot depend on the codebase (echo is included only without pipes/
+ * redirects/substitution, which could reintroduce a real gate). */
+const NOOP_SEGMENT =
+  /^(?:true|:|exit\s+0+|sleep\s+\d+(?:\.\d+)?|cd(?:\s+(?:\.|~))?|pwd|#[\s\S]*|echo(?:\s[^|<>`$]*)?)$/;
+
+/** Does this command always exit 0, making it useless as a verify gate?
+ *
+ * Models the shell's exit semantics one level deep, not the full grammar:
+ * split on `;`/newlines (the LAST non-empty list's status wins), then within
+ * a list split on `&&`/`||` left-associatively — a chain is always-0 when its
+ * last segment is always-0 and either it stands alone, follows `||` (which
+ * erases any earlier failure), or the whole prefix chain is itself always-0.
+ * Quoting is not parsed; mis-splitting inside quotes can only over-accept
+ * (the fragments never match NOOP_SEGMENT), never falsely reject. */
+export function isNoopVerifyCommand(command: string): boolean {
+  const always0 = (segment: string): boolean => {
+    const s = segment.trim();
+    if (s === "") return false; // empty segments never decide a chain
+    const subshell = /^\((.*)\)$/.exec(s);
+    if (subshell) return subshell[1].split(";").every((part) => always0(part));
+    return NOOP_SEGMENT.test(s);
+  };
+  // An &&/|| chain exits with the status of the last command that ran: it is
+  // always-0 when its last segment is always-0 AND either the chain is a
+  // single segment, the last operator is `||` (which erases any earlier
+  // failure), or every gating prefix is itself always-0 (`x && always0`
+  // propagates x's failure, so x must be unable to fail too).
+  const chainAlways0 = (segs: string[], ops: string[]): boolean => {
+    if (!always0(segs[segs.length - 1])) return false;
+    if (segs.length === 1) return true;
+    if (ops[ops.length - 1] === "||") return true;
+    return chainAlways0(segs.slice(0, -1), ops.slice(0, -1));
+  };
+  // A `;` list exits with the status of the LAST non-empty list.
+  const lists = command
+    .split(/[;\n]/)
+    .map((l) => l.trim())
+    .filter((l) => l !== "");
+  const last = lists[lists.length - 1];
+  if (!last) return false;
+  const parts = last.split(/\s*(?:&&|\|\|)\s*/);
+  const ops = [...last.matchAll(/&&|\|\|/g)].map((m) => m[0]);
+  return chainAlways0(parts, ops);
+}
 
 /** Validate the optional `verify` command. Empty, oversized, or always-pass commands are rejected. */
 export function validateVerify(raw: unknown): { verify?: string; error?: string } {
@@ -114,7 +159,7 @@ export function validateVerify(raw: unknown): { verify?: string; error?: string 
   const v = raw.trim();
   if (v === "") return { error: "verify must be a non-empty command" };
   if (v.length > MAX_VERIFY_CHARS) return { error: `verify exceeds ${MAX_VERIFY_CHARS} chars` };
-  if (NOOP_VERIFY.has(v))
+  if (isNoopVerifyCommand(v))
     return { error: `verify "${v}" is a no-op that always passes; give a real check (e.g. \`npm test\`)` };
   return { verify: v };
 }

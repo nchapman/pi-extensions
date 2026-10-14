@@ -943,12 +943,43 @@ describe("validateVerify", () => {
       expect(validateVerify(bad).error).toContain("no-op");
     }
   });
+  it("rejects trivially-true variants the exact-match set missed", () => {
+    // Shell exit semantics: `;` takes the last list's status, `|| true` erases
+    // any failure, and sleep/cd/pwd/echo-alone always exit 0. A model can't
+    // prove anything with any of these — they self-certify.
+    for (const bad of [
+      "true;",
+      "true ;",
+      ":;:",
+      "sleep 0",
+      "sleep 2",
+      "exit 0;",
+      "(true)",
+      "cd .",
+      "pwd",
+      "true && :",
+      "npm test; true", // ; discards npm's status — always 0
+      "npm test || true", // || true erases npm's failure — always 0
+      "echo done", // echo alone always exits 0 — no pipe, no gate
+    ]) {
+      expect(validateVerify(bad).error).toContain("no-op");
+    }
+  });
   it("rejects oversized commands", () => {
     expect(validateVerify("x".repeat(501)).error).toContain("exceeds");
   });
   it("does not flag legitimate commands that merely contain the word 'true'", () => {
-    expect(validateVerify("echo true").error).toBeUndefined();
     expect(validateVerify("npm test --if true").error).toBeUndefined();
+    expect(validateVerify("grep -q true config.yml").error).toBeUndefined();
+  });
+  it("accepts real checks built around always-true pieces", () => {
+    // `true && npm test` gates on npm test (&& runs it only on success, and
+    // its failure propagates); `npm test && echo done` keeps npm's failure;
+    // a pipe makes echo's output checkable. Note `npm test; echo done` is
+    // correctly REJECTED — the `;` discards npm's status for echo's 0.
+    expect(validateVerify("true && npm test").error).toBeUndefined();
+    expect(validateVerify("npm test && echo done").error).toBeUndefined();
+    expect(validateVerify("echo done | grep done").error).toBeUndefined();
   });
 });
 
@@ -3056,7 +3087,7 @@ describe("registerGoalTool", () => {
     const { pi, tools, commands } = makePi();
     registerGoalTool(pi);
     const tool = tools.get(GOAL_TOOL_NAME)!;
-    await tool.execute("1", { action: "set", objective: "ship it", verify: "echo hi" });
+    await tool.execute("1", { action: "set", objective: "ship it", verify: "test -f package.json" });
     // A live check (the settle loop's verifyRunner is runVerify in production).
     const p = runVerify("sleep 30", { timeoutMs: 5000 });
     await commands.get("goal")!.handler("stop", { ui: { notify: vi.fn() }, mode: "tui" });
@@ -3067,7 +3098,9 @@ describe("registerGoalTool", () => {
   it("/goal pause also kills an in-flight verify", async () => {
     const { pi, tools, commands } = makePi();
     registerGoalTool(pi);
-    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it", verify: "echo hi" });
+    await tools
+      .get(GOAL_TOOL_NAME)!
+      .execute("1", { action: "set", objective: "ship it", verify: "test -f package.json" });
     const p = runVerify("sleep 30", { timeoutMs: 5000 });
     await commands.get("goal")!.handler("pause", { ui: { notify: vi.fn() }, mode: "tui" });
     const r = await p;
