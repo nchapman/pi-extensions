@@ -236,11 +236,13 @@ export function extractSnippet(text: string, query: string, maxChars: number): s
   const lower = text.toLowerCase();
   let at = -1;
   for (const t of queryTokens) {
-    // Word-boundary match only, so "parse" does not window on "sparse".
+    // Token-boundary match only, so "parse" does not window on "sparse" —
+    // and, symmetrically with tokenize(), DOES window on "parseHeader" or
+    // "v2": the boundary check runs against the original text (case intact)
+    // so the camel/digit/acronym splits the tokenizer makes are positions a
+    // query token may legitimately start or end at.
     for (let i = lower.indexOf(t); i !== -1; i = lower.indexOf(t, i + 1)) {
-      const before = i === 0 ? " " : lower[i - 1];
-      const after = i + t.length >= lower.length ? " " : lower[i + t.length];
-      if (/[a-z0-9]/.test(before) || /[a-z0-9]/.test(after)) continue;
+      if (!tokenStartOk(text, i) || !tokenEndOk(text, i, t.length)) continue;
       if (at === -1 || i < at) at = i;
       break;
     }
@@ -260,6 +262,42 @@ export function extractSnippet(text: string, query: string, maxChars: number): s
   const prefix = start > 0 ? "…" : "";
   const suffix = end < text.length ? "…" : "";
   return `${prefix}${snippet}${suffix}`;
+}
+
+/** Mirrors tokenize()'s split rules as position validity on the original
+ * text: a token may start where the tokenizer would split — after a
+ * non-alphanumeric, at a camel hump, across a letter↔digit edge, or at an
+ * acronym boundary ([A-Z]{2,} followed by [A-Z][a-z]). */
+const isAlnum = (ch: string | undefined): boolean => ch !== undefined && /[A-Za-z0-9]/.test(ch);
+
+function tokenStartOk(text: string, i: number): boolean {
+  const prev = i === 0 ? undefined : text[i - 1];
+  if (!isAlnum(prev)) return true;
+  const cur = text[i];
+  if (/[a-z]/.test(cur) && /[A-Z0-9]/.test(prev!)) return true; // camel hump or digit edge
+  if (/[0-9]/.test(cur) && /[A-Za-z]/.test(prev!)) return true; // letter→digit edge
+  if (/[A-Z]/.test(cur) && /[a-z0-9]/.test(prev!)) return true; // camel hump (upper head)
+  if (/[A-Z]/.test(cur) && i >= 2 && /[A-Z]/.test(prev!) && /[A-Z]/.test(text[i - 2])) {
+    const after = text[i + 1];
+    if (after !== undefined && /[a-z]/.test(after)) return true; // acronym: HTTP|Server
+  }
+  return false;
+}
+
+function tokenEndOk(text: string, i: number, len: number): boolean {
+  const nextPos = i + len;
+  if (nextPos >= text.length) return true;
+  const next = text[nextPos];
+  if (!isAlnum(next)) return true;
+  const last = text[nextPos - 1];
+  if (/[A-Z]/.test(next) && /[a-z0-9]/.test(last)) return true; // camel hump or digit edge ahead
+  if (/[0-9]/.test(next) && /[A-Za-z]/.test(last)) return true; // letter→digit edge ahead
+  if (/[A-Za-z]/.test(next) && /[0-9]/.test(last)) return true; // digit→letter edge ahead
+  if (/[A-Z]/.test(next) && /[A-Z]/.test(last)) {
+    const after = text[nextPos + 1];
+    if (after !== undefined && /[a-z]/.test(after)) return true; // acronym: HTTP|Server
+  }
+  return false;
 }
 
 function shortDate(iso: string): string {

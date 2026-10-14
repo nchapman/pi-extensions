@@ -614,6 +614,25 @@ describe("extractSnippet", () => {
     expect(snippet.startsWith("f")).toBe(true); // head window, not windowed on "sparse"
   });
 
+  it("windows on camelCase identifiers the tokenizer splits (normalization symmetry)", () => {
+    // Ranking tokenizes BOTH sides (parseHeader → parse|header), so the chunk
+    // matches — the snippet pass must window on the identifier too, not fall
+    // back to the head because the lowercased haystack lost the boundary.
+    const text = `${"filler ".repeat(50)}see parseHeader for details${" more filler".repeat(50)}`;
+    expect(extractSnippet(text, "parseHeader", 40)).toContain("parseHeader");
+    expect(extractSnippet(text, "header", 40)).toContain("parseHeader");
+  });
+
+  it("windows on digit-boundary splits like v2", () => {
+    const text = `${"filler ".repeat(50)}upgrade to v2 endpoints${" more filler".repeat(50)}`;
+    expect(extractSnippet(text, "v2", 40)).toContain("v2");
+  });
+
+  it("windows on acronym boundaries like HTTPServer", () => {
+    const text = `${"filler ".repeat(50)}HTTPServer boots first${" more filler".repeat(50)}`;
+    expect(extractSnippet(text, "server", 40)).toContain("HTTPServer");
+  });
+
   it("returns the head when nothing matches", () => {
     const snippet = extractSnippet("abcdef".repeat(200), "zzz", 50);
     expect(snippet.endsWith("…")).toBe(true);
