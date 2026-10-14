@@ -454,9 +454,11 @@ describe("parseSettleVerdict", () => {
   it("returns no opinion for junk, missing, or invalid verdicts", () => {
     expect(parseSettleVerdict("I think it is done.")).toBeUndefined();
     expect(parseSettleVerdict("")).toBeUndefined();
+    expect(parseSettleVerdict(42 as unknown as string)).toBeUndefined(); // the child writes text; anything else is no opinion
     expect(parseSettleVerdict('{"verdict":"maybe"}')).toBeUndefined();
     expect(parseSettleVerdict('{"reason":"no verdict key"}')).toBeUndefined();
     expect(parseSettleVerdict('broken {"verdict":"working"')).toBeUndefined();
+    expect(parseSettleVerdict('{"verdict": "working",}')).toBeUndefined(); // balanced but not JSON
   });
   it("omits empty reason and non-string remaining entries", () => {
     const v = parseSettleVerdict('{"verdict":"blocked","reason":"  ","remaining":[1,"real"]}');
@@ -569,6 +571,27 @@ describe("buildWorkDigest", () => {
     const digest = buildWorkDigest(many);
     expect(digest.split("\n").length).toBeLessThanOrEqual(40); // 90 blocks → capped
     expect(digest).toContain("step 29"); // newest message kept
+  });
+  it("stops taking blocks once the char budget is spent (takeEntry guard)", () => {
+    // One message with many max-length blocks: the walk (newest block
+    // first) collects until the 6000-char budget is exhausted mid-message;
+    // the remaining blocks must be dropped, natural order preserved for the
+    // ones that made it.
+    const blocks = Array.from({ length: 35 }, (_, i) => ({
+      type: "text",
+      text: `blk-${String(i).padStart(2, "0")} ${"x".repeat(190)}`,
+    }));
+    const digest = buildWorkDigest([msg("assistant", blocks)]);
+    expect(digest).toContain("note: blk-00"); // first block kept, natural order
+    expect(digest).not.toContain("blk-34"); // budget gone before the last blocks
+    expect(digest.length).toBeLessThanOrEqual(WORK_DIGEST_MAX_CHARS);
+  });
+  it("skips entries whose message content is not a content-block array", () => {
+    const digest = buildWorkDigest([
+      msg("assistant", "plain string content"),
+      msg("assistant", [{ type: "text", text: "real block" }]),
+    ]);
+    expect(digest).toBe("note: real block");
   });
 });
 
@@ -797,6 +820,12 @@ describe("renderGoalResult", () => {
   it("renders errors and the no-goal state", () => {
     expect(renderGoalResult({ goal: null, error: "boom" }, { expanded: false }, THEME)).toContain("boom");
     expect(renderGoalResult({ goal: null }, { expanded: false }, THEME)).toContain("no goal");
+    const blocked = renderGoalResult(
+      { goal: goal({ status: "blocked", blockedReason: "needs credentials" }) },
+      { expanded: true },
+      THEME,
+    );
+    expect(blocked).toContain("blocked: needs credentials");
   });
 });
 
@@ -818,6 +847,16 @@ describe("scanGoalState / lastGoalSnapshot", () => {
       { type: "custom", customType: "other.state", data: { goal: goal({ id: 9 }) } },
     ];
     expect(lastGoalSnapshot(branch)).toEqual(goal({ id: 1 }));
+    // Every field-level veto: non-object data, and a mistyped stopped flag.
+    expect(lastGoalSnapshot([{ type: "custom", customType: "goal.state", data: "junk" }])).toBeNull();
+    expect(
+      scanGoalState([
+        goalState(goal({ id: 3 })),
+        { type: "custom", customType: "goal.state", data: { goal: goal({ id: 4 }), stopped: "yes" } },
+      ]).goal?.id,
+    ).toBe(3);
+    // A goal with mistyped criteria is not a goal either.
+    expect(scanGoalState([goalState(goal({ id: 5, criteria: ["a", 7 as unknown as string] }))]).goal).toBeNull();
   });
   it("derives the loop latch: explicit flag wins, else only paused, else none", () => {
     expect(scanGoalState([goalState(goal({ id: 1, status: "paused" }))]).sessionStopped).toBe(true);
@@ -1096,6 +1135,8 @@ describe("settle triage — parser and task", () => {
     expect(parseTriageVerdict("I think it should continue")).toBeUndefined();
     expect(parseTriageVerdict('{"action":"maybe"}')).toBeUndefined();
     expect(parseTriageVerdict("")).toBeUndefined();
+    expect(parseTriageVerdict(null as unknown as string)).toBeUndefined(); // non-string child output
+    expect(parseTriageVerdict('{"action":3,"reason":"numeric"}')).toBeUndefined(); // parsed but not an action
   });
   it("parses the hold action offered while background tasks run", () => {
     expect(parseTriageVerdict('sure! {"action": "Hold", "reason": "gate suite in flight"}')).toEqual({
@@ -1327,6 +1368,14 @@ describe("registerGoalTool — settle triage", () => {
       expect(isGoalLoopState({ ...good, spendMs: Number.NaN })).toBe(false);
       expect(isGoalLoopState({ ...good, trajectory: ["a", 3] })).toBe(false);
       expect(isGoalLoopState({ ...good, trajectory: new Array(9).fill("x") })).toBe(false);
+      // Per-element length: the read side must bound what the write side bounds
+      // (a capped entry legitimately reaches cap + truncation-prefix length).
+      expect(isGoalLoopState({ ...good, trajectory: ["x".repeat(9999)] })).toBe(false);
+      // goalSpendMs is optional but not exempt — a bad value must drop the
+      // accounting, not NaN-poison the next persist.
+      expect(isGoalLoopState({ ...good, goalSpendMs: "12" as unknown })).toBe(false);
+      expect(isGoalLoopState({ ...good, goalSpendMs: -1 })).toBe(false);
+      expect(isGoalLoopState({ ...good, goalSpendMs: 250 })).toBe(true); // legacy entries omit it
     });
 
     it("a reload restores mid-budget accounting instead of re-granting it (F1)", async () => {
@@ -2534,6 +2583,36 @@ describe("registerGoalTool", () => {
       evidence: ["migrated"],
     })) as { details: GoalDetails };
     expect(complete.details.error).toContain("not active");
+  });
+
+  it("rejects boundary violations loudly: no goal, stale ids, wrong status, empty input", async () => {
+    const { pi, tools, commands } = makePi();
+    registerGoalTool(pi, { verifyRunner: async () => failVerify });
+    const tool = tools.get(GOAL_TOOL_NAME)!;
+    const text = async (id: string, params: unknown) => {
+      const r = (await tool.execute(id, params)) as { content: Array<{ type: string; text: string }> };
+      return r.content[0].text;
+    };
+
+    // blocked/complete before any goal exists — errors, never a silent no-op.
+    expect(await text("1", { action: "blocked", reason: "stuck" })).toContain("no goal to block");
+    expect(await text("2", { action: "complete", goalId: 1, summary: "x", evidence: ["x"] })).toContain(
+      "no goal to complete",
+    );
+
+    await tool.execute("3", { action: "set", objective: "x", verify: "npm test" });
+    expect(await text("4", { action: "blocked", goalId: 99, reason: "stuck" })).toContain("stale goal id 99");
+
+    const ui = { notify: vi.fn(), setStatus: vi.fn() };
+    await commands.get("goal")!.handler("pause", { mode: "headless", ui });
+    expect(await text("5", { action: "blocked", goalId: 1, reason: "stuck" })).toContain("not active");
+    await commands.get("goal")!.handler("resume", { mode: "headless", ui });
+
+    expect(await text("6", { action: "blocked", goalId: 1, reason: "   " })).toContain("non-empty");
+    // The pure validators' errors must reach the model through the tool too.
+    expect(await text("7", { action: "set", objective: "  " })).toContain("objective must be non-empty");
+    expect(await text("8", { action: "set", objective: "x", criteria: "nope" })).toContain("criteria must be an array");
+    expect(await text("9", { action: "set", objective: "x", verify: "   " })).toContain("non-empty");
   });
 
   it("reconstructs the goal from the session branch and resumes the id sequence", async () => {
@@ -4210,6 +4289,15 @@ describe("registerGoalTool", () => {
     })) as { content: Array<{ type: string; text: string }> };
     expect(r.content[0].text).not.toContain("loop is STOPPED");
     expect(await fire(fresh.events, "agent_before_settle", settleCtx)).toEqual({ continue: true });
+  });
+
+  it("/goal rejects an oversized objective instead of routing it to the model", async () => {
+    const { pi, commands, sent } = makePi();
+    registerGoalTool(pi);
+    const ui = { notify: vi.fn(), setStatus: vi.fn() };
+    await commands.get("goal")!.handler("x".repeat(4001), { mode: "headless", ui });
+    expect(ui.notify).toHaveBeenCalledWith(expect.stringContaining("objective exceeds"), "error");
+    expect(sent).toHaveLength(0); // nothing routed to the model
   });
 
   it("registers /goal: status view and a model-routed kickoff", async () => {
