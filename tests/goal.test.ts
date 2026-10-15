@@ -7,11 +7,9 @@ import { createTaskRegistry, getSharedTaskRegistry, publishSharedTaskRegistry, t
 import {
   checkCompletion,
   checkEvidenceCoverage,
-  defaultProgressJudge,
   effectiveCriteria,
   GOAL_CHECK_EVERY_DEFAULT,
   GOAL_MAX_CONTINUATIONS_DEFAULT,
-  GOAL_MAX_PROGRESS_RESETS_DEFAULT,
   GOAL_MAX_TURNS_PER_RUN_DEFAULT,
   MAX_BUDGET_OUTPUTS,
   GOAL_REMINDER_TYPE,
@@ -21,7 +19,6 @@ import {
   listenForTerminalInput,
   parseCheckEvery,
   parseMaxContinuations,
-  parseMaxProgressResets,
   parseMaxTurnsPerRun,
   parseMaxPivots,
   projectCompletion,
@@ -67,7 +64,6 @@ import {
   type GoalBranchEntry,
   type GoalCheckDetails,
   type GoalDetails,
-  type ProgressJudge,
   type SettleJudge,
   type SettleTriage,
   type SettleVerdict,
@@ -100,6 +96,10 @@ const okVerify: VerifyResult = { ok: true, exitCode: 0, timedOut: false, output:
 // The default LLM triage (PI_GOAL_TRIAGE, default on in production) spawns a
 // child model; the suite exercises it through injected seams only.
 process.env.PI_GOAL_TRIAGE = "0";
+// Same isolation for the pivot budget: several cap tests rely on the default
+// of exactly 1 without passing it explicitly, and an ambient 0 (or >1) would
+// flip them for reasons unrelated to the code under test.
+process.env.PI_GOAL_MAX_PIVOTS = "1";
 
 const failVerify: VerifyResult = { ok: false, exitCode: 1, timedOut: false, output: "FAIL: expected 2 to be 3" };
 const timedOutVerify: VerifyResult = { ok: false, exitCode: null, timedOut: true, output: "" };
@@ -325,21 +325,6 @@ describe("parseMaxTurnsPerRun", () => {
   it("accepts a valid integer", () => expect(parseMaxTurnsPerRun("7")).toBe(7));
 });
 
-describe("parseMaxProgressResets", () => {
-  it("defaults on missing, empty, and invalid values", () => {
-    expect(parseMaxProgressResets(undefined)).toBe(GOAL_MAX_PROGRESS_RESETS_DEFAULT);
-    expect(parseMaxProgressResets("")).toBe(GOAL_MAX_PROGRESS_RESETS_DEFAULT);
-    expect(parseMaxProgressResets("abc")).toBe(GOAL_MAX_PROGRESS_RESETS_DEFAULT);
-    expect(parseMaxProgressResets("-1")).toBe(GOAL_MAX_PROGRESS_RESETS_DEFAULT);
-    expect(parseMaxProgressResets("1e9")).toBe(GOAL_MAX_PROGRESS_RESETS_DEFAULT);
-  });
-
-  it("accepts a valid integer, including zero (judge resets disabled)", () => {
-    expect(parseMaxProgressResets("5")).toBe(5);
-    expect(parseMaxProgressResets("0")).toBe(0);
-  });
-});
-
 describe("recordBudgetOutput", () => {
   it("keeps the oldest entry as the baseline and bounds the window", () => {
     const outputs = ["baseline"];
@@ -347,29 +332,6 @@ describe("recordBudgetOutput", () => {
     expect(outputs).toHaveLength(MAX_BUDGET_OUTPUTS);
     expect(outputs[0]).toBe("baseline"); // baseline survives
     expect(outputs.at(-1)).toBe(`state ${MAX_BUDGET_OUTPUTS + 9}`); // newest survives
-  });
-});
-
-describe("defaultProgressJudge", () => {
-  it("continues when the measured state changed across the window", () => {
-    const v = defaultProgressJudge(goal(), ["coverage 41%", "coverage 41%", "coverage 55%"]);
-    expect(v.continueRun).toBe(true);
-  });
-
-  it("stops on an unchanged measured state (plateau)", () => {
-    const same = "FAIL: expected 2 to be 3";
-    const v = defaultProgressJudge(goal(), [same, same, same]);
-    expect(v.continueRun).toBe(false);
-  });
-
-  it("stops without at least two measured states", () => {
-    expect(defaultProgressJudge(goal(), ["coverage 41%"]).continueRun).toBe(false);
-    expect(defaultProgressJudge(goal(), []).continueRun).toBe(false);
-  });
-
-  it("ignores whitespace-only differences and empty outputs", () => {
-    const v = defaultProgressJudge(goal(), ["  coverage 41%\n", "", " \tcoverage 41% \n"]);
-    expect(v.continueRun).toBe(false);
   });
 });
 
@@ -539,6 +501,30 @@ describe("parseSettleVerdict", () => {
     expect(parseSettleVerdict('sure {"verdict":" Hold ","reason":"gate suite in flight"}')).toEqual({
       verdict: "hold",
       reason: "gate suite in flight",
+    });
+  });
+  it("normalizes a case-drifted stopFlavor instead of silently parking as premise", () => {
+    // A drifted flavor used to fall to undefined → the caller's premise
+    // fallback, skipping the work-appears-complete re-engagement entirely.
+    expect(parseSettleVerdict('{"verdict":"Stop","stopFlavor":"Work-Appears-Complete"}')).toEqual({
+      verdict: "stop",
+      stopFlavor: "work-appears-complete",
+    });
+    expect(parseSettleVerdict('{"verdict":"stop","stopFlavor":" Budget "}')).toEqual({
+      verdict: "stop",
+      stopFlavor: "budget",
+    });
+    expect(parseSettleVerdict('{"verdict":"stop","stopFlavor":"not-a-flavor"}')).toEqual({ verdict: "stop" });
+  });
+  it('accepts a string "true" reframe — children drift between JSON and string truthiness', () => {
+    expect(parseSettleVerdict('{"verdict":"working","reframe":"true"}')).toEqual({
+      verdict: "working",
+      reframe: true,
+    });
+    expect(parseSettleVerdict('{"verdict":"working","reframe":"false"}')).toEqual({ verdict: "working" });
+    expect(parseSettleVerdict('{"verdict":"working","reframe":" True "}')).toEqual({
+      verdict: "working",
+      reframe: true,
     });
   });
   it("finds the verdict inside a reply with nested JSON fields", () => {
@@ -715,6 +701,33 @@ describe("buildSettleJudgeTask", () => {
     expect(task).toContain("Your previous assessment\ncriterion 1 met, 2 open");
     expect(task).toContain("note: deployed v0.0.3");
     expect(task).toContain("ONLY the JSON object");
+  });
+  it("renders the trajectory section at 2+ points and escapes its entries", () => {
+    const task = buildSettleJudgeTask(goal(), {
+      workDigest: "",
+      continuation: 3,
+      maxContinuations: 10,
+      trajectory: ["working:[badge]", "coverage 41%\n2 failing tests"],
+    });
+    expect(task).toContain("## Trajectory of measured states");
+    expect(task).toContain('"working:[badge]"');
+    // JSON-escaped: a newline inside verify output must not re-open the
+    // task's line structure (prompt-injection hardening, same as REFRAME's
+    // Basis line).
+    expect(task).toContain('"coverage 41%\\n2 failing tests"');
+  });
+  it("omits the trajectory section below two points, and renders pivots only when offered", () => {
+    const one = buildSettleJudgeTask(goal(), {
+      workDigest: "",
+      continuation: 1,
+      maxContinuations: 10,
+      trajectory: ["working:[badge]"],
+      pivotsRemaining: 1,
+    });
+    expect(one).not.toContain("Trajectory of measured states");
+    expect(one).toContain("Pivots remaining");
+    const noPivots = buildSettleJudgeTask(goal(), { workDigest: "", continuation: 1, maxContinuations: 10 });
+    expect(noPivots).not.toContain("Pivots remaining");
   });
   it("omits the previous-assessment section when there was none", () => {
     const task = buildSettleJudgeTask(goal(), { workDigest: "", continuation: 1, maxContinuations: 5 });
@@ -1470,11 +1483,12 @@ describe("registerGoalTool — settle triage", () => {
   });
 
   it("an endless run of triage-continues trips the cap — the breaker still works", async () => {
-    const { pi, tools, events, sentCustom } = makePi();
+    const { pi, tools, events, entries, sentCustom } = makePi();
     const notify = vi.fn();
     const verifyRunner = vi.fn(async () => failVerify);
     registerGoalTool(pi, {
       maxContinuations: 2,
+      maxPivots: 0,
       verifyRunner,
       triage: { triage: async () => ({ action: "continue", reason: "still going" }) },
     });
@@ -1483,11 +1497,24 @@ describe("registerGoalTool — settle triage", () => {
     const ctx = settleCtx(notify);
     expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 1/2
     expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 2/2
-    // Third settle: the cap fires; the progress judge sees only unmeasured
-    // markers and fails closed — the loop stops instead of rubber-stamping.
-    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
-    expect(notify).toHaveBeenCalledWith(expect.stringContaining("still active after 2 auto-continuations"));
-    expect(sentCustom).toHaveLength(2); // no third continuation message
+    // Third settle: the cap fires with no pivot remaining — the deterministic
+    // breaker parks (budget flavor) instead of rubber-stamping unmeasured turns.
+    const parked: GoalParkedEvent[] = [];
+    const off = onGoalParked("test-budget-park", (e) => parked.push(e));
+    try {
+      expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+      expect(notify).toHaveBeenCalledWith(expect.stringContaining("parked (budget"));
+      expect(sentCustom).toHaveLength(2); // no third continuation message
+      // The packet and event carry the full budget-park shape — the
+      // disclosure (no judge consulted) rides the persisted state and the
+      // out-of-band channel, not just the notify line.
+      expect(parked).toHaveLength(1);
+      expect(parked[0]).toMatchObject({ id: 1, flavor: "budget", resumeRequires: "spend", unverified: true });
+      const st = entries.filter((e) => e.customType === "goal.state").at(-1)!.data as GoalStateData;
+      expect(st.goal!.park).toMatchObject({ flavor: "budget", resumeRequires: "spend", unverified: true });
+    } finally {
+      off();
+    }
   });
 
   describe("loop accounting persistence (goal.state)", () => {
@@ -1513,6 +1540,14 @@ describe("registerGoalTool — settle triage", () => {
       expect(isGoalLoopState({ ...good, goalSpendMs: "12" as unknown })).toBe(false);
       expect(isGoalLoopState({ ...good, goalSpendMs: -1 })).toBe(false);
       expect(isGoalLoopState({ ...good, goalSpendMs: 250 })).toBe(true); // legacy entries omit it
+      // windowContinuations / reengagedOnce: optional but not exempt — a bad
+      // span would inflate the projection rate after reload; a bad flag would
+      // re-arm the once-per-goal evidence round.
+      expect(isGoalLoopState({ ...good, windowContinuations: -1 })).toBe(false);
+      expect(isGoalLoopState({ ...good, windowContinuations: 1.5 })).toBe(false);
+      expect(isGoalLoopState({ ...good, windowContinuations: 4 })).toBe(true);
+      expect(isGoalLoopState({ ...good, reengagedOnce: "yes" as unknown })).toBe(false);
+      expect(isGoalLoopState({ ...good, reengagedOnce: true })).toBe(true);
     });
 
     it("a reload restores mid-budget accounting instead of re-granting it (F1)", async () => {
@@ -1525,6 +1560,7 @@ describe("registerGoalTool — settle triage", () => {
       } satisfies { triage: SettleTriage["triage"] };
       registerGoalTool(first.pi, {
         maxContinuations: 2,
+        maxPivots: 0,
         verifyRunner: async () => failVerify,
         triage,
       });
@@ -1541,6 +1577,7 @@ describe("registerGoalTool — settle triage", () => {
       const notify = vi.fn();
       registerGoalTool(fresh.pi, {
         maxContinuations: 2,
+        maxPivots: 0,
         verifyRunner: async () => failVerify,
         triage,
       });
@@ -1552,7 +1589,7 @@ describe("registerGoalTool — settle triage", () => {
       expect(notify).toHaveBeenCalledWith(expect.stringContaining("loop restored mid-budget"));
       expect(await fire(fresh.events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 2/2
       expect(await fire(fresh.events, "agent_before_settle", ctx)).toBeUndefined(); // cap
-      expect(notify).toHaveBeenCalledWith(expect.stringContaining("still active after 2 auto-continuations"));
+      expect(notify).toHaveBeenCalledWith(expect.stringContaining("parked (budget"));
       // The cap latches durably: the newest entry carries stopped: true, so a
       // reload after the cap cannot resurrect the loop.
       const capped = fresh.entries.at(-1)!.data as GoalStateData;
@@ -1683,62 +1720,88 @@ describe("registerGoalTool — settle triage", () => {
     it("a plateau of long verify outputs still reads as a plateau after a reload", async () => {
       // Regression: the live window used to keep raw output (up to
       // MAX_VERIFY_OUTPUT) while the persisted trajectory clipped to 2000 —
-      // after a reload the judge diffed clipped-vs-raw, “saw progress”, and
-      // granted a reset the plateau should have denied.
-      const longPlateau = "x".repeat(4300);
+      // after a reload a first-vs-last diff saw "progress" in the clipping
+      // artifact. The judge is gone; the projection consumes the window now,
+      // and the invariant is the same: restored first must equal restored last.
+      // Heads differ, the entire clip-window tail agrees: the tail-preserving
+      // cap must collapse both to the same measured state, while a
+      // head-preserving clip would not — a uniform fixture could never
+      // detect the difference.
+      // MAX_VERIFY_OUTPUT is 4096: the differing head (3000 chars) falls
+      // entirely outside the tail-preserving window, so both clip to Z-only.
+      const plateauA = `${"a".repeat(3000)}${"Z".repeat(4096)}`;
+      const plateauB = `${"b".repeat(3000)}${"Z".repeat(4096)}`;
+      const calls = { n: 0 };
+      const plateauRunner = async () => ({
+        ok: false,
+        exitCode: 1,
+        timedOut: false,
+        output: calls.n++ < 2 ? plateauA : plateauB,
+      });
       const first = makePi();
       registerGoalTool(first.pi, {
         maxContinuations: 2,
-        verifyRunner: async () => ({ ok: false, exitCode: 1, timedOut: false, output: longPlateau }),
+        maxPivots: 0,
+        verifyRunner: plateauRunner,
         triage: { triage: async () => ({ action: "verify", reason: "claims done" }) },
       });
       await first.tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
       expect(await fire(first.events, "agent_before_settle", settleCtx())).toEqual({ continue: true }); // 1/2
 
       const fresh = makePi();
+      const notify = vi.fn();
       registerGoalTool(fresh.pi, {
         maxContinuations: 2,
-        verifyRunner: async () => ({ ok: false, exitCode: 1, timedOut: false, output: longPlateau }),
+        maxPivots: 0,
+        verifyRunner: plateauRunner,
         triage: { triage: async () => ({ action: "verify", reason: "claims done" }) },
       });
-      const notify = vi.fn();
       fire(fresh.events, "session_start", {
         ...sessionCtx(first.entries),
         ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() },
       });
-      // The cap gate runs pre-increment, so reaching 2/2 needs one more settle
-      // than the restored count implies; the NEXT settle trips the cap and
-      // consults the judge on the restored window.
       expect(await fire(fresh.events, "agent_before_settle", settleCtx())).toEqual({ continue: true }); // 2/2
-      // At the cap the judge must see first === last and stop — not grant a
-      // reset on a clipping artifact.
+      // Snapshot the LIVE persisted window pre-reload: the restored window
+      // must EQUAL it (a dropped or differently-clipped restore fails here,
+      // and the differing heads make a head-preserving clip fail too).
+      const liveLoop = (first.entries.filter((e) => e.customType === "goal.state").at(-1)!.data as GoalStateData).loop!;
+      expect(liveLoop.trajectory.length).toBeGreaterThanOrEqual(2);
+      // The cap parks (no pivots), and the restored window that the projection
+      // would read shows first === last — a plateau is a plateau after reload.
       expect(await fire(fresh.events, "agent_before_settle", settleCtx(notify))).toBeUndefined();
-      expect(notify).toHaveBeenCalledWith(expect.stringContaining("still active after 2 auto-continuations"));
+      expect(notify).toHaveBeenCalledWith(expect.stringContaining("parked (budget"));
+      const loop = (fresh.entries.filter((e) => e.customType === "goal.state").at(-1)!.data as GoalStateData).loop!;
+      expect(loop.trajectory.length).toBeGreaterThanOrEqual(2);
+      // The restored window begins as EXACTLY the live one (the post-reload
+      // settles only append); both ends collapse to the same clipped tail.
+      expect(loop.trajectory.slice(0, liveLoop.trajectory.length)).toEqual(liveLoop.trajectory);
+      expect(loop.trajectory[0]).toBe(loop.trajectory.at(-1));
     });
 
-    it("tail-only differences in long verify outputs read as progress, not plateau", async () => {
+    it("tail-only differences in long verify outputs survive the window cap", async () => {
       // The verify cap preserves the TAIL because that is where the signal
-      // lives (failing counts, summary lines). A head-preserving trajectory
-      // cap would collapse outputs that differ only past char 2000 into the
-      // same string and stop a genuinely progressing loop at the cap.
-      const { pi, tools, events } = makePi();
+      // lives (failing counts, summary lines). A head-preserving trajectory cap
+      // would collapse outputs that differ only past char 2000 into one string
+      // and the projection would read genuine progress as a flat plateau.
+      const { pi, tools, events, entries } = makePi();
       let n = 0;
       registerGoalTool(pi, {
         maxContinuations: 2,
+        maxPivots: 0,
         verifyRunner: async () => ({ ok: false, exitCode: 1, timedOut: false, output: `${"h".repeat(4300)}-${++n}` }),
-        triage: { triage: async () => ({ action: "verify", reason: "claims done" }) },
+        triage: { triage: async () => ({ action: "verify", reason: "claims done" }) } satisfies {
+          triage: SettleTriage["triage"];
+        },
       });
-      const notify = vi.fn();
       await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
-      expect(await fire(events, "agent_before_settle", settleCtx(notify))).toEqual({ continue: true }); // 1/2
-      expect(await fire(events, "agent_before_settle", settleCtx(notify))).toEqual({ continue: true }); // 2/2
-      // At the cap the judge sees first !== last (the -1/-2/-3 tails) and
-      // grants the reset instead of stopping on a clipping artifact.
-      expect(await fire(events, "agent_before_settle", settleCtx(notify))).toEqual({ continue: true });
-      expect(notify).toHaveBeenCalledWith(expect.stringContaining("still progressing"));
+      expect(await fire(events, "agent_before_settle", settleCtx())).toEqual({ continue: true }); // 1/2
+      expect(await fire(events, "agent_before_settle", settleCtx())).toEqual({ continue: true }); // 2/2
+      expect(await fire(events, "agent_before_settle", settleCtx())).toBeUndefined(); // cap parks (pivotless)
+      const loop = (entries.filter((e) => e.customType === "goal.state").at(-1)!.data as GoalStateData).loop!;
+      expect(loop.trajectory[0]).not.toBe(loop.trajectory.at(-1)); // the -1/-2 tails survived
     });
 
-    it("the persisted trajectory keeps the window baseline the progress judge diffs against", async () => {
+    it("the persisted trajectory keeps the window baseline the projection diffs against", async () => {
       const { pi, tools, events, entries } = makePi();
       let n = 0;
       registerGoalTool(pi, {
@@ -2153,11 +2216,10 @@ describe("registerGoalTool — judge-decided holds on background tasks", () => {
     const notify = vi.fn();
     const ctx = settleCtx(notify);
     let running: BgTask[] = [];
-    const assess = vi.fn(() => undefined);
     const verifyRunner = vi.fn(async () => failVerify);
     registerGoalTool(pi, {
       maxContinuations: 1,
-      progressJudge: { assess },
+      maxPivots: 0,
       runningTasks: () => running,
       verifyRunner,
       triage: { triage: async () => ({ action: "hold", reason: "gate suite in flight" }) },
@@ -2175,16 +2237,14 @@ describe("registerGoalTool — judge-decided holds on background tasks", () => {
     // like the pre-judge unconditional deferral).
     running = [devServer];
     expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
-    expect(assess).not.toHaveBeenCalled();
     expect(sentCustom).toHaveLength(1);
     expect(notify).toHaveBeenCalledWith(expect.stringContaining("check held"));
-    expect(notify).not.toHaveBeenCalledWith(expect.stringContaining("stopping"));
+    expect(notify).not.toHaveBeenCalledWith(expect.stringContaining("parked"));
 
-    // Calm again: the breaker decides now (no opinion → fail closed to the stop).
+    // Calm again: the breaker decides now (deterministic — the pivotless cap parks).
     running = [];
     expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
-    expect(assess).toHaveBeenCalledTimes(1);
-    expect(notify).toHaveBeenCalledWith(expect.stringContaining("stopping"));
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("parked (budget"));
   });
 
   it("a judge-decided proceed at the cap meets the breaker: the progress judge gates it", async () => {
@@ -2192,11 +2252,10 @@ describe("registerGoalTool — judge-decided holds on background tasks", () => {
     const notify = vi.fn();
     const ctx = settleCtx(notify);
     let running: BgTask[] = [];
-    const assess = vi.fn(() => undefined);
     const verifyRunner = vi.fn(async () => failVerify);
     registerGoalTool(pi, {
       maxContinuations: 1,
-      progressJudge: { assess },
+      maxPivots: 0,
       runningTasks: () => running,
       verifyRunner,
       triage: { triage: async () => ({ action: "verify", reason: "claims done beside the server" }) },
@@ -2212,18 +2271,16 @@ describe("registerGoalTool — judge-decided holds on background tasks", () => {
     // cap fires before the verify — fail closed (no opinion → stop).
     running = [devServer];
     expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
-    expect(assess).toHaveBeenCalledTimes(1);
-    expect(verifyRunner).toHaveBeenCalledTimes(2); // no verify past the stop
+    expect(verifyRunner).toHaveBeenCalledTimes(2); // no verify past the park
     expect(sentCustom).toHaveLength(1);
-    expect(notify).toHaveBeenCalledWith(expect.stringContaining("stopping"));
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("parked (budget"));
   });
 
   it("the milestone judge hold at the cap defers; its proceed meets the breaker", async () => {
-    const { pi, tools, events, sentCustom } = makePi();
+    const { pi, tools, events, entries, sentCustom } = makePi();
     const notify = vi.fn();
     const ctx = settleCtx(notify);
     let running: BgTask[] = [];
-    const assess = vi.fn(() => undefined);
     const verdicts: SettleVerdict[] = [
       { verdict: "working", reason: "criterion 1 open" },
       { verdict: "hold", reason: "waiting on the build" },
@@ -2232,7 +2289,7 @@ describe("registerGoalTool — judge-decided holds on background tasks", () => {
     let call = 0;
     registerGoalTool(pi, {
       maxContinuations: 1,
-      progressJudge: { assess },
+      maxPivots: 0,
       runningTasks: () => running,
       settleJudge: { assess: () => verdicts[call++] },
     });
@@ -2242,12 +2299,17 @@ describe("registerGoalTool — judge-decided holds on background tasks", () => {
     // Hold at the cap: park, breaker not consulted.
     running = [devServer];
     expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
-    expect(assess).not.toHaveBeenCalled();
     expect(sentCustom).toHaveLength(1);
-    // Working at the cap (beside the ambient server): the breaker gates it.
+    // Working at the cap (beside the ambient server): the breaker gates it —
+    // and the packet discloses that a judge ASSESSED this turn (parked via
+    // the notify alone reads "(budget, unverified)"; this park is witnessed).
     expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
-    expect(assess).toHaveBeenCalledTimes(1);
-    expect(notify).toHaveBeenCalledWith(expect.stringContaining("stopping"));
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("parked (budget"));
+    expect(notify).not.toHaveBeenCalledWith(expect.stringContaining("unverified"));
+    const st = entries.filter((e) => e.customType === "goal.state").at(-1)!.data as GoalStateData;
+    expect(st.goal!.park).toMatchObject({ flavor: "budget", resumeRequires: "spend" });
+    expect(st.goal!.park!.unverified).toBeUndefined(); // judge-witnessed
+    expect(st.goal!.park!.caseText).toContain("assessed this turn");
   });
 
   it("an aborted triage ends the park episode: the next hold re-announces", async () => {
@@ -2987,20 +3049,30 @@ describe("registerGoalTool", () => {
       ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() },
       sessionManager: { getBranch: () => [] },
     } as unknown as ExtensionContext;
-    await tool.execute("1", { action: "set", objective: "migrate db", verify: "npm test" });
+    await tool.execute("1", {
+      action: "set",
+      objective: "migrate db",
+      verify: "npm test",
+      criteria: ["schema migrated", "tests green"],
+    });
     await fire(events, "agent_before_settle", ctx); // measured
     await fire(events, "agent_before_settle", ctx); // measured again
+    const before = entries.filter((e) => e.customType === GOAL_STATE_TYPE).at(-1)!.data as GoalStateData;
     const r = (await tool.execute("2", { action: "blocked", goalId: 1, reason: "wall" })) as {
       content: Array<{ text: string }>;
     };
     expect(r.content[0].text).toContain("REFRAME");
-    const state = entries.filter((e) => e.customType === GOAL_STATE_TYPE).at(-1)?.data as {
-      loop?: { pivotsUsed?: number; continuations?: number; totalContinuations?: number; spendMs?: number };
-    };
+    const state = entries.filter((e) => e.customType === GOAL_STATE_TYPE).at(-1)?.data as GoalStateData;
     expect(state.loop?.pivotsUsed).toBe(1);
     expect(state.loop?.continuations).toBe(0); // the window is what a pivot refreshes
     expect(state.loop?.totalContinuations).toBeGreaterThanOrEqual(2); // lifetime carried
-    expect(state.loop?.spendMs).toBeGreaterThanOrEqual(0);
+    // The non-reset contract, non-vacuously: spend, criteria, and the
+    // trajectory baseline all SURVIVE the refresh — the new epoch is judged
+    // against the same gap, not a laundered one.
+    expect(state.loop!.totalContinuations).toBeGreaterThanOrEqual(before.loop!.totalContinuations);
+    expect(state.loop!.spendMs).toBeGreaterThanOrEqual(before.loop!.spendMs);
+    expect(state.goal!.criteria).toEqual(["schema migrated", "tests green"]);
+    expect(state.loop!.trajectory).toEqual(before.loop!.trajectory);
   });
 
   it("the pivot budget is per goal: a fresh set re-arms it", async () => {
@@ -3258,10 +3330,9 @@ describe("registerGoalTool", () => {
     const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
     const gpu: BgTask = { id: "t-1", name: "gate", kind: "bash", state: "running", startedAt: 0 };
     let running: BgTask[] = [];
-    const assess = vi.fn(() => undefined);
     registerGoalTool(pi, {
       maxContinuations: 1,
-      progressJudge: { assess },
+      maxPivots: 0,
       runningTasks: () => running,
       verifyRunner: async () => failVerify,
     });
@@ -3275,14 +3346,12 @@ describe("registerGoalTool", () => {
     // calm settle — the judge would read a half-finished state otherwise).
     running = [gpu];
     expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
-    expect(assess).not.toHaveBeenCalled();
     expect(sentCustom).toHaveLength(1);
 
-    // Calm again: the judge decides now (no opinion → fail closed to the stop).
+    // Calm again: the breaker decides now (deterministic — the pivotless cap parks).
     running = [];
     expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
-    expect(assess).toHaveBeenCalledTimes(1);
-    expect(ctx.ui!.notify).toHaveBeenCalledWith(expect.stringContaining("stopping"));
+    expect(ctx.ui!.notify).toHaveBeenCalledWith(expect.stringContaining("parked (budget"));
   });
 
   it("reads the real shared superbash registry through the default seam", async () => {
@@ -3907,29 +3976,28 @@ describe("registerGoalTool", () => {
     registerGoalTool(pi, {
       settleJudge: { assess: async () => ({ verdict: "working", reason: "criterion 2 still open" }) },
       maxContinuations: 1,
+      maxPivots: 0,
     });
     await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it" });
 
     expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 1/1
-    // At the cap the default progress judge has one reason in the window — not
-    // enough measured states — so it fails closed to the stop.
+    // At the cap with no pivots remaining the deterministic breaker parks.
     expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
-    expect(notify).toHaveBeenCalledWith(expect.stringContaining("still active after"));
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("parked (budget"));
     expect(sentCustom).toHaveLength(1);
   });
 
-  it("a plateaued judge (same remaining, reworded prose) stops at the cap — prose is not the measured state", async () => {
-    const { pi, tools, events, sentCustom } = makePi();
+  it("a plateaued judge (same remaining, reworded prose) parks at the cap — prose is not the measured state", async () => {
+    const { pi, tools, events, entries, sentCustom } = makePi();
     const notify = vi.fn();
     const ctx = {
       ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() },
       sessionManager: { getBranch: () => [] },
     } as unknown as ExtensionContext;
     let call = 0;
-    const windows: string[][] = [];
     registerGoalTool(pi, {
       // Same remaining set every turn; only the reason wording varies — prose
-      // drift must not read as movement.
+      // drift must not read as movement in the window the projection consumes.
       settleJudge: {
         assess: async () => {
           call += 1;
@@ -3937,25 +4005,20 @@ describe("registerGoalTool", () => {
         },
       },
       maxContinuations: 2,
-      progressJudge: {
-        // Spy that delegates to the real default breaker, so the plateau
-        // decision is exercised, not stubbed.
-        assess: (g, outputs) => {
-          windows.push([...outputs]);
-          return defaultProgressJudge(g, outputs);
-        },
-      },
+      maxPivots: 0,
     });
     await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it" });
 
     expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 1/2
     expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 2/2
-    expect(windows).toEqual([]); // the breaker is consulted only at the cap
-    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined(); // at the cap: plateau → stop
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined(); // at the cap: park
     // The window held the STABLE measured state (verdict + sorted remaining),
-    // identical across turns despite the reworded prose.
-    expect(windows).toEqual([["working:[badge]", "working:[badge]"]]);
-    expect(notify).toHaveBeenCalledWith(expect.stringContaining("still active after"));
+    // identical across turns despite the reworded prose — the trajectory the
+    // projection diffs is immune to prose drift.
+    const loop = (entries.filter((e) => e.customType === "goal.state").at(-1)!.data as GoalStateData).loop!;
+    expect(loop.trajectory[0]).toBe("working:[badge]");
+    expect(loop.trajectory.at(-1)).toBe("working:[badge]");
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("parked (budget"));
     expect(sentCustom).toHaveLength(2);
   });
 
@@ -4086,7 +4149,7 @@ describe("registerGoalTool", () => {
     const { pi, tools, events, sentCustom } = makePi();
     const notify = vi.fn();
     const ctx = { ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
-    registerGoalTool(pi, { maxContinuations: 2, verifyRunner: async () => failVerify });
+    registerGoalTool(pi, { maxContinuations: 2, maxPivots: 0, verifyRunner: async () => failVerify });
     const tool = tools.get(GOAL_TOOL_NAME)!;
     await tool.execute("1", { action: "set", objective: "stuck goal", verify: "npm test" });
 
@@ -4094,10 +4157,10 @@ describe("registerGoalTool", () => {
     // Re-setting the goal mid-loop must NOT reset the continuation budget.
     await tool.execute("2", { action: "set", objective: "stuck goal", verify: "npm test" });
     expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // continuation 2
-    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined(); // at cap → stop + notify
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined(); // at cap → park + notify
     expect(sentCustom).toHaveLength(2);
     expect(notify).toHaveBeenCalledTimes(1);
-    expect(notify.mock.calls[0]![0]).toContain("2");
+    expect(notify.mock.calls[0]![0]).toContain("parked (budget");
 
     expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined(); // still capped
     expect(sentCustom).toHaveLength(2);
@@ -4107,7 +4170,7 @@ describe("registerGoalTool", () => {
     const { pi, tools, events, sentCustom } = makePi();
     const notify = vi.fn();
     const ctx = { ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
-    registerGoalTool(pi, { maxContinuations: 1, verifyRunner: async () => failVerify });
+    registerGoalTool(pi, { maxContinuations: 1, maxPivots: 0, verifyRunner: async () => failVerify });
     const tool = tools.get(GOAL_TOOL_NAME)!;
     await tool.execute("1", { action: "set", objective: "resumable", verify: "npm test" });
 
@@ -4158,27 +4221,29 @@ describe("registerGoalTool", () => {
     const { pi, tools, events, sentCustom } = makePi();
     const notify = vi.fn();
     const ctx = { ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
-    registerGoalTool(pi, { maxContinuations: 2, verifyRunner: async () => failVerify });
+    registerGoalTool(pi, { maxContinuations: 2, maxPivots: 0, verifyRunner: async () => failVerify });
     const tool = tools.get(GOAL_TOOL_NAME)!;
     await tool.execute("1", { action: "set", objective: "stuck goal", verify: "npm test" });
 
     expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
     expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
-    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined(); // at cap → stop + notify
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined(); // at cap → park + notify
     expect(sentCustom).toHaveLength(2);
     expect(notify).toHaveBeenCalledTimes(1);
-    expect(notify.mock.calls[0]![0]).toContain("2");
+    expect(notify.mock.calls[0]![0]).toContain("parked (budget");
 
     // Stopped: no further continuations on more settles.
     expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
     expect(sentCustom).toHaveLength(2);
   });
 
-  it("resets the budget at the cap when the measured state is still progressing", async () => {
+  it("refreshes the window at the cap by spending the pivot — the counter restarts", async () => {
     const { pi, tools, events, sentCustom } = makePi();
     const notify = vi.fn();
     const ctx = { ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
-    // Each check reports a different measured state — the run is visibly moving.
+    // Each check reports a different measured state — the trajectory the
+    // projection later diffs. The pivot decision is deterministic (no judge);
+    // the moving outputs just exercise the real window, not a stub.
     let calls = 0;
     const outputs = ["geomean 0.33", "geomean 0.47", "geomean 0.55", "geomean 0.62", "geomean 0.71"];
     registerGoalTool(pi, {
@@ -4189,156 +4254,516 @@ describe("registerGoalTool", () => {
 
     expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 1/2
     expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 2/2
-    // At the cap the judge sees a changed measured state → reset, not stop.
-    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 1/2 (reset)
+    // At the cap the pivot is spent: continuations reset to 0, run continues.
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 1/2 (refreshed)
     expect(notify).toHaveBeenCalledTimes(1);
-    expect(notify.mock.calls[0]![0]).toContain("still progressing");
-    expect(notify.mock.calls[0]![0]).toContain("1/3");
+    expect(notify.mock.calls[0]![0]).toContain("spending pivot 1/1");
     expect(sentCustom).toHaveLength(3);
-    // The reset prompt's counter restarts from the new budget.
+    // The refreshed prompt's counter restarts from the new budget.
     const last = sentCustom.at(-1)!.msg as { content: string };
     expect(last.content).toContain("continuation 1/2");
   });
 
-  it("stops for good once the judge resets are exhausted", async () => {
-    const { pi, tools, events } = makePi();
+  it("a stop verdict parks the loop latch with its flavor — the goal itself stays active", async () => {
+    const { pi, tools, events, entries } = makePi();
     const notify = vi.fn();
-    const ctx = { ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
+    const ctx = {
+      ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() },
+      sessionManager: { getBranch: () => [] },
+    } as unknown as ExtensionContext;
+    registerGoalTool(pi, {
+      settleJudge: {
+        assess: () => ({ verdict: "stop", stopFlavor: "premise", reason: "the premise changed underneath" }),
+      },
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it" });
+
+    const parked: GoalParkedEvent[] = [];
+    const off = onGoalParked("test-stop-verdict", (e) => parked.push(e));
+    try {
+      expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined(); // halted — no continuation
+      expect(notify).toHaveBeenCalledWith(expect.stringContaining("parked (premise"));
+      // The LATCH parks, not the goal: status stays active (the agent remains
+      // the author of semantic state), and the packet rides the persisted state.
+      expect(parked).toHaveLength(1);
+      expect(parked[0]).toMatchObject({ id: 1, flavor: "premise", resumeRequires: "goal-change" });
+      expect(parked[0].reason).toContain("premise changed underneath");
+      const st = entries.filter((e) => e.customType === "goal.state").at(-1)!.data as GoalStateData;
+      expect(st.goal!.status).toBe("active");
+      expect(st.goal!.park?.flavor).toBe("premise");
+      // The latch holds across further settles — a park is not a one-turn pause.
+      expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    } finally {
+      off();
+    }
+  });
+
+  it("completing a latch-parked goal clears the packet — a finished goal is not resumable", async () => {
+    const { pi, tools, commands, events, entries } = makePi();
+    const notify = vi.fn();
+    const setStatus = vi.fn();
+    const settleCtx = {
+      ui: { notify, setStatus, setWidget: vi.fn() },
+      sessionManager: { getBranch: () => [] },
+    } as unknown as ExtensionContext;
+    let verifyPasses = false;
+    registerGoalTool(pi, {
+      maxContinuations: 1,
+      maxPivots: 0,
+      verifyRunner: async () =>
+        verifyPasses ? { ok: true, exitCode: 0, timedOut: false, output: "3 tests passed" } : failVerify,
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "finishable", verify: "npm test" });
+    expect(await fire(events, "agent_before_settle", settleCtx)).toEqual({ continue: true });
+    expect(await fire(events, "agent_before_settle", settleCtx)).toBeUndefined(); // cap → latch park (goal stays active)
+
+    // The model produces evidence and completes: the packet must not survive
+    // onto the terminal goal.
+    verifyPasses = true;
+    const r = (await tools.get(GOAL_TOOL_NAME)!.execute("2", {
+      action: "complete",
+      goalId: 1,
+      summary: "all green",
+      evidence: ["npm test output shows 0 failing"],
+    })) as { content: Array<{ text: string }> };
+    expect(r.content[0].text).toContain("complete");
+    expect(r.content[0].text).not.toContain("NOT completed");
+    const st = entries.filter((e) => e.customType === "goal.state").at(-1)!.data as GoalStateData;
+    expect(st.goal!.status).toBe("complete");
+    expect(st.goal!.park).toBeUndefined();
+
+    // A finished goal is not resumable — no resurrecting a completed goal
+    // with a stray packet.
+    await commands.get("goal")!.handler("resume", { mode: "headless", ui: { notify, setStatus } });
+    expect(notify).toHaveBeenCalledWith("No paused or stopped goal to resume.");
+  });
+
+  it("a kickoff re-arm strips a surviving park packet — no double re-arm via /goal resume", async () => {
+    const { pi, tools, commands, events, entries } = makePi();
+    const notify = vi.fn();
+    const setStatus = vi.fn();
+    const settleCtx = {
+      ui: { notify, setStatus, setWidget: vi.fn() },
+      sessionManager: { getBranch: () => [] },
+    } as unknown as ExtensionContext;
+    registerGoalTool(pi, { maxContinuations: 1, maxPivots: 0, verifyRunner: async () => failVerify });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "parked work", verify: "npm test" });
+    expect(await fire(events, "agent_before_settle", settleCtx)).toEqual({ continue: true });
+    expect(await fire(events, "agent_before_settle", settleCtx)).toBeUndefined(); // cap → latch park
+
+    // The user kicks off (re-arms) the goal: any packet is stripped, so the
+    // live goal renders active and a following /goal resume cannot farm a
+    // SECOND budget from the same park.
+    await commands.get("goal")!.handler("same objective, keep going", { mode: "headless", ui: { notify, setStatus } });
+    const st = entries.filter((e) => e.customType === "goal.state").at(-1)!.data as GoalStateData;
+    expect(st.goal!.park).toBeUndefined();
+    await commands.get("goal")!.handler("resume", { mode: "headless", ui: { notify, setStatus } });
+    expect(notify).toHaveBeenCalledWith("No paused or stopped goal to resume.");
+  });
+
+  it("the work-appears-complete re-engagement is durable — a reload cannot mint a second one", async () => {
+    // First session: the judge claims the work looks done; the loop demands
+    // evidence once (the re-engagement).
+    const first = makePi();
+    registerGoalTool(first.pi, {
+      settleJudge: {
+        assess: () => ({ verdict: "stop", stopFlavor: "work-appears-complete", reason: "criteria look met" }),
+      },
+    });
+    const ctx1 = {
+      ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() },
+      sessionManager: { getBranch: () => [] },
+    } as unknown as ExtensionContext;
+    await first.tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it" });
+    expect(await fire(first.events, "agent_before_settle", ctx1)).toEqual({ continue: true });
+
+    // Reload: the restored loop carries reengagedOnce, so the SAME claim now
+    // parks instead of earning another evidence round.
+    const fresh = makePi();
+    const notify = vi.fn();
+    registerGoalTool(fresh.pi, {
+      settleJudge: {
+        assess: () => ({ verdict: "stop", stopFlavor: "work-appears-complete", reason: "criteria look met" }),
+      },
+    });
+    const ctx2 = {
+      ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() },
+      sessionManager: { getBranch: () => [] },
+    } as unknown as ExtensionContext;
+    fire(fresh.events, "session_start", sessionCtx(first.entries));
+    expect(await fire(fresh.events, "agent_before_settle", ctx2)).toBeUndefined();
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("parked (work-appears-complete"));
+  });
+
+  it("resume clears the park packet on an ACTIVE latch-parked goal — no ghost parked status, no re-arm loop", async () => {
+    const { pi, tools, commands, events, entries } = makePi();
+    const notify = vi.fn();
+    const setStatus = vi.fn();
+    const settleCtx = {
+      ui: { notify, setStatus, setWidget: vi.fn() },
+      sessionManager: { getBranch: () => [] },
+    } as unknown as ExtensionContext;
+    registerGoalTool(pi, { maxContinuations: 1, maxPivots: 0, verifyRunner: async () => failVerify });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "latch park", verify: "npm test" });
+    expect(await fire(events, "agent_before_settle", settleCtx)).toEqual({ continue: true });
+    expect(await fire(events, "agent_before_settle", settleCtx)).toBeUndefined(); // cap → latch park
+
+    // Resume re-arms AND clears the packet: the goal renders active, not
+    // "Parked (budget)".
+    await commands.get("goal")!.handler("resume", { mode: "headless", ui: { notify, setStatus } });
+    const st = entries.filter((e) => e.customType === "goal.state").at(-1)!.data as GoalStateData;
+    expect(st.goal!.status).toBe("active");
+    expect(st.goal!.park).toBeUndefined();
+
+    // The live goal is no longer resumable — a bare resume cannot farm fresh
+    // budgets on a running goal.
+    await commands.get("goal")!.handler("resume", { mode: "headless", ui: { notify, setStatus } });
+    expect(notify).toHaveBeenCalledWith("No paused or stopped goal to resume.");
+  });
+
+  it("windowContinuations persists the trajectory span — a pivot refreshes the window counter, not the span", async () => {
+    // The projection's rate denominator is the span over which the
+    // trajectory was measured. A pivot zeroes `continuations` while the
+    // trajectory carries over, so the span needs its own durable counter —
+    // otherwise the projection would cite an inflated rate (and
+    // "projects-complete" on a flat trend) after every pivot.
+    const { pi, tools, events, entries } = makePi();
     let calls = 0;
     registerGoalTool(pi, {
       maxContinuations: 2,
-      maxProgressResets: 1,
       verifyRunner: async () => ({ ...failVerify, output: `coverage ${40 + calls++}%` }),
+    });
+    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
+
+    await fire(events, "agent_before_settle", ctx); // 1/2
+    await fire(events, "agent_before_settle", ctx); // 2/2
+    const before = entries.filter((e) => e.customType === "goal.state").at(-1)!.data as GoalStateData;
+    expect(before.loop!.continuations).toBe(2);
+    expect(before.loop!.windowContinuations).toBe(2);
+
+    await fire(events, "agent_before_settle", ctx); // cap → pivot
+    const after = entries.filter((e) => e.customType === "goal.state").at(-1)!.data as GoalStateData;
+    expect(after.loop!.continuations).toBe(1); // the window refreshed (pivot settle burned slot 1)
+    expect(after.loop!.windowContinuations).toBe(3); // the span kept counting
+    expect(after.loop!.totalContinuations).toBe(3); // lifetime carried
+  });
+
+  it("a reload restores windowContinuations from the persisted field, not the trajectory-length fallback", async () => {
+    // Divergence construction: an unmeasured (triage-continue) settle burns a
+    // continuation without recording a trajectory point, so the span (5)
+    // exceeds trajectory length − 1 (4) — the legacy fallback the restore must
+    // NOT take when the field is present.
+    const { pi, tools, events, entries } = makePi();
+    let measured = 0;
+    let triageCalls = 0;
+    registerGoalTool(pi, {
+      maxContinuations: 3,
+      triage: {
+        triage: async () =>
+          // The 3rd settle continues without measuring; every other one measures.
+          ++triageCalls === 3
+            ? { action: "continue", reason: "mid-work" }
+            : { action: "verify", reason: "claims done" },
+      },
+      verifyRunner: async () => ({ ...failVerify, output: `coverage ${40 + measured++}%` }),
+    });
+    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
+
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 1/3 measured
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 2/3 measured
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 3/3 unmeasured → cap next
+    // The cap spends the pivot (default 1): the 4th settle refreshes the window.
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // pivot settle, measured
+    const before = entries.filter((e) => e.customType === "goal.state").at(-1)!.data as GoalStateData;
+    // Span counts all four continuations; the trajectory holds baseline + the
+    // three MEASURED settles (the unmeasured one records nothing).
+    expect(before.loop!.windowContinuations).toBe(4);
+    expect(before.loop!.trajectory.length).toBe(4); // fallback (length−1) would read 3
+
+    // Reload + one measured settle: the span continues from the restored 4
+    // (the fallback would continue from 3) — 5 pins the field-driven restore.
+    const fresh = makePi();
+    registerGoalTool(fresh.pi, {
+      maxContinuations: 3,
+      triage: { triage: async () => ({ action: "verify", reason: "claims done" }) },
+      verifyRunner: async () => ({ ...failVerify, output: `coverage ${60 + measured++}%` }),
+    });
+    const freshCtx = { ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
+    fire(fresh.events, "session_start", sessionCtx(entries));
+    expect(await fire(fresh.events, "agent_before_settle", freshCtx)).toEqual({ continue: true }); // 1/3 measured
+    const after = fresh.entries.filter((e) => e.customType === "goal.state").at(-1)!.data as GoalStateData;
+    expect(after.loop!.windowContinuations).toBe(5);
+  });
+
+  it("a holding settle at the cap parks with the judge's stop flavor, not an unverified budget park", async () => {
+    const { pi, tools, events, entries } = makePi();
+    const notify = vi.fn();
+    let running: BgTask[] = [];
+    const verdicts: SettleVerdict[] = [
+      { verdict: "working", reason: "criterion 1 open" },
+      { verdict: "stop", stopFlavor: "premise", reason: "the requirement changed underneath" },
+    ];
+    let call = 0;
+    registerGoalTool(pi, {
+      maxContinuations: 1,
+      maxPivots: 0,
+      runningTasks: () => running,
+      settleJudge: { assess: () => verdicts[call++] },
+    });
+    const ctx = {
+      ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() },
+      sessionManager: { getBranch: () => [] },
+    } as unknown as ExtensionContext;
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it" });
+
+    // Burn the budget calmly, then settle at the cap while a task runs: the
+    // judge's stop must win over the cap — the packet carries the judge's
+    // flavor and reason, verified (a judge WAS consulted).
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 1/1
+    running = [{ id: "t-1", name: "npm run dev", kind: "bash", state: "running", startedAt: 0 }];
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("parked (premise"));
+    const st = entries.filter((e) => e.customType === "goal.state").at(-1)!.data as GoalStateData;
+    expect(st.goal!.park).toMatchObject({ flavor: "premise", resumeRequires: "goal-change" });
+    expect(st.goal!.park!.unverified).toBeUndefined(); // judge-witnessed, not unverified
+    expect(st.goal!.park!.caseText).toContain("requirement changed underneath");
+  });
+
+  it("a holding settle at the cap with a silent judge parks as consulted-but-no-assessment", async () => {
+    const { pi, tools, events, entries } = makePi();
+    const notify = vi.fn();
+    let running: BgTask[] = [];
+    registerGoalTool(pi, {
+      maxContinuations: 1,
+      maxPivots: 0,
+      runningTasks: () => running,
+      settleJudge: {
+        assess: () => undefined, // consulted, no opinion (no throw)
+        assessBlocked: async () => ({ impasse: false, reason: "no" }),
+      },
+    });
+    const ctx = {
+      ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() },
+      sessionManager: { getBranch: () => [] },
+    } as unknown as ExtensionContext;
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it" });
+
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 1/1 (judge fail-open)
+    running = [{ id: "t-1", name: "npm run dev", kind: "bash", state: "running", startedAt: 0 }];
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined(); // holding at cap → park
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("parked (budget"));
+    const st = entries.filter((e) => e.customType === "goal.state").at(-1)!.data as GoalStateData;
+    expect(st.goal!.park).toMatchObject({ flavor: "budget", resumeRequires: "spend", unverified: true });
+    expect(st.goal!.park!.caseText).toContain("was consulted but returned no assessment.");
+    expect(st.goal!.park!.caseText).not.toContain("()"); // no empty parentheses
+  });
+
+  it("a judge-mandated reframe at the cap is not eaten by the window refresh", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const notify = vi.fn();
+    let running: BgTask[] = [];
+    const verdicts: SettleVerdict[] = [
+      { verdict: "working", reason: "criterion 1 open" },
+      { verdict: "working", reason: "the approach is flat", reframe: true },
+    ];
+    let call = 0;
+    registerGoalTool(pi, {
+      maxContinuations: 1,
+      runningTasks: () => running,
+      settleJudge: { assess: () => verdicts[call++] },
+    });
+    const ctx = {
+      ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() },
+      sessionManager: { getBranch: () => [] },
+    } as unknown as ExtensionContext;
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it" });
+
+    // 1/1 calmly (no pivot spent — no reframe verdict below the cap), then a
+    // holding settle AT the cap with a reframe mandate: the judge's pivot is
+    // spent for the REFRAME, and the ladder reaches the agent.
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    running = [{ id: "t-1", name: "npm run dev", kind: "bash", state: "running", startedAt: 0 }];
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    expect((sentCustom.at(-1)!.msg as { content: string }).content).toContain("REFRAME (pivot 1/1)");
+    expect(notify).not.toHaveBeenCalledWith(expect.stringContaining("parked"));
+  });
+
+  it("a flavorless stop parks as premise — the conservative default", async () => {
+    const { pi, tools, events } = makePi();
+    const notify = vi.fn();
+    const ctx = {
+      ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() },
+      sessionManager: { getBranch: () => [] },
+    } as unknown as ExtensionContext;
+    registerGoalTool(pi, {
+      settleJudge: { assess: () => ({ verdict: "stop", reason: "cannot continue meaningfully" }) },
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it" });
+
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("parked (premise"));
+  });
+
+  it("work-appears-complete re-engages once demanding evidence, then parks on the repeat", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const notify = vi.fn();
+    const ctx = {
+      ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() },
+      sessionManager: { getBranch: () => [] },
+    } as unknown as ExtensionContext;
+    registerGoalTool(pi, {
+      settleJudge: {
+        assess: () => ({ verdict: "stop", stopFlavor: "work-appears-complete", reason: "criteria look met" }),
+      },
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it" });
+
+    // First sight: NOT a park — the loop re-engages once, rewriting the
+    // verdict to working with a single demand: per-criterion evidence.
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    const first = sentCustom.at(-1)!.msg as { content: string };
+    expect(first.content).toContain("per-criterion evidence");
+    expect(notify).not.toHaveBeenCalledWith(expect.stringContaining("parked"));
+
+    // Second sight of the same claim: the evidence was demanded and not
+    // produced — park, preserving the wrap-up path without an infinite loop.
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("parked (work-appears-complete"));
+  });
+
+  it("the settle judge receives the persisted-shaped trajectory (clamped) and the pivot budget", async () => {
+    const { pi, tools, events } = makePi();
+    const seen: Array<{ trajectory?: string[]; pivotsRemaining?: number }> = [];
+    registerGoalTool(pi, {
+      maxContinuations: 8,
+      settleJudge: {
+        assess: (_g, c) => {
+          if (c.trajectory) seen.push({ trajectory: [...c.trajectory], pivotsRemaining: c.pivotsRemaining });
+          return { verdict: "working", reason: "open" };
+        },
+      },
+    });
+    const ctx = {
+      ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() },
+      sessionManager: { getBranch: () => [] },
+    } as unknown as ExtensionContext;
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it" });
+    for (let i = 0; i < 9; i++) await fire(events, "agent_before_settle", ctx);
+
+    // The judge saw the trajectory only once it held >=2 points, and the view
+    // is the persisted shape: baseline + last MAX_PERSISTED_TRAJECTORY-1 (a
+    // longer live window would make stop/reframe verdicts reload-dependent).
+    expect(seen.length).toBeGreaterThanOrEqual(7); // offered from the 2-point settle on
+    const last = seen.at(-1)!;
+    expect(last.trajectory!.length).toBeLessThanOrEqual(8);
+    // The budget is offered with the full 1 before the cap spends it (the
+    // settle-9 judge, consulted post-cap, correctly sees 0).
+    expect(seen[0]!.pivotsRemaining).toBe(1);
+  });
+
+  it("a working+reframe verdict spends a pivot: the reframe prompt once, then a plain continue", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const notify = vi.fn();
+    const ctx = {
+      ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() },
+      sessionManager: { getBranch: () => [] },
+    } as unknown as ExtensionContext;
+    registerGoalTool(pi, {
+      maxContinuations: 5,
+      settleJudge: { assess: () => ({ verdict: "working", reason: "the approach is flat", reframe: true }) },
+    });
+    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it" });
+
+    // First reframe: the ladder replaces the steer — pivot 1/1 consumed.
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    expect((sentCustom.at(-1)!.msg as { content: string }).content).toContain("REFRAME (pivot 1/1)");
+
+    // The pivot is spent: the same mandate degrades to a plain continue —
+    // the reframe ladder must not repeat, and no second pivot is minted.
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    expect((sentCustom.at(-1)!.msg as { content: string }).content).not.toContain("REFRAME");
+    expect(notify).not.toHaveBeenCalledWith(expect.stringContaining("parked"));
+  });
+
+  it("the cap consumes the pivot, then parks when the pivot is spent", async () => {
+    const { pi, tools, events } = makePi();
+    const notify = vi.fn();
+    const ctx = { ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
+    registerGoalTool(pi, {
+      maxContinuations: 2,
+      verifyRunner: async () => ({ ...failVerify, output: `coverage ${40 + (Date.now() % 7)}%` }),
     });
     await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
 
     expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 1/2
     expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 2/2
-    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // judge reset 1/1
-    expect(notify).toHaveBeenCalledTimes(1);
+    // Cap with a pivot remaining: spend it — continuations reset, run continues.
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+    expect(notify.mock.calls[0]![0]).toContain("spending pivot 1/1");
+    // The refreshed window runs to the cap again; the spent pivot parks.
+    // (The pivot settle's own check burns the first slot: one more continue,
+    // then the cap lands with no pivot to spend.)
     expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 2/2 again
-    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined(); // resets exhausted → stop
-    expect(notify).toHaveBeenCalledTimes(2);
-    expect(notify.mock.calls[1]![0]).toContain("resets exhausted");
-    // Stopped stays stopped even though the measured state keeps changing.
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined(); // pivots exhausted → park
+    expect(notify.mock.calls[1]![0]).toContain("parked (budget");
+    // Parked stays parked even though the measured state keeps changing.
     expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
     expect(notify).toHaveBeenCalledTimes(2);
   });
 
-  it("stops at the cap when the judge has no opinion (fail closed)", async () => {
-    const { pi, tools, events, sentCustom } = makePi();
-    const notify = vi.fn();
-    const ctx = { ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
-    const noOpinion: ProgressJudge = { assess: () => undefined };
-    registerGoalTool(pi, {
-      maxContinuations: 2,
-      progressJudge: noOpinion,
-      verifyRunner: async () => ({ ...failVerify, output: `coverage ${Date.now()}%` }),
-    });
-    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
-
-    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
-    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
-    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined(); // no opinion → stop
-    expect(notify).toHaveBeenCalledTimes(1);
-    expect(sentCustom).toHaveLength(2);
-  });
-
-  it("a throwing progress judge fails closed to the stop", async () => {
-    const { pi, tools, events } = makePi();
-    const notify = vi.fn();
-    const ctx = { ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
-    registerGoalTool(pi, {
-      maxContinuations: 1,
-      progressJudge: {
-        assess: () => {
-          throw new Error("judge offline");
-        },
-      },
-      verifyRunner: async () => ({ ...failVerify, output: `coverage ${Date.now()}%` }),
-    });
-    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
-
-    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
-    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined(); // throw → stop, not crash
-    expect(notify).toHaveBeenCalledTimes(1);
-  });
-
-  it("an async (LLM-style) judge is awaited; its rejection fails closed to the stop", async () => {
-    const { pi, tools, events } = makePi();
-    const notify = vi.fn();
-    const ctx = { ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
-    let mode: "ok" | "reject" = "ok";
-    const asyncJudge: ProgressJudge = {
-      assess: async (_g, outputs) => {
-        if (mode === "reject") throw new Error("llm down");
-        return outputs.length >= 2 ? { continueRun: true, reason: "async ok" } : { continueRun: false };
-      },
-    };
-    registerGoalTool(pi, {
-      maxContinuations: 2,
-      progressJudge: asyncJudge,
-      verifyRunner: async () => failVerify,
-    });
-    await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
-
-    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
-    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
-    // Async judge approved → the budget resets and the run continues.
-    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
-    expect(notify.mock.calls[0]![0]).toContain("async ok");
-
-    // A rejecting async judge must fail closed (stop), not crash or dangle a rejection.
-    mode = "reject";
-    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
-    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
-    expect(notify.mock.calls.at(-1)![0]).toContain("progress judge unavailable");
-  });
-
-  it("re-setting the goal mid-window cannot buy a reset with a differently-printing verify", async () => {
-    const { pi, tools, events } = makePi();
+  it("re-setting the goal mid-window clears the trajectory, not the pivot budget", async () => {
+    const { pi, tools, events, entries } = makePi();
     const notify = vi.fn();
     const ctx = { ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
     // Goal A's verify prints one thing forever; goal B's prints another forever.
     let which = "A";
     registerGoalTool(pi, {
-      maxContinuations: 2,
+      maxContinuations: 1,
+      maxPivots: 0,
       verifyRunner: async () => ({ ...failVerify, output: which === "A" ? "state A" : "state B" }),
     });
     await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "A", verify: "npm test" });
 
-    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 1/2
-    // Re-set to goal B: the window is re-scoped to B's baseline, so B's static
-    // verify reads as a plateau — no free reset from the A/B output difference.
+    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 1/1 (window: A baseline + A measured)
+    // Re-set to goal B: the window is re-scoped to B's baseline — the A/B
+    // output difference cannot masquerade as movement, and the cap still parks.
     which = "B";
     await tools.get(GOAL_TOOL_NAME)!.execute("2", { action: "set", objective: "B", verify: "npm test" });
-    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 2/2 (cap not raised)
-    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined(); // plateau → stop
-    expect(notify).toHaveBeenCalledTimes(1);
+    // The re-set does NOT re-grant the budget: the next settle is still at the
+    // cap and parks (no pivot to spend).
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined(); // cap → park
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("parked (budget"));
+    // The persisted window was re-scoped to B's set-time baseline — no
+    // cross-goal splicing with A's outputs.
+    const loop = (entries.filter((e) => e.customType === "goal.state").at(-1)!.data as GoalStateData).loop!;
+    expect(loop.trajectory).toEqual(["state B"]);
   });
 
-  it("seeds the budget window with the set-time baseline, so a tiny cap still judges two states", async () => {
-    const { pi, tools, events } = makePi();
-    const notify = vi.fn();
-    const ctx = { ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
+  it("seeds the window with the set-time baseline, so a tiny cap still records two states", async () => {
+    const { pi, tools, events, entries } = makePi();
+    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
     let calls = 0;
     registerGoalTool(pi, {
       maxContinuations: 1,
+      maxPivots: 0,
       verifyRunner: async () => ({ ...failVerify, output: `coverage ${40 + calls++}%` }),
     });
     await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "x", verify: "npm test" });
 
     expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // 1/1
-    // Baseline (set preflight) + one continuation ⇒ the judge sees movement.
-    expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // reset, continue
-    expect(notify).toHaveBeenCalledTimes(1);
-    expect(notify.mock.calls[0]![0]).toContain("still progressing");
+    // At the cap the park fires, but the window the projection reads holds
+    // the set-time baseline PLUS the one measurement — two points to diff.
+    expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+    const loop = (entries.filter((e) => e.customType === "goal.state").at(-1)!.data as GoalStateData).loop!;
+    expect(loop.trajectory).toEqual(["coverage 40%", "coverage 41%"]);
   });
 
   it("the cap path does not throw when the settle ctx has no ui (headless)", async () => {
     const { pi, tools, events, sentCustom } = makePi();
     const ctx = {} as unknown as ExtensionContext; // no ui, as in print mode
-    registerGoalTool(pi, { maxContinuations: 1, verifyRunner: async () => failVerify });
+    registerGoalTool(pi, { maxContinuations: 1, maxPivots: 0, verifyRunner: async () => failVerify });
     await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "stuck goal", verify: "npm test" });
 
     expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // continuation 1
@@ -4353,7 +4778,7 @@ describe("registerGoalTool", () => {
     const notify = vi.fn();
     const setStatus = vi.fn();
     const uiCtx = { ui: { notify, setStatus, setWidget: vi.fn() } } as unknown as ExtensionContext;
-    registerGoalTool(pi, { maxContinuations: 1, verifyRunner: async () => failVerify });
+    registerGoalTool(pi, { maxContinuations: 1, maxPivots: 0, verifyRunner: async () => failVerify });
     await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "stuck goal", verify: "npm test" });
 
     // Continuation 1 (also primes uiRef from the settle ctx), then the cap: the
@@ -4881,14 +5306,15 @@ describe("registerGoalTool", () => {
     const setStatus = vi.fn();
     const cmdCtx = { mode: "headless", ui: { notify, setStatus } };
     const settleCtx = { ui: { notify, setStatus, setWidget: vi.fn() } } as unknown as ExtensionContext;
-    registerGoalTool(pi, { maxContinuations: 1, verifyRunner: async () => failVerify });
+    registerGoalTool(pi, { maxContinuations: 1, maxPivots: 0, verifyRunner: async () => failVerify });
     await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "first", verify: "npm test" });
 
-    // Burn the 1-continuation budget and trip the cap: stopped = true, the
-    // goal itself stays active — the production trap shape from warp3090.
+    // Burn the 1-continuation budget and trip the cap: stopped = true (loop
+    // latch parked), the goal itself stays active — the production trap shape
+    // from warp3090.
     expect(await fire(events, "agent_before_settle", settleCtx)).toEqual({ continue: true });
     expect(await fire(events, "agent_before_settle", settleCtx)).toBeUndefined();
-    expect(notify).toHaveBeenLastCalledWith(expect.stringContaining("still active after"));
+    expect(notify).toHaveBeenLastCalledWith(expect.stringContaining("parked (budget"));
 
     // A model set re-activates a NEW goal (allowed — the cap says "adjust it")
     // but the loop stays dead: both sides must be told, not trapped silently.
@@ -5076,13 +5502,13 @@ describe("registerGoalTool", () => {
     const setStatus = vi.fn();
     const cmdCtx = { mode: "headless", ui: { notify, setStatus } };
     const settleCtx = { ui: { notify, setStatus, setWidget: vi.fn() } } as unknown as ExtensionContext;
-    registerGoalTool(pi, { maxContinuations: 1, verifyRunner: async () => failVerify });
+    registerGoalTool(pi, { maxContinuations: 1, maxPivots: 0, verifyRunner: async () => failVerify });
     await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "stuck work", verify: "npm test" });
 
     // The first settle continues (budget 1/1); the second trips the cap.
     expect(await fire(events, "agent_before_settle", settleCtx)).toEqual({ continue: true });
     expect(await fire(events, "agent_before_settle", settleCtx)).toBeUndefined();
-    expect(notify).toHaveBeenLastCalledWith(expect.stringContaining("still active after"));
+    expect(notify).toHaveBeenLastCalledWith(expect.stringContaining("parked (budget"));
 
     // Pause, then resume: the budget was re-armed, so the loop continues.
     await commands.get("goal")!.handler("pause", cmdCtx);

@@ -62,22 +62,6 @@ export function parseMaxTurnsPerRun(raw: string | undefined): number {
 }
 
 /**
- * Cap on judge-approved budget resets at the continuation cap
- * (PI_GOAL_MAX_PROGRESS_RESETS). Each reset re-arms the continuation budget;
- * without this the progress judge would defeat the circuit breaker entirely.
- */
-export const GOAL_MAX_PROGRESS_RESETS_DEFAULT = 3;
-export const GOAL_MAX_PROGRESS_RESETS_ENV = "PI_GOAL_MAX_PROGRESS_RESETS";
-
-/** Parse PI_GOAL_MAX_PROGRESS_RESETS. Invalid values fall back to the default — fail-open, no throw. */
-export function parseMaxProgressResets(raw: string | undefined): number {
-  if (raw === undefined || raw.trim() === "") return GOAL_MAX_PROGRESS_RESETS_DEFAULT;
-  const n = Number(raw);
-  if (!Number.isInteger(n) || n < 0 || n > 100_000) return GOAL_MAX_PROGRESS_RESETS_DEFAULT;
-  return n;
-}
-
-/**
  * Run the verify check every Nth continuation (PI_GOAL_CHECK_EVERY), reusing the
  * previous measured state in between. Default 1 (every turn — the graded loop
  * as designed). An expensive verify (a full benchmark suite can take minutes)

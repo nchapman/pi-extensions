@@ -203,6 +203,14 @@ export interface GoalLoopState {
    * entries predate it — but validated: a NaN here would arm a fresh pivot
    * every settle after reload. */
   pivotsUsed?: number;
+  /** Continuations consumed since the trajectory baseline began — the
+   * projection's rate denominator. The window counter (continuations) is
+   * refreshed by pivots while the trajectory deliberately carries over, so
+   * the span needs its own durable counter. */
+  windowContinuations?: number;
+  /** The work-appears-complete evidence re-engagement was used for this
+   * goal — durable so a reload cannot mint a second one. */
+  reengagedOnce?: boolean;
   trajectory: string[];
 }
 
@@ -240,6 +248,16 @@ export function isGoalLoopState(l: unknown): l is GoalLoopState {
     !(typeof s.pivotsUsed === "number" && Number.isInteger(s.pivotsUsed) && s.pivotsUsed >= 0)
   )
     return false;
+  if (
+    s.windowContinuations !== undefined &&
+    !(
+      typeof s.windowContinuations === "number" &&
+      Number.isInteger(s.windowContinuations) &&
+      s.windowContinuations >= 0
+    )
+  )
+    return false;
+  if (s.reengagedOnce !== undefined && typeof s.reengagedOnce !== "boolean") return false;
   return (
     Array.isArray(s.trajectory) &&
     s.trajectory.length <= MAX_PERSISTED_TRAJECTORY &&

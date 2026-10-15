@@ -93,15 +93,17 @@
  *   model-untouchable circuit breakers keep a stuck run bounded: a per-session
  *   cap (PI_GOAL_MAX_CONTINUATIONS) on auto-continuations, and a per-run turn
  *   bound (PI_GOAL_MAX_TURNS_PER_RUN) that steers a long turn to settle so the
- *   cap can re-engage. At the cap, an injectable ProgressJudge seam decides
- *   between "still progressing → reset the budget and continue" and "plateaued
- *   → stop": the default judge is deterministic (the verify output changed
- *   across the budget window ⇒ progressing), a semantic judge can slot in
- *   later, and a no-opinion or throwing judge fails closed to the stop. The
- *   seam is awaitable so an async (LLM) judge needs no adapter; judge resets are
- *   themselves capped (PI_GOAL_MAX_PROGRESS_RESETS) so the breaker stays a
- *   breaker — the worst case any strategy achieves is
- *   maxContinuations × (maxProgressResets + 1). The
+ *   cap can re-engage. At the cap a DETERMINISTIC breaker decides: a remaining
+ *   pivot (PI_GOAL_MAX_PIVOTS) refreshes the continuation window — spend,
+ *   criteria, and trajectory baseline carry over — and with none remaining the
+ *   loop latch parks with a budget packet. The park's disclosure names its
+ *   basis honestly: whether a judge assessed the turn (holding settles run
+ *   the judge before the cap gate), was consulted but failed, or was never
+ *   consulted (calm settles gate before any judge call). The judge never
+ *   extends its own run — that was a conflict of interest — and the spend
+ *   budget is a strictly safer bound than a reset count. The worst case any
+ *   strategy achieves is
+ *   maxContinuations × (maxPivots + 1). The
  *   model's set/complete/blocked actions never reset
  *   either (a stuck model can't farm fresh turns by re-setting or faking a
  *   completion); the budget re-arms only when the user resumes or starts a
@@ -150,14 +152,12 @@ import type {
 import {
   GOAL_CHECK_EVERY_ENV,
   GOAL_MAX_CONTINUATIONS_ENV,
-  GOAL_MAX_PROGRESS_RESETS_ENV,
   GOAL_MAX_TURNS_PER_RUN_ENV,
   GOAL_MAX_PIVOTS_ENV,
   GOAL_TOOL_NAME,
   VERIFY_TIMEOUT_ENV,
   parseCheckEvery,
   parseMaxContinuations,
-  parseMaxProgressResets,
   parseMaxTurnsPerRun,
   parseMaxPivots,
   parseVerifyTimeoutMs,
@@ -165,7 +165,7 @@ import {
 import type { VerifyResult, VerifyRunner } from "./verify";
 import { capVerifyOutput, liveCheckAborts, runVerify } from "./verify";
 import { GOAL_KILL_KEY, listenForTerminalInput } from "./input";
-import type { Goal, GoalBranchEntry, GoalDetails, GoalLoopState, ParkPacket } from "./state";
+import type { Goal, GoalBranchEntry, GoalDetails, GoalLoopState, GoalParkFlavor, ParkPacket } from "./state";
 import {
   GOAL_CHECK_TYPE,
   GOAL_PAUSED_STEER_TYPE,
@@ -188,8 +188,6 @@ import type {
   ImpasseVerdict,
   JudgeChildRunner,
   MilestoneKind,
-  ProgressJudge,
-  ProgressVerdict,
   SettleJudge,
   SettleTriage,
   SettleVerdict,
@@ -204,7 +202,6 @@ import {
   buildWorkDigest,
   createLlmSettleJudge,
   createLlmSettleTriage,
-  defaultProgressJudge,
   describeBgTasks,
   milestoneKind,
   parseJudgeEnabled,
@@ -248,17 +245,6 @@ export * from "./render";
 export interface RegisterGoalOptions {
   /** Optional semantic judge (Jev-style). v1 leaves this unset; the structural gate is the floor. */
   judge?: GoalJudge;
-  /** Optional progress judge consulted at the continuation cap. Defaults to the
-   *  deterministic defaultProgressJudge (verify output changed ⇒ progressing).
-   *  CONTRACT: the live window holds up to MAX_BUDGET_OUTPUTS (32) entries,
-   *  but a RELOADED window restores only the persisted tail (baseline + last
-   *  MAX_PERSISTED_TRAJECTORY−1 = 7). Judges must treat anything beyond
-   *  first-vs-last as advisory — deciding on the middle of the window makes
-   *  the cap verdict reload-dependent. */
-  progressJudge?: ProgressJudge;
-  /** Cap on judge-approved budget resets at the continuation cap. Defaults to
-   *  PI_GOAL_MAX_PROGRESS_RESETS, then GOAL_MAX_PROGRESS_RESETS_DEFAULT. */
-  maxProgressResets?: number;
   /** Run the verify check every Nth continuation, reusing the last measured
    *  state in between. Defaults to PI_GOAL_CHECK_EVERY, then 1 (every turn). */
   checkEvery?: number;
@@ -325,9 +311,6 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
   const maxContinuations = options.maxContinuations ?? parseMaxContinuations(process.env[GOAL_MAX_CONTINUATIONS_ENV]);
   const maxTurnsPerRun = options.maxTurnsPerRun ?? parseMaxTurnsPerRun(process.env[GOAL_MAX_TURNS_PER_RUN_ENV]);
   const maxPivots = options.maxPivots ?? parseMaxPivots(process.env[GOAL_MAX_PIVOTS_ENV]);
-  const maxProgressResets =
-    options.maxProgressResets ?? parseMaxProgressResets(process.env[GOAL_MAX_PROGRESS_RESETS_ENV]);
-  const progressJudge: ProgressJudge = options.progressJudge ?? { assess: defaultProgressJudge };
   const judge = options.judge;
   const verifyTimeoutMs = options.verifyTimeoutMs ?? parseVerifyTimeoutMs(process.env[VERIFY_TIMEOUT_ENV]);
   const verifyRunner: VerifyRunner = options.verifyRunner ?? runVerify;
@@ -365,13 +348,19 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
   // on a dead registry (or miss the fresh one) after every reload.
   const runningTasks: () => BgTask[] = options.runningTasks ?? (() => getSharedTaskRegistry()?.running() ?? []);
   // Verify outputs observed during the current budget window (oldest first) —
-  // the evidence the progress judge reads at the cap. Cleared with the budget.
+  // the trajectory the settle judge's projection diffs (first-vs-last).
+  // Cleared with the budget.
   let budgetOutputs: string[] = [];
-  let resetsUsed = 0;
   // Pivots consumed this goal (PI_GOAL_MAX_PIVOTS). A pivot refreshes ONLY
   // the continuation window — never spend, never met criteria, never the
   // trajectory baseline: the new epoch is judged against the same gap.
   let pivotsUsed = 0;
+  // Continuations consumed since the trajectory baseline began — the span the
+  // projection's rate is denominated over. Pivot refreshes zero `continuations`
+  // while the trajectory carries over, so the span keeps its own counter.
+  let windowContinuations = 0;
+  // work-appears-complete re-engages ONCE per goal — a second sight parks.
+  let workAppearsReengaged = false;
   // Lifetime accounting (per session, crosses goals): every auto-continuation
   // ever granted, and wall-clock pursuit time. Monotonic — never reset by the
   // budget re-arm — so a loud resume can say what the goal has truly consumed.
@@ -442,9 +431,9 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
   // model's set/complete/blocked, which is how a stuck model would defeat the cap.
   const resetContinuationBudget = () => {
     continuations = 0;
+    windowContinuations = 0; // the window restarts, so its span does too
     stopped = false;
     budgetOutputs = [];
-    resetsUsed = 0;
     lastCheck = undefined; // a resumed goal re-establishes its measured state
     lastCheckAge = 0;
     lastCheckKind = undefined;
@@ -476,14 +465,16 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
   };
   const currentLoopState = (): GoalLoopState => {
     // The budget window's FIRST entry is its baseline — recordBudgetOutput
-    // never evicts index 0, because the progress judge diffs first-vs-last.
+    // never evicts index 0, because the projection diffs first-vs-last.
     // Persist [baseline + tail] so a restored window keeps that comparison;
-    // a tail-only slice would quietly change the cap decision across a reload.
+    // a tail-only slice would quietly change the projection across a reload.
     const rest = budgetOutputs.slice(1).map((t) => capVerifyOutput(t));
     return {
       continuations,
-      resetsUsed,
+      resetsUsed: 0, // frozen: the seam is gone; the field survives for old state files
       pivotsUsed,
+      windowContinuations,
+      ...(workAppearsReengaged ? { reengagedOnce: true } : {}),
       totalContinuations,
       spendMs: Math.max(0, accruedSpendMs()),
       goalSpendMs: Math.max(0, accruedGoalSpendMs()),
@@ -521,8 +512,10 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     // state is still re-established by the next check — only the accounting
     // and the evidence window carry over.
     continuations = loop?.continuations ?? 0;
-    resetsUsed = loop?.resetsUsed ?? 0;
     pivotsUsed = loop?.pivotsUsed ?? 0;
+    // The "once" re-engagement is per goal and durable: a reload between the
+    // evidence demand and its non-production must not mint a second one.
+    workAppearsReengaged = loop?.reengagedOnce ?? false;
     totalContinuations = loop?.totalContinuations ?? 0;
     spendMs = loop?.spendMs ?? 0;
     // Legacy entries predate the per-goal clock — the lifetime spend is the
@@ -530,6 +523,11 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     // available estimate otherwise.
     goalSpendMs = loop?.goalSpendMs ?? loop?.spendMs ?? 0;
     budgetOutputs = loop ? [...loop.trajectory] : [];
+    // The span defaults to the restored trajectory's length-1 (baseline + one
+    // measured point per continuation): legacy entries predate the field, and
+    // a 0 span over a multi-point trajectory would inflate the projection
+    // rate on the very first settle after an upgrade.
+    windowContinuations = loop?.windowContinuations ?? Math.max(0, budgetOutputs.length - 1);
     lastCheck = undefined;
     lastCheckAge = 0;
     lastCheckKind = undefined;
@@ -616,6 +614,8 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     // A pivot budget is per goal too: a fresh objective must not inherit the
     // predecessor's consumed pivots — the bet was on THAT goal's non-linearity.
     pivotsUsed = 0;
+    workAppearsReengaged = false; // the one re-engagement is per goal too
+    windowContinuations = 0; // a fresh window restarts its span
     // Scope the judge's evidence to THIS goal: a window mixing goal A's outputs
     // with goal B's would let a re-set with any differently-printing verify buy
     // a "progressing" reset without moving the current goal. Clearing only the
@@ -768,6 +768,36 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
       }
       return undefined;
     };
+    // Park the LOOP LATCH — never goal.status — with a typed packet and
+    // event (the judge-verdict Stop the design describes: the agent stays
+    // the single author of semantic state; the latch is what halts spend).
+    const parkLoopLatch = (flavor: GoalParkFlavor, caseText: string, unverified = false) => {
+      const packet: ParkPacket = {
+        flavor,
+        caseText: clip(caseText, MAX_PARK_CASE_CHARS),
+        resumeRequires: parkResumeRequires(flavor),
+        spendMs: accruedGoalSpendMs(),
+        ...(unverified ? { unverified: true } : {}),
+      };
+      goal = { ...goal!, park: packet };
+      stopped = true;
+      persistGoalState(true);
+      emitGoalParked({
+        id: goal.id,
+        objective: goal.objective,
+        flavor,
+        reason: packet.caseText,
+        resumeRequires: packet.resumeRequires,
+        spendMs: packet.spendMs,
+        cwd: process.cwd(),
+        at: Date.now(),
+        ...(unverified ? { unverified: true } : {}),
+      });
+      uiRef?.notify(
+        `Goal #${goal.id} parked (${flavor}${unverified ? ", unverified" : ""}) — resume requires: ${packet.resumeRequires}. /goal resume re-arms it once you act on the packet.`,
+      );
+      updateFooter();
+    };
     // The continuation-cap gate: true when the loop must halt (the notify and
     // footer already said so). On a calm settle it runs before any judge call
     // (a stop must not spend a triage/judge pass) — its old position. On a
@@ -776,55 +806,51 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     // settle" — the breaker must not read a parked run as a plateau), so it
     // is re-invoked after the triage/judge declines to hold and gates every
     // budget-burning action from there down.
+    // capRefreshedThisSettle (set by the pivot branch) makes the two pivot
+    // consumers mutually exclusive within one settle: a calm cap refresh
+    // pre-empts a judge reframe grant, so at most one pivot is ever spent.
+    let capRefreshedThisSettle = false;
     const applyCap = async (): Promise<boolean> => {
       if (continuations < maxContinuations) return false;
-      // At the cap, a progress judge decides: still moving → reset the budget
-      // and continue (itself capped, so the judge can't defeat the breaker);
-      // plateaued or no opinion → stop. Fail-closed on ambiguity.
-      let verdict: ProgressVerdict | undefined;
-      try {
-        // Awaited so an async (LLM) judge needs no adapter; its rejection lands
-        // in this catch and fails closed.
-        verdict = await progressJudge.assess(activeGoal, budgetOutputs);
-      } catch {
-        verdict = undefined; // a throwing judge must not extend the run
-      }
-      if (verdict?.continueRun && resetsUsed < maxProgressResets) {
-        resetsUsed += 1;
+      // Pivots replace the old judge-approved resets (the design's cut): the
+      // breaker consults the pivot budget, not a judge — a judge that could
+      // extend its own run was a conflict of interest, and the spend budget
+      // is a strictly safer bound than a reset count. A remaining pivot
+      // refreshes the window (notified); none remains → deterministic Stop:
+      // budget flavor, packet + event, unverified (no judge was consulted).
+      if (pivotsUsed < maxPivots) {
+        pivotsUsed += 1;
         continuations = 0;
-        budgetOutputs = [];
-        // Drop the cached check too: a fresh window must open with a fresh
-        // baseline, else (with a high checkEvery) the window would hold a
-        // single fresh output and the judge would fail closed on "not enough
-        // measured states" — defeating the judge in exactly the configs the
-        // throttle exists for.
-        lastCheck = undefined;
-        lastCheckAge = 0;
+        capRefreshedThisSettle = true;
+        persistGoalState();
         ctx.ui?.notify(
-          `Goal #${activeGoal.id} hit the continuation cap but is still progressing (${verdict.reason ?? "judge approved"}) — ` +
-            `resetting the budget (reset ${resetsUsed}/${maxProgressResets}).`,
+          `Goal #${activeGoal.id} hit the continuation cap — spending pivot ${pivotsUsed}/${maxPivots} to continue ` +
+            "(window refreshed; spend, criteria, and trajectory carry over).",
         );
         return false;
       }
-      stopped = true;
-      // Persist the latch: without this, a reload after the cap resurrects the
-      // loop (the derived latch reads the last pre-cap entry). The restored
-      // accounting would re-trip the cap at the next settle anyway — persisting
-      // makes the halt immediate and durable instead of eventual.
-      persistGoalState(true);
-      const why = verdict?.continueRun
-        ? `progress-judge resets exhausted (${resetsUsed}/${maxProgressResets})`
-        : verdict
-          ? (verdict.reason ?? "no progress signal")
-          : "progress judge unavailable — failing closed";
-      ctx.ui?.notify(
-        `Goal #${activeGoal.id} still active after ${maxContinuations} auto-continuations — stopping (${why}). ` +
-          "Complete it via the goal tool, adjust it, or /goal stop.",
+      const basis =
+        judgeOutcome === "assessed"
+          ? "The settle judge assessed this turn and did not stop the run, but no funded reframe remained."
+          : judgeOutcome === "consulted"
+            ? // No-opinion (no throw) must not render empty parentheses.
+              `The settle judge was consulted but returned no assessment${
+                lastJudgeError.trim() !== "" ? ` (${clip(lastJudgeError, 200)})` : ""
+              }.`
+            : "The breaker is deterministic — no judge was consulted (unverified).";
+      parkLoopLatch(
+        "budget",
+        `continuation budget exhausted: ${maxContinuations} auto-continuations and no pivots remaining. ${basis}`,
+        judgeOutcome !== "assessed",
       );
-      updateFooter();
       return true;
     };
     if (holding && !judged && !triage) return park();
+    // Declared before the first applyCap call (calm settles gate at the cap
+    // before any judge runs — judgeOutcome stays undefined there, which is
+    // exactly the "no judge was consulted" basis).
+    let judgeOutcome: "assessed" | "consulted" | undefined;
+    let lastJudgeError = "";
     if (!holding) {
       parkedForTasks = false;
       if (await applyCap()) return;
@@ -842,6 +868,13 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     // verdict exists for. The triage still gates the expensive part.
     const due = holding || (continuations + 1) % checkEvery === 0 || !lastCheck;
     const verifyCommand = goal.verify; // captured for the closure: narrowing of `goal` doesn't cross it
+    // Carried out of the measured block below (verdict is block-scoped): a
+    // working-with-reframe verdict requests the pivot-consuming reframe.
+    let reframeRequested: string | undefined;
+    // Whether the judge's reframe mandate was FUNDED (a pivot was consumed
+    // for it). Carried out of the judged block: consumption happens pre-cap,
+    // rendering below.
+    let reframeGranted = false;
     if (due) {
       // Settle triage for verify goals (PI_GOAL_TRIAGE / options.triage): a
       // judge-first gate. The verify can run minutes and hold locks the
@@ -974,6 +1007,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
           // the breaker, not launder it.
           continuations += 1;
           totalContinuations += 1;
+          windowContinuations += 1;
           // The cached measurement (if any) aged by this unmeasured turn —
           // a frozen age would keep reporting "just measured" across a long
           // run of skips.
@@ -1074,6 +1108,27 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
                 continuation: continuations + 1,
                 maxContinuations,
                 ...(lastJudgeReason ? { previousReason: lastJudgeReason } : {}),
+                // The payload contract: the judge's memory is the trajectory
+                // (persisted stable measured states). The feasibility
+                // projection is deliberately NOT offered here yet: judged
+                // goals have no verify, so this trajectory holds verdict
+                // labels, not measurements — projecting over them (or over
+                // the judge's own prose) would launder the judge's wording
+                // into a "computed" citation. The projection returns when
+                // verify goals reach this judge (the triage-deletion step),
+                // with windowContinuations as its denominator.
+                // The SAME clamped view the persisted trajectory holds
+                // (baseline + last 7): the live window holds up to 32
+                // entries, and a stop/reframe decision that could read the
+                // longer window would flip on whether a reload intervened.
+                ...(budgetOutputs.length >= 2
+                  ? {
+                      trajectory: [budgetOutputs[0], ...budgetOutputs.slice(1).slice(-(MAX_PERSISTED_TRAJECTORY - 1))],
+                    }
+                  : {}),
+                // Clamped: a restored pivotsUsed can exceed a lowered
+                // PI_GOAL_MAX_PIVOTS, and "-2 pivots remaining" would contradict itself.
+                ...(maxPivots > 0 ? { pivotsRemaining: Math.max(0, maxPivots - pivotsUsed) } : {}),
                 signal: judgeSignal,
                 // The live tasks the hold decision needs: without them the
                 // judge cannot tell in-flight work from an ambient server.
@@ -1085,6 +1140,8 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
           })();
           await Promise.race([assessed, killed]);
           aborted = judgeSignal.aborted;
+          judgeOutcome = verdict ? "assessed" : "consulted";
+          lastJudgeError = judgeError;
           check = { ok: false, exitCode: null, timedOut: false, output: "" };
         } else {
           check = await verifyRunner(verifyCommand!, {
@@ -1160,8 +1217,49 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         // the fail-open "unavailable" continuation instead.
         if (verdict?.verdict === "hold" && holding) return park();
         parkedForTasks = false; // a decided settle ends any park episode
-        // The cap gates the re-engagement — after the hold decision, not
-        // before it (same ordering as the triage path above).
+        // The judge-verdict Stop: parks the loop latch, never goal.status.
+        // work-appears-complete is the exception that does not park: it
+        // re-engages ONCE with "produce the per-criterion evidence" — a
+        // second sight of it parks (the evidence was demanded and not
+        // produced; preserving the wrap-up path without an infinite loop).
+        if (verdict?.verdict === "stop") {
+          if (verdict.stopFlavor === "work-appears-complete" && !workAppearsReengaged) {
+            workAppearsReengaged = true;
+            verdict = {
+              verdict: "working",
+              reason: verdict.reason ?? "the criteria look met",
+              remaining: [
+                'Call the goal tool with action "complete" and per-criterion evidence citing the actual command output — the structural gate needs it.',
+              ],
+            };
+          } else {
+            const flavor = verdict.stopFlavor ?? "premise"; // a stop without a flavor is treated as the conservative park
+            parkLoopLatch(
+              flavor,
+              verdict.reason ?? `judge stop (${flavor}) at continuation ${continuations + 1}/${maxContinuations}`,
+            );
+            return undefined; // halted — no continuation, no budget
+          }
+        }
+        // A working verdict carrying a reframe consumes its pivot HERE —
+        // before the cap gate — so the cap's window refresh cannot eat the
+        // bet the judge asked for. Without a pivot remaining the mandate is
+        // unfulfillable: it degrades to the plain continue below (the spend
+        // budget stays the bound).
+        if (verdict?.verdict === "working" && verdict.reframe === true) {
+          reframeRequested = verdict.reason ?? "";
+          // Exclusive with the cap's refresh (one pivot max per settle): a
+          // calm settle at the cap already refreshed the window pre-judge.
+          if (pivotsUsed < maxPivots && !capRefreshedThisSettle) {
+            pivotsUsed += 1;
+            continuations = 0; // the pivot refresh: window only (same contract as the blocked path)
+            reframeGranted = true;
+          }
+        }
+        // The cap gates every remaining re-engagement — after the hold and
+        // stop decisions, not before them (same ordering as the triage path).
+        // judgeOutcome (set at the race) makes any budget park here disclose
+        // the judge's actual role in the turn.
         if (holding && (await applyCap())) return;
         const note = verdict?.reason ?? "the judge returned no opinion";
         check = {
@@ -1183,11 +1281,23 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     }
     continuations += 1;
     totalContinuations += 1;
+    windowContinuations += 1;
+    // The reframe ladder replaces the plain working steer when the judge's
+    // mandate was FUNDED (consumed above, pre-cap). Consumption and rendering
+    // are split so the cap gate can sit between them.
+    const reframeText = reframeGranted
+      ? renderReframePrompt(
+          goal,
+          reframeRequested !== "" ? reframeRequested! : "the judge mandated a reframe",
+          pivotsUsed,
+          maxPivots,
+        )
+      : undefined;
     updateFooter();
     // The budget window needs a STABLE measured state, not prose: the judge's
     // reason rewords itself every turn even at a plateau, so feeding it here
-    // would let the default progress judge read any rewording as movement and
-    // multiply the cap on exactly the goals the judge drives. Verdict + the
+    // would let the projection read any rewording as movement and multiply the
+    // spend read on exactly the goals the judge drives. Verdict + the
     // sorted remaining set is stable: same assessment ⇒ identical string.
     if (due)
       recordBudgetOutput(
@@ -1197,17 +1307,19 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     pi.sendMessage(
       {
         customType: GOAL_CHECK_TYPE,
-        content: judged
-          ? renderMilestonePrompt(
-              goal,
-              lastCheckKind ?? "unavailable",
-              check.output,
-              lastJudgeRemaining,
-              continuations,
-              maxContinuations,
-              lastCheckAge,
-            )
-          : renderCheckPrompt(goal, check, continuations, maxContinuations, lastCheckAge),
+        content: reframeText
+          ? reframeText
+          : judged
+            ? renderMilestonePrompt(
+                goal,
+                lastCheckKind ?? "unavailable",
+                check.output,
+                lastJudgeRemaining,
+                continuations,
+                maxContinuations,
+                lastCheckAge,
+              )
+            : renderCheckPrompt(goal, check, continuations, maxContinuations, lastCheckAge),
         // Visible in the transcript via the compact renderer (registerMessageRenderer
         // below) — the loop's heartbeat shouldn't be invisible to the user.
         display: true,
@@ -1502,7 +1614,10 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
           const judgeReason = `judge: ${verdict.reason ?? "insufficient evidence"}`;
           return finish(goal, `Goal #${goal.id} NOT completed: ${judgeReason}`, judgeReason);
         }
-        goal = { ...goal, status: "complete" };
+        // A latch park can be outstanding on an ACTIVE goal; completing it
+        // makes the goal terminal — the packet must not survive to make a
+        // finished goal look resumable.
+        goal = { ...goal, status: "complete", park: undefined, blockedReason: undefined };
         persistGoalState();
         clearFooter();
         // Lifecycle gossip for out-of-band consumers (pushover et al.): fired
@@ -1777,8 +1892,14 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         // but deliberately never re-arms the loop, and without this arm that
         // goal would tick its footer forever with a dead loop and no recovery
         // (stop refuses it as already-stopped, resume as not-paused).
+        // Status-driven, never `goal.park`-driven: a packet surviving on a
+        // terminal or live goal (complete, or a kickoff that re-armed it)
+        // must not make it resumable — the packet renders and persists, it
+        // does not authorize spend.
         const resumableGoal =
-          goal && (goal.status === "paused" || (goal.status === "active" && stopped) || goal.park) ? goal : undefined;
+          goal && (goal.status === "paused" || goal.status === "blocked" || (goal.status === "active" && stopped))
+            ? goal
+            : undefined;
         if (!resumableGoal) {
           ctx.ui.notify("No paused or stopped goal to resume.");
           return;
@@ -1794,10 +1915,12 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         // Resuming clears the park packet: the user acted on resumeRequires,
         // and the goal that continues is active — the packet survives in the
         // branch history for the trail, not on the live goal.
-        goal =
-          resumableGoal.park && resumableGoal.status === "blocked"
-            ? { ...resumableGoal, status: "active", park: undefined, blockedReason: undefined }
-            : { ...resumableGoal, status: "active" };
+        goal = resumableGoal.park
+          ? // Clear the packet on every arm — a latch park leaves the goal
+            // ACTIVE, and a surviving packet would keep rendering "Parked"
+            // after the re-arm (and keep the goal resumable while live).
+            { ...resumableGoal, status: "active", park: undefined, blockedReason: undefined }
+          : { ...resumableGoal, status: "active", blockedReason: undefined };
         stopped = false;
         resetContinuationBudget();
         persistGoalState(false);
@@ -1825,7 +1948,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         // not-pursuing (blocked) and the loop latch set, so a reload can no
         // longer resurrect a goal the user stopped.
         stopped = true;
-        goal = { ...goal, status: "blocked", blockedReason: "stopped by user" };
+        goal = { ...goal, status: "blocked", blockedReason: "stopped by user", park: undefined };
         persistGoalState(true);
         clearFooter();
         ctx.ui.notify(`Goal #${goal.id} stopped.`);
@@ -1848,7 +1971,16 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
         // superseded stop onto the goal the user is replacing. Only a paused
         // goal is resurrected to active; terminal goals keep their status —
         // the model's set persists the replacement goal (and its own state).
-        goal = goal.status === "paused" ? { ...goal, status: "active" } : goal;
+        // Re-arming strips any park packet (a latch park leaves the goal
+        // ACTIVE with stopped=true; a blocked park leaves it blocked): the
+        // kicked-off goal must render live, and a stray packet would keep it
+        // resumable per the status guard below.
+        goal = {
+          ...goal,
+          ...(goal.status === "paused" ? { status: "active" as const } : {}),
+          park: undefined,
+          blockedReason: undefined,
+        };
         stopped = false;
       }
       // A user (re)starting a goal re-arms the loop budget — a deliberate
