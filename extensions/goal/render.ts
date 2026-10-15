@@ -92,11 +92,12 @@ export function renderCheckMessage(
   let outcome: string;
   if (details.aborted) {
     // Aborted first: an aborted row must not read as a verify abort.
-    outcome = details.triage
-      ? theme.fg("muted", "triage aborted — re-triaging next settle")
-      : details.judge
-        ? theme.fg("muted", "milestone judge aborted — re-assessing next settle")
-        : theme.fg("muted", "verify aborted — re-measuring next settle");
+    outcome =
+      details.triage === "aborted"
+        ? theme.fg("muted", "settle judge aborted — re-assessing next settle")
+        : details.judge
+          ? theme.fg("muted", "milestone judge aborted — re-assessing next settle")
+          : theme.fg("muted", "verify aborted — re-measuring next settle");
   } else if (details.triage === "continue") {
     outcome = theme.fg("accent", "judge: mid-work — verify skipped, continuing");
   } else if (details.judge) {
