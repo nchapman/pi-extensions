@@ -209,7 +209,7 @@ Net effect: fewer child LLM calls per cycle and one fewer knob than today.
 3. **Pivot plumbing** — counter, budget refresh semantics, the procedural reframe
    prompt template (the ladder). — SHIPPED
 4. **The merged judge** — one pass with trajectory + feasibility projection; delete
-   the triage child and the `ProgressJudge` seam + knob in the same motion.
+   the triage child and the `ProgressJudge` seam + knob in the same motion. — SHIPPED
 
 ## Deferred / open
 
