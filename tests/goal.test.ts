@@ -1917,6 +1917,24 @@ describe("registerGoalTool — settle triage", () => {
     expect((sentCustom[0]!.msg as { content: string }).content).toContain("milestone");
   });
 
+  it("PI_GOAL_TRIAGE set at registration warns that the knob moved to PI_GOAL_JUDGE", () => {
+    const { pi } = makePi();
+    const warns: string[] = [];
+    const orig = console.warn;
+    console.warn = (...a: unknown[]) => warns.push(a.join(" "));
+    process.env.PI_GOAL_TRIAGE = "0";
+    try {
+      registerGoalTool(pi, {});
+    } finally {
+      console.warn = orig;
+      delete process.env.PI_GOAL_TRIAGE;
+    }
+    // The deleted triage child's opt-out must not silently no-op: a user who
+    // pinned it gets told, once at registration, where the knob went.
+    expect(warns.join("\n")).toContain("PI_GOAL_TRIAGE");
+    expect(warns.join("\n")).toContain("PI_GOAL_JUDGE");
+  });
+
   it("with the judge off (PI_GOAL_JUDGE=0), the verify runs on every due settle", async () => {
     const { pi, tools, events } = makePi();
     const verifyRunner = vi.fn(async () => failVerify);
