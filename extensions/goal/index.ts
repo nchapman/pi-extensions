@@ -62,9 +62,8 @@
  *   the agent as a fresh run), so measuring now could read a half-finished
  *   state or block on a lock the running work holds — but a never-ending
  *   task (a dev server) never wakes, and a blanket defer would park the
- *   loop until the next user prompt. So the settle triage / milestone judge
- *   also receives the live task list and answers "hold" (defer to the first
- *   calm settle — the pre-judge behavior: no budget burned, nothing cached,
+ *   loop until the next user prompt. So the settle judge also receives the
+ *   live task list and answers "hold" (defer to the first calm settle — the pre-judge behavior: no budget burned, nothing cached,
  *   announced once per park) or lets the check proceed while the tasks run.
  *   A hold at the continuation cap defers the breaker to a calm settle; a
  *   proceed meets it like any calm settle would.
@@ -267,10 +266,9 @@ export interface RegisterGoalOptions {
    *  the registration-path wiring (model inheritance, signal, timeout) is
    *  assertable without spawning pi. */
   judgeRunChildFn?: JudgeChildRunner;
-  /** Live background tasks at settle time; while any run, the settle's
-   *  judge (triage / milestone judge) decides hold-vs-proceed — without one
-   *  in the loop, the check defers unconditionally. Defaults to the shared
-   *  superbash registry — absent registry means no background work
+  /** Live background tasks at settle time; while any run, the settle
+   *  judge decides hold-vs-proceed — without one in the loop, the check
+   *  defers unconditionally. Defaults to the shared superbash registry — absent registry means no background work
    *  (fail-open: the loop must not stall on a missing writer). Inject a fake
    *  in tests. */
   runningTasks?: () => BgTask[];

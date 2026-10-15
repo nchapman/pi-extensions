@@ -39,8 +39,9 @@
  *   single markdown report delivered to the caller as a follow-up message.
  *
  * Design cuts:
- * - Command, not a tool: reviews are user-initiated and the parent agent's
- *   context pays only for the final report — no ambient tool declaration.
+ * - Exposed as both the `/review` command and the `review` tool: human users get
+ *   progress chatter and full reports in chat, while agents self-reviewing before
+ *   commit get compact summaries in context with full reports written to `.pi/review/`.
  * - No repository index: at local scale grep is instant and always fresh;
  *   Copilot's migration to plain grep/glob/view showed the quality lives in
  *   the workflow instructions, not precomputed retrieval. If a monorepo ever

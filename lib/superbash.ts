@@ -77,6 +77,7 @@ import type { TSchema } from "typebox";
 /** Budget (chars for replies, bytes for command output) that rides inline in the wake message. */
 export const WAKE_TEXT_CAP = 4_000;
 
+/** A running or settled background task managed by the registry. */
 export interface BgTask {
   id: string;
   name: string;
@@ -100,6 +101,7 @@ export interface AdoptedHandle<T = { text: string; usage?: unknown }> {
   startedAt: number;
 }
 
+/** Injected external capabilities and messaging channels for the task registry. */
 export interface TaskDeps {
   /** Wake channel — receives the steered user message text. */
   sendUserMessage?: (text: string) => void;
@@ -116,6 +118,7 @@ export interface TaskDeps {
   unschedule?: (handle: unknown) => void;
 }
 
+/** The session-scoped background task registry interface. */
 export interface TaskRegistry {
   /** Register a running task; returns its id (t-<base36 time>, e.g. t-1134z8v). */
   adopt(record: {
@@ -168,12 +171,14 @@ function parseAfterMs(env: Record<string, string | undefined>, key: string, fall
   return raw && Number.isFinite(Number(raw)) && Number(raw) >= 0 ? Number(raw) : fallback;
 }
 
+/** Parse PI_SUBAGENT_BG_AFTER_MS: threshold in ms after which a blocking child is backgrounded. */
 export function parseBgAfterMs(env: Record<string, string | undefined>): number {
   // Default: never adopt — blocking is the norm; the env knob opts into the
   // old auto-adoption window.
   return parseAfterMs(env, "PI_SUBAGENT_BG_AFTER_MS", NEVER_ADOPT_MS);
 }
 
+/** Parse PI_BASH_BG_AFTER_MS: default auto-wait window in ms before promoting bash commands. */
 export function parseBashBgAfterMs(env: Record<string, string | undefined>): number {
   return parseAfterMs(env, "PI_BASH_BG_AFTER_MS", DEFAULT_BASH_BG_AFTER_MS);
 }

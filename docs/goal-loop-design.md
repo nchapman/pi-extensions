@@ -1,10 +1,9 @@
 # Goal loop control architecture
 
-**Status: design, not yet implemented.** Source: post-mortem of the 2026-10-13/14
+**Status: Implemented and shipped (Slices 1–4 complete).** Source: post-mortem of the 2026-10-13/14
 warp3090 autonomous campaign (session `01a12bc2`, 26h, four goals), followed by an
-adversarial expert review of two candidate designs. This document is the contract for
-the next revision of `extensions/goal.ts`; where it conflicts with the current code,
-the code is the incumbent and this is the change plan.
+adversarial expert review of two candidate designs. This document describes the control
+architecture for `extensions/goal/`.
 
 The design principle throughout: as simple as possible, but not simpler. The loop must
 finish work **without the user**; the user is needed only to change intent and to
@@ -22,8 +21,8 @@ Both happened in the same session, and neither was a failure of effort.
 pause/resume silently reset the counter). The settle judge approved every continuation
 because the work digest showed real effort — commits landed, root-causes found,
 already-met criteria re-stamped — while the **unmet** criteria were flat for six hours
-(one sat at ~475 t/s against a 1542 gate whose target was derived from an *assumed,
-never-measured* vLLM number). Mid-loop the agent wrote, in plain text: "we're now on
+(one sat at ~475 t/s against a 1542 gate whose target was derived from an _assumed,
+never-measured_ vLLM number). Mid-loop the agent wrote, in plain text: "we're now on
 the asymptote, and two of the four criteria are provably unreachable… the remaining
 gap is a scope decision, not an engineering unknown." The loop had no channel for that
 sentence and ran five more continuations until the user killed it manually at 14/25.
@@ -37,8 +36,8 @@ recon of the vendored reference implementation, a fresh lever list — and the s
 agent beat the same gate in 2h. Post-mortem: the "structural" verdicts rested on 1–2
 datapoints and one profile window contaminated by prefill work (a hazard the agent had
 itself documented the previous evening, then repeated), and the goal's scope-cap
-language ("each lever gets at most two root-caused attempts") let *named lever
-exhausted* masquerade as *component impossible*.
+language ("each lever gets at most two root-caused attempts") let _named lever
+exhausted_ masquerade as _component impossible_.
 
 ### What the failures teach
 
@@ -50,19 +49,19 @@ exhausted* masquerade as *component impossible*.
 - Both exits are claims about the future ("no path exists from here") and deserve
   adversarial review, with **asymmetric standards**: a false `complete` is the worst
   outcome (the user believes a lie); a false continue is unbounded spend; a false stop
-  costs a night. Under uncertainty, park — but park *richly*.
+  costs a night. Under uncertainty, park — but park _richly_.
 - A breaker must bound **money units** (wall-clock, tokens), not counts: a
   continuation can be 5 minutes or 3h45m.
 
 ## Responsibility: who owns what
 
-| | User | Agent | Judge | Breaker (deterministic) |
-|---|---|---|---|---|
-| Owns | intent + authorization | effort, diagnosis, all semantic state transitions | trajectory, evidence standards | budgets, caps, counters |
-| Authors | goal text, criteria, pivot allowance, budgets | work; `complete` / `blocked` requests | verdicts + procedural mandates (advisory, escaped) | halt latches only |
-| Ratifies | resumed goals, re-scopes, spend beyond budget | — (single write path preserved) | stops and reframes | — |
-| Forbidden | — (sovereign) | resetting budgets; self-certifying a bail | steering tactics; mutating state; spending | any semantics |
-| Absent default | — | keep working within epoch | fail-open to continue (semantics) / fail-safe to park (bail requests) | fail-closed on spend |
+|                | User                                          | Agent                                             | Judge                                                                 | Breaker (deterministic) |
+| -------------- | --------------------------------------------- | ------------------------------------------------- | --------------------------------------------------------------------- | ----------------------- |
+| Owns           | intent + authorization                        | effort, diagnosis, all semantic state transitions | trajectory, evidence standards                                        | budgets, caps, counters |
+| Authors        | goal text, criteria, pivot allowance, budgets | work; `complete` / `blocked` requests             | verdicts + procedural mandates (advisory, escaped)                    | halt latches only       |
+| Ratifies       | resumed goals, re-scopes, spend beyond budget | — (single write path preserved)                   | stops and reframes                                                    | —                       |
+| Forbidden      | — (sovereign)                                 | resetting budgets; self-certifying a bail         | steering tactics; mutating state; spending                            | any semantics           |
+| Absent default | —                                             | keep working within epoch                         | fail-open to continue (semantics) / fail-safe to park (bail requests) | fail-closed on spend    |
 
 The division compensates each party's observed bias: the agent can't hold trajectory
 (compaction) and shouldn't hold the wallet; the judge can't see the repo and must never
@@ -75,14 +74,14 @@ steer; the breaker is the user's enforcement proxy while they are away.
 > **Should this goal keep spending as framed?**
 
 Asked by three callers at the settle boundary: routinely (every due settle), on the
-agent's `blocked` request (now a *request*, not an action), and forced by the breaker
+agent's `blocked` request (now a _request_, not an action), and forced by the breaker
 when budget or cap is hit. One judge pass, one verdict machine — but a per-caller
 failure table, because "Continue by default" is only correct for one caller:
 
-| Caller | Judge dead / no opinion |
-|---|---|
-| Routine settle | Continue, plain (fail-open — a dead judge must not kill a healthy run) |
-| `blocked` request | Park — packet notes "bail requested, unverifiable" (never a forced grind) |
+| Caller               | Judge dead / no opinion                                                     |
+| -------------------- | --------------------------------------------------------------------------- |
+| Routine settle       | Continue, plain (fail-open — a dead judge must not kill a healthy run)      |
+| `blocked` request    | Park — packet notes "bail requested, unverifiable" (never a forced grind)   |
 | Breaker (budget/cap) | Stop regardless (deterministic; the packet notes the judge was unavailable) |
 
 ### THREE verdicts
@@ -90,7 +89,7 @@ failure table, because "Continue by default" is only correct for one caller:
 1. **Continue** — the default. May carry a **procedural reframe**: a mandate to produce
    evidence (clean-window re-measure → enumerate wall components against the reference
    implementation → propose a fresh lever list), never a tactical instruction (never
-   *which* lever or optimization). A reframe consumes one pivot.
+   _which_ lever or optimization). A reframe consumes one pivot.
 2. **Stop** — parks the **loop latch**; it never writes `goal.status` (the agent stays
    the single author of semantic state). Emits a decision packet:
    - free text (the case),
@@ -103,6 +102,7 @@ failure table, because "Continue by default" is only correct for one caller:
    about has saved money and lost the night. The `work-appears-complete` flavor is the
    exception that does not park: it re-engages once with "call complete with
    per-criterion evidence," preserving the wrap-up path for verify-less goals.
+
 3. **Complete** — the existing structural gate (per-criterion evidence + verify exit
    0). The judge never completes anything by verdict.
 
@@ -222,43 +222,29 @@ Net effect: fewer child LLM calls per cycle and one fewer knob than today.
   free-text Stop reasons widen the laundering surface, so the typed fields carry the
   routing and the prose stays clipped.
 
-## Slice 4 execution plan (the one remaining item)
+## Slice 4 implementation (shipped)
 
-Slices 1–3 are shipped (see Implementation order). Slice 4 is a rewrite of the
-`agent_before_settle` handler (~512 lines in extensions/goal/index.ts) plus
-judge.ts restructure; ~110 test references touch the seams being deleted.
-Suggested sub-commits, each independently green:
+All slices (1–4) are implemented and in production:
 
-1. **Feasibility projection, pure and additive** (`judge.ts` or a new
-   `projection.ts`): `projectCompletion(trajectory, budgetRemainingMs)` →
-   `"projects-complete" | "cannot-close-by-budget" | "insufficient-data"`.
-   Input: the persisted trajectory tail (capped verify outputs) + spend
-   remaining. Tests first; no wiring.
-2. **Typed park flavors for the system stops**: premise (contradiction
-   detected) and budget (breaker) park paths emitting `GoalParked` with the
-   right flavor/resumeRequires; work-appears-complete re-engages ONCE with
-   "call complete with per-criterion evidence" instead of parking. The
-   ParkPacket/GoalParkedEvent unions already carry all four flavors.
-3. **Merged verdict machine**: extend `SettleVerdict` to the design's
-   vocabulary — Continue (may carry `reframe: true`, consuming a pivot via the
-   slice-3 refresh), Stop (flavor + resumeRequires; parks the LOOP LATCH
-   `stopped=true` WITHOUT writing goal.status), Complete. Trajectory +
-   projection handed to the judge to cite; flat label offered only at ≥2
-   measured points.
-4. **The deletions, in the same motion**: `SettleTriage` +
-   `createLlmSettleTriage` + `buildTriageTask` + `parseTriageVerdict` +
-   `PI_GOAL_TRIAGE*` envs; `ProgressJudge` + `defaultProgressJudge` +
-   `PI_GOAL_MAX_PROGRESS_RESETS` + `resetsUsed`/`maxProgressResets` (keep
-   `resetsUsed` in the loop-state type one release for state-file
-   compatibility, ignored). Rewrite the ~110 test references: triage tests
-   become merged-verdict tests; progress-judge cap tests become
-   budget-flavor park tests.
-5. **Settle-time pivot consumption**: a Continue-with-reframe at a routine
-   settle consumes a pivot exactly like the blocked-rejection path (slice 3's
-   `pivotsUsed`/window-refresh logic), reusing `renderReframePrompt`.
+1. **Feasibility projection** (`extensions/goal/projection.ts`):
+   `projectCompletion(trajectory, budgetRemainingMs)` returns
+   `"projects-complete" | "cannot-close-by-budget" | "insufficient-data"` based on
+   the persisted trajectory tail (capped verify outputs) and remaining budget. Handed
+   to the judge as evidence to cite, not an automated gate.
+2. **Typed park flavors**: `impasse`, `premise`, `budget`, and
+   `work-appears-complete` park paths emit `GoalParked` with the appropriate
+   flavor and `resumeRequires` attributes (`goal-change | spend | evidence`).
+   `work-appears-complete` re-engages once demanding per-criterion evidence.
+3. **Merged verdict machine**: Settle verdicts (`Continue`, `Stop`, `Complete`,
+   `Hold`) are evaluated in a single judge pass. A `Stop` parks the loop latch
+   (`stopped=true`) without mutating the semantic `goal.status`.
+4. **Deletions complete**: Removed the legacy triage child pass and `ProgressJudge`
+   machinery; the single settle judge owns measurement cadence directly.
+5. **Settle-time pivot consumption**: Settle-time reframes consume pivots via the
+   same budget-refresh logic as blocked rejections, presenting the agent with a
+   clear procedural reframe prompt.
 
-Failure table (already half-built in the blocked handler) completes here:
-routine settle judge-dead → Continue plain (fail-open, exists); breaker
-(budget/cap) → deterministic Stop regardless of judge health, packet notes
-judge-unavailable; judge Stop at a routine settle → latch-park + packet +
-`GoalParked` (pushover already subscribes).
+The failure table operates as designed: routine settle with a dead judge fails
+open to a plain continuation; breaker triggers (budget/cap) deterministically
+stop regardless of judge health; and judge stops park the loop latch and emit
+`GoalParked` events for out-of-band notification (such as Pushover).

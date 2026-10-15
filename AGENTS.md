@@ -8,7 +8,7 @@ Personal [pi](https://pi.dev) coding-agent extension package. pi loads this dire
 npm run check      # typecheck + full test suite — the gate to run before every commit
 npm test           # vitest only
 npx tsc --noEmit   # typecheck only
-npm run format     # prettier --write extensions lib tests
+npm run format     # prettier --write extensions lib scripts tests
 npm run check:format
 npm run test:coverage  # vitest with V8 coverage report
 ```
@@ -20,12 +20,14 @@ npm run test:coverage  # vitest with V8 coverage report
 - `extensions/<name>/` — one directory per extension, `index.ts` as the entry pi loads (a subdirectory with an `index.ts` registers as ONE extension; sibling modules are never loaded separately). Pure layers live in sibling modules and `index.ts` re-exports their surfaces, so `import … from "../extensions/<name>"` keeps working for tests and cross-extension importers (see `extensions/goal/` for the fullest example; small extensions like `superedit/` may be index-only until they grow). Cross-extension imports exist — e.g. `recall/render.ts` imports plan rendering from `../todo`, so vendoring one directory can pull in another
 - `lib/` — shared core modules (e.g. the task registry) imported by extensions and tests alike
 - `tests/*.test.ts` — one vitest suite per module/extension; keep new tests in the matching file
+- `scripts/` — benchmarks (`bench-recall`, `bench-review-models`), evaluations (`eval-review`), and dataset utilities
+- `docs/` — design documents and architecture specifications
 
 ## Code conventions
 
 - TypeScript with lint-grade strictness beyond `strict: true` (`noUnusedLocals`, `noUnusedParameters`, `noImplicitReturns`, `noFallthroughCasesInSwitch`, `verbatimModuleSyntax`, and more). No unused anything; type-only imports use `import type`.
 - Prettier enforced: double quotes, semicolons, 2-space indent, 120-col width, trailing commas. Run `npm run format` before committing.
-- Comment the *why* — file headers explain the deliberate design cut (see `lib/superbash.ts` for the pattern), not a narration of the code.
+- Comment the _why_ — file headers explain the deliberate design cut (see `lib/superbash.ts` for the pattern), not a narration of the code.
 - Configuration is environment knobs (`PI_*`) parsed through small pure `parse*` helpers; invalid values fall back to documented defaults (range-clamped), never throw. Read timing varies — at registration (recall) or per-call (subagents) — match the surrounding code.
 - Every network fetch and child process is bounded (timeout, capped buffers). Errors must carry enough detail to act on; choose fail-open vs fail-closed deliberately and say which in a comment.
 

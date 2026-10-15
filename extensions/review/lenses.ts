@@ -8,6 +8,7 @@ import type { Finding } from "./findings";
 // Prompts
 // ---------------------------------------------------------------------------
 
+/** Specification for a focused review lens (e.g., correctness, security, tests). */
 export interface Lens {
   id: string;
   name: string;
@@ -68,6 +69,7 @@ const FINDER_RULES = `## Deciding what to report
 - Substantiate every finding: trace the triggering input, state, or execution path to a consequence, and check existing guards, callers, and tests before concluding something is broken. If you cannot substantiate it, do not report it.
 - Scope: the diff is the review. Report issues this change introduces or aggravates; skip pre-existing problems it merely passes by.`;
 
+/** Construct the AgentDef configuration for a finder child specialized to the given lens. */
 export function finderAgent(lens: Lens): AgentDef {
   return {
     name: `review-${lens.id}`,
@@ -93,6 +95,7 @@ Severity: critical = credible severe security exposure, data loss, or broad brea
   };
 }
 
+/** Construct the AgentDef configuration for the adversarial verifier subagent. */
 export function verifyAgent(): AgentDef {
   return {
     name: "review-verify",
@@ -118,6 +121,7 @@ Judge every candidate; an empty array claims every one was fine as listed, which
   };
 }
 
+/** Build the review prompt presented to a finder subagent for a given lens, diff chunk, and attachments. */
 export function finderTask(opts: {
   lens: Lens;
   chunkIndex: number;
@@ -148,6 +152,7 @@ export function finderTask(opts: {
   return parts.join("\n\n");
 }
 
+/** Build the adversarial verification prompt presented to the verify subagent with candidate findings. */
 export function verifyTask(opts: {
   diffText: string;
   guidelines: string;

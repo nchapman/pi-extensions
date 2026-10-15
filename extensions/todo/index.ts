@@ -37,11 +37,15 @@ import { matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 
+/** Tool name registered for whole-list task planning. */
 export const TODO_TOOL_NAME = "todo";
+/** Minimum turns of user inactivity before an unfinished plan triggers a staleness reminder. */
 export const REMINDER_MIN_TURNS = 4;
 
+/** Lifecycle statuses an item in the todo list may hold. */
 export type TodoStatus = "pending" | "in_progress" | "completed" | "cancelled";
 
+/** A single discrete item in the session's todo list. */
 export interface TodoItem {
   content: string;
   status: TodoStatus;
@@ -125,6 +129,7 @@ export function validateTodoList(input: unknown): { todos: TodoItem[]; error?: s
   return { todos };
 }
 
+/** Aggregated counts and active items representing progress through a todo list. */
 export interface TodoProgress {
   resolved: number;
   total: number;
@@ -132,6 +137,7 @@ export interface TodoProgress {
   active: TodoItem[];
 }
 
+/** Compute overall counts (resolved vs total) and active items from a list of todos. */
 export function summarizeTodos(todos: TodoItem[]): TodoProgress {
   return {
     resolved: todos.filter((t) => t.status === "completed" || t.status === "cancelled").length,
@@ -180,6 +186,7 @@ export function renderReminder(todos: TodoItem[]): string {
   return lines.join("\n");
 }
 
+/** Internal conditions evaluated to decide whether to trigger a staleness reminder. */
 export interface ReminderState {
   unfinished: boolean;
   turnsSinceUpdate: number;
@@ -222,6 +229,7 @@ export interface TodoChanges {
   cancelled: string[];
 }
 
+/** Compute delta summary (completed, started, added, cancelled) between two list states. */
 export function summarizeChanges(prev: TodoItem[], next: TodoItem[]): TodoChanges {
   const before = new Map(prev.map((t) => [t.content, t.status]));
   const changes: TodoChanges = { completed: [], started: [], added: [], cancelled: [] };
@@ -419,6 +427,7 @@ function reconstructFromSession(ctx: ExtensionContext): { todos: TodoItem[]; pla
   return { todos, planHiddenByCompaction };
 }
 
+/** Register the todo tool, branch state listeners, compaction handling, and /todos command. */
 export function registerTodoTool(pi: ExtensionAPI): void {
   let todos: TodoItem[] = [];
   let turnsSinceUpdate = 0;
@@ -471,7 +480,8 @@ export function registerTodoTool(pi: ExtensionAPI): void {
     // without emitting it), so the freeze is structural. What remains is
     // the echo case: a user prompt quoting a wake's text is still not
     // neglect, same as before the pin.
-    if (!isWakeMessage(event.prompt)) turnsSinceUpdate++;
+    const prompt = "prompt" in event ? event.prompt : undefined;
+    if (!isWakeMessage(prompt)) turnsSinceUpdate++;
     const p = summarizeTodos(todos);
     if (!shouldRemind({ unfinished: p.resolved < p.total, turnsSinceUpdate, compactedSinceUpdate })) return;
     // Consume the trigger so the reminder fires once, not every turn.

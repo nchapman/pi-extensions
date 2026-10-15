@@ -90,6 +90,10 @@ export function resolveTools(fm: Record<string, unknown>): string[] {
   return [...BUILTIN_TOOLS];
 }
 
+/**
+ * Parse an agent markdown definition containing YAML frontmatter and markdown body instructions.
+ * Validates thinking level if specified and falls back to fallbackName if frontmatter omits a name.
+ */
 export function agentFromText(text: string, fallbackName: string): AgentDef {
   const { fm, body } = splitFrontmatter(text);
   const name = typeof fm.name === "string" && fm.name ? fm.name : fallbackName;
@@ -128,6 +132,7 @@ You are a focused subagent operating in an isolated pi session. The parent agent
 - If the task is ambiguous or cannot be completed, say so plainly and explain what is missing instead of improvising.
 `;
 
+/** Reference identifying an agent by pre-registered name or inline markdown definition. */
 export interface AgentRef {
   agent?: string;
   agent_md?: string;
@@ -170,6 +175,10 @@ export function refLabel(ref: AgentRef): string {
   }
 }
 
+/**
+ * Scan a directory for `*.md` files and load them into agent definitions.
+ * Skips files that fail frontmatter parsing or carry invalid configurations.
+ */
 export function loadAgents(dir: string): AgentDef[] {
   if (!existsSync(dir)) return [];
   const agents: AgentDef[] = [];
@@ -194,6 +203,7 @@ export function extractAssistantText(content: unknown): string {
     .join("\n");
 }
 
+/** Default directory containing user agent definition markdown files (`~/.pi/agent/agents`). */
 export const AGENTS_DIR = join(homedir(), ".pi/agent/agents");
 
 /** Command names must be a single word: letters, digits, hyphens, underscores. */

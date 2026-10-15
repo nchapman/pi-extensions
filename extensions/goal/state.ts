@@ -30,11 +30,11 @@ export interface Goal {
   status: GoalStatus;
   blockedReason?: string;
   /** The park decision packet, present exactly when the loop parked this
-   * goal through a judge-mediated Stop (an accepted `blocked` request today;
-   * premise/budget/work-appears-complete flavors arrive with the merged
-   * judge). A plain status write never sets it — the packet is what an
-   * out-of-band channel (pushover) needs: the case, the typed flavor, what a
-   * resume requires, and the spend it cost to learn this. */
+   * goal through a judge-mediated Stop (an accepted `blocked` request, premise
+   * contradiction, budget exhaustion, or work-appears-complete wrap-up). A
+   * plain status write never sets it — the packet is what an out-of-band
+   * channel (pushover) needs: the case, the typed flavor, what a resume
+   * requires, and the spend it cost to learn this. */
   park?: ParkPacket;
   /**
    * Optional measurable check: a shell command that prints the measured state
@@ -214,7 +214,7 @@ export interface GoalLoopState {
   trajectory: string[];
 }
 
-/** Trajectory tail kept per goal.state entry — enough for the progress
+/** Trajectory tail kept per goal.state entry — enough for the settle
  * judge's first-vs-last diff to survive a reload, small enough that a
  * per-settle accounting write stays cheap. The entry cap IS the verify cap
  * (same constant, same tail-preserving formula): a smaller or differently-

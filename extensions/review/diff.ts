@@ -6,12 +6,14 @@
 // Diff parsing, exclusion, chunking
 // ---------------------------------------------------------------------------
 
+/** Represents a parsed unified git diff section for a single target file. */
 export interface DiffFile {
   path: string;
   text: string;
   chars: number;
 }
 
+/** A grouped subset of DiffFiles bounded by a character threshold for batch subagent review. */
 export interface DiffChunk {
   files: DiffFile[];
   chars: number;
@@ -30,6 +32,7 @@ const EXCLUDED = [
   /\.(png|jpe?g|gif|webp|ico|pdf|woff2?|ttf|otf)$/i,
 ];
 
+/** Check if a file path matches standard noise patterns that should be excluded from code review. */
 export function isExcludedPath(p: string): boolean {
   return EXCLUDED.some((re) => re.test(p));
 }
@@ -102,6 +105,7 @@ export function chunkDiffFiles(files: DiffFile[], maxChars: number): DiffChunk[]
   return chunks;
 }
 
+/** Labeled text section of a diff presented for inspection or subagent consumption. */
 export interface DiffSection {
   label: string;
   text: string;

@@ -80,12 +80,17 @@ export function chunkKey(
   return h.digest("hex").slice(0, KEY_HEX);
 }
 
+/** A candidate vector search match with its binary sign-agreement similarity. */
 export interface VectorHit {
   key: string;
   /** Sign-agreement fraction in [0, 1] — the binary "similarity". */
   similarity: number;
 }
 
+/**
+ * Append-only binary vector store using packed sign-quantized embeddings
+ * and fast Hamming-distance popcount scanning.
+ */
 export class VectorStore {
   private vectors = new Map<string, Uint8Array>();
   private file: Awaited<ReturnType<typeof open>> | null = null;

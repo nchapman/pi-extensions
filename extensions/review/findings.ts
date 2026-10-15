@@ -6,9 +6,12 @@
 // Findings: schema, parsing, merge, verdicts
 // ---------------------------------------------------------------------------
 
+/** Finding severity classification. */
 export type Severity = "critical" | "important" | "suggestion";
+/** Numeric rank for sorting severities (lowest number = highest priority). */
 export const SEVERITY_ORDER: Record<Severity, number> = { critical: 0, important: 1, suggestion: 2 };
 
+/** Structured code review finding identified by an analysis lens. */
 export interface Finding {
   file: string;
   line?: number;
@@ -131,6 +134,7 @@ export function mergeFindings(lists: Finding[][]): Finding[] {
   return merged.sort(severityThenLocation);
 }
 
+/** Individual verdict emitted by the verification subagent for a candidate finding. */
 export interface Verdict {
   id: number;
   verdict: "confirmed" | "rejected" | "downgraded";
@@ -163,6 +167,7 @@ export function parseVerdicts(text: string): Verdict[] | null {
   return arr.length > 0 && out.length === 0 ? null : out;
 }
 
+/** Outcome bundle combining confirmed findings, rejected candidates with rationale, and verification status. */
 export interface VerifiedBundle {
   findings: Finding[];
   /** Candidates the verifier rejected, with reasons (for the report footer). */

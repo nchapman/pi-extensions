@@ -87,6 +87,7 @@ export type ParkFlavor = "impasse" | "premise" | "budget" | "work-appears-comple
  * the flavor. */
 export type ResumeRequirement = "goal-change" | "spend" | "evidence";
 
+/** Event emitted when the goal loop parks and requires human intervention to resume. */
 export interface GoalParkedEvent {
   /** The goal's monotonic id. */
   id: number;
@@ -119,6 +120,10 @@ function sharedParked(): Map<string, GoalParkedListener> {
   return (globals[SHARED_PARKED_KEY] ??= new Map());
 }
 
+/**
+ * Subscribe to goal parked events under an owner key (e.g. "pushover").
+ * Replaces any existing listener for that owner.
+ */
 export function onGoalParked(owner: string, listener: GoalParkedListener): () => void {
   sharedParked().set(owner, listener);
   return () => {

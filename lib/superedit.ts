@@ -121,6 +121,7 @@ export function normalizeForFuzzyMatch(text: string): string {
     .replace(/[\u00A0\u2002-\u200A\u202F\u205F\u3000]/g, " ");
 }
 
+/** Normalize all CRLF or CR line endings in text to standard LF (\n). */
 export function normalizeToLF(text: string): string {
   return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 }
@@ -133,6 +134,7 @@ export function detectLineEnding(content: string): "\n" | "\r\n" {
   return crlf < lf ? "\r\n" : "\n";
 }
 
+/** Restore the original line ending format (\r\n or \n) to text. */
 export function restoreLineEndings(text: string, ending: "\n" | "\r\n"): string {
   return ending === "\r\n" ? text.replace(/\n/g, "\r\n") : text;
 }
@@ -158,6 +160,7 @@ function resolveToCwd(filePath: string, baseDir: string): string {
 // Line model
 // ---------------------------------------------------------------------------
 
+/** Representation of a single line within a file, with byte offsets and newline status. */
 export interface Line {
   /** Offset of the line's first character. */
   start: number;
@@ -169,6 +172,7 @@ export interface Line {
   hasNewline: boolean;
 }
 
+/** Parse LF-normalized content into an indexed array of Line objects. */
 export function getLines(content: string): Line[] {
   const lines: Line[] = [];
   let start = 0;
@@ -247,8 +251,10 @@ function shiftText(text: string, shift: number): string {
 // The matching ladder
 // ---------------------------------------------------------------------------
 
+/** Tiers in the superedit matching ladder, from strictest to most forgiving. */
 export type TierName = "exact" | "normalized" | "indent-elastic";
 
+/** A single match site found on a tier of the ladder. */
 export interface TierMatch {
   start: number;
   end: number;
@@ -256,6 +262,7 @@ export interface TierMatch {
   indentShift: number;
 }
 
+/** Result of scanning the file across the matching ladder tiers. */
 export interface TierResult {
   /** The first tier with at least one match, or "none". */
   tier: TierName | "none";
@@ -493,6 +500,7 @@ export class OffsetMap {
 // Sequential application
 // ---------------------------------------------------------------------------
 
+/** Specification for a single replacement within a superedit call. */
 export interface EditSpec {
   oldText: string;
   newText: string;
@@ -500,6 +508,7 @@ export interface EditSpec {
   occurrence?: number | "all";
 }
 
+/** Record of a successfully matched and applied replacement. */
 export interface AppliedEdit {
   editIndex: number;
   tier: TierName;
@@ -1226,11 +1235,13 @@ export function prepareEditArguments(input: unknown): unknown {
 // The tool
 // ---------------------------------------------------------------------------
 
+/** Input parameters accepted by the superedit tool. */
 export interface SuperEditInput {
   path: string;
   edits: EditSpec[];
 }
 
+/** Details object attached to successful superedit tool results. */
 export interface SuperEditDetails extends EditToolDetails {
   /** Human-readable notes for every non-exact or multi-occurrence application. */
   notes: string[];

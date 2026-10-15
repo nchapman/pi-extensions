@@ -87,10 +87,10 @@ export interface SettleJudgeContext {
   previousReason?: string;
   /** The trajectory tail (stable measured states, oldest→newest) — the judge's
    * memory across settles: verdict labels for judge goals, capped verify
-   * output for verify goals once they reach this seam. Present at ≥2 points.
-   * (A computed feasibility projection joins this payload when verify goals
-   * do — projecting over verdict labels would launder the judge's own prose
-   * into a "computed" citation.) */
+   * output for verify goals. Present at ≥2 points. (A computed feasibility
+   * projection joins this payload for verify goals — projecting over verdict
+   * labels on judge goals would launder the judge's own prose into a
+   * "computed" citation.) */
   trajectory?: string[];
   /** Continuations since the last measurement (verify goals): the judge
    * owns measurement cadence and must demand a re-measure when this grows. */

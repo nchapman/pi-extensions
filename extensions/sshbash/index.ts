@@ -56,6 +56,7 @@ import { Type } from "typebox";
 import type { BashOperations, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createBashTool, getSharedTaskRegistry, piAgentDir, type BashToolCallParams } from "../../lib/superbash";
 
+/** Tool name registered for remote command execution over SSH. */
 export const SSH_TOOL_NAME = "ssh_bash";
 
 /** Seconds a control master stays up after the last call (PI_SSH_IDLE_SECS). */
@@ -65,6 +66,7 @@ export const DEFAULT_SSH_CONNECT_TIMEOUT_SECS = 20;
 /** Cap on the stderr tail carried into connection-failure errors. */
 const STDERR_TAIL_CAP = 2_000;
 
+/** Parsed SSH destination target options. */
 export interface SshTarget {
   user?: string;
   host: string;
@@ -87,10 +89,12 @@ function parseBoundedInt(
   return Number.isFinite(n) && n >= min && n <= max ? Math.floor(n) : fallback;
 }
 
+/** Parse PI_SSH_IDLE_SECS: seconds an idle control master socket persists before exiting. */
 export function parseSshIdleSecs(env: Record<string, string | undefined>): number {
   return parseBoundedInt(env, "PI_SSH_IDLE_SECS", DEFAULT_SSH_IDLE_SECS, 0, 86_400);
 }
 
+/** Parse PI_SSH_CONNECT_TIMEOUT: seconds allowed for initial SSH connection establishment. */
 export function parseSshConnectTimeoutSecs(env: Record<string, string | undefined>): number {
   return parseBoundedInt(env, "PI_SSH_CONNECT_TIMEOUT", DEFAULT_SSH_CONNECT_TIMEOUT_SECS, 1, 300);
 }
@@ -185,6 +189,7 @@ function expandHome(path: string): string {
   return path === "~" || path.startsWith("~/") ? join(homedir(), path.slice(1)) : path;
 }
 
+/** Options configuring multiplexed SSH process execution and socket management. */
 export interface SshExecOptions {
   controlDir: string;
   idleSecs: number;
@@ -289,6 +294,7 @@ export interface SshProcess {
   on(event: "error", cb: (err: Error) => void): void;
   kill(signal?: NodeJS.Signals): void;
 }
+/** Factory function type for spawning child SSH processes, injectable in tests. */
 export type SshSpawn = (command: string, args: string[]) => SshProcess;
 
 const defaultSpawn: SshSpawn = (command, args) =>
@@ -508,6 +514,7 @@ export function createSshBashOperations(
   };
 }
 
+/** Represents an active or remembered SSH connection session handle. */
 export interface SshConnection {
   id: string;
   target: SshTarget;
@@ -568,6 +575,10 @@ export function describeConnection(conn: SshConnection): string {
   return `${destinationArg(t)}${t.port !== undefined ? `:${t.port}` : ""}${t.key ? ` (key ${t.key})` : ""}`;
 }
 
+/**
+ * Registers the `ssh_bash` tool with pi, wiring up connection multiplexing,
+ * background task lifecycle handling, and session shutdown cleanup.
+ */
 export function registerSshBashExtension(
   pi: ExtensionAPI,
   opts: { spawnFn?: SshSpawn; controlDir?: string } = {},

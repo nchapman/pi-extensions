@@ -15,6 +15,7 @@ import {
 } from "../../lib/superbash";
 import { extractAssistantText } from "./agents";
 
+/** The standard built-in tool set recognized and filterable by subagents. */
 export const BUILTIN_TOOLS = ["read", "write", "edit", "bash", "grep", "find", "ls"];
 const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000;
 /** Default idle watchdog: a child waiting on its LLM this long without a
@@ -45,6 +46,7 @@ const DEFAULT_CONCURRENCY = 4;
 const STDERR_TAIL_MAX = 8 * 1024;
 const STDOUT_BUF_MAX = 1024 * 1024;
 
+/** In-memory definition of an agent parsed from markdown frontmatter or inline config. */
 export interface AgentDef {
   name: string;
   description: string;
@@ -54,6 +56,7 @@ export interface AgentDef {
   thinking?: string;
 }
 
+/** Parse PI_SUBAGENT_TIMEOUT_MS: maximum milliseconds allowed for a child run before killing it. */
 export function parseTimeoutMs(env: NodeJS.ProcessEnv): number {
   const raw = Number(env.PI_SUBAGENT_TIMEOUT_MS);
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_TIMEOUT_MS;
@@ -82,11 +85,13 @@ export function resolveIdleTimeoutMs(options: Pick<RunChildOptions, "idleTimeout
   return options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
 }
 
+/** Parse PI_SUBAGENT_CONCURRENCY: maximum parallel child processes executed during batch runs. */
 export function parseConcurrency(env: NodeJS.ProcessEnv): number {
   const raw = Number(env.PI_SUBAGENT_CONCURRENCY);
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_CONCURRENCY;
 }
 
+/** Narrow child process interface consumed by runChild, injected in tests. */
 export interface ChildLike {
   stdout: { on(event: "data", cb: (chunk: Buffer) => void): void };
   stderr: { on(event: "data", cb: (chunk: Buffer) => void): void };
@@ -95,11 +100,14 @@ export interface ChildLike {
   kill(signal?: string): void;
 }
 
+/** Function type for spawning subagent child processes. */
 export type SpawnFn = (command: string, args: string[], options: { stdio: ["ignore", "pipe", "pipe"] }) => ChildLike;
 
+/** Default process spawner using Node's child_process.spawn. */
 export const defaultSpawn: SpawnFn = (command, args, options) =>
   nodeSpawn(command, args, options) as unknown as ChildLike;
 
+/** Options passed to runChild configuring deadlines, watchers, adoption, and event streaming. */
 export interface RunChildOptions {
   timeoutMs?: number;
   /** Kill the child when it has waited on its LLM this long without a stdout
@@ -160,6 +168,7 @@ export function resolveChildModel(
  * agent-file authors can pin the contract. */
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
+/** Check whether a given thinking string matches one of the recognized pi thinking levels. */
 export function isValidThinkingLevel(level: string): boolean {
   return (THINKING_LEVELS as readonly string[]).includes(level);
 }
@@ -177,6 +186,7 @@ export function resolveChildThinking(param: string | undefined, agentThinking: s
   return param ?? agentThinking ?? DEFAULT_SUBAGENT_THINKING;
 }
 
+/** Construct CLI argv array for launching a pi subprocess in print/json mode with isolated configuration. */
 export function buildChildArgs(agent: AgentDef, task: string, model?: string, thinking?: string): string[] {
   const args = [
     "-p",
@@ -325,6 +335,10 @@ export function adoptSubagentTask(
   return id;
 }
 
+/**
+ * Execute a subagent task in an isolated pi child process.
+ * Streams JSON events, monitors hard and idle deadlines, and optionally adopts into the task registry.
+ */
 // Two overloads: a literal without onAdopted stays typed as ChildRun; anything
 // else — including a prebuilt options variable — gets ChildOutcome and narrows.
 export function runChild(

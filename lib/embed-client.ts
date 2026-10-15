@@ -131,6 +131,7 @@ interface PendingRequest {
 /** Rolling tail of child stderr for diagnostics (bounded). */
 const STDERR_TAIL_BYTES = 4096;
 
+/** Configuration options for spawning and communicating with the embedding worker. */
 export interface EmbedClientOptions {
   workerPath: string;
   dtype: string;
@@ -145,6 +146,10 @@ export interface EmbedClientOptions {
   idleTimeoutMs?: number;
 }
 
+/**
+ * Client for managing an out-of-process embedding worker child, handling request/response
+ * serialization, idle timeouts, and automatic restart on crash.
+ */
 export class EmbedClient {
   private child: WorkerChild | null = null;
   private pending = new Map<number, PendingRequest>();

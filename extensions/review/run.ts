@@ -39,12 +39,14 @@ import { FINDER_LENSES, finderAgent, finderTask, verifyAgent, verifyTask } from 
 // Orchestration
 // ---------------------------------------------------------------------------
 
+/** Process execution result from a git command. */
 export interface GitResult {
   code: number;
   stdout: string;
   stderr: string;
 }
 
+/** Injected external dependencies and environment bindings for the review pipeline. */
 export interface ReviewDeps {
   /** Run git in the repo (args only, cwd fixed by the caller); bounded. */
   git: (args: string[]) => Promise<GitResult>;
@@ -102,6 +104,7 @@ export function defaultShell(cwd: string): (command: string) => Promise<string |
     });
 }
 
+/** Final outcome of a complete code review run, including formatted report, structured findings, and metadata. */
 export interface ReviewResult {
   report: string;
   /** The final (capped) findings behind the report — data, not just display. */
@@ -776,6 +779,7 @@ export async function runReview(opts: {
 // Registration
 // ---------------------------------------------------------------------------
 
+/** Construct the production ReviewDeps implementation with optional overrides for testing. */
 export function reviewDeps(cwd: string, overrides?: Partial<ReviewDeps>): ReviewDeps {
   return {
     git: defaultGit(cwd),
