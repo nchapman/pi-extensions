@@ -25,7 +25,7 @@ export interface RecallConfig {
   summaryReuseCache: boolean;
   /** Hard character budget for generated summaries (PI_RECALL_SUMMARY_CHARS). */
   summaryChars: number;
-  /** Thinking for the summarization call: "session" mirrors the session level; or a fixed ThinkingLevel / "off" (PI_RECALL_SUMMARY_THINKING). Defaults to "off": no thinking is requested so the provider applies its own default (glm-5.3 disables outright, deepseek keeps a light default), and the instruction-sandwich layout carries template adherence at literally 0 reasoning tokens — measured across the fleet — so the whole output cap stays available for summary text and no reasoning run can starve it. */
+  /** Thinking for the summarization call: "session" mirrors the session level; or a fixed ThinkingLevel / "off" (PI_RECALL_SUMMARY_THINKING). Governs the one-off legacy layout only — the cached layout always mirrors the session's level (a diverging level re-renders the replayed history on template-aware providers, e.g. zai clear_thinking, and busts the prompt-cache prefix it exists to ride). Defaults to "off": no thinking is requested so the provider applies its own default (glm-5.3 disables outright, deepseek keeps a light default), and the instruction-sandwich layout carries template adherence at literally 0 reasoning tokens — measured across the fleet — so the whole output cap stays available for summary text and no reasoning run can starve it. */
   summaryThinking: "session" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   chunkChars: number;
   snippetChars: number;
@@ -41,6 +41,8 @@ export interface RecallConfig {
   embedForeignMaxBytes: number;
   /** Where the ONNX model caches (must survive npm installs — never inside node_modules). */
   embedModelDir: string;
+  /** Dump the rendered provider payloads of cached-layout summary calls and the last live request for first-divergence diffing (PI_RECALL_DEBUG_PREFIX=1; files land under <sessionDir>/recall-debug/). Debug-only: keeps one live payload in memory while armed. */
+  debugPrefix: boolean;
 }
 
 export const DEFAULTS: RecallConfig = {
@@ -65,6 +67,7 @@ export const DEFAULTS: RecallConfig = {
   embedWeight: 0.15,
   embedForeignMaxBytes: 32 * 1024 * 1024,
   embedModelDir: `${process.env.HOME ?? "~"}/.pi/agent/models`,
+  debugPrefix: false,
 };
 
 /** Minimum for PI_RECALL_SUMMARY_CHARS. */
@@ -148,5 +151,6 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): RecallConfi
     embedWeight: numFromEnv(env, "PI_RECALL_EMBED_WEIGHT", DEFAULTS.embedWeight, 0, 2),
     embedForeignMaxBytes: Math.floor(numFromEnv(env, "PI_RECALL_EMBED_MAX_MB", 32, 0, 4096) * 1024 * 1024),
     embedModelDir: env.PI_RECALL_MODEL_DIR?.trim() || DEFAULTS.embedModelDir,
+    debugPrefix: boolFromEnv(env, "PI_RECALL_DEBUG_PREFIX", DEFAULTS.debugPrefix),
   };
 }

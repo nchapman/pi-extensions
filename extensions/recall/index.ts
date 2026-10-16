@@ -151,8 +151,10 @@ import {
   carryForwardFileLists,
   collectFileOps,
   compactionFingerprint,
+  createPrefixDebugger,
   defaultSummaryFn,
   draftPreparation,
+  effectiveSummaryThinking,
   lastCompactionDetails,
   planSection,
   retryTransient,
@@ -229,6 +231,30 @@ export function registerRecallTool(
   let autoCompactInFlight = false;
   const corpusCache = new ProjectCorpusCache(reader, config.projectMaxBytes, config.chunkChars);
   const summarize = deps.summarize ?? defaultSummaryFn;
+  // PI_RECALL_DEBUG_PREFIX: capture rendered payloads to make a cache miss a
+  // mechanical diff (see createPrefixDebugger). The before_provider_request
+  // hook observes only agent-loop requests — the summarization call goes
+  // straight through the registry — so live payloads arrive via the hook and
+  // the cached layout's own payload via the onPayload tap threaded into the
+  // call. Registered only when armed; every failure inside the dumper is a crumb.
+  const prefixDebug = config.debugPrefix ? createPrefixDebugger() : undefined;
+  if (prefixDebug) {
+    pi.on("before_provider_request", (event, ctx) => {
+      // Total on purpose: a degenerate context (no manager — in-memory sessions)
+      // degrades to a skipped stash, never a throw here.
+      const sm = (ctx as Partial<ExtensionContext>).sessionManager;
+      prefixDebug.onLiveRequest(event.payload, sm?.getSessionDir?.(), sm?.getSessionId?.());
+      return undefined;
+    });
+  }
+  /** The cached layout's payload tap: undefined when not debugging or not riding the cache (the legacy one-off layout is not a cache replay — dumping it would only mislabel the pair). Fire-and-forget: the dump never delays the request that triggers it. */
+  const summaryTap = (cachedLayout: boolean, sessionDir: string | undefined, sessionId: string | undefined) =>
+    prefixDebug && cachedLayout
+      ? (payload: unknown) => {
+          void prefixDebug.onSummaryRequest(payload, sessionDir, sessionId);
+          return undefined;
+        }
+      : undefined;
   // Semantic support, opened lazily at session_start and torn down at
   // session_shutdown. `vectors` is null whenever the feature is off, the
   // store failed to open, or the session ended — search treats null as
@@ -476,11 +502,13 @@ export function registerRecallTool(
       const preparation = livePreparation(ctx);
       if (!preparation) return; // nothing compactable; pi's near-limit backstop owns the rest
       // Registry object captured (staleness), method called bound to it —
-      // ModelRegistry.complete reads `this.runtime`, so a bare method capture
+      // ModelRegistry.streamSimple reads `this.runtime`, so a bare method capture
       // throws on every real call (test fakes are plain arrows and hide it).
       const registry = ctx.modelRegistry;
-      const complete: Parameters<typeof summarize>[0]["complete"] = (m, context, options) =>
-        registry.complete(m, context, options);
+      const prefixMessages =
+        config.summaryReuseCache && preparation.prefixCacheable ? preparation.prefixMessages : undefined;
+      const streamSimple: Parameters<typeof summarize>[0]["streamSimple"] = (m, context, options) =>
+        registry.streamSimple(m, context, options);
       controller = new AbortController();
       const signal = controller.signal; // captured: TS cannot narrow the mutable let through the retry closure
       const pending: PendingCompaction = {
@@ -492,12 +520,19 @@ export function registerRecallTool(
         () =>
           summarize({
             model,
-            complete,
-            thinkingLevel: config.summaryThinking === "session" ? ctx.thinkingLevel : config.summaryThinking,
+            streamSimple,
+            // Cached layout mirrors the session level (effectiveSummaryThinking):
+            // a level that diverges from the session's re-renders the replayed
+            // history and busts the prompt-cache prefix the layout exists to ride.
+            thinkingLevel: effectiveSummaryThinking(
+              config.summaryThinking,
+              ctx.thinkingLevel,
+              prefixMessages !== undefined,
+            ),
             messages: preparation.messages,
-            prefixMessages:
-              config.summaryReuseCache && preparation.prefixCacheable ? preparation.prefixMessages : undefined,
+            prefixMessages,
             sessionId: sm?.getSessionId?.(), // same tolerance as sessionRoutingId: degenerate managers degrade, never throw
+            onPayload: summaryTap(prefixMessages !== undefined, sm?.getSessionDir?.(), sm?.getSessionId?.()),
             previousSummary: preparation.previousSummary,
             userFocus: undefined, // background triggers never carry /compact focus
             budgetChars: config.summaryChars,
@@ -745,20 +780,31 @@ export function registerRecallTool(
       }
     }
     const signal = ctx.signal ?? new AbortController().signal;
+    const prefixMessages =
+      config.summaryReuseCache && preparation.prefixCacheable ? preparation.prefixMessages : undefined;
     try {
       const { text, usage: summaryUsage } = await retryTransient(
         () =>
           summarize({
             model,
-            complete: (m, context, options) => ctx.modelRegistry.complete(m, context, options),
-            thinkingLevel: config.summaryThinking === "session" ? ctx.thinkingLevel : config.summaryThinking,
+            streamSimple: (m, context, options) => ctx.modelRegistry.streamSimple(m, context, options),
+            // Cached layout mirrors the session level — see effectiveSummaryThinking.
+            thinkingLevel: effectiveSummaryThinking(
+              config.summaryThinking,
+              ctx.thinkingLevel,
+              prefixMessages !== undefined,
+            ),
             // Chronological, mirroring the session_before_compact path; the auto
             // trigger never sets a user focus. The cached layout rides the
             // session's prompt-cache prefix when the knob allows.
             messages: preparation.messages,
-            prefixMessages:
-              config.summaryReuseCache && preparation.prefixCacheable ? preparation.prefixMessages : undefined,
+            prefixMessages,
             sessionId: sessionRoutingId(ctx),
+            onPayload: summaryTap(
+              prefixMessages !== undefined,
+              (ctx as Partial<ExtensionContext>).sessionManager?.getSessionDir?.(),
+              sessionRoutingId(ctx),
+            ),
             previousSummary: preparation.previousSummary,
             userFocus: undefined,
             budgetChars: config.summaryChars,
@@ -864,21 +910,29 @@ export function registerRecallTool(
         () =>
           summarize({
             model,
-            complete: (m, context, options) => ctx.modelRegistry.complete(m, context, options),
-            // Default "off": no thinking is requested (the provider applies its
-            // own default) — the instruction-sandwich prompt holds template
-            // adherence at zero reasoning tokens across the fleet, and nothing
-            // can starve the output cap from the reasoning side.
-            // PI_RECALL_SUMMARY_THINKING pins another level or mirrors the
-            // session's (often low) interactive level with "session" — measured
-            // on glm-5.3, "low" effort followed the template ~1/3 runs on a long
-            // input while "high" adhered.
-            thinkingLevel: config.summaryThinking === "session" ? ctx.thinkingLevel : config.summaryThinking,
+            streamSimple: (m, context, options) => ctx.modelRegistry.streamSimple(m, context, options),
+            // The knob governs the one-off layout: default "off" — no thinking
+            // requested, so the provider applies its own default and nothing can
+            // starve the output cap from the reasoning side (the sandwich prompt
+            // holds template adherence at zero reasoning tokens, measured across
+            // the fleet; on glm-5.3 "low" effort followed the template ~1/3 runs
+            // while "high" adhered). The cached layout instead mirrors the
+            // session's level unconditionally — see effectiveSummaryThinking.
+            thinkingLevel: effectiveSummaryThinking(
+              config.summaryThinking,
+              ctx.thinkingLevel,
+              prefixMessages !== undefined,
+            ),
             // Chronological: older spans first, split-turn prefix last, so the
             // newest state the prompt re-derives sits at the end of the transcript.
             messages: [...p.messagesToSummarize, ...p.turnPrefixMessages],
             prefixMessages,
             sessionId: prefixMessages === undefined ? undefined : sessionRoutingId(ctx),
+            onPayload: summaryTap(
+              prefixMessages !== undefined,
+              (ctx as Partial<ExtensionContext>).sessionManager?.getSessionDir?.(),
+              sessionRoutingId(ctx),
+            ),
             previousSummary: p.previousSummary,
             userFocus: event.customInstructions?.trim() || undefined,
             // Tight target: recall makes the summary a map, not the archive.

@@ -1,8 +1,14 @@
 /** Context budget and compaction ownership: the auto/idle compaction triggers,
  * boundary preparation and span fingerprinting, the extension's own
- * summarization prompt and seam (retry, salvage), file-list carry-forward, and
- * the todo-plan carry-through for mid-run drafts. */
+ * summarization prompt and seam (retry, salvage), file-list carry-forward,
+ * the todo-plan carry-through for mid-run drafts, and the PI_RECALL_DEBUG_PREFIX
+ * payload dumper for first-divergence diffing of cached-layout replays. */
 
+import { mkdir as mkdirFs, writeFile as writeFileFs } from "node:fs/promises";
+import { join } from "node:path";
+
+/** Yields past the current tick — unlike a microtask hop, this lands after the request dispatch, not before it. */
+const yieldToLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
 import {
   convertToLlm,
   DEFAULT_COMPACTION_SETTINGS,
@@ -14,7 +20,7 @@ import {
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { PLAN_SECTION_HEADER, lastTodoSnapshot, renderPlainList } from "../todo";
-import { DEFAULTS } from "./config";
+import { DEFAULTS, type RecallConfig } from "./config";
 
 // ---------------------------------------------------------------------------
 // Context budget & compaction ownership
@@ -419,7 +425,7 @@ export interface DraftPreparation {
   firstKeptEntryId: string;
   /** Chronological messages to summarize — older spans first; the split-turn prefix folds in at the end, the same set the session_before_compact path sees. */
   messages: ProjectedMessage[];
-  /** The projected transcript before the cut — system messages and the previous compaction's summary included. Exactly the prefix the session's own requests sent, so a summarization request over it hits the provider's prompt cache. */
+  /** The projected transcript before the cut — system messages and the previous compaction's summary included. Exactly the prefix the session's own requests sent, so a summarization request over it hits the provider's prompt cache — provided the request's template-affecting options match the session's too (see effectiveSummaryThinking: on zai, a level-less request strips prior reasoning_content via the clear_thinking default and busts the match at the first assistant message). */
   prefixMessages: ProjectedMessage[];
   /** False when prefixMessages cannot be replayed as a standalone request — a split-turn cut leaves a toolCall at the end whose toolResult is kept; providers reject that conversation shape, so the caller must fall back to the one-off prompt. */
   prefixCacheable: boolean;
@@ -625,15 +631,23 @@ export function planSection(branchEntries: SessionEntry[]): string {
 }
 
 /** Boundaries of one model completion, as the extension seam sees it. */
-export type SummaryComplete = ModelRegistry["complete"];
-export type SummaryModel = Parameters<SummaryComplete>[0];
+export type SummaryStreamFn = ModelRegistry["streamSimple"];
+export type SummaryModel = Parameters<SummaryStreamFn>[0];
 export type SummaryThinkingLevel = NonNullable<ExtensionContext["thinkingLevel"]>;
 export type CompactionUsage = NonNullable<import("@earendil-works/pi-coding-agent").CompactionEntryDraft["usage"]>;
 
 /** Seam for tests: one summarization call with the extension's own prompt. */
 export interface SummaryFnArgs {
   model: SummaryModel;
-  complete: SummaryComplete;
+  /**
+   * The summarization call MUST ride `streamSimple`, not `complete`: the
+   * provider-neutral `reasoning` option is translated into the per-API fields
+   * that shape the rendered prompt (`reasoning_effort`, `thinking`,
+   * `chat_template_kwargs`…) only on the streamSimple path, and live turns take
+   * that same path — the cached layout needs both requests rendered by the
+   * identical code. (`complete` additionally never routed virtual models.)
+   */
+  streamSimple: SummaryStreamFn;
   thinkingLevel: SummaryThinkingLevel | undefined;
   /** AgentMessages in chronological order — older spans first, split-turn prefix last. */
   messages: Parameters<typeof convertToLlm>[0];
@@ -641,6 +655,8 @@ export interface SummaryFnArgs {
   prefixMessages?: Parameters<typeof convertToLlm>[0];
   /** The session's routing id — cache affinity for the cached layout (ignored by the legacy layout, which uses a fresh one-off id). */
   sessionId?: string;
+  /** Tap for the summarization request's rendered provider payload (PI_RECALL_DEBUG_PREFIX). Return undefined to keep the payload unchanged; every provider invokes it just before sending. */
+  onPayload?: NonNullable<Parameters<SummaryStreamFn>[2]>["onPayload"];
   previousSummary: string | undefined;
   /** Free-form focus from /compact args; the auto trigger never sets one. */
   userFocus: string | undefined;
@@ -653,23 +669,48 @@ export interface SummaryFnArgs {
 export type SummaryFn = (args: SummaryFnArgs) => Promise<{ text: string; usage: unknown }>;
 
 /**
+ * Effective thinking level for one summarization call. The cached layout
+ * mirrors the session's level unconditionally: template-affecting request
+ * options decide how the provider renders the *replayed history*, so any
+ * divergence from the level the session's requests ran at re-renders every
+ * prior assistant turn and busts the whole prefix match. Concretely on zai
+ * (glm, coding endpoint): a set level sends `thinking:{type:"enabled",
+ * clear_thinking:false}` — prior turns' reasoning_content stays in the prompt —
+ * while a level-less request sends `thinking:{type:"disabled"}` and the
+ * `clear_thinking` default (true) strips it. Same history, different prompt:
+ * the cache diverges at the first assistant message, leaving only the
+ * system-prompt/tools/first-user prefix as a partial hit. The configured knob
+ * (PI_RECALL_SUMMARY_THINKING) therefore governs the legacy one-off layout
+ * alone; "session" there mirrors the level too.
+ */
+export function effectiveSummaryThinking(
+  configured: RecallConfig["summaryThinking"],
+  sessionLevel: SummaryThinkingLevel | undefined,
+  cachedLayout: boolean,
+): SummaryThinkingLevel | undefined {
+  if (cachedLayout) return sessionLevel;
+  return configured === "session" ? sessionLevel : configured;
+}
+
+/**
  * The production summarizer seam — exported so tests and validation harnesses
- * drive the exact request the extension sends (boundary-injected `complete`).
+ * drive the exact request the extension sends (boundary-injected `streamSimple`).
  */
 export const defaultSummaryFn: SummaryFn = async ({
   model,
-  complete,
+  streamSimple,
   thinkingLevel,
   messages,
   prefixMessages,
   sessionId,
+  onPayload,
   previousSummary,
   userFocus,
   budgetChars,
   keptRecentTokens,
   signal,
 }) => {
-  const context: Parameters<SummaryComplete>[1] = prefixMessages
+  const context: Parameters<SummaryStreamFn>[1] = prefixMessages
     ? // Cached layout: the projected transcript IS the conversation — byte-equal
       // to the session's own requests up to the cut, so the provider serves the
       // span from its prompt cache and prefills only the trailing instruction.
@@ -708,9 +749,10 @@ export const defaultSummaryFn: SummaryFn = async ({
           },
         ],
       };
-  const options: NonNullable<Parameters<SummaryComplete>[2]> & { reasoning?: SummaryThinkingLevel } = {
+  const options: NonNullable<Parameters<SummaryStreamFn>[2]> & { reasoning?: SummaryThinkingLevel } = {
     maxTokens: Math.min(SUMMARY_MAX_OUTPUT_TOKENS, model.maxTokens > 0 ? model.maxTokens : SUMMARY_MAX_OUTPUT_TOKENS),
     signal,
+    ...(onPayload ? { onPayload } : {}),
     // Cached layout rides the session's cache: its routing id plus default
     // retention (affinity headers / prompt_cache_key on OpenAI-compatible
     // providers, automatic prefix reads on Anthropic-style ones). Legacy
@@ -722,17 +764,20 @@ export const defaultSummaryFn: SummaryFn = async ({
         : { sessionId }
       : { cacheRetention: "none" as const, sessionId: crypto.randomUUID() }),
   };
-  // Mirror pi's summarizer: only forward thinking when the model reasons and a level is set.
+  // Mirror pi's summarizer: only forward thinking when the model reasons and a
+  // level is set — an absent `reasoning` (and "off" alike) is the agent's own
+  // convention for "level-less request" and must stay distinguishable, because
+  // providers render the replayed history differently with and without it.
   if (model.reasoning && thinkingLevel && thinkingLevel !== "off") {
     options.reasoning = thinkingLevel;
   }
-  const textOf = (r: Awaited<ReturnType<typeof complete>>) =>
+  const textOf = (r: Awaited<ReturnType<ReturnType<SummaryStreamFn>["result"]>>) =>
     r.content
       .filter((block): block is { type: "text"; text: string } => block.type === "text")
       .map((block) => block.text)
       .join("\n")
       .trim();
-  let response = await complete(model, context, options);
+  let response = await streamSimple(model, context, options).result();
   if (response.stopReason === "length") {
     // A length-stop cuts the summary mid-generation, but the dropped transcript
     // stays recall-searchable and the kept tail carries the newest work — a
@@ -746,7 +791,7 @@ export const defaultSummaryFn: SummaryFn = async ({
     if (options.reasoning !== undefined) {
       const reasoningFree: typeof options = { ...options };
       delete reasoningFree.reasoning;
-      response = await complete(model, context, reasoningFree);
+      response = await streamSimple(model, context, reasoningFree).result();
       if (response.stopReason === "length") {
         const retrySalvaged = salvageLengthStoppedSummary(textOf(response), budgetChars);
         if (retrySalvaged) return { text: retrySalvaged, usage: response.usage };
@@ -756,7 +801,7 @@ export const defaultSummaryFn: SummaryFn = async ({
       throw new Error(`summarizer hit the output cap (${options.maxTokens} tokens)`);
     }
   }
-  // complete() resolves (never rejects) error and abort terminations, keeping any
+  // streamSimple's result() resolves (never rejects) error and abort terminations, keeping any
   // partial content — a partial text must never become the session checkpoint.
   // Throwing routes aborts into the hook's silent return and errors into the crumb.
   if (response.stopReason === "error" || response.stopReason === "aborted") {
@@ -801,3 +846,125 @@ export function salvageLengthStoppedSummary(text: string, budgetChars: number): 
   const trimmed = (lastLine > 0 ? window.slice(0, lastLine) : window).trimEnd();
   return `${trimmed}\n\n${SALVAGE_MARKER}`;
 }
+
+// ---------------------------------------------------------------------------
+// Cached-layout replay debugging (PI_RECALL_DEBUG_PREFIX)
+// ---------------------------------------------------------------------------
+
+/** Filesystem seams for the dumper — injected so tests cover pairing without disk. Both may be sync or async. */
+export interface PrefixDebugDeps {
+  mkdir?: (dir: string) => void | Promise<void>;
+  writeFile?: (file: string, text: string) => void | Promise<void>;
+  onError?: (message: string) => void;
+  /** Called with the written dump path — the default crumb reminds the operator the file is secret-bearing. */
+  onDumped?: (path: string) => void;
+}
+
+/** Combined size both dump halves may reach — a debug dump must not fill the disk. */
+const MAX_DUMP_BYTES = 64 * 1024 * 1024;
+
+/** Dump filename, session-scoped: the sessions dir is shared per project, so a sibling session must not clobber the file under diagnosis. */
+const dumpFile = (sessionId: string) => `${sessionId}-diff.json`;
+
+/**
+ * PI_RECALL_DEBUG_PREFIX=1 instrumentation. Pairs the two rendered provider
+ * payloads whose token divergence decides a cache hit: the session's newest
+ * live request (fed from the before_provider_request hook, which observes
+ * agent-loop requests) and the cached layout's summarization replay (fed from
+ * the call's own onPayload tap — explicit sources, no payload sniffing, so
+ * every provider shape works and a legacy one-off summary can never pose as
+ * either half). A dump writes one self-contained file —
+ * `<sessionDir>/recall-debug/<sessionId>-diff.json`, carrying both payloads
+ * (session-scoped name: sibling sessions in the shared per-project dir cannot
+ * clobber each other's artifact) — rewritten whole per dump, so retries never
+ * accumulate files or leave mismatched halves, making the first divergence a
+ * mechanical diff (issue #2's diagnosis path). Pairing keys on the
+ * session id: a replaced session's stashed payload must not pair with the new
+ * session's summary. Debug-only by design: one live payload retained while
+ * armed, restrictive file modes (the dump is the full unredacted transcript),
+ * a byte cap, async writes off the request path, and every failure is a
+ * console crumb — a dump must never break a compaction.
+ */
+export function createPrefixDebugger(deps: PrefixDebugDeps = {}) {
+  const mkdir = deps.mkdir ?? ((dir: string) => mkdirFs(dir, { recursive: true, mode: 0o700 }));
+  const writeFile = deps.writeFile ?? ((file: string, text: string) => writeFileFs(file, text, { mode: 0o600 }));
+  const onError =
+    deps.onError ?? ((message: string) => console.error(`recall: PI_RECALL_DEBUG_PREFIX dump failed: ${message}`));
+  const onDumped =
+    deps.onDumped ??
+    ((path: string) =>
+      console.error(
+        `recall: PI_RECALL_DEBUG_PREFIX dump written to ${path} (secret-bearing — delete after diagnosis)`,
+      ));
+  let lastLive: { payload: unknown; sessionId: string } | undefined;
+
+  const writeDump = async (
+    pairedLive: { payload: unknown; sessionId: string },
+    payload: unknown,
+    sessionDir: string,
+    sessionId: string,
+  ): Promise<void> => {
+    // Everything below runs after a macrotask yield: the tap calls this
+    // fire-and-forget from the provider's onPayload, and serializing two full
+    // transcripts must not land ahead of the request dispatch. The pairing
+    // decision was locked at tap time — the hop cannot re-pair the halves.
+    await yieldToLoop();
+    try {
+      // Halves are serialized separately and capped before anything is built:
+      // an oversized payload never materializes the combined document. The
+      // assembled JSON is compact — the diff workflow reshapes it with jq anyway.
+      const liveJson = JSON.stringify(pairedLive.payload);
+      const summaryJson = JSON.stringify(payload);
+      if (Buffer.byteLength(liveJson) + Buffer.byteLength(summaryJson) > MAX_DUMP_BYTES) {
+        onError("dump exceeds the 64 MiB cap — skipped");
+        return;
+      }
+      const text = `{"dumpedAt":${JSON.stringify(new Date().toISOString())},"sessionId":${JSON.stringify(
+        sessionId,
+      )},"live":${liveJson},"summary":${summaryJson}}`;
+      // The sessions dir is shared per project and sibling sessions run their
+      // own dumpers, so the name is session-scoped: a sibling can only
+      // overwrite its own file, never half of someone else's pair, and retries
+      // (the stash is retained for exactly that) rewrite the file whole.
+      const dir = join(sessionDir, "recall-debug");
+      await mkdir(dir);
+      const file = join(dir, dumpFile(sessionId));
+      await writeFile(file, text);
+      onDumped(file);
+    } catch (err) {
+      onError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  return {
+    /** A live agent request: stash the newest for the next summary's pair. */
+    onLiveRequest(payload: unknown, sessionDir: string | undefined, sessionId: string | undefined): void {
+      if (sessionDir === undefined || sessionId === undefined) return; // nothing pairable without both
+      lastLive = { payload, sessionId };
+    },
+    /**
+     * The cached layout's summarization replay: write the diff file. Returns
+     * the write so tests can await it; production taps fire-and-forget so a
+     * dump never delays the request that triggers it.
+     */
+    onSummaryRequest(payload: unknown, sessionDir: string | undefined, sessionId: string | undefined): Promise<void> {
+      if (!sessionDir || sessionId === undefined) {
+        onError("no session directory or id on the context (in-memory session?) — dump not written");
+        return Promise.resolve();
+      }
+      // Pairing is decided synchronously at tap time: the dump must be two
+      // halves of one session, and a live request that arrives during the
+      // deferred write must not re-pair it.
+      if (lastLive === undefined) {
+        onError("no live payload captured yet — dump not written");
+        return Promise.resolve();
+      }
+      if (lastLive.sessionId !== sessionId) {
+        onError("stashed live payload was from another session — dump not written");
+        return Promise.resolve();
+      }
+      return writeDump(lastLive, payload, sessionDir, sessionId);
+    },
+  };
+}
+export type PrefixDebugger = ReturnType<typeof createPrefixDebugger>;

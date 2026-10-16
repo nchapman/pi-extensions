@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
-import { DEFAULT_COMPACTION_SETTINGS } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_COMPACTION_SETTINGS, SessionManager, convertToLlm } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { chunkKey, KEY_HEX } from "../lib/vecstore";
 import {
@@ -40,6 +41,9 @@ import {
   salvageLengthStoppedSummary,
   shouldAutoCompact,
   shouldIdleCompact,
+  createPrefixDebugger,
+  defaultSummaryFn,
+  effectiveSummaryThinking,
   type SummaryFn,
   registerRecallTool,
   visibleEntryIds,
@@ -78,6 +82,7 @@ const CONFIG: RecallConfig = {
   embedWeight: 0.7,
   embedForeignMaxBytes: 32 * 1024 * 1024,
   embedModelDir: "/virtual/models",
+  debugPrefix: false,
 };
 
 let nextId = 0;
@@ -2668,16 +2673,20 @@ describe("background idle compaction", () => {
       isIdle: () => (typeof isIdle === "function" ? isIdle() : isIdle),
       model: { provider: "test", id: "test-model", reasoning: false },
       modelRegistry: {
-        complete:
-          opts.complete ??
-          (async (_m: unknown, context: unknown, options?: unknown) => {
-            completeCalls.push({ context, options });
-            return {
-              content: [{ type: "text", text: "## Goal\n- background summary" }],
-              usage: { totalTokens: 5 },
-              stopReason: "stop",
-            };
-          }),
+        streamSimple: opts.complete
+          ? (_m: unknown, _context: unknown, _options?: unknown) => ({
+              result: () => opts.complete!(_m, _context, _options),
+            })
+          : (m: unknown, context: unknown, options?: unknown) => ({
+              result: async () => {
+                completeCalls.push({ m, context, options });
+                return {
+                  content: [{ type: "text", text: "## Goal\n- background summary" }],
+                  usage: { totalTokens: 5 },
+                  stopReason: "stop",
+                };
+              },
+            }),
       },
       thinkingLevel: undefined,
       sessionManager: {
@@ -2693,8 +2702,9 @@ describe("background idle compaction", () => {
   function beforeCompactFromProjection(
     entries: Parameters<typeof draftPreparation>[0],
     overrides: Record<string, unknown> = {},
+    keepRecentTokens: number = 20_000,
   ) {
-    const prep = draftPreparation(entries, 20_000)!;
+    const prep = draftPreparation(entries, keepRecentTokens)!;
     return {
       type: "session_before_compact",
       preparation: {
@@ -2705,7 +2715,7 @@ describe("background idle compaction", () => {
         tokensBefore: 150_000,
         previousSummary: prep.previousSummary,
         fileOps: { read: new Set(), written: new Set(), edited: new Set() },
-        settings: { enabled: true, reserveTokens: 16_384, keepRecentTokens: 20_000 },
+        settings: { enabled: true, reserveTokens: 16_384, keepRecentTokens },
       },
       branchEntries: [compactionEntry("## Goal\n- earlier era", "k0")],
       reason: "threshold",
@@ -2772,6 +2782,383 @@ describe("background idle compaction", () => {
     expect(call.options.cacheRetention).toBe("none");
     expect(call.options.sessionId).toEqual(expect.any(String));
     expect(call.options.sessionId).not.toBe("sess-settled");
+  });
+
+  // -------------------------------------------------------------------------
+  // Cached-layout replay fidelity (issue #2)
+  // -------------------------------------------------------------------------
+
+  /**
+   * A representative session through the REAL SessionManager — system prompt
+   * with tool declarations, thinking on, tool turns whose assistant messages
+   * carry reasoning_content (zai thinkingSignature), a todo plan custom
+   * message, a prior compaction (folded system head + summary + kept tail),
+   * and post-compaction growth past the kept tail. The regression that matters:
+   * the cached layout's replayed request must be message-identical to the live
+   * request's prefix (the agent sends convertToLlm(projection.messages)) and
+   * carry the session's thinking level — on zai a level-less request renders
+   * `thinking:{type:"disabled"}` with the clear_thinking default stripping
+   * prior reasoning_content, which re-renders every assistant turn and busts
+   * the provider KV prefix the layout exists to ride.
+   */
+  function representativeSession() {
+    const sm = SessionManager.inMemory("/repo");
+    const tool = (name: string) => ({
+      name,
+      description: `The ${name} tool.`,
+      parameters: { type: "object" as const, properties: {}, required: [] },
+    });
+    sm.appendMessage({
+      role: "system",
+      content: "You are a coding agent.",
+      toolsAdded: [tool("read"), tool("edit")],
+      timestamp: 1,
+    } as never);
+    sm.appendThinkingLevelChange("high");
+    sm.appendMessage({ role: "user", content: [{ type: "text", text: "fix the cache bug" }], timestamp: 2 } as never);
+    sm.appendMessage({
+      role: "assistant",
+      api: "openai-completions",
+      provider: "zai",
+      model: "glm-5.3",
+      content: [
+        { type: "thinking", thinking: "the replay must keep my reasoning", thinkingSignature: "reasoning_content" },
+        { type: "text", text: "reading the file first" },
+        { type: "toolCall", id: "call-1", name: "read", arguments: { path: "a.ts" } },
+      ],
+      usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: { total: 0 } },
+      stopReason: "toolUse",
+      timestamp: 3,
+    } as never);
+    sm.appendMessage({
+      role: "toolResult",
+      toolCallId: "call-1",
+      toolName: "read",
+      content: [{ type: "text", text: "file body" }],
+      timestamp: 4,
+    } as never);
+    sm.appendCustomMessageEntry("todo.plan", [{ type: "text", text: "## Current Plan\n- [x] repro the miss" }], false);
+    const keptId = sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "ship the first era" }],
+      timestamp: 5,
+    } as never);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "shipped" }],
+      stopReason: "stop",
+      timestamp: 6,
+    } as never);
+    sm.appendCompaction("## Goal\n- the first era, summarized", keptId, 90_000);
+    // Post-compaction growth: a reasoning tool turn, a plan re-injection, then
+    // bulk pairs so the kept-tail walk cuts mid-tail (entry-aligned, no
+    // dangling toolCall at the cut).
+    sm.appendMessage({ role: "user", content: [{ type: "text", text: "second era" }], timestamp: 7 } as never);
+    sm.appendMessage({
+      role: "assistant",
+      api: "openai-completions",
+      provider: "zai",
+      model: "glm-5.3",
+      content: [
+        { type: "thinking", thinking: "second-era reasoning", thinkingSignature: "reasoning_content" },
+        { type: "toolCall", id: "call-2", name: "edit", arguments: { path: "b.ts" } },
+      ],
+      stopReason: "toolUse",
+      timestamp: 8,
+    } as never);
+    sm.appendMessage({
+      role: "toolResult",
+      toolCallId: "call-2",
+      toolName: "edit",
+      content: [{ type: "text", text: "edited" }],
+      timestamp: 9,
+    } as never);
+    sm.appendCustomMessageEntry("todo.plan", [{ type: "text", text: "## Current Plan\n- [ ] verify the hit" }], false);
+    const bulk = (n: number, role: "user" | "assistant") =>
+      sm.appendMessage({
+        role,
+        content: [{ type: "text", text: `${role} ${n}\n${"z".repeat(2_100)}` }],
+        ...(role === "assistant" ? { stopReason: "stop" as const } : {}),
+        timestamp: 10 + n,
+      } as never);
+    bulk(1, "user");
+    bulk(2, "assistant");
+    bulk(3, "user");
+    bulk(4, "assistant");
+    bulk(5, "user");
+    bulk(6, "assistant");
+    return sm;
+  }
+
+  it("cached-layout replay is message-identical to the live request prefix and mirrors the session thinking level", async () => {
+    const sm = representativeSession();
+    const projection = sm.buildSessionProjection();
+    expect(projection.thinkingLevel).toBe("high"); // the session runs thinking on
+    const preparation = draftPreparation(projection.entries, 1_200);
+    expect(preparation).toBeDefined();
+    expect(preparation!.prefixCacheable).toBe(true); // no dangling toolCall at the cut
+    // The prior compaction rides at the head: folded system message, then the summary.
+    expect(preparation!.prefixMessages[0].role).toBe("system");
+    expect((preparation!.prefixMessages[0] as { toolsAdded?: unknown }).toolsAdded).toHaveLength(2);
+
+    const calls: Array<{ context: { messages: unknown[] }; options: Record<string, unknown> }> = [];
+    const streamSimple = (_m: unknown, context: unknown, options?: unknown) => ({
+      result: async () => {
+        calls.push({
+          context: context as { messages: unknown[] },
+          options: (options ?? {}) as Record<string, unknown>,
+        });
+        return { content: [{ type: "text", text: "## Goal\n- replay summary" }], usage: {}, stopReason: "stop" };
+      },
+    });
+    await defaultSummaryFn({
+      model: { provider: "zai", id: "glm-5.3", reasoning: true, maxTokens: 131_072 } as never,
+      streamSimple: streamSimple as never,
+      // The policy the call sites apply: knob "off" must NOT reach a cached layout.
+      thinkingLevel: effectiveSummaryThinking("off", "high", true),
+      messages: preparation!.messages,
+      prefixMessages: preparation!.prefixMessages,
+      sessionId: "sess-replay",
+      previousSummary: preparation!.previousSummary,
+      userFocus: undefined,
+      budgetChars: 5_000,
+      keptRecentTokens: 1_200,
+      signal: new AbortController().signal,
+    });
+    expect(calls).toHaveLength(1);
+
+    // The live request's message list — exactly what the agent's request loop
+    // sends for this session: convertToLlm over the same projection.
+    const live = convertToLlm(projection.messages as never);
+    const replay = calls[0].context.messages;
+    const replayPrefix = replay.slice(0, -1); // everything but the trailing instruction
+    expect(replayPrefix.length).toBeGreaterThan(4); // system head, summary, turns — a real prefix
+    expect(live.length).toBeGreaterThan(replayPrefix.length); // the cut really kept a tail
+    expect(replayPrefix).toEqual(live.slice(0, replayPrefix.length)); // token-identical prefix
+    // The trailing instruction is the only appended delta.
+    expect((replay[replay.length - 1] as { role: string }).role).toBe("user");
+    expect(
+      ((replay[replay.length - 1] as { content: { type: string; text: string }[] }).content[0].text ?? "").startsWith(
+        "You are a context summarization assistant.",
+      ),
+    ).toBe(true);
+
+    // THE regression (issue #2): the cached layout must ride the session's
+    // thinking level — a level-less request re-renders prior reasoning_content
+    // on zai (clear_thinking default) and busts the whole prefix match.
+    expect(calls[0].options.reasoning).toBe("high");
+    expect(calls[0].options.sessionId).toBe("sess-replay");
+    expect(calls[0].options.cacheRetention).toBeUndefined();
+  });
+
+  it("legacy one-off layout keeps the configured knob (off → no reasoning requested)", async () => {
+    const sm = representativeSession();
+    const preparation = draftPreparation(sm.buildSessionProjection().entries, 1_200)!;
+    const calls: Array<{ context: { messages: unknown[] }; options: Record<string, unknown> }> = [];
+    await defaultSummaryFn({
+      model: { provider: "zai", id: "glm-5.3", reasoning: true, maxTokens: 131_072 } as never,
+      streamSimple: ((_m: unknown, context: unknown, options?: unknown) => ({
+        result: async () => {
+          calls.push({
+            context: context as { messages: unknown[] },
+            options: (options ?? {}) as Record<string, unknown>,
+          });
+          return { content: [{ type: "text", text: "## Goal\n- legacy" }], usage: {}, stopReason: "stop" };
+        },
+      })) as never,
+      thinkingLevel: effectiveSummaryThinking("off", "high", false),
+      messages: preparation.messages,
+      prefixMessages: undefined,
+      sessionId: undefined,
+      previousSummary: preparation.previousSummary,
+      userFocus: undefined,
+      budgetChars: 5_000,
+      keptRecentTokens: 1_200,
+      signal: new AbortController().signal,
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].context.messages).toHaveLength(1); // instruction-sandwich prompt
+    expect(calls[0].options.reasoning).toBeUndefined(); // knob honored: no thinking requested
+    expect(calls[0].options.cacheRetention).toBe("none");
+  });
+
+  it("PI_RECALL_DEBUG_PREFIX wiring: live payloads stash via the hook, the cached layout's payload dumps via its onPayload tap", async () => {
+    // The hook observes only agent-loop requests; the cached layout's rendered
+    // payload reaches the dumper through the onPayload option threaded into the
+    // summarization call. End-to-end through the registered extension — and the
+    // legacy one-off layout gets no tap at all (it is not a cache replay).
+    const dir = await mkdtemp(join(tmpdir(), "recall-debug-"));
+    const calls: Array<{ options: Record<string, unknown> }> = [];
+    const summaryPayload = {
+      model: "glm-5.3",
+      input: "responses-shaped — the tap classifies explicitly, never by payload shape",
+    };
+    const mirrorCtx = () => {
+      const sm = representativeSession();
+      const projection = sm.buildSessionProjection();
+      return {
+        ctx: {
+          model: { id: "glm-5.3", reasoning: false },
+          modelRegistry: {
+            streamSimple: (_m: unknown, _c: unknown, options?: { onPayload?: (p: unknown) => unknown }) => ({
+              result: async () => {
+                calls.push({ options: (options ?? {}) as Record<string, unknown> });
+                // The provider invokes onPayload just before sending.
+                if (options?.onPayload) await options.onPayload(summaryPayload);
+                return { content: [{ type: "text", text: "## Goal\n- tapped" }], usage: {}, stopReason: "stop" };
+              },
+            }),
+          },
+          thinkingLevel: undefined,
+          sessionManager: {
+            getSessionId: () => "sess-debug",
+            getSessionDir: () => dir,
+            buildSessionProjection: () => projection,
+          },
+        } as Record<string, unknown>,
+        event: beforeCompactFromProjection(projection.entries, {}, 1_200),
+      };
+    };
+    const { pi, events } = makePi();
+    registerRecallTool(pi, { ...CONFIG, debugPrefix: true });
+    // A live agent request streams past first: stashed, not written.
+    const { ctx, event } = mirrorCtx();
+    await fire(events, "before_provider_request", ctx, {
+      type: "before_provider_request",
+      payload: { model: "glm-5.3", messages: [{ role: "user", content: "the last live turn" }] },
+    });
+    const result = (await fire(events, "session_before_compact", ctx, event)) as {
+      compaction: { summary: string };
+    };
+    expect(result.compaction.summary).toBe("## Goal\n- tapped"); // the call went through untouched
+    await vi.waitFor(async () =>
+      expect((await readdir(join(dir, "recall-debug"))).sort()).toEqual(["sess-debug-diff.json"]),
+    ); // the tap fire-and-forgets the async dump
+    const pairText = await readFile(join(dir, "recall-debug", "sess-debug-diff.json"), "utf8");
+    expect(pairText).toContain("the last live turn");
+    expect(pairText).toContain("responses-shaped");
+    // Knob off (legacy one-off layout): no tap, no new files — on its own pi so
+    // the cached-layout registration above does not also answer the event.
+    const legacyPi = makePi();
+    registerRecallTool(legacyPi.pi, { ...CONFIG, debugPrefix: true, summaryReuseCache: false });
+    const legacy = mirrorCtx();
+    await fire(legacyPi.events, "session_before_compact", legacy.ctx, legacy.event);
+    expect((calls.at(-1) as { options: Record<string, unknown> }).options.onPayload).toBeUndefined();
+    await new Promise((r) => setTimeout(r, 5));
+    expect((await readdir(join(dir, "recall-debug"))).sort()).toEqual(["sess-debug-diff.json"]); // unchanged
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("cached-layout summaries mirror the session's thinking level through the call sites (issue #2)", async () => {
+    // The knob deliberately contradicts the session: a cached-layout replay
+    // rendered at any other level re-renders the history (zai clear_thinking)
+    // and busts the prefix — the call sites must mirror regardless of config.
+    const sm = representativeSession();
+    const projection = sm.buildSessionProjection();
+    const event = beforeCompactFromProjection(projection.entries, {}, 1_200);
+    const mirrorCtx = (reuseCache: boolean) => {
+      const calls: Array<{ options: Record<string, unknown>; context: { messages: unknown[] } }> = [];
+      return {
+        calls,
+        ctx: {
+          model: { id: "glm-5.3", reasoning: true },
+          thinkingLevel: "high",
+          modelRegistry: {
+            streamSimple: (_m: unknown, context: unknown, options?: unknown) => ({
+              result: async () => {
+                calls.push({
+                  options: (options ?? {}) as Record<string, unknown>,
+                  context: context as { messages: unknown[] },
+                });
+                return { content: [{ type: "text", text: "## Goal\n- mirrored" }], usage: {}, stopReason: "stop" };
+              },
+            }),
+          },
+          sessionManager: {
+            getSessionId: () => "sess-mirror",
+            buildSessionProjection: () => projection,
+          },
+        } as Record<string, unknown>,
+        register: reuseCache,
+      };
+    };
+
+    const cached = mirrorCtx(true);
+    const first = makePi();
+    registerRecallTool(first.pi, { ...CONFIG, summaryThinking: "off" }, undefined, { logCompactionError: () => {} });
+    await fire(first.events, "session_before_compact", cached.ctx, event);
+    expect(cached.calls).toHaveLength(1);
+    // Cached layout active (prefix + trailing instruction) and mirroring the session.
+    expect(cached.calls[0].context.messages.length).toBeGreaterThan(1);
+    expect(cached.calls[0].options.reasoning).toBe("high");
+    expect(cached.calls[0].options.sessionId).toBe("sess-mirror");
+
+    const legacy = mirrorCtx(false);
+    const second = makePi();
+    registerRecallTool(second.pi, { ...CONFIG, summaryReuseCache: false, summaryThinking: "off" });
+    await fire(second.events, "session_before_compact", legacy.ctx, event);
+    expect(legacy.calls).toHaveLength(1);
+    // Legacy layout: the knob governs — "off" requests no thinking.
+    expect(legacy.calls[0].context.messages).toHaveLength(1);
+    expect(legacy.calls[0].options.reasoning).toBeUndefined();
+  });
+
+  it("effectiveSummaryThinking: the cached layout mirrors the session; the knob governs the one-off layout", () => {
+    expect(effectiveSummaryThinking("off", "high", true)).toBe("high"); // the issue #2 default case
+    expect(effectiveSummaryThinking("low", "high", true)).toBe("high"); // a pinned knob never busts the cache
+    expect(effectiveSummaryThinking("session", "low", true)).toBe("low");
+    expect(effectiveSummaryThinking("off", undefined, true)).toBeUndefined(); // level-less session
+    expect(effectiveSummaryThinking("off", "high", false)).toBe("off"); // legacy keeps the knob
+    expect(effectiveSummaryThinking("session", "medium", false)).toBe("medium");
+    expect(effectiveSummaryThinking("high", undefined, false)).toBe("high");
+  });
+
+  it("PI_RECALL_DEBUG_PREFIX pairs the stashed live payload with the summary request", async () => {
+    const writes: Array<[string, string]> = [];
+    const dirs: string[] = [];
+    const errors: string[] = [];
+    const dumped: string[] = [];
+    const d = createPrefixDebugger({
+      mkdir: (dir) => void dirs.push(dir),
+      writeFile: (file, text) => void writes.push([file, text]),
+      onError: (message) => void errors.push(message),
+      onDumped: (path) => void dumped.push(path),
+    });
+    const summaryPayload = { input: "responses-shaped payload — classification is explicit, not sniffed" };
+    // Live requests stream past: only the newest is retained, nothing written.
+    d.onLiveRequest({ messages: [{ role: "user", content: "stale" }] }, "/proj-sessions", "sess-1");
+    d.onLiveRequest({ messages: [{ role: "user", content: "current turn" }] }, "/proj-sessions", "sess-1");
+    expect(writes).toEqual([]);
+    // The summary request writes one self-contained pair file — both halves,
+    // same write, newest live included, session-scoped name (sibling sessions
+    // in the shared dir cannot clobber each other's artifact).
+    await d.onSummaryRequest(summaryPayload, "/proj-sessions", "sess-1");
+    expect(dirs).toEqual(["/proj-sessions/recall-debug"]);
+    expect(writes.map(([file]) => file)).toEqual(["/proj-sessions/recall-debug/sess-1-diff.json"]);
+    expect(dumped).toEqual(["/proj-sessions/recall-debug/sess-1-diff.json"]); // reminder crumb carries the path
+    expect(writes[0][1]).toContain("current turn");
+    expect(writes[0][1]).toContain("responses-shaped payload");
+    expect(writes[0][1]).toContain('"sessionId":"sess-1"');
+    // Retries rewrite the pair whole — the stash is retained for exactly that,
+    // so the live half never goes missing on a second attempt.
+    await d.onSummaryRequest(summaryPayload, "/proj-sessions", "sess-1");
+    expect(writes).toHaveLength(2);
+    expect(writes[1][1]).toContain("current turn");
+    // The sessions dir is shared per project — pairing keys on the session id:
+    // a replaced session's stash never pairs, and nothing is written that
+    // could leave a mismatched pair on disk.
+    d.onLiveRequest({ messages: [{ role: "user", content: "previous session" }] }, "/proj-sessions", "sess-old");
+    await d.onSummaryRequest(summaryPayload, "/proj-sessions", "sess-new");
+    expect(writes).toHaveLength(2); // nothing written
+    expect(dumped).toHaveLength(2); // and no dumped crumb for the refusal
+    expect(errors).toEqual([expect.stringContaining("another session")]);
+    // No session directory or id (in-memory session): a crumb, never a throw.
+    await d.onSummaryRequest(summaryPayload, undefined, "sess-1");
+    expect(errors).toHaveLength(2);
+    expect(errors[1]).toEqual(expect.stringContaining("no session directory or id"));
+    // A live request without both is simply not stashable — silent, no crumb.
+    d.onLiveRequest({ messages: [] }, "/proj-sessions", undefined);
+    expect(errors).toHaveLength(2);
   });
 
   it("never stacks a second generation while one is in flight", async () => {
@@ -2958,20 +3345,26 @@ describe("background idle compaction", () => {
     expect(compactCalls).toHaveLength(0);
   });
 
-  it("binds the registry method — a class-style complete (this.runtime) must not throw", async () => {
-    // Real ModelRegistry.complete reads `this.runtime`; a bare method capture
+  it("binds the registry method — a class-style streamSimple (this.runtime) must not throw", async () => {
+    // Real ModelRegistry.streamSimple reads `this.runtime`; a bare method capture
     // detaches `this` and throws on every call (arrow-function test fakes hide
     // it), which would break every real idle compaction with only a crumb.
     const crumbs: string[] = [];
     let calls = 0;
+    const okResult = {
+      content: [{ type: "text", text: "## Goal\n- bound" }],
+      usage: {},
+      stopReason: "stop",
+    };
     class FakeRegistry {
-      complete(): Promise<unknown> {
+      // streamSimple must read this.runtime exactly like the real ModelRegistry,
+      // so a bare method capture (losing the receiver) throws on every call.
+      private readonly runtime = {
+        streamSimple: (_m: unknown, _c: unknown, _o?: unknown) => ({ result: async () => okResult }),
+      };
+      streamSimple(m: unknown, c: unknown, o?: unknown) {
         calls++;
-        return Promise.resolve({
-          content: [{ type: "text", text: "## Goal\n- bound" }],
-          usage: {},
-          stopReason: "stop",
-        });
+        return this.runtime.streamSimple(m, c, o);
       }
     }
     const { pi, events } = makePi();
@@ -3202,11 +3595,9 @@ describe("compaction summary ownership", () => {
     return {
       model: { id: "test-model", reasoning: false },
       modelRegistry: {
-        complete:
-          complete ??
-          (async () => {
-            throw new Error("complete must be provided");
-          }),
+        streamSimple: (_m: unknown, _c: unknown, _o?: unknown) => ({
+          result: () => (complete ? complete(_m, _c, _o) : Promise.reject(new Error("complete must be provided"))),
+        }),
       },
       thinkingLevel: undefined,
       ...overrides,
@@ -4123,10 +4514,12 @@ describe("mid-run compaction wiring (turn_end)", () => {
       compact: () => {},
       model: { id: "test-model", reasoning: false },
       modelRegistry: {
-        complete: async () => ({
-          content: [{ type: "text", text: "## Goal\n- mid-run summary" }],
-          usage: { totalTokens: 7 },
-          stopReason: "stop",
+        streamSimple: () => ({
+          result: async () => ({
+            content: [{ type: "text", text: "## Goal\n- mid-run summary" }],
+            usage: { totalTokens: 7 },
+            stopReason: "stop",
+          }),
         }),
       },
       thinkingLevel: undefined,
@@ -4390,7 +4783,9 @@ describe("mid-run compaction wiring (turn_end)", () => {
     const entries = longRunProjection();
     const ctx = turnEndCtx(OVER, {
       isIdle: () => false,
-      modelRegistry: { complete },
+      modelRegistry: {
+        streamSimple: () => ({ result: () => complete() }),
+      },
       sessionManager: {
         getBranch: () => [],
         getSessionId: () => "sess-turnend",
