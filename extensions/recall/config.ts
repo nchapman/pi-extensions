@@ -17,8 +17,8 @@ export interface RecallConfig {
   compactTargetTokens: number;
   /** Also bound the target to this fraction of the model's context window — the smaller of token cap and ratio wins (0 disables the ratio). */
   compactTargetRatio: number;
-  /** Idle moments compact early when tokens exceed this fraction of the effective target (1 disables; the mid-run trigger stays at the strict target). */
-  compactIdleRatio: number;
+  /** Idle moments compact early when tokens exceed the target minus this fraction of it (0 disables the early trigger; the mid-run trigger stays at the strict target). */
+  compactIdleDiscount: number;
   /** Generate compaction summaries ourselves with recall-aware instructions (PI_RECALL_COMPACT_OWN=0 to opt out). */
   ownSummaries: boolean;
   /** Reuse the session's provider KV cache for summaries: send the projected transcript prefix + a trailing instruction under the session's routing id, instead of a one-off embedded prompt (PI_RECALL_SUMMARY_CACHE=0 opts out). */
@@ -52,7 +52,7 @@ export const DEFAULTS: RecallConfig = {
   recencyFloor: 0.25,
   compactTargetTokens: 80_000,
   compactTargetRatio: 0.7,
-  compactIdleRatio: 0.875,
+  compactIdleDiscount: 0.125,
   ownSummaries: true,
   summaryReuseCache: true,
   summaryChars: 5_000,
@@ -134,7 +134,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): RecallConfi
       numFromEnv(env, "PI_RECALL_COMPACT_TARGET", DEFAULTS.compactTargetTokens, 0, 10_000_000),
     ),
     compactTargetRatio: numFromEnv(env, "PI_RECALL_COMPACT_RATIO", DEFAULTS.compactTargetRatio, 0, 1),
-    compactIdleRatio: numFromEnv(env, "PI_RECALL_COMPACT_IDLE_RATIO", DEFAULTS.compactIdleRatio, 0.25, 1),
+    compactIdleDiscount: numFromEnv(env, "PI_RECALL_COMPACT_IDLE_DISCOUNT", DEFAULTS.compactIdleDiscount, 0, 0.75),
     ownSummaries: boolFromEnv(env, "PI_RECALL_COMPACT_OWN", DEFAULTS.ownSummaries),
     summaryReuseCache: boolFromEnv(env, "PI_RECALL_SUMMARY_CACHE", DEFAULTS.summaryReuseCache),
     summaryChars: Math.floor(

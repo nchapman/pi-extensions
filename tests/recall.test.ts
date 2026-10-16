@@ -67,7 +67,7 @@ const CONFIG: RecallConfig = {
   recencyFloor: 0.25,
   compactTargetTokens: 131_072,
   compactTargetRatio: 0.7,
-  compactIdleRatio: 0.8,
+  compactIdleDiscount: 0.2,
   ownSummaries: true,
   summaryReuseCache: true,
   summaryChars: 5_000,
@@ -2189,26 +2189,26 @@ describe("context budget", () => {
     expect(shouldAutoCompact(139_999, 200_000, 500_000, 0.7, false)).toBe(false); // just under the ratio bound
   });
 
-  it("shouldIdleCompact fires at the strict target and early at the idle ratio", () => {
-    // Over the strict target (140k ratio bound): always fires, any ratio.
-    expect(shouldIdleCompact(150_000, 200_000, 131_072, 0.7, 0.8, false)).toBe(true);
-    expect(shouldIdleCompact(150_000, 200_000, 131_072, 0.7, 1, false)).toBe(true);
-    // Between idleRatio × target and the target: the early trigger.
-    expect(shouldIdleCompact(110_000, 200_000, 131_072, 0.7, 0.8, false)).toBe(true); // > 0.8 × 131_072
-    expect(shouldIdleCompact(100_000, 200_000, 131_072, 0.7, 0.8, false)).toBe(false); // below it
-    expect(shouldIdleCompact(110_000, 200_000, 131_072, 0.7, 1, false)).toBe(false); // ratio 1 disables early
+  it("shouldIdleCompact fires at the strict target and early at the idle discount", () => {
+    // Over the strict target (140k ratio bound): always fires, any discount.
+    expect(shouldIdleCompact(150_000, 200_000, 131_072, 0.7, 0.2, false)).toBe(true);
+    expect(shouldIdleCompact(150_000, 200_000, 131_072, 0.7, 0, false)).toBe(true);
+    // Between target × (1 − discount) and the target: the early trigger.
+    expect(shouldIdleCompact(110_000, 200_000, 131_072, 0.7, 0.2, false)).toBe(true); // > 0.8 × 131_072
+    expect(shouldIdleCompact(100_000, 200_000, 131_072, 0.7, 0.2, false)).toBe(false); // below it
+    expect(shouldIdleCompact(110_000, 200_000, 131_072, 0.7, 0, false)).toBe(false); // discount 0 disables early
     // Unknown tokens, in flight, or compaction disabled: never.
-    expect(shouldIdleCompact(null, 200_000, 131_072, 0.7, 0.8, false)).toBe(false);
-    expect(shouldIdleCompact(150_000, 200_000, 131_072, 0.7, 0.8, true)).toBe(false);
-    expect(shouldIdleCompact(150_000, 200_000, 0, 0.7, 0.8, false)).toBe(false);
+    expect(shouldIdleCompact(null, 200_000, 131_072, 0.7, 0.2, false)).toBe(false);
+    expect(shouldIdleCompact(150_000, 200_000, 131_072, 0.7, 0.2, true)).toBe(false);
+    expect(shouldIdleCompact(150_000, 200_000, 0, 0.7, 0.2, false)).toBe(false);
   });
 
   it("shouldIdleCompact never plans a compaction the kept tail alone defeats", () => {
-    // A target in [MIN_ACHIEVABLE_COMPACT_TARGET, ~30k) puts 0.8 × target below
-    // the floor: a fresh post-compaction context (~kept tail + summary) would
-    // sit over the early bound and re-compact on every settle.
-    expect(shouldIdleCompact(23_000, 200_000, 25_000, 0.7, 0.8, false)).toBe(false); // below the floored early bound
-    expect(shouldIdleCompact(26_000, 200_000, 25_000, 0.7, 0.8, false)).toBe(true); // over the strict target itself
+    // A target in [MIN_ACHIEVABLE_COMPACT_TARGET, ~30k) puts the discounted
+    // bound below the floor: a fresh post-compaction context (~kept tail +
+    // summary) would sit over the early bound and re-compact on every settle.
+    expect(shouldIdleCompact(23_000, 200_000, 25_000, 0.7, 0.2, false)).toBe(false); // below the floored early bound
+    expect(shouldIdleCompact(26_000, 200_000, 25_000, 0.7, 0.2, false)).toBe(true); // over the strict target itself
   });
 
   it("compactionFingerprint identifies the span: shape, previous summary, and model", () => {
@@ -3223,20 +3223,35 @@ describe("background idle compaction", () => {
     await vi.waitFor(() => expect(compactCalls).toHaveLength(1)); // …which commits when done (idle now)
   });
 
-  it("fires early below the strict target at the idle ratio — the moment the provider cache is warm", async () => {
-    // 110k of a 131_072 target: under the strict bound, over 0.8 × target (104_857).
+  it("fires early below the strict target at the idle discount — the moment the provider cache is warm", async () => {
+    // 110k of a 131_072 target: under the strict bound, over target × (1 − 0.2) (104_857).
     const { pi, events } = makePi();
     registerRecallTool(pi, CONFIG);
     const { ctx, completeCalls } = settledCtx({ usage: { tokens: 110_000, contextWindow: 200_000 } });
     await fire(events, "agent_settled", ctx);
     await vi.waitFor(() => expect(completeCalls).toHaveLength(1));
-    // Below the idle ratio: nothing.
+    // Below the discounted bound: nothing.
     const quiet = settledCtx({ usage: { tokens: 100_000, contextWindow: 200_000 } });
     const quietPi = makePi();
     registerRecallTool(quietPi.pi, CONFIG);
     await fire(quietPi.events, "agent_settled", quiet.ctx);
     await new Promise((r) => setTimeout(r, 5));
     expect(quiet.completeCalls).toHaveLength(0);
+  });
+
+  it("ships the issue #3 defaults: strict 80k, opportunistic 70k (12.5% off)", async () => {
+    const shipped: RecallConfig = { ...CONFIG, compactTargetTokens: 80_000, compactIdleDiscount: 0.125 };
+    const armed = makePi();
+    registerRecallTool(armed.pi, shipped);
+    const at70k = settledCtx({ usage: { tokens: 70_500, contextWindow: 1_000_000 } });
+    await fire(armed.events, "agent_settled", at70k.ctx);
+    await vi.waitFor(() => expect(at70k.completeCalls).toHaveLength(1)); // over the discounted bound, under strict
+    const quiet = makePi();
+    registerRecallTool(quiet.pi, shipped);
+    const below = settledCtx({ usage: { tokens: 69_500, contextWindow: 1_000_000 } });
+    await fire(quiet.events, "agent_settled", below.ctx);
+    await new Promise((r) => setTimeout(r, 5));
+    expect(below.completeCalls).toHaveLength(0);
   });
 
   it("a background failure leaves a breadcrumb and clears the way for the next settle", async () => {
@@ -4177,10 +4192,10 @@ describe("compaction summary ownership", () => {
     expect(configFromEnv({ PI_RECALL_COMPACT_RATIO: "0" }).compactTargetRatio).toBe(0); // ratio off
     expect(configFromEnv({ PI_RECALL_COMPACT_RATIO: "3" }).compactTargetRatio).toBe(1); // clamped
     expect(configFromEnv({ PI_RECALL_COMPACT_RATIO: "nope" }).compactTargetRatio).toBe(0.7); // invalid → default
-    expect(configFromEnv({ PI_RECALL_COMPACT_IDLE_RATIO: "0.9" }).compactIdleRatio).toBe(0.9);
-    expect(configFromEnv({ PI_RECALL_COMPACT_IDLE_RATIO: "1" }).compactIdleRatio).toBe(1); // early trigger off
-    expect(configFromEnv({ PI_RECALL_COMPACT_IDLE_RATIO: "0" }).compactIdleRatio).toBe(0.25); // clamped
-    expect(configFromEnv({ PI_RECALL_COMPACT_IDLE_RATIO: "nope" }).compactIdleRatio).toBe(0.875); // invalid → default
+    expect(configFromEnv({ PI_RECALL_COMPACT_IDLE_DISCOUNT: "0.1" }).compactIdleDiscount).toBe(0.1);
+    expect(configFromEnv({ PI_RECALL_COMPACT_IDLE_DISCOUNT: "0" }).compactIdleDiscount).toBe(0); // early trigger off
+    expect(configFromEnv({ PI_RECALL_COMPACT_IDLE_DISCOUNT: "2" }).compactIdleDiscount).toBe(0.75); // clamped
+    expect(configFromEnv({ PI_RECALL_COMPACT_IDLE_DISCOUNT: "nope" }).compactIdleDiscount).toBe(0.125); // invalid → default
     expect(configFromEnv({ PI_RECALL_COMPACT_OWN: "nope" }).ownSummaries).toBe(true); // invalid → default with warning
     expect(configFromEnv({ PI_RECALL_SUMMARY_CACHE: "0" }).summaryReuseCache).toBe(false);
     expect(configFromEnv({ PI_RECALL_SUMMARY_CACHE: "nope" }).summaryReuseCache).toBe(true); // invalid → default

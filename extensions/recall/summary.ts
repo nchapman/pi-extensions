@@ -320,29 +320,29 @@ export function shouldAutoCompact(
 /**
  * Whether an idle moment (agent_settled) should start a background
  * compaction. Fires at the strict target — the same bound the mid-run trigger
- * enforces — or EARLY, once tokens cross `idleRatio` of the effective target:
- * a settled moment right after a run is when the provider's cache still holds
- * the session prefix, so the summary rides cache reads, and spending that
+ * enforces — or EARLY, this fraction of the target BELOW it: a settled
+ * moment right after a run is when the provider's cache still holds the
+ * session prefix, so the summary rides cache reads, and spending that
  * cheap summary early keeps mid-run crossings (which block a turn boundary)
- * rare. idleRatio ≥ 1 disables the early trigger; the strict bound stays.
+ * rare. idleDiscount ≤ 0 disables the early trigger; the strict bound stays.
  */
 export function shouldIdleCompact(
   tokens: number | null,
   contextWindow: number,
   configTarget: number,
   compactRatio: number,
-  idleRatio: number,
+  idleDiscount: number,
   inFlight: boolean,
 ): boolean {
   if (inFlight) return false;
   if (shouldAutoCompact(tokens, contextWindow, configTarget, compactRatio, false)) return true;
-  if (idleRatio >= 1 || tokens === null) return false;
+  if (idleDiscount <= 0 || tokens === null) return false;
   const target = effectiveCompactTarget(configTarget, contextWindow, compactRatio);
   if (target === undefined) return false;
   // The early threshold takes the same achievable floor as the strict target:
   // a post-compaction context sits around the kept tail plus the summary, so
   // an early bound below the floor would re-compact on every settle.
-  return tokens > Math.max(target * idleRatio, MIN_ACHIEVABLE_COMPACT_TARGET);
+  return tokens > Math.max(target * (1 - idleDiscount), MIN_ACHIEVABLE_COMPACT_TARGET);
 }
 
 /** Identity of the summarized span a background summary was generated over. */

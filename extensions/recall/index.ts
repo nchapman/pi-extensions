@@ -59,13 +59,13 @@
  *   session is idle again; session_before_compact serves the precomputed
  *   text when pi's preparation matches the fingerprint the background pass
  *   recorded (stale results are discarded and regenerated, never served).
- *   Idle triggers also fire EARLY, below the strict target, at
- *   PI_RECALL_COMPACT_IDLE_RATIO (default 0.875 — 70k at the 80k target) of
- *   the target: a settled moment right after a run is when the provider's
+ *   Idle triggers also fire EARLY, this fraction of the target BELOW it —
+ *   PI_RECALL_COMPACT_IDLE_DISCOUNT (default 0.125 — 70k at the 80k
+ *   target). A settled moment right after a run is when the provider's
  *   cache still holds the session prefix, so the summary's input is a cache
- *   read, and spending that
- *   cheap summary there keeps mid-run crossings of the strict target (which
- *   block a boundary) rare. The mid-run turn_end draft stays at the strict
+ *   read, and spending that cheap summary there keeps mid-run crossings of
+ *   the strict target (which block a boundary) rare. The mid-run turn_end
+ *   draft stays at the strict
  *   target and inline — boundary drafts must return synchronously — but it
  *   fast-paths a fresh background result instead of re-generating.
  * - Summaries reuse the session's prompt cache (PI_RECALL_SUMMARY_CACHE=0
@@ -456,7 +456,7 @@ export function registerRecallTool(
           usage?.contextWindow ?? 0,
           config.compactTargetTokens,
           config.compactTargetRatio,
-          config.compactIdleRatio,
+          config.compactIdleDiscount,
           false,
         )
       ) {
@@ -641,7 +641,7 @@ export function registerRecallTool(
   // commit when fresh; the mid-run turn_end draft below stays inline — boundary
   // drafts must return synchronously — but at the strict target, and it
   // fast-paths a fresh background result. Idle triggers also fire early, at
-  // PI_RECALL_COMPACT_IDLE_RATIO of the target, to spend the cheap
+  // PI_RECALL_COMPACT_IDLE_DISCOUNT below the target, to spend the cheap
   // cache-warm summary before a mid-run crossing can block a boundary.
   // PI_RECALL_COMPACT_TARGET=0 disables. Also drains the embedding backlog —
   // settled moments are exactly when background CPU is free.
@@ -685,7 +685,7 @@ export function registerRecallTool(
         usage?.contextWindow ?? 0,
         config.compactTargetTokens,
         config.compactTargetRatio,
-        config.compactIdleRatio,
+        config.compactIdleDiscount,
         autoCompactInFlight,
       )
     ) {
