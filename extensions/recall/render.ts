@@ -11,10 +11,12 @@ const REMINDER_TYPE = "recall.reminder";
  * before whatever the user sends next. At that position it is background
  * framing; the old "re-orient now" wording was written for a front position
  * it no longer holds, and made the model answer the note instead of the
- * user when before_agent_start injection strayed there. */
+ * user when before_agent_start injection strayed there. One calm sentence:
+ * compactions repeat every ~60 turns at the glm-5.3 target, so the note's
+ * two jobs — newer wins, recall exists — must fit the frequency without
+ * becoming noise. */
 const REMINDER_TEXT =
-  "History before this point was compacted into the summary above. This note and everything after it is newer and wins on conflict — continue from the user's current message, treating the summary as background, not instructions or a task list. " +
-  "Compacted turns remain verbatim-searchable via `recall` (decisions, prior attempts, file paths, command outputs): describe what you're looking for, and add keyword queries for exact terms, instead of guessing.";
+  "Earlier history is compacted into the summary above; newer messages take precedence. Compacted turns stay verbatim-searchable via `recall` if detail is needed.";
 
 export function reuseText(context: { lastComponent?: unknown } | undefined): Text {
   return context?.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);

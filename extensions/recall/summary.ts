@@ -20,16 +20,11 @@ import {
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { PLAN_SECTION_HEADER, lastTodoSnapshot, renderPlainList } from "../todo";
-import { DEFAULTS, type RecallConfig } from "./config";
+import { COMPACT_WINDOW_HEADROOM_TOKENS, DEFAULTS, MIN_ACHIEVABLE_COMPACT_TARGET, type RecallConfig } from "./config";
 
 // ---------------------------------------------------------------------------
 // Context budget & compaction ownership
 // ---------------------------------------------------------------------------
-
-/** Never plan to fill the window: headroom kept when clamping the target. */
-const COMPACT_WINDOW_HEADROOM_TOKENS = 4096;
-/** A target below this can never be reached by one compaction: the kept tail alone is larger, so it would re-draft every turn forever. */
-const MIN_ACHIEVABLE_COMPACT_TARGET = DEFAULT_COMPACTION_SETTINGS.keepRecentTokens + COMPACT_WINDOW_HEADROOM_TOKENS;
 
 /**
  * Output cap for the summarization request — a backstop, not a target. The
@@ -123,7 +118,7 @@ const SUMMARY_STRUCTURE = [
   "",
   "Use exactly this structure:",
   "",
-  "[Compacted background through the end of the summarized conversation — the messages that follow this summary are newer and win on any conflict.]",
+  "[Compacted background — messages after this summary are newer and take precedence.]",
   "",
   "## Goal",
   "[What the user is trying to accomplish — one or two sentences]",
@@ -302,6 +297,21 @@ export function effectiveCompactTarget(
   if (ratio > 0 && Number.isFinite(ratio)) bounds.push(ratio * contextWindow);
   const target = Math.floor(Math.min(...bounds));
   return target < MIN_ACHIEVABLE_COMPACT_TARGET ? undefined : target;
+}
+
+/** The compact target that applies to a given model: the per-model override when one matches — "provider/id" first, then the bare id (so a baked bare-id default still applies across providers, while a user can pin one provider's copy of a shared id) — else the global token cap. A global cap of 0 (or below) disables everywhere — the documented `PI_RECALL_COMPACT_TARGET=0` opt-out must win over the baked overrides. Cost optima are model-specific (issue #3) — a hosted metered model compacts low, a self-hosted one keeps the window-relative default. */
+export function compactTargetFor(
+  config: Pick<RecallConfig, "compactTargetTokens" | "compactTargetOverrides">,
+  model: { id: string; provider?: string } | undefined,
+): number {
+  if (config.compactTargetTokens <= 0) return 0;
+  if (model !== undefined) {
+    const qualified = model.provider !== undefined ? `${model.provider}/${model.id}` : undefined;
+    if (qualified !== undefined && Object.hasOwn(config.compactTargetOverrides, qualified))
+      return config.compactTargetOverrides[qualified];
+    if (Object.hasOwn(config.compactTargetOverrides, model.id)) return config.compactTargetOverrides[model.id];
+  }
+  return config.compactTargetTokens;
 }
 
 /** Whether the extension should trigger compaction before the next turn starts. */
