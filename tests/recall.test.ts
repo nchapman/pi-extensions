@@ -41,7 +41,6 @@ import {
   salvageLengthStoppedSummary,
   shouldAutoCompact,
   shouldIdleCompact,
-  compactTargetFor,
   createPrefixDebugger,
   defaultSummaryFn,
   effectiveSummaryThinking,
@@ -67,7 +66,6 @@ const CONFIG: RecallConfig = {
   halfLifeHours: 4,
   recencyFloor: 0.25,
   compactTargetTokens: 131_072,
-  compactTargetOverrides: {},
   compactTargetRatio: 0.7,
   compactIdleRatio: 0.8,
   ownSummaries: true,
@@ -2213,29 +2211,6 @@ describe("context budget", () => {
     expect(shouldIdleCompact(26_000, 200_000, 25_000, 0.7, 0.8, false)).toBe(true); // over the strict target itself
   });
 
-  it("compactTargetFor resolves the per-model target — provider-qualified first, then bare id — falling back to the global cap", () => {
-    const config = {
-      compactTargetTokens: 256_000,
-      compactTargetOverrides: { "glm-5.3": 80_000, "lmstudio/glm-5.3": 133_000 },
-    };
-    expect(compactTargetFor(config, { id: "glm-5.3", provider: "zai" })).toBe(80_000); // bare id matches
-    expect(compactTargetFor(config, { id: "glm-5.3", provider: "lmstudio" })).toBe(133_000); // qualified wins — a self-hosted copy can opt out of the hosted optimum
-    expect(compactTargetFor(config, { id: "glm-5.3" })).toBe(80_000); // no provider: bare id
-    expect(compactTargetFor(config, { id: "glm-5.3-highspeed", provider: "zai" })).toBe(256_000); // exact match only — no prefix creep
-    expect(compactTargetFor(config, undefined)).toBe(256_000); // no model on the context
-    expect(compactTargetFor(config, { id: "toString" })).toBe(256_000); // prototype keys are not overrides
-    expect(compactTargetFor({ compactTargetTokens: 256_000, compactTargetOverrides: {} }, { id: "glm-5.3" })).toBe(
-      256_000,
-    );
-    expect(
-      compactTargetFor({ compactTargetTokens: 256_000, compactTargetOverrides: { "glm-5.3": 0 } }, { id: "glm-5.3" }),
-    ).toBe(0); // 0 disables
-    // The documented global opt-out wins over the baked overrides.
-    expect(
-      compactTargetFor({ compactTargetTokens: 0, compactTargetOverrides: { "glm-5.3": 80_000 } }, { id: "glm-5.3" }),
-    ).toBe(0);
-  });
-
   it("compactionFingerprint identifies the span: shape, previous summary, and model", () => {
     const msgs = (emitted: unknown[]): Parameters<typeof compactionFingerprint>[0]["spanMessages"] =>
       emitted as Parameters<typeof compactionFingerprint>[0]["spanMessages"];
@@ -3248,42 +3223,6 @@ describe("background idle compaction", () => {
     await vi.waitFor(() => expect(compactCalls).toHaveLength(1)); // …which commits when done (idle now)
   });
 
-  it("re-arms a stale background result on the model's own override, not the global cap", async () => {
-    // The stale re-arm inside commitPendingCompaction resolves the target per
-    // model like every other trigger site: with the global cap at 500k and the
-    // session at 150k, only glm-5.3's 80k override can justify a regeneration.
-    const perModel: RecallConfig = {
-      ...CONFIG,
-      compactTargetTokens: 500_000,
-      compactTargetRatio: 0,
-      compactTargetOverrides: { "glm-5.3": 80_000 },
-      compactIdleRatio: 0.875,
-    };
-    const { pi, events } = makePi();
-    registerRecallTool(pi, perModel);
-    let idle = false; // the run is active while the first summary generates
-    const { ctx, compactCalls, completeCalls, entries } = settledCtx({ isIdle: () => idle });
-    (ctx as { model: unknown }).model = { provider: "zai", id: "glm-5.3", reasoning: false };
-    await fire(events, "agent_settled", ctx); // 150k is over glm's 70k idle bound
-    await vi.waitFor(() => expect(completeCalls).toHaveLength(1));
-    await new Promise((r) => setTimeout(r, 5)); // busy completion: the result is held, not committed
-    // The session grew while the agent ran: the cut moves, the summary is stale.
-    const grown = [
-      ...entries,
-      {
-        sourceEntry: msgEntry("assistant", { label: "t5" }),
-        messages: [{ role: "assistant", content: [{ type: "text", text: `t5\n${"y".repeat(60_000)}` }] }],
-      },
-    ] as unknown as Parameters<typeof draftPreparation>[0];
-    (ctx.sessionManager as { buildSessionProjection: () => { entries: unknown } }).buildSessionProjection = () => ({
-      entries: grown,
-    });
-    idle = true; // the run ended: the stale result is discarded at the next settle
-    await fire(events, "agent_settled", ctx);
-    expect(compactCalls).toHaveLength(0); // stale: no commit…
-    await vi.waitFor(() => expect(completeCalls).toHaveLength(2)); // …regenerated on the override (the 500k cap must not suppress it)
-  });
-
   it("fires early below the strict target at the idle ratio — the moment the provider cache is warm", async () => {
     // 110k of a 131_072 target: under the strict bound, over 0.8 × target (104_857).
     const { pi, events } = makePi();
@@ -3298,44 +3237,6 @@ describe("background idle compaction", () => {
     await fire(quietPi.events, "agent_settled", quiet.ctx);
     await new Promise((r) => setTimeout(r, 5));
     expect(quiet.completeCalls).toHaveLength(0);
-  });
-
-  it("resolves the target per model: glm-5.3 compacts at its override (idle 70k, strict 80k), other models keep the global cap", async () => {
-    // Issue #3's cost model: glm-5.3 at 80k strict / 70k opportunistic. The
-    // global cap sits far away and the ratio is off — the override must be
-    // the binding bound at both trigger sites.
-    const perModel: RecallConfig = {
-      ...CONFIG,
-      compactTargetTokens: 500_000,
-      compactTargetRatio: 0,
-      compactTargetOverrides: { "glm-5.3": 80_000 },
-      compactIdleRatio: 0.875,
-    };
-    const withGlm = (usage: { tokens: number; contextWindow: number }) => {
-      const s = settledCtx({ usage });
-      (s.ctx as { model: unknown }).model = { provider: "zai", id: "glm-5.3", reasoning: false };
-      return s;
-    };
-    // Idle early-fire at 70k of the 80k target.
-    const armed = makePi();
-    registerRecallTool(armed.pi, perModel);
-    const glm = withGlm({ tokens: 71_000, contextWindow: 1_000_000 });
-    await fire(armed.events, "agent_settled", glm.ctx);
-    await vi.waitFor(() => expect(glm.completeCalls).toHaveLength(1));
-    // Below 70k: nothing.
-    const below = makePi();
-    registerRecallTool(below.pi, perModel);
-    const quiet = withGlm({ tokens: 69_000, contextWindow: 1_000_000 });
-    await fire(below.events, "agent_settled", quiet.ctx);
-    await new Promise((r) => setTimeout(r, 5));
-    expect(quiet.completeCalls).toHaveLength(0);
-    // A model without an override keeps the global cap: 190k is under 500k — no fire.
-    const other = makePi();
-    registerRecallTool(other.pi, perModel);
-    const unlisted = settledCtx({ usage: { tokens: 190_000, contextWindow: 1_000_000 } }); // test-model
-    await fire(other.events, "agent_settled", unlisted.ctx);
-    await new Promise((r) => setTimeout(r, 5));
-    expect(unlisted.completeCalls).toHaveLength(0);
   });
 
   it("a background failure leaves a breadcrumb and clears the way for the next settle", async () => {
@@ -4271,7 +4172,7 @@ describe("compaction summary ownership", () => {
   it("config parses the budget knobs", () => {
     expect(configFromEnv({ PI_RECALL_COMPACT_TARGET: "60000" }).compactTargetTokens).toBe(60000);
     expect(configFromEnv({ PI_RECALL_COMPACT_TARGET: "0" }).compactTargetTokens).toBe(0);
-    expect(configFromEnv({ PI_RECALL_COMPACT_TARGET: "nope" }).compactTargetTokens).toBe(256_000);
+    expect(configFromEnv({ PI_RECALL_COMPACT_TARGET: "nope" }).compactTargetTokens).toBe(80_000);
     expect(configFromEnv({ PI_RECALL_COMPACT_RATIO: "0.8" }).compactTargetRatio).toBe(0.8);
     expect(configFromEnv({ PI_RECALL_COMPACT_RATIO: "0" }).compactTargetRatio).toBe(0); // ratio off
     expect(configFromEnv({ PI_RECALL_COMPACT_RATIO: "3" }).compactTargetRatio).toBe(1); // clamped
@@ -4280,41 +4181,6 @@ describe("compaction summary ownership", () => {
     expect(configFromEnv({ PI_RECALL_COMPACT_IDLE_RATIO: "1" }).compactIdleRatio).toBe(1); // early trigger off
     expect(configFromEnv({ PI_RECALL_COMPACT_IDLE_RATIO: "0" }).compactIdleRatio).toBe(0.25); // clamped
     expect(configFromEnv({ PI_RECALL_COMPACT_IDLE_RATIO: "nope" }).compactIdleRatio).toBe(0.875); // invalid → default
-    // Per-model targets: merged over the baked defaults, env wins per key.
-    expect(configFromEnv({}).compactTargetOverrides).toEqual({ "glm-5.3": 80_000 });
-    expect(
-      configFromEnv({ PI_RECALL_COMPACT_TARGETS: "glm-5.3=70000,qwen3-coder=133000" }).compactTargetOverrides,
-    ).toEqual({ "glm-5.3": 70_000, "qwen3-coder": 133_000 });
-    expect(configFromEnv({ PI_RECALL_COMPACT_TARGETS: "glm-5.3=0" }).compactTargetOverrides).toEqual({
-      "glm-5.3": 0, // 0 disables for that model
-    });
-    expect(configFromEnv({ PI_RECALL_COMPACT_TARGETS: "junk,also-junk" }).compactTargetOverrides).toEqual({
-      "glm-5.3": 80_000, // invalid entries skip, defaults survive
-    });
-    // An omitted value (trailing =) is a typo, not a deliberate 0 — it must
-    // warn and skip like other invalid entries, never silently disable a model.
-    // Out-of-range values skip the same way.
-    expect(configFromEnv({ PI_RECALL_COMPACT_TARGETS: "glm-5.3=" }).compactTargetOverrides).toEqual({
-      "glm-5.3": 80_000, // skipped, baked default survives
-    });
-    expect(configFromEnv({ PI_RECALL_COMPACT_TARGETS: "glm-5.3=-1" }).compactTargetOverrides).toEqual({
-      "glm-5.3": 80_000, // negative skips
-    });
-    expect(configFromEnv({ PI_RECALL_COMPACT_TARGETS: "glm-5.3=99999999" }).compactTargetOverrides).toEqual({
-      "glm-5.3": 80_000, // above the 10M cap skips
-    });
-    // A dropped zero (8k instead of 80k) is below the ~24k one compaction can
-    // achieve — it would silently disable the model, so it warns and skips.
-    expect(configFromEnv({ PI_RECALL_COMPACT_TARGETS: "glm-5.3=8000" }).compactTargetOverrides).toEqual({
-      "glm-5.3": 80_000, // dead-band value skips, baked default survives
-    });
-    expect(configFromEnv({ PI_RECALL_COMPACT_TARGETS: "glm-5.3=24095" }).compactTargetOverrides).toEqual({
-      "glm-5.3": 80_000, // one under the floor skips
-    });
-    expect(configFromEnv({ PI_RECALL_COMPACT_TARGETS: "glm-5.3=24096" }).compactTargetOverrides).toEqual({
-      "glm-5.3": 24_096, // exactly the floor is valid
-    });
-    expect(configFromEnv({ PI_RECALL_COMPACT_OWN: "0" }).ownSummaries).toBe(false);
     expect(configFromEnv({ PI_RECALL_COMPACT_OWN: "nope" }).ownSummaries).toBe(true); // invalid → default with warning
     expect(configFromEnv({ PI_RECALL_SUMMARY_CACHE: "0" }).summaryReuseCache).toBe(false);
     expect(configFromEnv({ PI_RECALL_SUMMARY_CACHE: "nope" }).summaryReuseCache).toBe(true); // invalid → default
@@ -4898,45 +4764,6 @@ describe("mid-run compaction wiring (turn_end)", () => {
     await fire(events, "turn_end", ctx, turnEndEvent());
     usage = { tokens: 30_000, contextWindow: 200_000 };
     expect(await fire(events, "turn_end", ctx, turnEndEvent())).toBeUndefined();
-  });
-
-  it("resolves the strict mid-run target per model: the override binds, the global cap does not", async () => {
-    // Same per-model config as the idle test: glm-5.3 at 80k, global cap 500k, ratio off.
-    const perModel: RecallConfig = {
-      ...CONFIG,
-      compactTargetTokens: 500_000,
-      compactTargetRatio: 0,
-      compactTargetOverrides: { "glm-5.3": 80_000 },
-      compactIdleRatio: 0.875,
-    };
-    const glm = { id: "glm-5.3", reasoning: false };
-    // Over the 80k override: the draft fires mid-run.
-    const over = makePi();
-    registerRecallTool(over.pi, perModel);
-    const fired = await fire(
-      over.events,
-      "turn_end",
-      turnEndCtx({ tokens: 81_000, contextWindow: 1_000_000 }, { model: glm }),
-      turnEndEvent(),
-    );
-    expect(fired).toBeDefined();
-    // Under it: quiet — the 500k global cap must not take over.
-    const under = makePi();
-    registerRecallTool(under.pi, perModel);
-    expect(
-      await fire(
-        under.events,
-        "turn_end",
-        turnEndCtx({ tokens: 79_000, contextWindow: 1_000_000 }, { model: glm }),
-        turnEndEvent(),
-      ),
-    ).toBeUndefined();
-    // A model without an override: 81k is under the 500k cap — quiet.
-    const other = makePi();
-    registerRecallTool(other.pi, perModel);
-    expect(
-      await fire(other.events, "turn_end", turnEndCtx({ tokens: 81_000, contextWindow: 1_000_000 }), turnEndEvent()),
-    ).toBeUndefined();
   });
 
   it("fast-paths a fresh background result into the boundary draft — no second provider call; stale results regenerate", async () => {

@@ -38,14 +38,11 @@
  * - Cache invariants hold by construction: a plain tool whose results ride at
  *   the tail; no context rewrites, no system-prompt churn, one promptSnippet.
  * - The extension owns the context budget and the summary: auto-compaction
- *   fires when projected context exceeds a target — min(the model's target
- *   tokens, 70% of the model's context window), whichever is reached first:
- *   an absolute per-model ceiling (the cost optimum is model-specific —
- *   issue #3's measured model puts glm-5.3 at 80k, baked as its default in
- *   PI_RECALL_COMPACT_TARGETS; other models keep the 256k global cap via
- *   PI_RECALL_COMPACT_TARGET, scaled down for smaller windows by
- *   PI_RECALL_COMPACT_RATIO; token cap 0 disables, and so does a target
- *   below what compaction can achieve) —
+ *   fires when projected context exceeds a target — min(80k tokens, 70% of
+ *   the model's context window), whichever is reached first, for every model
+ *   alike: 80k is the measured cost optimum from issue #3 (PI_RECALL_COMPACT_TARGET
+ *   overrides; token cap 0 disables, and so does a target below what
+ *   compaction can achieve) —
  *   via a turn_end boundary draft mid-run (a continuously busy agent never
  *   settles, so a settled-only trigger drifts to pi's near-limit backstop)
  *   and from agent_settled when idle, with pi's near-limit threshold as the
@@ -63,10 +60,10 @@
  *   text when pi's preparation matches the fingerprint the background pass
  *   recorded (stale results are discarded and regenerated, never served).
  *   Idle triggers also fire EARLY, below the strict target, at
- *   PI_RECALL_COMPACT_IDLE_RATIO (default 0.875 — 70k at glm-5.3's 80k
- *   target) of the target: a settled
- *   moment right after a run is when the provider's cache still holds the
- *   session prefix, so the summary's input is a cache read, and spending that
+ *   PI_RECALL_COMPACT_IDLE_RATIO (default 0.875 — 70k at the 80k target) of
+ *   the target: a settled moment right after a run is when the provider's
+ *   cache still holds the session prefix, so the summary's input is a cache
+ *   read, and spending that
  *   cheap summary there keeps mid-run crossings of the strict target (which
  *   block a boundary) rare. The mid-run turn_end draft stays at the strict
  *   target and inline — boundary drafts must return synchronously — but it
@@ -153,7 +150,6 @@ import type { RecallDetails } from "./render";
 import {
   carryForwardFileLists,
   collectFileOps,
-  compactTargetFor,
   compactionFingerprint,
   createPrefixDebugger,
   defaultSummaryFn,
@@ -458,7 +454,7 @@ export function registerRecallTool(
         shouldIdleCompact(
           usage?.tokens ?? null,
           usage?.contextWindow ?? 0,
-          compactTargetFor(config, model),
+          config.compactTargetTokens,
           config.compactTargetRatio,
           config.compactIdleRatio,
           false,
@@ -653,7 +649,6 @@ export function registerRecallTool(
     // ctx access is synchronous here; async work holds only captured pieces.
     void catchUp(ctx.sessionManager);
     const usage = ctx.getContextUsage();
-    const target = compactTargetFor(config, ctx.model);
     if (!config.ownSummaries) {
       // Not owning summaries: no background pass (the hook would discard it) —
       // trigger pi's compaction directly and let pi's summarizer run.
@@ -661,7 +656,7 @@ export function registerRecallTool(
         !shouldAutoCompact(
           usage?.tokens ?? null,
           usage?.contextWindow ?? 0,
-          target,
+          config.compactTargetTokens,
           config.compactTargetRatio,
           autoCompactInFlight,
         )
@@ -688,7 +683,7 @@ export function registerRecallTool(
       !shouldIdleCompact(
         usage?.tokens ?? null,
         usage?.contextWindow ?? 0,
-        target,
+        config.compactTargetTokens,
         config.compactTargetRatio,
         config.compactIdleRatio,
         autoCompactInFlight,
@@ -725,7 +720,7 @@ export function registerRecallTool(
       !shouldAutoCompact(
         usage?.tokens ?? null,
         usage?.contextWindow ?? 0,
-        compactTargetFor(config, ctx.model),
+        config.compactTargetTokens,
         config.compactTargetRatio,
         autoCompactInFlight,
       )

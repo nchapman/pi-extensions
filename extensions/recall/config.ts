@@ -2,17 +2,9 @@
  * with safe defaults — invalid values fall back (range-clamped) and warn,
  * never throw. Kept separate from the wiring so tests cover parsing directly. */
 
-import { DEFAULT_COMPACTION_SETTINGS } from "@earendil-works/pi-coding-agent";
-
 // ---------------------------------------------------------------------------
 // Config (env with safe defaults; invalid values fall back and warn)
 // ---------------------------------------------------------------------------
-
-/** Never plan to fill the window: headroom kept when clamping the target. Shared by the target math in summary.ts. */
-export const COMPACT_WINDOW_HEADROOM_TOKENS = 4096;
-/** A target below this can never be reached by one compaction: the kept tail alone is larger, so it would re-draft every turn forever. Also the validity floor for per-model override entries — a positive value below it silently disables the model. */
-export const MIN_ACHIEVABLE_COMPACT_TARGET =
-  DEFAULT_COMPACTION_SETTINGS.keepRecentTokens + COMPACT_WINDOW_HEADROOM_TOKENS;
 
 export interface RecallConfig {
   defaultScope: "session" | "project";
@@ -21,10 +13,8 @@ export interface RecallConfig {
   halfLifeHours: number;
   /** Minimum recency factor so old content fades but never vanishes (1 disables decay). */
   recencyFloor: number;
-  /** Auto-compact when projected context exceeds this many tokens (0 disables) — the fallback for models without a per-model override. */
+  /** Auto-compact when projected context exceeds this many tokens (0 disables) — min of this cap and the window ratio, for every model alike. 80k is the measured cost optimum from issue #3. */
   compactTargetTokens: number;
-  /** Per-model compact targets, keyed by model id or provider-qualified "provider/id" (PI_RECALL_COMPACT_TARGETS="zai/glm-5.3=80000,id2=133000", merged over the baked defaults; 0 disables for that model). The cost optimum is model-specific — a hosted metered model wants a low target, a self-hosted one is unbilled and wants the window-relative default. */
-  compactTargetOverrides: Record<string, number>;
   /** Also bound the target to this fraction of the model's context window — the smaller of token cap and ratio wins (0 disables the ratio). */
   compactTargetRatio: number;
   /** Idle moments compact early when tokens exceed this fraction of the effective target (1 disables; the mid-run trigger stays at the strict target). */
@@ -60,11 +50,7 @@ export const DEFAULTS: RecallConfig = {
   foreignWeight: 0.5,
   halfLifeHours: 4,
   recencyFloor: 0.25,
-  compactTargetTokens: 256_000,
-  // glm-5.3: measured cost optimum from issue #3 — carrying context past ~80k
-  // costs 3.4× more per turn than compacting there. Baked per-model so other
-  // models (self-hosted, where carrying is unbilled) keep the high default.
-  compactTargetOverrides: { "glm-5.3": 80_000 },
+  compactTargetTokens: 80_000,
   compactTargetRatio: 0.7,
   compactIdleRatio: 0.875,
   ownSummaries: true,
@@ -108,41 +94,6 @@ function numFromEnv(env: NodeJS.ProcessEnv, name: string, fallback: number, min:
   return Math.min(max, Math.max(min, v));
 }
 
-/** PI_RECALL_COMPACT_TARGETS="glm-5.3=80000,id2=133000" → per-model target map, merged over the baked defaults (env entries win per key). Invalid entries warn and skip — one typo must not disable a model's compaction. */
-function compactTargetOverridesFromEnv(
-  env: NodeJS.ProcessEnv,
-  defaults: Record<string, number>,
-): Record<string, number> {
-  const raw = env.PI_RECALL_COMPACT_TARGETS;
-  const merged: Record<string, number> = { ...defaults };
-  if (raw === undefined || raw.trim() === "") return merged;
-  for (const entry of raw.split(",")) {
-    const eq = entry.indexOf("=");
-    const modelId = eq === -1 ? "" : entry.slice(0, eq).trim();
-    const rawValue = eq === -1 ? "" : entry.slice(eq + 1).trim();
-    const value = rawValue === "" ? NaN : Number(rawValue);
-    if (modelId === "" || !Number.isFinite(value) || value < 0 || value > 10_000_000) {
-      console.error(
-        `recall: PI_RECALL_COMPACT_TARGETS entry "${entry.trim()}" is invalid (expected id=tokens) — skipped`,
-      );
-      continue;
-    }
-    // A positive value below what one compaction can achieve would silently
-    // disable the model (effectiveCompactTarget rejects it) — a dropped zero
-    // must warn and skip, never turn compaction off. 0 stays valid: explicit disable.
-    if (value > 0 && value < MIN_ACHIEVABLE_COMPACT_TARGET) {
-      console.error(
-        `recall: PI_RECALL_COMPACT_TARGETS entry "${entry.trim()}" is below the ${MIN_ACHIEVABLE_COMPACT_TARGET.toLocaleString(
-          "en-US",
-        )}-token minimum one compaction can achieve — skipped (0 disables explicitly)`,
-      );
-      continue;
-    }
-    merged[modelId] = Math.floor(value);
-  }
-  return merged;
-}
-
 function summaryThinkingFromEnv(env: NodeJS.ProcessEnv): RecallConfig["summaryThinking"] {
   const raw = env.PI_RECALL_SUMMARY_THINKING?.trim().toLowerCase();
   if (raw === undefined || raw === "") return DEFAULTS.summaryThinking;
@@ -182,7 +133,6 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): RecallConfi
     compactTargetTokens: Math.floor(
       numFromEnv(env, "PI_RECALL_COMPACT_TARGET", DEFAULTS.compactTargetTokens, 0, 10_000_000),
     ),
-    compactTargetOverrides: compactTargetOverridesFromEnv(env, DEFAULTS.compactTargetOverrides),
     compactTargetRatio: numFromEnv(env, "PI_RECALL_COMPACT_RATIO", DEFAULTS.compactTargetRatio, 0, 1),
     compactIdleRatio: numFromEnv(env, "PI_RECALL_COMPACT_IDLE_RATIO", DEFAULTS.compactIdleRatio, 0.25, 1),
     ownSummaries: boolFromEnv(env, "PI_RECALL_COMPACT_OWN", DEFAULTS.ownSummaries),
