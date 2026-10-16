@@ -864,7 +864,10 @@ const MAX_DUMP_BYTES = 64 * 1024 * 1024;
 const yieldToLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 /** Dump filename, session-scoped: the sessions dir is shared per project, so a sibling session must not clobber the file under diagnosis. */
-const dumpFile = (sessionId: string) => `${sessionId}-diff.json`;
+// Session ids from loaded (not created) session files are unvalidated — a
+// crafted header id could otherwise carry path separators into the dump name.
+const safeFileToken = (sessionId: string) => sessionId.replace(/[^A-Za-z0-9._-]/g, "_");
+const dumpFile = (sessionId: string) => `${safeFileToken(sessionId)}-diff.json`;
 
 /**
  * PI_RECALL_DEBUG_PREFIX=1 instrumentation. Pairs the two rendered provider
@@ -939,7 +942,7 @@ export function createPrefixDebugger(deps: PrefixDebugDeps = {}) {
   return {
     /** A live agent request: stash the newest for the next summary's pair. */
     onLiveRequest(payload: unknown, sessionDir: string | undefined, sessionId: string | undefined): void {
-      if (sessionDir === undefined || sessionId === undefined) return; // nothing pairable without both
+      if (!sessionDir || sessionId === undefined) return; // nothing pairable without both — and never stash a half the summary side would refuse to pair with
       lastLive = { payload, sessionId };
     },
     /**

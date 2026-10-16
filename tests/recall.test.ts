@@ -3143,6 +3143,24 @@ describe("background idle compaction", () => {
     // A live request without both is simply not stashable — silent, no crumb.
     d.onLiveRequest({ messages: [] }, "/proj-sessions", undefined);
     expect(errors).toHaveLength(2);
+    // An empty-string session dir is the same refusal (in-memory session) —
+    // never stashed live only to have every summary pairing reject it.
+    d.onLiveRequest({ messages: [] }, "", "sess-1");
+    await d.onSummaryRequest(summaryPayload, "/proj-sessions", "sess-1");
+    expect(writes).toHaveLength(2); // the empty-dir stash was ignored, the good pair stands
+  });
+
+  it("sanitizes the session id in the dump filename — a crafted loaded-session id cannot traverse out of recall-debug", async () => {
+    const writes: Array<[string, string]> = [];
+    const d = createPrefixDebugger({
+      mkdir: () => {},
+      writeFile: (file, text) => void writes.push([file, text]),
+      onError: () => {},
+      onDumped: () => {},
+    });
+    d.onLiveRequest({ messages: [] }, "/proj-sessions", "../../evil/id");
+    await d.onSummaryRequest({ input: "x" }, "/proj-sessions", "../../evil/id");
+    expect(writes.map(([file]) => file)).toEqual(["/proj-sessions/recall-debug/.._.._evil_id-diff.json"]);
   });
 
   it("never stacks a second generation while one is in flight", async () => {
