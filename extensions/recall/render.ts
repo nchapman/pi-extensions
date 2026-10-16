@@ -1,22 +1,9 @@
-/** What the user sees: the collapsed/expanded recall tool rows, the read-mode
- * full-text expansion of an entry, and the one-shot reminder that rides behind
- * every compaction commit. */
+/** What the user sees: the collapsed/expanded recall tool rows and the
+ * read-mode full-text expansion of an entry. */
 
 import { Text } from "@earendil-works/pi-tui";
 import type { SessionEntry, Theme } from "@earendil-works/pi-coding-agent";
 import { extractEntrySections, kindLabel } from "./chunks";
-
-const REMINDER_TYPE = "recall.reminder";
-/** The reminder rides behind the compaction commit — after the kept tail,
- * before whatever the user sends next. At that position it is background
- * framing; the old "re-orient now" wording was written for a front position
- * it no longer holds, and made the model answer the note instead of the
- * user when before_agent_start injection strayed there. One calm sentence:
- * compactions repeat every ~60 turns at the glm-5.3 target, so the note's
- * two jobs — newer wins, recall exists — must fit the frequency without
- * becoming noise. */
-const REMINDER_TEXT =
-  "Earlier history is compacted into the summary above; newer messages take precedence. Compacted turns stay verbatim-searchable via `recall` if detail is needed.";
 
 export function reuseText(context: { lastComponent?: unknown } | undefined): Text {
   return context?.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
@@ -72,12 +59,4 @@ export function entryFullText(entry: SessionEntry): string {
       s.kind === "toolCall" || s.kind === "toolResult" ? `[${kindLabel(s.kind, s.label)}]\n${s.text}` : s.text,
     )
     .join("\n\n");
-}
-
-export function reminderMessage(): { customType: string; content: string; display: boolean } {
-  return {
-    customType: REMINDER_TYPE,
-    content: REMINDER_TEXT,
-    display: false,
-  };
 }

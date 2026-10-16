@@ -92,12 +92,6 @@
  *   carrier; pi-triggered compactions stay plan-less and lean on that reminder
  *   instead (the todo extension's resume scan recognizes the chained carrier,
  *   so resumed drafts do not double-inject).
- * - Every compaction chains/sends a one-shot reminder message at commit time —
- *   appended behind the compaction (after the kept tail, before whatever the
- *   user sends next), never injected at the next run start, where it would
- *   land after the user's message and get answered instead of the user
- *   (observed live: the first idle compaction in a long session derailed the
- *   next turn into re-orienting from the summary).
  */
 
 /**
@@ -107,7 +101,7 @@
  * - chunks.ts   tokenize → entry sections → line-aligned chunks; the archive definition
  * - rank.ts     BM25 + recency decay, the semantic side and RRF fusion, result formatting
  * - corpus.ts   sibling session files as a labeled, LRU-cached foreign corpus
- * - render.ts   what the user sees: tool rows, read-mode full text, the reminder
+ * - render.ts   what the user sees: tool rows, read-mode full text
  * - summary.ts  context budget, compaction ownership, the summarization seam
  */
 
@@ -145,7 +139,7 @@ import {
 import type { EmbedSeam, SearchHit, VectorStoreLike } from "./rank";
 import { fsProjectReader, ProjectCorpusCache } from "./corpus";
 import type { FileCorpus, ProjectReader } from "./corpus";
-import { entryFullText, reminderMessage, renderRecallCall, renderRecallResult, reuseText } from "./render";
+import { entryFullText, renderRecallCall, renderRecallResult, reuseText } from "./render";
 import type { RecallDetails } from "./render";
 import {
   carryForwardFileLists,
@@ -605,18 +599,6 @@ export function registerRecallTool(
     // backstop) retires the background pass: its span no longer exists.
     pendingCompact?.controller.abort();
     pendingCompact = null;
-    // The reminder rides at the compaction commit, not the next run start.
-    // Appended now it lands after the kept tail and before whatever the user
-    // sends next — the position mid-run compactions always had. A
-    // before_agent_start injection instead lands after the user's next
-    // message (the front of context), where the model answers the reminder
-    // instead of the user — observed live in a long session's first idle
-    // compaction. pi.sendMessage with triggerTurn:false appends while idle
-    // and defers to turn end mid-run; it never steers and never lands
-    // between a tool call and its result. Fire-and-forget by design: a
-    // failed append surfaces as a pi extension error, and the lost reminder
-    // is bounded — the summary and kept tail still carry the session.
-    pi.sendMessage(reminderMessage(), { triggerTurn: false });
   });
 
   // Torn down on quit, reload, and session replacement — the worker child
@@ -761,11 +743,6 @@ export function registerRecallTool(
         : ([
             { type: "custom_message", customType: PLAN_MESSAGE_TYPE, content: plan, display: false },
           ] as SessionBoundaryDraft[])),
-      // The reminder rides the same chain: boundary commits fire no
-      // session_compact, so the immediate-send path there never runs —
-      // chained here it keeps its position behind the compaction without
-      // waiting for the next run start.
-      { type: "custom_message", ...reminderMessage() } as SessionBoundaryDraft,
     ];
     // A background result for exactly this span commits for free. An in-flight
     // generation defers (the idle commit owns it); a landed-but-stale one is

@@ -1192,24 +1192,6 @@ describe("registerRecallTool", () => {
     };
     expect(read.content[0].text).toContain("the exact foreign detail we need to read fully");
   });
-
-  it("sends the reminder at the compaction commit, behind the compaction — never at run start", async () => {
-    const { events, sent } = setup();
-    await fire(events, "session_compact", sessionCtx());
-    expect(sent).toHaveLength(1);
-    expect(sent[0].message).toMatchObject({ customType: "recall.reminder", display: false });
-    // triggerTurn:false — appended while idle, never steering a running agent.
-    expect(sent[0].options).toEqual({ triggerTurn: false });
-    // Background framing, not a directive: at this position the model must
-    // read it as context, and the user's next message stays the latest thing.
-    // One calm sentence — compactions repeat every ~60 turns at the glm-5.3
-    // target, so the note must not grow into per-turn noise.
-    expect(sent[0].message.content).toContain("take precedence");
-    expect(sent[0].message.content).toContain("recall");
-    // No run-start injection anymore — that landed after the user's next
-    // message and got answered instead of the user (observed live).
-    expect(events.get("before_agent_start")).toBeUndefined();
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -3137,7 +3119,7 @@ describe("background idle compaction", () => {
     await d.onSummaryRequest(summaryPayload, "/proj-sessions", "sess-1");
     expect(dirs).toEqual(["/proj-sessions/recall-debug"]);
     expect(writes.map(([file]) => file)).toEqual(["/proj-sessions/recall-debug/sess-1-diff.json"]);
-    expect(dumped).toEqual(["/proj-sessions/recall-debug/sess-1-diff.json"]); // reminder crumb carries the path
+    expect(dumped).toEqual(["/proj-sessions/recall-debug/sess-1-diff.json"]); // onDumped crumb carries the path
     expect(writes[0][1]).toContain("current turn");
     expect(writes[0][1]).toContain("responses-shaped payload");
     expect(writes[0][1]).toContain('"sessionId":"sess-1"');
@@ -4551,16 +4533,13 @@ describe("mid-run compaction wiring (turn_end)", () => {
       { entries: unknown[]; continue?: boolean } | undefined;
     expect(result).toBeDefined();
     expect(result!.continue).toBeUndefined(); // pi's own continuation decision stands
-    const [draft, reminder] = result!.entries as Array<Record<string, unknown>>;
+    const [draft] = result!.entries as Array<Record<string, unknown>>;
     expect(draft.type).toBe("compaction");
     expect(draft.summary).toBe("## Goal\n- mid-run summary");
     expect(typeof draft.firstKeptEntryId).toBe("string");
     expect(draft.usage).toEqual({ totalTokens: 7 });
-    // No todo state on the branch — no plan message, but the chained
-    // reminder still rides behind the compaction draft.
-    expect(result!.entries).toHaveLength(2);
-    expect(reminder.type).toBe("custom_message");
-    expect(reminder.customType).toBe("recall.reminder");
+    // No todo state on the branch — the draft chains nothing behind it.
+    expect(result!.entries).toHaveLength(1);
   });
 
   it("chains the current plan as a message after the draft — drafts fire no session_compact, so nothing else carries it", async () => {
@@ -4580,9 +4559,9 @@ describe("mid-run compaction wiring (turn_end)", () => {
       turnEndEvent(),
     )) as { entries: Array<Record<string, unknown>> };
 
-    // Plan-less compaction first, then the plan carrier, then the reminder —
-    // all at the recent position, chained in order.
-    expect(result.entries).toHaveLength(3);
+    // Plan-less compaction first, then the plan carrier — all at the recent
+    // position, chained in order.
+    expect(result.entries).toHaveLength(2);
     expect(result.entries[0].type).toBe("compaction");
     expect(result.entries[0].summary).not.toContain("## Current Plan");
     const planMessage = result.entries[1] as {
@@ -4596,9 +4575,6 @@ describe("mid-run compaction wiring (turn_end)", () => {
     expect(planMessage.content).toContain("## Current Plan");
     expect(planMessage.content).toContain("[>] survive compaction");
     expect(planMessage.display).toBe(false);
-    const reminder = result.entries[2] as { type: string; customType: string };
-    expect(reminder.type).toBe("custom_message");
-    expect(reminder.customType).toBe("recall.reminder");
   });
 
   it("summarizes the projection chronologically with the previous compaction summary, and unions file lists", async () => {
@@ -4823,12 +4799,6 @@ describe("mid-run compaction wiring (turn_end)", () => {
     expect(draft.entries[0].type).toBe("compaction");
     expect(draft.entries[0].summary).toBe("## Goal\n- background summary");
     expect(draft.entries[0].usage).toEqual({ totalTokens: 9 });
-    // Boundary commits fire no session_compact — the reminder rides the same
-    // chain, behind the compaction draft, instead of waiting for a run start.
-    expect(draft.entries.at(-1)).toMatchObject({
-      type: "custom_message",
-      customType: "recall.reminder",
-    });
   });
 
   it("drops a stale background result at the boundary and regenerates inline", async () => {
@@ -4867,19 +4837,16 @@ describe("mid-run compaction wiring (turn_end)", () => {
     expect(staleDraft.entries[0].summary).toBe("## Goal\n- summary 2");
   });
 
-  it("merges with earlier handlers' proposals and arms the post-compaction reminder", async () => {
+  it("merges with earlier handlers' proposals", async () => {
     const { pi, events } = makePi();
     registerRecallTool(pi, CONFIG);
     const earlier = { type: "custom", customType: "other.note", data: { keep: true } };
     const result = (await fire(events, "turn_end", turnEndCtx(), turnEndEvent({ entries: [earlier] }))) as {
       entries: Array<Record<string, unknown>>;
     };
-    expect(result.entries).toHaveLength(3);
+    expect(result.entries).toHaveLength(2);
     expect(result.entries[0]).toEqual(earlier); // not clobbered
     expect(result.entries[1].type).toBe("compaction");
-    // Boundary commits never fire session_compact — the reminder rides the
-    // chained entries rather than a run-start injection.
-    expect(result.entries[2]).toMatchObject({ type: "custom_message", customType: "recall.reminder" });
   });
 
   it("defers when another handler already proposed a compaction this boundary", async () => {

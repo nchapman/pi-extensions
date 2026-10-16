@@ -6,9 +6,6 @@
 
 import { mkdir as mkdirFs, writeFile as writeFileFs } from "node:fs/promises";
 import { join } from "node:path";
-
-/** Yields past the current tick — unlike a microtask hop, this lands after the request dispatch, not before it. */
-const yieldToLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
 import {
   convertToLlm,
   DEFAULT_COMPACTION_SETTINGS,
@@ -862,6 +859,9 @@ export interface PrefixDebugDeps {
 
 /** Combined size both dump halves may reach — a debug dump must not fill the disk. */
 const MAX_DUMP_BYTES = 64 * 1024 * 1024;
+
+/** Yields past the current tick — unlike a microtask hop, this lands after the request dispatch, not before it. */
+const yieldToLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 /** Dump filename, session-scoped: the sessions dir is shared per project, so a sibling session must not clobber the file under diagnosis. */
 const dumpFile = (sessionId: string) => `${sessionId}-diff.json`;
