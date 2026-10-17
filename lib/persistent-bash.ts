@@ -65,6 +65,9 @@ export const IDENTITY_TOLERANCE_MS = 60_000;
 
 /** How long a finalize path re-reads a missing/empty status file before concluding. */
 export const STATUS_RETRY_BUDGET_MS = 2_000;
+/** Aggregate bound across a whole scan: many dead leftovers must not each burn
+ *  the per-task retry on the session-start path. */
+export const SCAN_BUDGET_MS = 10_000;
 
 const tasksDir = (sessionDir: string): string => join(sessionDir, "tasks");
 
@@ -147,7 +150,7 @@ export function writeTaskMeta(sessionDir: string, meta: PersistentTaskMeta): voi
   mkdirSync(tasksDir(sessionDir), { recursive: true });
   const path = taskMetaPath(sessionDir, meta.id);
   const tmp = `${path}.tmp`;
-  writeFileSync(tmp, `${JSON.stringify(meta, null, 2)}\n`, "utf8");
+  writeFileSync(tmp, `${JSON.stringify(meta, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   renameSync(tmp, path);
 }
 
@@ -376,6 +379,11 @@ export async function scanSessionTasks(sessionDir: string, deps: ScanDeps = {}):
   const isAlive = deps.isAlive ?? isProcessAlive;
   const now = deps.now ?? Date.now;
   const verify = deps.verifyIdentity ?? ((meta) => verifyTaskIdentity(meta, { now }));
+  // The per-task status retry (2s) is bounded per task, not in the aggregate —
+  // abandoned sessions can leave many dead entries, and 2s × N on the
+  // session-start path would delay every outcome behind the pile. One shared
+  // budget: once spent, later dead tasks decide on their last read alone.
+  const scanDeadline = now() + SCAN_BUDGET_MS;
   const outcomes: ScanOutcome[] = [];
   for (const id of listIds(sessionDir)) {
     try {
@@ -397,7 +405,7 @@ export async function scanSessionTasks(sessionDir: string, deps: ScanDeps = {}):
           readStatus,
           sleep: deps.sleep,
           now,
-          budgetMs: STATUS_RETRY_BUDGET_MS,
+          budgetMs: Math.max(0, Math.min(STATUS_RETRY_BUDGET_MS, scanDeadline - now())),
         });
         outcomes.push({
           id,
@@ -419,41 +427,52 @@ export async function scanSessionTasks(sessionDir: string, deps: ScanDeps = {}):
   return outcomes;
 }
 
+/** Why a persisted kill did not happen. "denied" = verified as ours but the
+ *  signal was refused (EPERM on a setuid descendant, say). */
+export type KillDeclineReason = "mismatched" | "unknown" | "denied";
+export type KillOutcome = { killed: true } | { killed: false; reason: KillDeclineReason };
+
+/** Group-signal result: signalled, already gone (ESRCH — fine), or refused
+ *  (EPERM — the record must survive so a later attempt can retry). */
+type GroupSignal = "signalled" | "gone" | "denied";
+
 /** Kill a persisted task by process group, after verifying the pid still is ours.
  *  An unverifiable pid is neither signalled nor cleaned — "not ours to signal"
- *  and "gone" are different facts, and a ps blip must not orphan the task. */
+ *  and "gone" are different facts, and a ps blip must not orphan the task. A
+ *  refused signal likewise keeps the durable state for a retry. */
 export async function killPersistedTask(
   meta: PersistentTaskMeta,
   sessionDir: string,
   opts: {
     verifyIdentity?: (meta: PersistentTaskMeta) => Promise<IdentityVerdict>;
-    killGroup?: (pid: number) => boolean;
+    killGroup?: (pid: number) => GroupSignal;
     now?: () => number;
   } = {},
-): Promise<boolean> {
+): Promise<KillOutcome> {
   const verify = opts.verifyIdentity ?? ((meta) => verifyTaskIdentity(meta, { now: opts.now }));
   const killGroup =
     opts.killGroup ??
-    ((pid: number) => {
+    ((pid: number): GroupSignal => {
       try {
         process.kill(-pid, "SIGKILL");
-        return true;
-      } catch {
-        return false; // already gone (ESRCH) or not ours to signal (EPERM)
+        return "signalled";
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === "EPERM" ? "denied" : "gone";
       }
     });
   const verdict = await verify(meta);
-  if (verdict !== "verified") {
-    if (verdict === "mismatched") {
-      // Verified as someone else's pid: never signal — clean the artifacts so
-      // scans stop considering it.
-      removePersistedArtifacts(sessionDir, meta.id, { keepLog: false });
-    }
-    return false;
+  if (verdict === "unknown") return { killed: false, reason: "unknown" };
+  if (verdict === "mismatched") {
+    // Verified as someone else's pid: never signal — clean the artifacts so
+    // scans stop considering it.
+    removePersistedArtifacts(sessionDir, meta.id, { keepLog: false });
+    return { killed: false, reason: "mismatched" };
   }
-  killGroup(meta.pid);
+  const signal = killGroup(meta.pid);
+  if (signal === "denied") return { killed: false, reason: "denied" };
+  // signalled or already gone: the work is over either way.
   removePersistedArtifacts(sessionDir, meta.id, { keepLog: false });
-  return true;
+  return { killed: true };
 }
 
 /** Options for spawnPersistentTask; the shell comes resolved (pi's getShellConfig). */
@@ -483,7 +502,9 @@ export function spawnPersistentTask(opts: PersistentSpawnOptions): ChildProcess 
   mkdirSync(dirname(opts.logPath), { recursive: true });
   // "a" = O_APPEND: leader and grandchildren share one open-file description,
   // and interleaved writes must extend the file, not overwrite each other.
-  const logFd = openSync(opts.logPath, "a");
+  // 0o600: the command line (and its output) is where credentials live; the
+  // umask must not widen a durable, secret-bearing file.
+  const logFd = openSync(opts.logPath, "a", 0o600);
   let child: ChildProcess;
   try {
     child = doSpawn(opts.shell, [...(opts.shellArgs ?? ["-c"]), PERSISTENT_WRAPPER_SCRIPT], {

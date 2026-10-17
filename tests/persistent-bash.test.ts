@@ -382,9 +382,12 @@ describe("killPersistedTask", () => {
     const dir = mkdtempSync(join(tmpdir(), "pb-kill-"));
     const m = meta();
     seedArtifacts(dir, m);
-    const killGroup = vi.fn(() => true);
-    const killed = await killPersistedTask(m, dir, { verifyIdentity: async () => "mismatched", killGroup });
-    expect(killed).toBe(false);
+    const killGroup = vi.fn((): "signalled" => "signalled");
+    const mismatched = await killPersistedTask(m, dir, {
+      verifyIdentity: async () => "mismatched",
+      killGroup,
+    });
+    expect(mismatched).toEqual({ killed: false, reason: "mismatched" });
     expect(killGroup).not.toHaveBeenCalled();
     expect(existsSync(taskMetaPath(dir, m.id))).toBe(false);
     expect(existsSync(persistentLogPath(dir, m.id))).toBe(false); // kill cleanup takes the log too
@@ -393,23 +396,34 @@ describe("killPersistedTask", () => {
     // must not orphan a healthy task by destroying its durable state.
     seedArtifacts(dir, m);
     const unknown = await killPersistedTask(m, dir, { verifyIdentity: async () => "unknown", killGroup });
-    expect(unknown).toBe(false);
+    expect(unknown).toEqual({ killed: false, reason: "unknown" });
     expect(killGroup).not.toHaveBeenCalled();
     expect(existsSync(taskMetaPath(dir, m.id))).toBe(true);
     expect(existsSync(persistentLogPath(dir, m.id))).toBe(true);
   });
 
-  it("kills the group by pid after verification and removes everything", async () => {
+  it("kills the group by pid after verification and removes everything; a refused signal keeps the record for a retry", async () => {
     const dir = mkdtempSync(join(tmpdir(), "pb-kill2-"));
     const m = meta();
     seedArtifacts(dir, m);
-    const killGroup = vi.fn(() => true);
+    const killGroup = vi.fn((): "signalled" => "signalled");
     const killed = await killPersistedTask(m, dir, { verifyIdentity: async () => "verified", killGroup });
-    expect(killed).toBe(true);
+    expect(killed).toEqual({ killed: true });
     expect(killGroup).toHaveBeenCalledWith(m.pid);
     expect(existsSync(taskMetaPath(dir, m.id))).toBe(false);
     expect(existsSync(taskStatusPath(dir, m.id))).toBe(false);
     expect(existsSync(persistentLogPath(dir, m.id))).toBe(false);
+
+    // A refused signal (EPERM on a verified-ours pid) is not a kill: the
+    // durable record survives so a later attempt can retry.
+    seedArtifacts(dir, m);
+    const denied = await killPersistedTask(m, dir, {
+      verifyIdentity: async () => "verified",
+      killGroup: vi.fn((): "denied" => "denied"),
+    });
+    expect(denied).toEqual({ killed: false, reason: "denied" });
+    expect(existsSync(taskMetaPath(dir, m.id))).toBe(true);
+    expect(existsSync(persistentLogPath(dir, m.id))).toBe(true);
   });
 });
 

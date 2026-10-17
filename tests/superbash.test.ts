@@ -2063,13 +2063,17 @@ describe("bash tool persistent background (real)", () => {
     const result = await runPersist(d, "sleep 1");
     const id = idOf(result);
     const meta = readTaskMeta(dir, id) as PersistentTaskMeta;
+    const monitorStart = Date.now(); // the poll interval (2s) starts with the spawn
     d.registry.killAll({ sparePersistent: true });
     expect(d.registry.get(id)).toBeUndefined(); // handed off, unknown here
     expect(readTaskMeta(dir, id)).toBeDefined(); // the disk state is the owner now
     // Let the command finish and pass the 2s monitor tick: a leftover monitor
     // would have settled and woken by now.
     await vi.waitFor(() => expect(existsSync(taskStatusPath(dir, id))).toBe(true), { timeout: 10_000 });
-    await new Promise((r) => setTimeout(r, 1_600));
+    // Outlast one full monitor tick (2s) from the spawn reference — a detached
+    // monitor that failed to stop would settle and wake inside this window.
+    const waitMs = Math.max(0, monitorStart + 2_500 - Date.now());
+    await new Promise((r) => setTimeout(r, waitMs));
     expect(isProcessAlive(meta.pid)).toBe(false); // it ran to completion, unhindered
     expect(d.sendUserMessage).not.toHaveBeenCalled(); // and pi never woke for it
     // A monitor that detached without stopping would have settled by now:
@@ -2241,32 +2245,52 @@ describe("resumePersistedTasks (real)", () => {
 
   it("re-adopts live tasks under their durable id and wakes their outcome through the new runtime", async () => {
     const dir = mkdtempSync(join(tmpdir(), "pb-resume-adopt-"));
-    // Simulate the real flow: old runtime spares (shutdown), new one scans.
+    // Simulate the real flow: old runtime spares (shutdown), new one scans. The
+    // command outlives the scan by a wide margin — "still running at scan time"
+    // must be deterministic, not a race with ps.
     const oldRt = newRuntime();
     const oldTool = createBashTool(oldRt.registry, {});
     const oldCtx = { sessionManager: { getSessionDir: () => dir } } as never;
-    const result = await oldTool.execute(
-      "1",
-      { command: "sleep 0.4 && echo re-adopted-out", wait: "background", persist: true },
-      undefined,
-      undefined,
-      oldCtx,
-    );
-    const id = idOf(result);
-    oldRt.registry.killAll({ sparePersistent: true }); // shutdown detach — old monitor silent forever
+    let result: Awaited<ReturnType<typeof oldTool.execute>>;
+    let pid: number | undefined;
+    try {
+      result = await oldTool.execute(
+        "1",
+        { command: "sleep 30 && echo re-adopted-out", wait: "background", persist: true },
+        undefined,
+        undefined,
+        oldCtx,
+      );
+      const id = idOf(result);
+      pid = readTaskMeta(dir, id)!.pid; // before any settle deletes the metadata
+      oldRt.registry.killAll({ sparePersistent: true }); // shutdown detach — old monitor silent forever
 
-    const rt = newRuntime();
-    const adoptedWake = vi.fn();
-    const outcomes = await resumePersistedTasks(rt.registry, dir, { wake: adoptedWake, pollMs: 25 });
-    expect(outcomes[0].decision.action).toBe("adopt");
-    expect(adoptedWake).toHaveBeenCalledWith(expect.stringContaining(`Background task still running (${id})`));
-    expect(rt.registry.running()[0]).toMatchObject({ id, persistent: true }); // same durable id
-    expect(oldRt.sendUserMessage).not.toHaveBeenCalled(); // the old runtime stays silent
+      const rt = newRuntime();
+      const adoptedWake = vi.fn();
+      const outcomes = await resumePersistedTasks(rt.registry, dir, { wake: adoptedWake, pollMs: 25 });
+      expect(outcomes[0].decision.action).toBe("adopt");
+      expect(adoptedWake).toHaveBeenCalledWith(expect.stringContaining(`Background task still running (${id})`));
+      expect(rt.registry.running()[0]).toMatchObject({ id, persistent: true }); // same durable id
+      expect(oldRt.sendUserMessage).not.toHaveBeenCalled(); // the old runtime stays silent
 
-    await vi.waitFor(() => expect(wakes(rt.sendUserMessage)).toContain("exited 0"), { timeout: 10_000 });
-    expect(wakes(rt.sendUserMessage)).toContain("re-adopted-out");
-    expect(existsSync(taskMetaPath(dir, id))).toBe(false); // settled by the new monitor
-    expect(existsSync(persistentLogPath(dir, id))).toBe(true);
+      // The wrapper's status write (and the log tail it implies) is what the
+      // poll settles on — provide it directly to end the task on the spot; the
+      // end-to-end wrapper flow is covered by the spawn tests.
+      appendFileSync(persistentLogPath(dir, id), "re-adopted-out\n");
+      writeFileSync(taskStatusPath(dir, id), "0");
+      await vi.waitFor(() => expect(wakes(rt.sendUserMessage)).toContain("exited 0"), { timeout: 10_000 });
+      expect(wakes(rt.sendUserMessage)).toContain("re-adopted-out");
+      expect(existsSync(taskMetaPath(dir, id))).toBe(false); // settled by the new monitor
+      expect(existsSync(persistentLogPath(dir, id))).toBe(true);
+    } finally {
+      // Force-kill by the captured pid: killPersistedTask can no-op when ps is
+      // unavailable, and the settled metadata is already gone by now.
+      try {
+        if (pid !== undefined && isProcessAlive(pid)) process.kill(-pid, "SIGKILL");
+      } catch {
+        // already gone
+      }
+    }
   }, 15_000);
 
   it("adopt is idempotent under the durable id — a second resume never duplicates a task", async () => {

@@ -1589,7 +1589,16 @@ describe("registerSubagentsExtension (full wiring)", () => {
       expect(wired.sendUserMessage).not.toHaveBeenCalled(); // detach means no wake from this runtime
     } finally {
       meta = meta ?? readTaskMeta(dir, id);
-      if (meta) await killPersistedTask(meta, dir); // test cleanup: cross-restart kill path
+      if (meta) {
+        await killPersistedTask(meta, dir); // cross-restart kill path
+        // Force-kill backstop: killPersistedTask alone can no-op when ps is
+        // unavailable, and this test must never leak its detached sleep.
+        try {
+          if (isProcessAlive(meta.pid)) process.kill(-meta.pid, "SIGKILL");
+        } catch {
+          // already gone
+        }
+      }
     }
     await vi.waitFor(() => expect(isProcessAlive(meta!.pid)).toBe(false), { timeout: 5_000 });
   }, 15_000);

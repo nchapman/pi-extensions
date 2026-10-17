@@ -592,7 +592,23 @@ function adoptPersistedMonitor(
       persistent: true,
       progress: logProgressFor(() => logPath),
       kill: () => {
-        void killPersistedTask(meta, sessionDir).catch(() => {});
+        // Registry kill (task_kill, /tasks kill). The registry already reports
+        // success from in-memory state; when the verified kill is declined, the
+        // durable state survives — say so, or the task reads as dead while it
+        // keeps running and the next start re-adopts a "killed" task.
+        void killPersistedTask(meta, sessionDir)
+          .then((outcome) => {
+            if (!outcome.killed && outcome.reason !== "mismatched") {
+              deps.wake?.(
+                `Background task kill not confirmed (${meta.id}): ${
+                  outcome.reason === "unknown"
+                    ? "its pid could not be verified (ps unavailable?}"
+                    : "the signal was denied"
+                } — left running and re-examined on the next start.`,
+              );
+            }
+          })
+          .catch(() => {});
       },
       detach: () => {
         handedOff = true;
@@ -605,18 +621,30 @@ function adoptPersistedMonitor(
     deadlineTimer = setTimeout(
       () => {
         if (handedOff || settled) return;
-        const tail = readTail(); // killPersistedTask removes the log — read first
+        const tail = readTail(); // a successful kill removes the log — read first
         void killPersistedTask(meta, sessionDir)
-          .then((killed) =>
-            settle(
-              killed
-                ? `timed out after ${meta.timeoutSecs}s (deadline passed while pi was away)`
-                : "died while pi was away (pid no longer verified)",
-              false,
-              killed ? tail : { output: tail.output }, // no log pointer if it was removed
-            ),
-          )
-          .catch(() => settle("timed out", false, tail));
+          .then((outcome) => {
+            if (outcome.killed) {
+              settle(`timed out after ${meta.timeoutSecs}s (deadline passed while pi was away)`, false, tail);
+              return;
+            }
+            if (outcome.reason === "mismatched") {
+              settle(`timed out after ${meta.timeoutSecs}s — pid was reused while pi was away; not killed`, false, {
+                output: tail.output,
+              });
+              return;
+            }
+            // ps could not answer, or the signal was refused: do NOT settle —
+            // the task may be healthy and its durable state is the only record
+            // (the same verdict the scan leaves alone). Say so and keep
+            // monitoring; the poll still settles on status or liveness.
+            deps.wake?.(
+              `Background task (${meta.id}) hit its ${meta.timeoutSecs}s timeout but could not be killed (${
+                outcome.reason === "unknown" ? "pid not verified — ps unavailable?" : "signal denied"
+              }); left running and still monitored. Kill: task_kill ${meta.id}`,
+            );
+          })
+          .catch(() => settle(`timed out after ${meta.timeoutSecs}s`, false, tail));
       },
       Math.max(0, meta.startedAt + meta.timeoutSecs * 1000 - now()),
     );
@@ -711,24 +739,29 @@ export async function resumePersistedTasks(
           reportSettled("lost while pi was away (its pid was reused; exit code unknown)", false);
           break;
         case "kill-expired": {
-          const tail = logTail(); // read before the kill removes the log
-          const killed = await killPersistedTask(meta, sessionDir);
+          const tail = logTail(); // read before any kill removes the log
+          const outcome = await killPersistedTask(meta, sessionDir);
           const id = registry.adopt(
             { name: head, kind: "bash", persistent: true, kill: () => undefined, detach: () => undefined },
             meta.id,
           );
+          const statusText = outcome.killed
+            ? "timed out — deadline passed while pi was away"
+            : outcome.reason === "mismatched"
+              ? "timed out — deadline passed while pi was away (pid was reused; not killed)"
+              : "timed out — deadline passed while pi was away (could not be killed; left for the next start)";
           registry.complete(id, {
             ok: false,
             status: "timed out",
             text: formatBashWake({
               command: head,
               id,
-              status: killed
-                ? "timed out — deadline passed while pi was away"
-                : "timed out — deadline passed while pi was away (pid no longer verified; not killed)",
+              status: statusText,
               durationMs: now() - meta.startedAt,
-              output: tail.output, // captured before the kill; the log file may be gone — never point at it
-              outputNote: undefined,
+              output: tail.output, // captured before the kill
+              // Only point at the log when it still exists (kept on a decline,
+              // removed on a kill or a recycled pid).
+              outputNote: outcome.killed || outcome.reason === "mismatched" ? undefined : tail.note,
             }),
           });
           break;
