@@ -1170,6 +1170,10 @@ describe("prompts", () => {
     expect(task.indexOf("Current contents of the changed files")).toBeGreaterThan(task.indexOf("## Your job"));
     expect(task.indexOf("Current contents of the changed files")).toBeLessThan(task.indexOf("## The diff"));
     expect(task).toContain("diff --git a/x b/x");
+    // The closing restatement must describe the FINDER's contract — the
+    // verifier's ({id, verdict, reason}) once leaked in here verbatim.
+    expect(task).toContain("one JSON array of findings ({file, line, severity, title, detail, recommendation})");
+    expect(task).not.toContain("{id, verdict, reason}");
   });
 
   it("verify task lists numbered candidates with details", () => {
@@ -1183,6 +1187,8 @@ describe("prompts", () => {
     expect(task).toContain("1. [important] src/a.ts:2 — Off-by-one in loop bound");
     expect(task).toContain("typecheck: 2 errors");
     expect(task).toContain("THE-DIFF");
+    // The verifier, conversely, is told to verdict its numbered candidates.
+    expect(task).toContain("Verdict every candidate: one JSON array of {id, verdict, reason}");
     expect(verifyAgent().name).toBe("review-verify");
   });
 });

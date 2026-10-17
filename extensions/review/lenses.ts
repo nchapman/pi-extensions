@@ -147,8 +147,14 @@ export function finderTask(opts: {
   }
   if (opts.attachments) parts.push(opts.attachments);
   parts.push(`## The diff\n${opts.diffText}`);
-  // Same sandwich: restate the objective after the payload.
-  parts.push(`Verdict every candidate: one JSON array of {id, verdict, reason} — evidence, not inference.`);
+  // Sandwich: restate the objective after the payload — the tail of a long
+  // task is the highest-attention position. It must restate THIS agent's
+  // contract (findings JSON), not the verifier's ({id, verdict, reason}): a
+  // verbatim copy once had the finder told to "verdict candidates" it never
+  // received, in a shape its output parser would read as zero findings.
+  parts.push(
+    "Report only what you substantiate: one JSON array of findings ({file, line, severity, title, detail, recommendation}), ordered by severity — evidence, not inference.",
+  );
   return parts.join("\n\n");
 }
 
