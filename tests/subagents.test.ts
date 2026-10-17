@@ -443,6 +443,26 @@ describe("runChild", () => {
     expect(r.usage).toBeUndefined();
   });
 
+  it("passes cwd through to the spawned child, omitting it when unset", async () => {
+    const seen: Array<{ cwd?: string }> = [];
+    const withCwd = fakeChild();
+    const p1 = runChild(AGENT, "task", undefined, { timeoutMs: 5000, cwd: "/other/repo" }, (_c, _a, options) => {
+      seen.push(options);
+      return withCwd;
+    });
+    withCwd.close(0);
+    await p1;
+    expect(seen[0].cwd).toBe("/other/repo");
+    const withoutCwd = fakeChild();
+    const p2 = runChild(AGENT, "task", undefined, { timeoutMs: 5000 }, (_c, _a, options) => {
+      seen.push(options);
+      return withoutCwd;
+    });
+    withoutCwd.close(0);
+    await p2;
+    expect("cwd" in seen[1]).toBe(false); // unset stays unset, not cwd: undefined
+  });
+
   it("keeps earlier text when the final message has only tool calls", async () => {
     const child = fakeChild();
     const promise = runChild(AGENT, "task", undefined, { timeoutMs: 5000 }, () => child);

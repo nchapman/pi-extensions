@@ -3,7 +3,7 @@
  * persistence, and the agent-facing summary. */
 
 import { execFile } from "node:child_process";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   defaultSpawn,
@@ -16,7 +16,7 @@ import {
   type SpawnFn,
   sumUsages,
 } from "../subagents";
-import { collectGuidelines } from "./config";
+import { collectGuidelines, readRepoFile } from "./config";
 import type { ReviewConfig, TargetSpec } from "./config";
 import {
   chunkDiffFiles,
@@ -107,6 +107,10 @@ export function defaultShell(cwd: string): (command: string) => Promise<string |
 /** Final outcome of a complete code review run, including formatted report, structured findings, and metadata. */
 export interface ReviewResult {
   report: string;
+  /** Every pipeline note (wiring disclosures plus per-finder errors), exposed
+   * so callers that cannot reach the written report — e.g. the report write
+   * itself failed — still surface the disclosures. */
+  notes: string[];
   /** The final (capped) findings behind the report — data, not just display. */
   findings: Finding[];
   /** Per-finder failures and lens coverage gaps, disclosed in the report and
@@ -189,28 +193,66 @@ async function resolveDiffSections(
   return { sections };
 }
 
-/** Untracked files as synthetic new-file diffs, within the byte budget. */
-async function untrackedSection(repoRoot: string, deps: ReviewDeps, maxBytes: number): Promise<DiffSection | null> {
+/** Untracked files as synthetic new-file diffs, within the byte budget.
+ * Guard refusals ride the section note when there is a section to carry
+ * them (the finder sees what it is missing); when every untracked file was
+ * refused there is no diff to review, and the refusals come back as
+ * `notes` instead — runReview surfaces them in the report's pipeline notes
+ * rather than letting a note-only section masquerade as reviewable content
+ * (splitDiffFiles would parse zero files out of it). */
+async function untrackedSection(
+  repoRoot: string,
+  deps: ReviewDeps,
+  maxBytes: number,
+): Promise<{ section: DiffSection | null; notes: string[] }> {
   const listing = await deps.git(["ls-files", "--others", "--exclude-standard"]);
-  if (listing.code !== 0) return null;
+  if (listing.code !== 0) return { section: null, notes: [] };
   const paths = listing.stdout
     .split("\n")
     .map((s) => s.trim())
     .filter(Boolean);
   const eligible = paths.filter((p) => !isExcludedPath(p));
   const blocks: string[] = [];
+  const refused: string[] = [];
   let budget = maxBytes;
+  let budgetExhausted = false;
   for (const p of eligible) {
-    const content = await deps.readFile(path.join(repoRoot, p));
-    if (content === undefined) continue;
-    if (content.length > budget) break; // budget exhausted; the rest is disclosed by count
+    // Same anchored, symlink-refusing read as guidelines/state: an untracked
+    // `leak -> ~/.ssh/…` must not ride the diff into finder tasks. The byte
+    // bound is 4x the char budget so legit multibyte content still fits.
+    const r = await readRepoFile(repoRoot, path.join(repoRoot, p), maxBytes * 4, deps.readFile);
+    if (r.kind === "refused") {
+      refused.push(p); // named, not folded into the size-budget count — different cause
+      continue;
+    }
+    if (r.kind === "missing") continue;
+    const content = r.content;
+    if (content.length > budget) {
+      budgetExhausted = true;
+      break; // the rest is disclosed by count
+    }
     budget -= content.length;
     blocks.push(syntheticNewFileDiff(p, content));
   }
-  if (!blocks.length) return null;
-  const skipped = eligible.length - blocks.length;
-  const note = skipped > 0 ? `\n(${skipped} untracked file(s) skipped: size budget)` : "";
-  return { label: "untracked (new) files", text: blocks.join("\n") + note };
+  if (!blocks.length) {
+    if (refused.length === 0) return { section: null, notes: [] };
+    return {
+      section: null,
+      notes: [
+        `untracked file(s) skipped by the read guard (oversized, not a plain file, or a symlink escape) and not reviewed: ${refused.join(", ")}`,
+      ],
+    };
+  }
+  const skippedByBudget = eligible.length - blocks.length - refused.length;
+  // Refusals are named (a refused file must not masquerade as a size-budget
+  // skip — the finder may want to know WHY a file is unreadable); budget
+  // skips are counted, matching the pre-guard behavior.
+  const notes: string[] = [];
+  if (refused.length > 0)
+    notes.push(`${refused.length} skipped — oversized, not a plain file, or a symlink escape: ${refused.join(", ")}`);
+  if (skippedByBudget > 0 && budgetExhausted) notes.push(`${skippedByBudget} skipped: size budget`);
+  const note = notes.length > 0 ? `\n(${notes.join("; ")})` : "";
+  return { section: { label: "untracked (new) files", text: blocks.join("\n") + note }, notes: [] };
 }
 
 /** Assign (lens × chunk) pairs under the child cap: chunks shed lenses, correctness first. */
@@ -329,6 +371,15 @@ interface StateFile {
 }
 
 const STATE_PATH = ".pi/review-state.json";
+/** Upper bound on a readable review-state.json. Ours are a few tens of KB
+ * (findings carry detail); anything larger is not state we wrote. */
+const STATE_MAX_BYTES = 1_000_000;
+
+/** Byte bound for reading a whole changed file to attach a hunk-centered
+ * window. Deliberately far above the attachChars cap: the window logic needs
+ * the full file, and only pathological sources (>4MB) are refused (and then
+ * named in the skipped note) — the read itself is bounded and cheap. */
+const ATTACH_MAX_BYTES = 4_000_000;
 
 /** Track spawned children so a session shutdown can kill the whole pipeline —
  * an orphaned child burns tokens with nobody consuming the result. */
@@ -387,6 +438,14 @@ export async function withStallRetry(
   }
 }
 
+/** Markdown block for pipeline notes — wiring disclosures (e.g. a check
+ * command skipped in a foreign directory) and per-finder errors. Rendered on
+ * every path that produces a report, including the early returns: a clean
+ * foreign tree is exactly where the skip note must still surface. */
+function pipelineNotesBlock(notes: string[]): string {
+  return notes.length ? `\n\n**Pipeline notes**:\n${notes.map((e) => `- ${e}`).join("\n")}` : "";
+}
+
 function renderPrior(findings: Finding[], budget: number): string {
   if (budget <= 0 || findings.length === 0) return "";
   const line = (f: Finding) => `- [${f.severity}] ${f.file}${f.line ? `:${f.line}` : ""} — ${f.title}`;
@@ -414,6 +473,39 @@ function targetLabel(target: TargetSpec): string {
   }
 }
 
+/** True when none of the paths is an existing symlink. Review artifacts land
+ * under `<reviewed dir>/.pi/…`, and git preserves symlinks — a reviewed repo
+ * could commit `.pi -> ~/.ssh` and redirect writes outside the repo. Missing
+ * paths pass (mkdir creates them); the check closes the committed-symlink
+ * hole, not a local attacker racing the write. */
+export async function symlinkFree(...paths: string[]): Promise<boolean> {
+  for (const p of paths) {
+    try {
+      if ((await lstat(p)).isSymbolicLink()) return false;
+    } catch {
+      // Missing (or inaccessible) here just means mkdir will create it.
+    }
+  }
+  return true;
+}
+
+/** True when every path is absent or a real directory — stricter than
+ * symlinkFree for report destinations: a reviewed repo can commit `.pi` as a
+ * regular file too, and recursive mkdir would then fail (ENOTDIR) or worse.
+ * Symlinks fail isDirectory(), so they are refused here as well. */
+export async function dirsOrMissing(...paths: string[]): Promise<boolean> {
+  for (const p of paths) {
+    try {
+      if (!(await lstat(p)).isDirectory()) return false;
+    } catch (err) {
+      // Anything other than "does not exist" (e.g. EACCES on a parent) means
+      // we cannot vouch for the destination — refuse rather than write blind.
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") return false;
+    }
+  }
+  return true;
+}
+
 /** Run the full pipeline. Pure orchestration over injected deps. */
 export async function runReview(opts: {
   cwd: string;
@@ -426,10 +518,19 @@ export async function runReview(opts: {
    * out — abort never rides the fail-open path, which would complete a
    * cancelled review instead of stopping it. */
   signal?: AbortSignal;
+  /** Disclosure lines prepended to the report's "Pipeline notes" — wiring
+   * (the command/tool layer) reports deliberate behavior changes here, e.g.
+   * a check command skipped for a foreign review directory. */
+  notes?: string[];
 }): Promise<ReviewResult> {
   const { config, deps, signal } = opts;
   const now = deps.now ?? Date.now;
   const startedAt = now();
+
+  // Pipeline notes start as the caller's wiring disclosures and gain
+  // pipeline-internal ones (e.g. untracked files the read guard refused);
+  // they render on every report path, including the early returns.
+  const pipelineNotes = opts.notes ? [...opts.notes] : [];
 
   // Stage 0a: diff sections.
   let sections: DiffSection[];
@@ -449,19 +550,23 @@ export async function runReview(opts: {
     const resolved = await resolveDiffSections(opts.target, deps);
     if (resolved.error) throw new Error(resolved.error);
     sections = resolved.sections;
+    const extraNotes: string[] = [];
     if (opts.target.kind !== "staged") {
       const untracked = await untrackedSection(repoRoot, deps, config.untrackedMaxBytes);
-      if (untracked) sections.push(untracked);
+      if (untracked.section) sections.push(untracked.section);
+      extraNotes.push(...untracked.notes);
     }
+    if (extraNotes.length > 0) pipelineNotes.push(...extraNotes);
   }
   if (sections.length === 0) {
     const emptyNote =
       opts.target.kind === "default" ? " (nothing ahead of upstream, uncommitted, or untracked)" : " for this target";
     return {
-      report: `# Code review\n\nNo changes to review${emptyNote}.`,
+      report: `# Code review\n\nNo changes to review${emptyNote}.` + pipelineNotesBlock(pipelineNotes),
       findings: [],
       coverage: { errors: [], uncoveredFiles: [], lensCoverage: {} },
       findingCount: 0,
+      notes: [...pipelineNotes],
     };
   }
 
@@ -477,12 +582,16 @@ export async function runReview(opts: {
   if (files.length === 0) {
     const list = skipped.map((s) => `- ${s}`).join("\n");
     return {
-      report: `# Code review\n\nAll changed files are excluded from review (lockfiles, logs, generated, or binary):\n${list}`,
+      report:
+        `# Code review\n\nAll changed files are excluded from review (lockfiles, logs, generated, or binary):\n${list}` +
+        pipelineNotesBlock(pipelineNotes),
       findings: [],
       coverage: { errors: [], uncoveredFiles: [], lensCoverage: {} },
       findingCount: 0,
+      notes: [...pipelineNotes],
     };
   }
+
   // Stage 0c: guidelines + prior findings + optional check output — before
   // chunking, so the per-chunk budget accounts for the context they consume.
   const guidelines = await collectGuidelines(
@@ -494,10 +603,13 @@ export async function runReview(opts: {
   let priorNote = "";
   let carried: Finding[] = [];
   if (config.persist) {
-    const raw = await deps.readFile(path.join(repoRoot, STATE_PATH));
-    if (raw) {
+    // The read is anchored to the repo and bounded for the same reason as the
+    // write below: the reviewed repo controls this path, and a committed
+    // symlink or huge file must not hang or swamp the review.
+    const raw = await readRepoFile(repoRoot, path.join(repoRoot, STATE_PATH), STATE_MAX_BYTES, deps.readFile);
+    if (raw.kind === "ok") {
       try {
-        const state = JSON.parse(raw) as StateFile;
+        const state = JSON.parse(raw.content) as StateFile;
         // Only carry priors for the same target — findings from `/review main`
         // describe a different change set than `/review tree`.
         if (Array.isArray(state.findings) && state.target === label) carried = state.findings;
@@ -553,13 +665,33 @@ export async function runReview(opts: {
     // in comments are 3 bytes counted as 1) and truncate the diff we promised
     // never to shrink. Paths resolve against repoRoot, not cwd: git diff
     // prints repo-root-relative paths, and the session cwd may be a
-    // subdirectory. Files whose windows overflow the per-file cap are named
+    // subdirectory. The read is the same anchored, symlink-refusing one as
+    // guidelines/state — a committed `leak -> ~/.ssh/…` shows up as a normal
+    // file entry with hunks, and must not ride the diff into finder tasks
+    // (byte bound 4x the char cap keeps legit multibyte content eligible).
+    // Files whose windows overflow the per-file cap are named
     // in the skipped note — a finder that knows what it is missing reads it.
+    // Files the guard refuses (symlink escape, not a plain file, over the
+    // byte bound) land in the same skipped note as oversized windows — the
+    // finder must know what it is missing either way. The bound is generous
+    // (ATTACH_MAX_BYTES, not the char cap): window extraction needs the
+    // whole file, and refusing a 300KB source over a 3-line change would
+    // drop exactly the hunk context the attachment exists to provide.
     const read: Array<{ path: string; label: string; size: number; content: string }> = [];
     const oversized: string[] = [];
+    const refusedFiles: string[] = [];
     for (const f of chunks[i].files) {
-      const content = await deps.readFile(path.join(repoRoot, f.path));
-      if (content === undefined) continue;
+      const r = await readRepoFile(repoRoot, path.join(repoRoot, f.path), ATTACH_MAX_BYTES, deps.readFile);
+      if (r.kind === "refused") {
+        // Size refusals are ordinary readable files — they belong with the
+        // budget skips ("read them if needed") so the finder still knows it
+        // can open them. Escape/non-plain-file refusals go to the no-invitation
+        // list: advertising those paths as openable is exactly backwards.
+        (r.reason === "too-large" ? oversized : refusedFiles).push(f.path);
+        continue;
+      }
+      if (r.kind === "missing") continue;
+      const content = r.content;
       const piece = sliceAttachment(content, hunkRanges(f.text));
       if (piece) {
         read.push({
@@ -572,7 +704,7 @@ export async function runReview(opts: {
         oversized.push(f.path);
       }
     }
-    if (read.length === 0 && oversized.length === 0) continue;
+    if (read.length === 0 && oversized.length === 0 && refusedFiles.length === 0) continue;
     // Charge the rendered section, not just file bodies — per-file headers and
     // the preamble are real bytes, and dozens of files can overflow any fixed
     // margin. Compose, measure, drop the largest attachment, repeat: the
@@ -586,7 +718,7 @@ export async function runReview(opts: {
         budget,
       );
       const kept = candidates.filter((f) => sel.attached.includes(f.path));
-      section = renderAttachments(kept, [...sel.skipped, ...oversized]);
+      section = renderAttachments(kept, [...sel.skipped, ...oversized], refusedFiles);
       const taskBytes = Buffer.byteLength(
         finderTask({
           lens: FINDER_LENSES[0],
@@ -647,7 +779,9 @@ export async function runReview(opts: {
           agent,
           task,
           resolveChildModel(config.model ?? agent.model, deps.sessionModel),
-          { timeoutMs: config.timeoutMs, idleTimeoutMs: config.idleTimeoutMs, signal },
+          // Finders explore the reviewed repo: children run at its root (not
+          // the session cwd) so diff paths — repo-root-relative — resolve.
+          { timeoutMs: config.timeoutMs, idleTimeoutMs: config.idleTimeoutMs, signal, cwd: repoRoot },
           deps.spawnFn,
         ),
       ).then(
@@ -713,7 +847,7 @@ export async function runReview(opts: {
           vAgent,
           vTask,
           resolveChildModel(config.verifyModel ?? config.model ?? vAgent.model, deps.sessionModel),
-          { timeoutMs: config.timeoutMs, idleTimeoutMs: config.idleTimeoutMs, signal },
+          { timeoutMs: config.timeoutMs, idleTimeoutMs: config.idleTimeoutMs, signal, cwd: repoRoot },
           deps.spawnFn,
         ),
       );
@@ -751,19 +885,25 @@ export async function runReview(opts: {
     durationMs: now() - startedAt,
     priorNote,
   });
-  const pipelineNotes = errors.length ? `\n\n**Pipeline notes**:\n${errors.map((e) => `- ${e}`).join("\n")}` : "";
+  const pipelineErrors = [...pipelineNotes, ...errors];
+  const notesBlock = pipelineNotesBlock(pipelineErrors);
   if (config.persist) {
     try {
-      await deps.writeFile(
-        path.join(repoRoot, STATE_PATH),
-        JSON.stringify({ findings: capped, target: label, savedAt: Math.floor(now() / 1000) } satisfies StateFile),
-      );
+      // Never persist through a symlinked path — git preserves symlinks, so a
+      // reviewed repo could commit `.pi -> ~/.ssh` or a symlinked
+      // review-state.json itself and redirect the write outside the repo.
+      if (await symlinkFree(path.join(repoRoot, ".pi"), path.join(repoRoot, STATE_PATH))) {
+        await deps.writeFile(
+          path.join(repoRoot, STATE_PATH),
+          JSON.stringify({ findings: capped, target: label, savedAt: Math.floor(now() / 1000) } satisfies StateFile),
+        );
+      }
     } catch {
       // Persistence is best-effort; the review stands without it.
     }
   }
   return {
-    report: report + pipelineNotes,
+    report: report + notesBlock,
     findings: capped,
     coverage: {
       errors,
@@ -772,6 +912,7 @@ export async function runReview(opts: {
     },
     usage,
     findingCount: capped.length,
+    notes: pipelineErrors,
   };
 }
 

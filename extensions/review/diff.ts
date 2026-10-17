@@ -246,10 +246,15 @@ export function selectAttachments(
 
 /** Render the attachment section: current contents of the changed files as
  * reference material for the diff — the finder consults these before paying
- * for a tool round trip. */
+ * for a tool round trip. `skipped` are readable files whose windows overflow
+ * the budget (the finder may read them itself); `refused` are files the read
+ * guard stopped — deliberately rendered WITHOUT a "read them" invitation,
+ * since refusing was the point (a symlink escape must not be advertised as a
+ * todo for the child). */
 export function renderAttachments(
   files: Array<{ path: string; label?: string; content: string }>,
   skipped: string[],
+  refused: string[] = [],
 ): string {
   const parts: string[] = [];
   if (files.length > 0) {
@@ -258,6 +263,11 @@ export function renderAttachments(
     );
     for (const f of files)
       parts.push(`### ${f.path}${f.label && f.label !== "whole file" ? ` (${f.label})` : ""}\n${f.content}`);
+  }
+  if (refused.length > 0) {
+    parts.push(
+      `Files not attached — unreadable (oversized, not a plain file, or a symlink escape): ${refused.join(", ")}`,
+    );
   }
   if (skipped.length > 0) {
     parts.push(`Files not attached (over budget — read them if needed): ${skipped.join(", ")}`);

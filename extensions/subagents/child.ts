@@ -100,8 +100,17 @@ export interface ChildLike {
   kill(signal?: string): void;
 }
 
+/** Options accepted by a spawn: the piped stdio config (stdin is never
+ * wired — tasks ride in argv) and an optional working directory, so a child
+ * can run somewhere other than the parent's cwd (e.g. a review of another
+ * repository whose finders must explore the reviewed tree). */
+export interface SpawnOptions {
+  stdio: ["ignore", "pipe", "pipe"];
+  cwd?: string;
+}
+
 /** Function type for spawning subagent child processes. */
-export type SpawnFn = (command: string, args: string[], options: { stdio: ["ignore", "pipe", "pipe"] }) => ChildLike;
+export type SpawnFn = (command: string, args: string[], options: SpawnOptions) => ChildLike;
 
 /** Default process spawner using Node's child_process.spawn. */
 export const defaultSpawn: SpawnFn = (command, args, options) =>
@@ -131,6 +140,10 @@ export interface RunChildOptions {
    * background: true or PI_SUBAGENT_BG_AFTER_MS opts into adoption. */
   adoptAfterMs?: number;
   onAdopted?: OnAdopted;
+  /** Working directory for the child process (default: this process's cwd).
+   * Reviews of another directory run their finders in the reviewed repo so
+   * relative paths in the diff resolve there. */
+  cwd?: string;
 }
 
 /** What runChild hands to onAdopted when the soft threshold fires: the child's eventual outcome, plus a kill switch. Returns the task id embedded in the adoption marker. */
@@ -389,9 +402,7 @@ export function runChild(
     const child = spawnFn(
       resolveChildCommand(process.env, process.execPath),
       buildChildArgs(agent, task, model, options.thinking),
-      {
-        stdio: ["ignore", "pipe", "pipe"],
-      },
+      { stdio: ["ignore", "pipe", "pipe"], ...(options.cwd ? { cwd: options.cwd } : {}) },
     );
     let stdoutBuf = "";
     let stderrBuf = "";

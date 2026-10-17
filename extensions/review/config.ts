@@ -1,7 +1,12 @@
 /** Review configuration and invocation parsing: PI_REVIEW_* knobs with
- * fail-open defaults, /review target parsing, and repo guideline collection
- * (REVIEW.md plus the closest AGENTS.md "Review guidelines" section). */
+ * fail-open defaults, /review target parsing (including the review-directory
+ * argument), and repo guideline collection (REVIEW.md plus the closest
+ * AGENTS.md "Review guidelines" section). Pure helpers throughout — paths
+ * expand ~ and resolve against the session cwd; existence is checked by the
+ * caller. */
 
+import { lstat, realpath } from "node:fs/promises";
+import { homedir } from "node:os";
 import path from "node:path";
 
 // ---------------------------------------------------------------------------
@@ -113,6 +118,9 @@ export type TargetSpec =
 
 export interface ParsedArgs {
   target: TargetSpec;
+  /** Directory of the repo to review (--cwd <dir> or a path-shaped token).
+   * Unresolved — the caller expands ~ and resolves against its own cwd. */
+  cwd?: string;
   /** Child model overrides for this invocation (--model / --verify-model). */
   model?: string;
   verifyModel?: string;
@@ -135,31 +143,52 @@ export function resolveInvocation(
   };
 }
 
-/**
- * Parse `/review [target] [--model <m>] [--verify-model <m>]` tokens,
+/** A token that names a directory, not a git ref: absolute, `~`/`~/…`, or
+ * explicitly relative (./ ../ . ..). Bare names stay refs — a branch like
+ * feature/x must not be mistaken for a path, and a missing ref fails loudly
+ * in git, which is the right error for `/review nonexistent-ref`. `~user`
+ * forms are excluded deliberately: the resolver only expands the current
+ * user's home, so recognizing them would produce confusing paths like
+ * `<cwd>/~root` instead of a loud git error. */
+const isPathToken = (token: string) =>
+  ["~", ".", ".."].includes(token) || /^(~\/|\.\.?\/)/.test(token) || path.isAbsolute(token);
 
- * working; a `a..b`/`a...b` range; `--model=<m>`/`--model <m>` and
- * `--verify-model` overrides (flag form because refs and model names both
- * contain slashes — `origin/main` is a ref, `anthropic/claude-...` a model);
- * anything else is a ref (git validates it later and fails loudly).
+/**
+ * Parse `/review [target] [--cwd <dir>] [--model <m>] [--verify-model <m>]`
+ * tokens: a first bare word picks the target — `tree`/`local`/`uncommitted`/
+ * `working` mean uncommitted; `staged`/`cached` mean staged; a `a..b`/`a...b`
+ * range; anything else is a ref (git validates it later and fails loudly).
+ * A path-shaped token (`~/Code/foo`, `../bar`, `/abs`) or `--cwd <dir>` names
+ * the directory to review instead of the session cwd; `--model=<m>`/`--model
+ * <m>` and `--verify-model` override child models (flag form because refs and
+ * model names both contain slashes — `origin/main` is a ref, `anthropic/
+ * claude-...` a model).
  */
 export function parseReviewArgs(args: string): ParsedArgs {
   const tokens = args.split(/\s+/).filter(Boolean);
   let target: TargetSpec | undefined;
+  let cwd: string | undefined;
   let model: string | undefined;
   let verifyModel: string | undefined;
   let error: string | undefined;
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i];
-    const flag = /^(--model|--verify-model)(?:=(.*))?$/.exec(token);
+    const flag = /^(--cwd|--model|--verify-model)(?:=(.*))?$/.exec(token);
     if (flag) {
       const value = flag[2] ?? tokens[++i];
       if (!value || value.startsWith("--")) {
-        error = `${flag[1]} requires a model name (e.g. ${flag[1]} glm-5.3)`;
+        const usage =
+          flag[1] === "--cwd" ? "a directory path (e.g. --cwd ~/Code/foo)" : "a model name (e.g. --model glm-5.3)";
+        error = `${flag[1]} requires ${usage}`;
         break;
       }
-      if (flag[1] === "--model") model = value;
+      if (flag[1] === "--cwd") cwd ??= value;
+      else if (flag[1] === "--model") model = value;
       else verifyModel = value;
+      continue;
+    }
+    if (isPathToken(token)) {
+      cwd ??= token;
       continue;
     }
     if (UNCOMMITTED_WORDS.has(token)) {
@@ -177,8 +206,31 @@ export function parseReviewArgs(args: string): ParsedArgs {
     }
     target ??= { kind: "ref", ref: token };
   }
-  return { target: target ?? { kind: "default" }, model, verifyModel, ...(error ? { error } : {}) };
+  return { target: target ?? { kind: "default" }, cwd, model, verifyModel, ...(error ? { error } : {}) };
 }
+
+/** Resolve a review-directory argument to an absolute path: `~`/`~/...`
+ * expands to the home directory, everything else resolves against the
+ * session cwd (absolute paths pass through unchanged). Pure — whether the
+ * directory exists is the caller's fail-fast check, not the parser's. */
+export function resolveReviewCwd(sessionCwd: string, requested?: string): string {
+  const raw = requested?.trim();
+  if (!raw) return sessionCwd;
+  if (raw === "~") return homedir();
+  if (raw.startsWith("~/")) return path.join(homedir(), raw.slice(2));
+  return path.resolve(sessionCwd, raw);
+}
+
+/** Opt-in for running PI_REVIEW_CHECK_CMD inside a reviewed directory that
+ * is not the session cwd. The command is repo-owned (e.g. `npm run check`),
+ * so running it in a foreign checkout means executing that repo's scripts —
+ * off by default; `PI_REVIEW_CHECK_FOREIGN=1|true|on` allows it. Pure. */
+export const foreignCheckAllowed = (env: NodeJS.ProcessEnv): boolean =>
+  ["1", "true", "on"].includes(
+    String(env.PI_REVIEW_CHECK_FOREIGN ?? "")
+      .trim()
+      .toLowerCase(),
+  );
 
 // ---------------------------------------------------------------------------
 // Repo guidelines: REVIEW.md + AGENTS.md "Review guidelines" (closest wins)
@@ -203,6 +255,61 @@ export interface GuidelinesDeps {
   readFile: (p: string) => Promise<string | undefined>;
 }
 
+/** Outcome of a guarded repo-file read. "missing" defers to the injected
+ * reader's story (nothing there); "refused" means a guard stopped the read,
+ * with the reason — callers disclose refused files instead of silently
+ * behaving as if they were absent (e.g. an oversized nearer AGENTS.md must
+ * not quietly defer to an ancestor's rules), and the reason picks the
+ * wording: a too-large file is still readable by the finder, while a symlink
+ * escape must not be advertised as openable at all. */
+export type RepoFileRead =
+  | { kind: "ok"; content: string }
+  | { kind: "missing" }
+  | { kind: "refused"; reason: "outside-repo" | "not-plain-file" | "too-large" | "guard-error" };
+
+/** Bounded, symlink-refusing read of a repo-controlled file, anchored to the
+ * repo: the path is realpath'd and refused unless it still lands inside the
+ * anchor — git preserves symlinks, so a committed `.pi -> elsewhere` (or a
+ * symlinked directory component) must not redirect the read to private files.
+ * Also refuse anything that is not a plain file (/dev/zero is endless) or
+ * above maxBytes (a huge committed REVIEW.md stalls the review before caps
+ * can trim it). Only a plain miss (ENOENT/ENOTDIR) defers to the reader — it
+ * owns the missing-file story, and tests inject readers for paths not on
+ * disk. Any other stat failure (EACCES, ELOOP, fd exhaustion) is refused:
+ * reading past a failed guard is exactly what this function exists to
+ * prevent. */
+export async function readRepoFile(
+  anchor: string,
+  p: string,
+  maxBytes: number,
+  read: (p: string) => Promise<string | undefined>,
+): Promise<RepoFileRead> {
+  try {
+    const [realP, realAnchor] = await Promise.all([realpath(p), realpath(anchor)]);
+    if (realP !== realAnchor && !realP.startsWith(realAnchor + path.sep))
+      return { kind: "refused", reason: "outside-repo" };
+    const st = await lstat(realP);
+    if (!st.isFile()) return { kind: "refused", reason: "not-plain-file" };
+    if (st.size > maxBytes) return { kind: "refused", reason: "too-large" };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code !== "ENOENT" && code !== "ENOTDIR") return { kind: "refused", reason: "guard-error" }; // guard failed: refuse
+  }
+  const content = await read(p);
+  return content === undefined ? { kind: "missing" } : { kind: "ok", content };
+}
+
+/** Cap on collected repo guidelines: they ride in every finder/verifier task,
+ * and the repo under review controls their length — without a cap a hostile
+ * (or merely accidental) huge REVIEW.md crowds out the diff it is supposed
+ * to review. Generous: real guidelines are a few hundred words. */
+export const GUIDELINES_MAX_CHARS = 16_000;
+
+/** Byte bound for the on-disk read — UTF-8 can spend up to 4 bytes per
+ * character, so comparing st.size against the character cap would silently
+ * drop any non-ASCII REVIEW.md/AGENTS.md at exactly the budget edge. */
+const GUIDELINES_MAX_BYTES = GUIDELINES_MAX_CHARS * 4;
+
 /**
  * Collect repo review instructions: REVIEW.md from the repo root (whole file),
  * plus the closest AGENTS.md "Review guidelines" section for each changed
@@ -215,8 +322,15 @@ export async function collectGuidelines(
   deps: GuidelinesDeps,
 ): Promise<string> {
   const sections: string[] = [];
-  const reviewMd = await deps.readFile(path.join(repoRoot, "REVIEW.md"));
-  if (reviewMd?.trim()) sections.push(`# REVIEW.md\n${reviewMd.trim()}`);
+  // Reads are bounded and symlink-refusing: a reviewed repo controls these
+  // files, and git preserves symlinks — an unbounded or followed read lets a
+  // hostile REVIEW.md stall the review or pull private files into prompts.
+  // Guard-refused files are named in the output: a refused nearer AGENTS.md
+  // must visibly fall through to an ancestor, not silently substitute it.
+  const refused: string[] = [];
+  const reviewMd = await readRepoFile(repoRoot, path.join(repoRoot, "REVIEW.md"), GUIDELINES_MAX_BYTES, deps.readFile);
+  if (reviewMd.kind === "refused") refused.push("REVIEW.md");
+  if (reviewMd.kind === "ok" && reviewMd.content.trim()) sections.push(`# REVIEW.md\n${reviewMd.content.trim()}`);
   const byText = new Map<string, string>(); // section text -> originating path (first wins)
   for (const file of changedFiles) {
     // Walk from the file's directory up to the root; the first AGENTS.md with
@@ -224,8 +338,9 @@ export async function collectGuidelines(
     let dir = path.posix.dirname(file);
     for (;;) {
       const agentPath = dir === "." ? "AGENTS.md" : `${dir}/AGENTS.md`;
-      const body = await deps.readFile(path.join(repoRoot, agentPath));
-      const section = body ? extractReviewGuidelines(body) : "";
+      const body = await readRepoFile(repoRoot, path.join(repoRoot, agentPath), GUIDELINES_MAX_BYTES, deps.readFile);
+      if (body.kind === "refused") refused.push(agentPath);
+      const section = body.kind === "ok" ? extractReviewGuidelines(body.content) : "";
       if (section) {
         if (!byText.has(section)) byText.set(section, agentPath);
         break;
@@ -238,5 +353,24 @@ export async function collectGuidelines(
   for (const [section, agentPath] of byText) {
     sections.push(`# Review guidelines (${agentPath})\n${section}`);
   }
-  return sections.join("\n\n");
+  // Truncate only the guideline sections; the refusal notice rides outside
+  // the budget — a near-cap REVIEW.md must not truncate away the very
+  // disclosure that says a nearer AGENTS.md was refused. Deduped: one refused
+  // file is reachable from every changed file under it. The name list itself
+  // is capped (paths are repo-controlled) so the notice cannot balloon past
+  // the cap it sits outside of.
+  const joined = sections.join("\n\n");
+  const base =
+    joined.length <= GUIDELINES_MAX_CHARS
+      ? joined
+      : `${joined.slice(0, GUIDELINES_MAX_CHARS)}\n\n(guidelines truncated at ${GUIDELINES_MAX_CHARS} characters)`;
+  const unique = [...new Set(refused)];
+  const shown = unique.slice(0, 10);
+  const full =
+    shown.length === unique.length ? shown.join(", ") : `${shown.join(", ")}, and ${unique.length - shown.length} more`;
+  // Names are repo-controlled paths; slice the rendered list too so the
+  // whole notice stays a small fixed margin beyond the cap.
+  const names = full.length > 400 ? `${full.slice(0, 400)}…` : full;
+  if (unique.length === 0) return base;
+  return `${base}\n\n(guideline file(s) skipped — oversized, not a plain file, or a symlink escape: ${names})`;
 }

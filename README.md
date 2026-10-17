@@ -143,11 +143,12 @@ Every child run is protected by an idle watchdog (`PI_SUBAGENT_IDLE_TIMEOUT_MS`,
 
 ### Usage and Options
 
-- Command: `/review [target] [--model <m>] [--verify-model <m>]`
+- Command: `/review [target] [--cwd <dir>] [--model <m>] [--verify-model <m>]`
 - Target defaults to unpushed commits and uncommitted/untracked changes; can target `staged`, `tree`, a branch name, or a revision range.
+- Reviewing another project: `--cwd <dir>` (or a path-shaped target like `~/Code/foo`) reviews that directory instead of the session cwd — finder and verifier agents run inside the reviewed repo, and the report and priors land in its `.pi/`. The agent-facing `review` tool takes the same directory as its `cwd` parameter. Repo-controlled inputs (guidelines, priors, untracked files, attachments) are read through anchored, size-bounded, symlink-refusing guards; the check command is the explicit opt-in boundary. Residual risk: the review children read files by absolute path and their tasks quote repo text (the diff, `REVIEW.md`, `AGENTS.md`), so reviewing a foreign repo means trusting it not to prompt-inject — the same trust as opening it in an editor, not a sandbox.
 - Default finder model is `opencode-go/deepseek-v4.1-flash:off`.
 - Tool integration: Agents can execute the pipeline themselves via the `review` tool before committing changes.
-- Pre-commit check integration: `PI_REVIEW_CHECK_CMD` (e.g. `npm run check`) runs a check command and feeds its output into the verification stage.
+- Pre-commit check integration: `PI_REVIEW_CHECK_CMD` (e.g. `npm run check`) runs a check command and feeds its output into the verification stage. When reviewing a directory other than the session cwd the command is skipped unless `PI_REVIEW_CHECK_FOREIGN=1` — a foreign repo's scripts are untrusted.
 
 ### Evaluating the Reviewer
 

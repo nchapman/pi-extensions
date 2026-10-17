@@ -1,5 +1,5 @@
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import type { EventEmitter } from "node:events";
 import { EventEmitter as EE } from "node:events";
@@ -9,10 +9,12 @@ import {
   chunkDiffFiles,
   collectGuidelines,
   extractReviewGuidelines,
+  GUIDELINES_MAX_CHARS,
   type Finding,
   finderAgent,
   finderTask,
   fitTask,
+  foreignCheckAllowed,
   hunkRanges,
   isExcludedPath,
   mergeFindings,
@@ -22,9 +24,11 @@ import {
   registerReview,
   renderAttachments,
   resolveInvocation,
+  resolveReviewCwd,
   selectAttachments,
   sliceAttachment,
   summarizeForTool,
+  symlinkFree,
   parseReviewConfig,
   parseVerdicts,
   planFinderRuns,
@@ -174,6 +178,17 @@ const emptyDeps = (over: Record<string, unknown> = {}) => ({
   now: () => 1_000,
   ...over,
 });
+
+/** Production-shaped reader for tests with real files on disk: returns what
+ * exists, undefined otherwise — the boundary fake must not invent content for
+ * paths the guard refused (or the refusal would be unobservable). */
+const realReadFile = async (p: string): Promise<string | undefined> => {
+  try {
+    return readFileSync(p, "utf8");
+  } catch {
+    return undefined;
+  }
+};
 
 describe("attachments", () => {
   it("selects whole files smallest-first under the budget, naming the rest", () => {
@@ -525,6 +540,7 @@ describe("parseReviewConfig", () => {
       ],
       coverage: { errors: [], uncoveredFiles: [], lensCoverage: {} },
       findingCount: 2,
+      notes: [],
     };
     const text = summarizeForTool(full, "/repo/.pi/review-report.md");
     expect(text).toContain("2 finding(s): 1 critical, 1 suggestion.");
@@ -650,6 +666,35 @@ describe("parseReviewArgs", () => {
     expect(parseReviewArgs("--model --verify-model x")).toMatchObject({ error: expect.stringContaining("--model") });
   });
 
+  it("parses a review directory from --cwd or path-shaped tokens, never as a ref", () => {
+    expect(parseReviewArgs("--cwd ~/Code/foo")).toMatchObject({ cwd: "~/Code/foo" });
+    expect(parseReviewArgs("--cwd=../bar main")).toMatchObject({
+      cwd: "../bar",
+      target: { kind: "ref", ref: "main" },
+    });
+    expect(parseReviewArgs("~/Code/foo tree")).toMatchObject({ cwd: "~/Code/foo", target: { kind: "uncommitted" } });
+    expect(parseReviewArgs("/abs/repo")).toMatchObject({ cwd: "/abs/repo" });
+    expect(parseReviewArgs("./sibling").cwd).toBe("./sibling");
+    expect(parseReviewArgs("..").cwd).toBe("..");
+    // first directory wins, mirroring first-target-wins
+    expect(parseReviewArgs("~/Code/foo ~/Code/other")).toMatchObject({ cwd: "~/Code/foo" });
+    // bare and dot-free names stay refs — a branch like feature/x must not be
+    // mistaken for a path, and a missing ref fails loudly in git instead.
+    // ~user forms stay refs too: only ~/ resolves, so ~root would otherwise
+    // resolve to a bogus <cwd>/~root instead of failing loudly
+    expect(parseReviewArgs("main").cwd).toBeUndefined();
+    expect(parseReviewArgs("feature/x")).toMatchObject({ target: { kind: "ref", ref: "feature/x" } });
+    expect(parseReviewArgs("feature/x").cwd).toBeUndefined();
+    expect(parseReviewArgs("~root/proj")).toMatchObject({ target: { kind: "ref", ref: "~root/proj" } });
+  });
+
+  it("rejects --cwd without a value", () => {
+    expect(parseReviewArgs("--cwd")).toMatchObject({
+      error: expect.stringContaining("--cwd requires a directory path"),
+    });
+    expect(parseReviewArgs("--cwd --model x")).toMatchObject({ error: expect.stringContaining("--cwd requires") });
+  });
+
   it("resolves invocation models flag > env knob > inherit", () => {
     const envCfg = { model: "env-model" };
     expect(resolveInvocation(parseReviewArgs(""), envCfg)).toEqual({ model: "env-model", verifyModel: undefined });
@@ -661,6 +706,42 @@ describe("parseReviewArgs", () => {
       model: "a",
       verifyModel: "b",
     });
+  });
+});
+
+describe("resolveReviewCwd", () => {
+  it("defaults to the session cwd and expands ~ and relative paths", () => {
+    expect(resolveReviewCwd("/sess")).toBe("/sess");
+    expect(resolveReviewCwd("/sess", "")).toBe("/sess");
+    expect(resolveReviewCwd("/sess", "   ")).toBe("/sess");
+    expect(resolveReviewCwd("/sess", "~")).toBe(homedir());
+    expect(resolveReviewCwd("/sess", "~/Code/foo")).toBe(path.join(homedir(), "Code", "foo"));
+    expect(resolveReviewCwd("/sess", "/abs/repo")).toBe("/abs/repo");
+    expect(resolveReviewCwd("/sess", "../bar")).toBe(path.resolve("/sess", "../bar"));
+    expect(resolveReviewCwd("/sess", "sub/repo")).toBe(path.resolve("/sess", "sub/repo"));
+  });
+});
+
+describe("foreign check gating", () => {
+  it("defaults off and accepts only 1/true/on", () => {
+    expect(foreignCheckAllowed({})).toBe(false);
+    expect(foreignCheckAllowed({ PI_REVIEW_CHECK_FOREIGN: "0" })).toBe(false);
+    expect(foreignCheckAllowed({ PI_REVIEW_CHECK_FOREIGN: "yes" })).toBe(false);
+    expect(foreignCheckAllowed({ PI_REVIEW_CHECK_FOREIGN: "1" })).toBe(true);
+    expect(foreignCheckAllowed({ PI_REVIEW_CHECK_FOREIGN: " TRUE " })).toBe(true);
+    expect(foreignCheckAllowed({ PI_REVIEW_CHECK_FOREIGN: "on" })).toBe(true);
+  });
+});
+
+describe("symlinkFree", () => {
+  it("passes real and missing paths, rejects symlinked components", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "review-symlink-"));
+    mkdirSync(path.join(root, "pi-real"), { recursive: true });
+    symlinkSync(root, path.join(root, "pi-link"));
+    expect(await symlinkFree(path.join(root, "pi-real"))).toBe(true);
+    expect(await symlinkFree(path.join(root, "never-created"))).toBe(true);
+    expect(await symlinkFree(path.join(root, "pi-link"))).toBe(false);
+    expect(await symlinkFree(path.join(root, "pi-real"), path.join(root, "pi-link"))).toBe(false);
   });
 });
 
@@ -782,6 +863,123 @@ describe("guidelines", () => {
     expect(out).toContain("pkg rule"); // closest AGENTS.md wins for pkg/deep/a.ts
     expect(out).toContain("root rule"); // from root for other.ts and the deduped deep copy
     expect(out.match(/root rule/g)?.length).toBe(1); // identical sections deduplicated
+  });
+
+  it("caps repo-controlled guidelines so they cannot swamp the diff", async () => {
+    // A reviewed repo controls guideline length — without a cap a hostile
+    // REVIEW.md rides unbounded inside every finder task.
+    const deps = { readFile: async (p: string) => (p === "/repo/REVIEW.md" ? "x".repeat(50_000) : undefined) };
+    const out = await collectGuidelines("/repo", [], deps);
+    expect(out.length).toBeLessThanOrEqual(GUIDELINES_MAX_CHARS + 100);
+    expect(out).toContain("guidelines truncated at");
+  });
+
+  it("skips guideline files that are oversized on disk, before any read", async () => {
+    // The read itself must be bounded: stat first, skip what is too big to be
+    // real guidelines (git can commit a huge REVIEW.md to stall the review).
+    const root = mkdtempSync(path.join(tmpdir(), "review-guidelines-"));
+    writeFileSync(path.join(root, "REVIEW.md"), "x".repeat(GUIDELINES_MAX_CHARS * 4 + 1));
+    const calls: string[] = [];
+    const out = await collectGuidelines(root, [], {
+      readFile: async (p) => {
+        calls.push(p);
+        try {
+          return readFileSync(p, "utf8");
+        } catch {
+          return undefined;
+        }
+      },
+    });
+    expect(out).not.toContain("should not be consulted"); // nothing usable from a refused REVIEW.md
+    expect(out).toContain("REVIEW.md"); // …and the refusal is named, not silent
+    expect(calls).toHaveLength(0); // skipped before any read
+  });
+
+  it("does not follow a committed directory symlink out of the repo", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "review-guides-link-"));
+    const elsewhere = mkdtempSync(path.join(tmpdir(), "review-guides-else-"));
+    writeFileSync(path.join(elsewhere, "AGENTS.md"), "## Review guidelines\n- smuggled rule");
+    symlinkSync(elsewhere, path.join(root, "pkg")); // committed pkg -> elsewhere
+    const calls: string[] = [];
+    const out = await collectGuidelines(root, ["pkg/a.ts"], {
+      readFile: async (p) => {
+        calls.push(p);
+        try {
+          return readFileSync(p, "utf8");
+        } catch {
+          return undefined;
+        }
+      },
+    });
+    expect(out).not.toContain("smuggled rule"); // the redirected AGENTS.md is never read
+    expect(calls).not.toContain(path.join(root, "pkg", "AGENTS.md"));
+    expect(out).toContain("pkg/AGENTS.md"); // the refusal itself is disclosed
+  });
+
+  it("names guard-refused guideline files instead of silently substituting ancestors", async () => {
+    // An oversized nearer AGENTS.md must visibly fall through to the
+    // ancestor's section — not quietly adopt it as if the nearer one were absent.
+    const root = mkdtempSync(path.join(tmpdir(), "review-guides-refused-"));
+    mkdirSync(path.join(root, "pkg"), { recursive: true });
+    // 32k CJK chars ≈ 96KB: over the 4x-char-cap byte bound, refused on disk.
+    writeFileSync(path.join(root, "pkg", "AGENTS.md"), "\u898f".repeat(GUIDELINES_MAX_CHARS * 2 + 1));
+    writeFileSync(path.join(root, "AGENTS.md"), "## Review guidelines\n- fallback rule");
+    const out = await collectGuidelines(root, ["pkg/a.ts"], { readFile: realReadFile });
+    expect(out).toContain("(AGENTS.md)"); // ancestor's section still applies
+    expect(out).toContain("- fallback rule");
+    expect(out).toContain("pkg/AGENTS.md"); // …and the refusal is named
+    expect(out).toContain("symlink escape");
+  });
+
+  it("refuses a directory named AGENTS.md and says so", async () => {
+    // The guard must fail closed on non-plain files (a FIFO or directory is
+    // not readable content), with the refusal disclosed like any other.
+    const root = mkdtempSync(path.join(tmpdir(), "review-guides-dir-"));
+    mkdirSync(path.join(root, "pkg", "AGENTS.md"), { recursive: true });
+    writeFileSync(path.join(root, "AGENTS.md"), "## Review guidelines\n- fallback rule");
+    const out = await collectGuidelines(root, ["pkg/a.ts"], { readFile: realReadFile });
+    expect(out).toContain("- fallback rule"); // ancestor still applies
+    expect(out).toContain("pkg/AGENTS.md"); // the non-plain-file refusal is named
+  });
+
+  it("bounds the refusal notice itself, not just the guideline sections", async () => {
+    // Fifteen distinct refused AGENTS.md dirs: the count is capped at 10 with
+    // short names, and the rendered list is sliced with long ones — either way
+    // repo-controlled paths cannot push the notice past a small fixed margin.
+    const secret = mkdtempSync(path.join(tmpdir(), "review-secret-"));
+    const build = async (nameOf: (i: number) => string) => {
+      const root = mkdtempSync(path.join(tmpdir(), "review-guides-cap-"));
+      const files: string[] = [];
+      for (let i = 0; i < 15; i++) {
+        mkdirSync(path.join(root, nameOf(i)), { recursive: true });
+        symlinkSync(secret, path.join(root, nameOf(i), "AGENTS.md")); // refused: outside the repo
+        files.push(`${nameOf(i)}/a.ts`);
+      }
+      return collectGuidelines(root, files, { readFile: realReadFile });
+    };
+    const shortOut = await build((i) => `d${i}`);
+    expect(shortOut).toContain("and 5 more"); // count cap fires, tail intact
+    expect(shortOut.length).toBeLessThanOrEqual(GUIDELINES_MAX_CHARS + 500);
+    const longOut = await build((i) => `d${i}${"x".repeat(90)}`);
+    expect(longOut.trimEnd().endsWith("…)")).toBe(true); // the name list itself is sliced
+    expect(longOut.length).toBeLessThanOrEqual(GUIDELINES_MAX_CHARS + 500);
+  });
+
+  it("reads non-ASCII guidelines up to the byte budget, then truncates by characters", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "review-guides-cjk-"));
+    // 16k CJK characters are 48k UTF-8 bytes: inside the 4x byte budget, over
+    // the character cap — a byte/char mix-up at the read would skip it entirely.
+    writeFileSync(path.join(root, "REVIEW.md"), "\u898f".repeat(GUIDELINES_MAX_CHARS));
+    const out = await collectGuidelines(root, [], {
+      readFile: async (p) => {
+        try {
+          return readFileSync(p, "utf8");
+        } catch {
+          return undefined;
+        }
+      },
+    });
+    expect(out).toContain("guidelines truncated at");
   });
 });
 
@@ -1200,7 +1398,7 @@ describe("review tool", () => {
   const sandbox = mkdtempSync(path.join(tmpdir(), "review-tool-"));
   type ToolExecute = (
     id: string,
-    params: { target?: string },
+    params: { target?: string; cwd?: string },
     signal?: AbortSignal,
     onUpdate?: unknown,
     ctx?: unknown,
@@ -1268,6 +1466,277 @@ describe("review tool", () => {
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("--model requires a model name");
   });
+
+  /** Registration pinned to a given repo root: same wiring as register(),
+   * but git resolves there — for testing reviews of another directory. */
+  const registerIn = (repoRoot: string, deps: Record<string, unknown> = {}) => {
+    const tools = new Map<string, { execute: ToolExecute }>();
+    const pi = {
+      registerTool: (t: { name: string; execute: ToolExecute }) => tools.set(t.name, t),
+      registerCommand: () => {},
+      on: () => {},
+    } as unknown as Parameters<typeof registerReview>[0];
+    registerReview(pi, {
+      git: async (args: string[]) =>
+        args[0] === "rev-parse" && args[1] === "--show-toplevel"
+          ? { code: 0, stdout: `${repoRoot}\n`, stderr: "" }
+          : args[0] === "diff"
+            ? { code: 0, stdout: SAMPLE_DIFF, stderr: "" }
+            : { code: 0, stdout: "", stderr: "" },
+      readFile: async () => undefined,
+      sessionModel: null,
+      ...deps,
+    });
+    return tools;
+  };
+
+  it("reviews another directory via cwd: children run there and the report lands there", async () => {
+    const other = mkdtempSync(path.join(tmpdir(), "review-tool-other-"));
+    const cwds: Array<string | undefined> = [];
+    const spawn = ((_command: string, _args: string[], options: unknown) => {
+      cwds.push((options as { cwd?: string }).cwd);
+      return childWithMessage("[]");
+    }) as SpawnFn;
+    const tools = registerIn(other, { spawnFn: spawn });
+    const result = (await tools
+      .get("review")!
+      .execute("call_other", { cwd: other, target: "tree" }, undefined, undefined, {
+        cwd: sandbox,
+        model: null,
+      } as never)) as { content: Array<{ type: string; text: string }> };
+    // git root of the reviewed directory — every child explores the reviewed repo
+    expect(cwds.length).toBeGreaterThan(0);
+    expect(new Set(cwds)).toEqual(new Set([other]));
+    // the report is written into the reviewed project, and the summary points there
+    const reportPath = path.join(other, ".pi", "review", "call_other.md");
+    expect(result.content[0].text).toContain(reportPath);
+    expect(existsSync(reportPath)).toBe(true);
+
+    // a path-shaped target names the directory too — the two surfaces must
+    // agree, never silently drop the path and review the session repo. A
+    // blank cwd defers to it as well, since resolveReviewCwd treats "" as unset.
+    const byTarget = (await tools.get("review")!.execute("call_tgt", { target: other }, undefined, undefined, {
+      cwd: sandbox,
+      model: null,
+    } as never)) as { content: Array<{ type: string; text: string }> };
+    expect(new Set(cwds)).toEqual(new Set([other])); // still only the reviewed repo
+    expect(byTarget.content[0].text).toContain(path.join(other, ".pi", "review", "call_tgt.md"));
+
+    const byBlankCwd = (await tools
+      .get("review")!
+      .execute("call_blank", { cwd: "   ", target: other }, undefined, undefined, {
+        cwd: sandbox,
+        model: null,
+      } as never)) as { content: Array<{ type: string; text: string }> };
+    expect(byBlankCwd.content[0].text).toContain(path.join(other, ".pi", "review", "call_blank.md"));
+  });
+
+  it("fails fast on a cwd that is not a directory, before spawning anything", async () => {
+    const { tools, spawn } = register();
+    const result = (await tools
+      .get("review")!
+      .execute("call_x", { cwd: "/nonexistent/review/dir" }, undefined, undefined, {
+        cwd: sandbox,
+        model: null,
+      } as never)) as { isError?: boolean; content: Array<{ text: string }> };
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("no such directory");
+    expect(spawn.tasks).toHaveLength(0); // no children burned on a doomed path
+  });
+
+  it("fails fast on a cwd that names a file", async () => {
+    const { tools, spawn } = register();
+    const filePath = path.join(sandbox, "plain-file.txt");
+    writeFileSync(filePath, "not a directory");
+    const result = (await tools.get("review")!.execute("call_x", { cwd: filePath }, undefined, undefined, {
+      cwd: sandbox,
+      model: null,
+    } as never)) as { isError?: boolean; content: Array<{ text: string }> };
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("not a directory");
+    expect(spawn.tasks).toHaveLength(0);
+  });
+
+  it("skips the check command in a foreign directory unless PI_REVIEW_CHECK_FOREIGN is set", async () => {
+    const other = mkdtempSync(path.join(tmpdir(), "review-tool-check-"));
+    const shellCalls: string[] = [];
+    const tools = registerIn(other, {
+      spawnFn: fakeSpawn(() => "[]"),
+      shell: async (cmd: string) => {
+        shellCalls.push(cmd);
+        return "check output";
+      },
+    });
+    const prevCmd = process.env.PI_REVIEW_CHECK_CMD;
+    const prevForeign = process.env.PI_REVIEW_CHECK_FOREIGN;
+    process.env.PI_REVIEW_CHECK_CMD = "npm run check";
+    delete process.env.PI_REVIEW_CHECK_FOREIGN;
+    try {
+      // default: a foreign repo's scripts are untrusted — the command must not run
+      await tools.get("review")!.execute("call_skip", { cwd: other, target: "tree" }, undefined, undefined, {
+        cwd: sandbox,
+        model: null,
+      } as never);
+      expect(shellCalls).toHaveLength(0);
+      const report = readFileSync(path.join(other, ".pi", "review", "call_skip.md"), "utf8");
+      expect(report).toContain("check command skipped");
+      expect(report).toContain("PI_REVIEW_CHECK_FOREIGN=1");
+      // explicit opt-in: the command runs, no skip note
+      process.env.PI_REVIEW_CHECK_FOREIGN = "1";
+      await tools.get("review")!.execute("call_run", { cwd: other, target: "tree" }, undefined, undefined, {
+        cwd: sandbox,
+        model: null,
+      } as never);
+      expect(shellCalls).toEqual(["npm run check"]);
+      expect(readFileSync(path.join(other, ".pi", "review", "call_run.md"), "utf8")).not.toContain(
+        "check command skipped",
+      );
+    } finally {
+      if (prevCmd === undefined) delete process.env.PI_REVIEW_CHECK_CMD;
+      else process.env.PI_REVIEW_CHECK_CMD = prevCmd;
+      if (prevForeign === undefined) delete process.env.PI_REVIEW_CHECK_FOREIGN;
+      else process.env.PI_REVIEW_CHECK_FOREIGN = prevForeign;
+    }
+  });
+
+  it("treats an alternate spelling of the session directory as not foreign", async () => {
+    // A symlinked alias of the session dir is the same directory on disk —
+    // sameDirectory must see through the spelling (macOS /var vs /private/var
+    // is the real-world case). Built deterministically so the canonical-
+    // identity logic runs on every platform, not just alias-spelled tmpdirs.
+    const alias = path.join(tmpdir(), `review-alias-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    symlinkSync(sandbox, alias);
+    const shellCalls: string[] = [];
+    const tools = registerIn(alias, {
+      spawnFn: fakeSpawn(() => "[]"),
+      shell: async (cmd: string) => {
+        shellCalls.push(cmd);
+        return null;
+      },
+    });
+    const prevCmd = process.env.PI_REVIEW_CHECK_CMD;
+    const prevForeign = process.env.PI_REVIEW_CHECK_FOREIGN;
+    process.env.PI_REVIEW_CHECK_CMD = "npm run check";
+    delete process.env.PI_REVIEW_CHECK_FOREIGN;
+    try {
+      await tools.get("review")!.execute("call_alias", { cwd: alias, target: "tree" }, undefined, undefined, {
+        cwd: sandbox,
+        model: null,
+      } as never);
+      expect(shellCalls).toEqual(["npm run check"]); // same repo: the check runs
+      expect(readFileSync(path.join(alias, ".pi", "review", "call_alias.md"), "utf8")).not.toContain(
+        "check command skipped",
+      );
+    } finally {
+      rmSync(alias, { force: true }); // removes the link, never the target
+      if (prevCmd === undefined) delete process.env.PI_REVIEW_CHECK_CMD;
+      else process.env.PI_REVIEW_CHECK_CMD = prevCmd;
+      if (prevForeign === undefined) delete process.env.PI_REVIEW_CHECK_FOREIGN;
+      else process.env.PI_REVIEW_CHECK_FOREIGN = prevForeign;
+    }
+  });
+
+  it("anchors the report to the owning repo, not the reviewed subdirectory", async () => {
+    const repo = mkdtempSync(path.join(tmpdir(), "review-tool-sub-"));
+    const sub = path.join(repo, "packages", "app");
+    mkdirSync(sub, { recursive: true });
+    const tools = registerIn(repo, { spawnFn: fakeSpawn(() => "[]") });
+    const result = (await tools.get("review")!.execute("call_sub", { cwd: sub, target: "tree" }, undefined, undefined, {
+      cwd: sandbox,
+      model: null,
+    } as never)) as { content: Array<{ text: string }> };
+    // The report and the review-state.json priors share <repo>/.pi — the
+    // summary points there, not at packages/app/.pi.
+    const reportPath = path.join(repo, ".pi", "review", "call_sub.md");
+    expect(result.content[0].text).toContain(reportPath);
+    expect(existsSync(reportPath)).toBe(true);
+  });
+
+  it("refuses to write the report through a symlinked .pi in the reviewed repo", async () => {
+    const hostile = mkdtempSync(path.join(tmpdir(), "review-tool-link-"));
+    symlinkSync(tmpdir(), path.join(hostile, ".pi")); // committed .pi -> elsewhere
+    const spawn = fakeSpawn(() => "[]");
+    const tools = registerIn(hostile, { spawnFn: spawn });
+    const result = (await tools
+      .get("review")!
+      .execute("call_x", { cwd: hostile, target: "tree" }, undefined, undefined, {
+        cwd: sandbox,
+        model: null,
+      } as never)) as { isError?: boolean; content: Array<{ text: string }> };
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("symlink");
+    expect(spawn.tasks).toHaveLength(0); // refused pre-flight, before children spawn
+  });
+
+  it("refuses pre-flight when .pi is committed as a regular file, before spawning anything", async () => {
+    const hostile = mkdtempSync(path.join(tmpdir(), "review-tool-file-pi-"));
+    writeFileSync(path.join(hostile, ".pi"), "not a directory");
+    const spawn = fakeSpawn(() => "[]");
+    const tools = registerIn(hostile, { spawnFn: spawn });
+    const result = (await tools
+      .get("review")!
+      .execute("call_x", { cwd: hostile, target: "tree" }, undefined, undefined, {
+        cwd: sandbox,
+        model: null,
+      } as never)) as { isError?: boolean; content: Array<{ text: string }> };
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("non-directory");
+    expect(spawn.tasks).toHaveLength(0);
+  });
+
+  it("returns the finished review even when the report write fails", async () => {
+    const other = mkdtempSync(path.join(tmpdir(), "review-tool-readonly-"));
+    const tools = registerIn(other, {
+      spawnFn: fakeSpawn(() => "[]"),
+      writeFile: async () => {
+        throw new Error("EACCES: read-only file system");
+      },
+    });
+    const result = (await tools
+      .get("review")!
+      .execute("call_ro", { cwd: other, target: "tree" }, undefined, undefined, {
+        cwd: sandbox,
+        model: null,
+      } as never)) as { isError?: boolean; content: Array<{ text: string }> };
+    // The write is best-effort: the paid-for review is returned, with a note —
+    // and no dangling "Full report:" pointer to the file that was never written
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("could not be written");
+    expect(result.content[0].text).toContain("read-only");
+    expect(result.content[0].text).not.toContain("Full report:");
+  });
+
+  it("carries pipeline notes inline when the report write fails", async () => {
+    const other = mkdtempSync(path.join(tmpdir(), "review-tool-notes-"));
+    const tools = registerIn(other, {
+      spawnFn: fakeSpawn(() => "[]"),
+      writeFile: async () => {
+        throw new Error("EACCES: read-only file system");
+      },
+    });
+    const prevCmd = process.env.PI_REVIEW_CHECK_CMD;
+    const prevForeign = process.env.PI_REVIEW_CHECK_FOREIGN;
+    process.env.PI_REVIEW_CHECK_CMD = "npm run check";
+    delete process.env.PI_REVIEW_CHECK_FOREIGN; // foreign dir: skip is on by default
+    try {
+      const result = (await tools
+        .get("review")!
+        .execute("call_notes", { cwd: other, target: "tree" }, undefined, undefined, {
+          cwd: sandbox,
+          model: null,
+        } as never)) as { isError?: boolean; content: Array<{ text: string }> };
+      // The report file was the disclosure channel; with the write gone, the
+      // check-command-skip note must ride in the message itself.
+      expect(result.isError).toBeUndefined();
+      expect(result.content[0].text).toContain("check command skipped");
+      expect(result.content[0].text).toContain("could not be written");
+    } finally {
+      if (prevCmd === undefined) delete process.env.PI_REVIEW_CHECK_CMD;
+      else process.env.PI_REVIEW_CHECK_CMD = prevCmd;
+      if (prevForeign === undefined) delete process.env.PI_REVIEW_CHECK_FOREIGN;
+      else process.env.PI_REVIEW_CHECK_FOREIGN = prevForeign;
+    }
+  });
 });
 
 describe("runReview", () => {
@@ -1307,6 +1776,380 @@ describe("runReview", () => {
     expect(spawn.tasks.filter((t) => t.startsWith("# Verify"))).toHaveLength(0);
     expect(result.findings).toHaveLength(1);
     expect(result.report).toContain("Verification skipped (PI_REVIEW_VERIFY=0)");
+  });
+
+  it("runs finder and verifier children with cwd at the reviewed repo root, not the session cwd", async () => {
+    const cwds: Array<string | undefined> = [];
+    const spawn = ((_command: string, args: string[], options: unknown) => {
+      cwds.push((options as { cwd?: string }).cwd);
+      const dash = args.lastIndexOf("--");
+      const task = dash >= 0 ? String(args[dash + 1]) : "";
+      return childWithMessage(
+        task.includes("Correctness and logic")
+          ? '```json\n[{"file":"src/a.ts","line":2,"severity":"important","title":"Bug","detail":"D"}]\n```'
+          : "[]",
+      );
+    }) as SpawnFn;
+    const git = gitFor([
+      { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: "/repo\n", stderr: "" } },
+      {
+        match: (a) => a[0] === "diff" && a[a.length - 1] === "HEAD",
+        result: { code: 0, stdout: SAMPLE_DIFF, stderr: "" },
+      },
+    ]);
+    // Session cwd is a subdirectory; the repo root (where diff paths point)
+    // is what children must explore.
+    await runReview({
+      cwd: "/repo/packages/app",
+      config: CONFIG(),
+      target: { kind: "uncommitted" },
+      deps: emptyDeps({ git, spawnFn: spawn }) as never,
+    });
+    expect(cwds.length).toBeGreaterThanOrEqual(5); // four finders + the verifier
+    expect(new Set(cwds)).toEqual(new Set(["/repo"]));
+  });
+
+  it("prepends wiring notes to the report's pipeline notes, even with no errors", async () => {
+    const git = gitFor([
+      { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: "/repo\n", stderr: "" } },
+      {
+        match: (a) => a[0] === "diff" && a[a.length - 1] === "HEAD",
+        result: { code: 0, stdout: SAMPLE_DIFF, stderr: "" },
+      },
+    ]);
+    const result = await runReview({
+      cwd: "/repo",
+      config: CONFIG(),
+      target: { kind: "uncommitted" },
+      deps: emptyDeps({ git }) as never,
+      notes: ["check command skipped (npm run check): foreign directory"],
+    });
+    expect(result.report).toContain("**Pipeline notes**");
+    expect(result.report).toContain("- check command skipped");
+    expect(result.notes).toEqual(["check command skipped (npm run check): foreign directory"]);
+  });
+
+  it("keeps wiring notes on the empty-review early return too", async () => {
+    // A clean foreign tree is exactly where the check-command-skip disclosure
+    // must still surface — the early return must not drop it.
+    const git = gitFor([
+      { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: "/repo\n", stderr: "" } },
+      { match: (a) => a[0] === "diff", result: { code: 0, stdout: "", stderr: "" } }, // clean tree
+    ]);
+    const result = await runReview({
+      cwd: "/repo",
+      config: CONFIG(),
+      target: { kind: "uncommitted" },
+      deps: emptyDeps({ git }) as never,
+      notes: ["check command skipped (npm run check): foreign directory"],
+    });
+    expect(result.report).toContain("No changes to review");
+    expect(result.report).toContain("**Pipeline notes**");
+    expect(result.report).toContain("check command skipped");
+  });
+
+  it("refuses to persist review state through a symlinked .pi in the reviewed repo", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "review-persist-link-"));
+    symlinkSync(tmpdir(), path.join(root, ".pi")); // committed .pi -> elsewhere
+    const written: string[] = [];
+    const git = gitFor([
+      { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: `${root}\n`, stderr: "" } },
+      {
+        match: (a) => a[0] === "diff" && a[a.length - 1] === "HEAD",
+        result: { code: 0, stdout: SAMPLE_DIFF, stderr: "" },
+      },
+    ]);
+    await runReview({
+      cwd: root,
+      config: CONFIG({ persist: true }),
+      target: { kind: "uncommitted" },
+      deps: emptyDeps({ git, writeFile: async (p: string) => void written.push(p) }) as never,
+    });
+    expect(written).toHaveLength(0); // best-effort skip, not a redirected write
+  });
+
+  it("refuses to persist through a symlinked review-state.json even when .pi is real", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "review-persist-leaf-"));
+    mkdirSync(path.join(root, ".pi"), { recursive: true });
+    // git preserves symlinks: the state file itself can be the committed hook
+    symlinkSync(tmpdir(), path.join(root, ".pi", "review-state.json"));
+    const written: string[] = [];
+    const git = gitFor([
+      { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: `${root}\n`, stderr: "" } },
+      {
+        match: (a) => a[0] === "diff" && a[a.length - 1] === "HEAD",
+        result: { code: 0, stdout: SAMPLE_DIFF, stderr: "" },
+      },
+    ]);
+    await runReview({
+      cwd: root,
+      config: CONFIG({ persist: true }),
+      target: { kind: "uncommitted" },
+      deps: emptyDeps({ git, writeFile: async (p: string) => void written.push(p) }) as never,
+    });
+    expect(written).toHaveLength(0);
+  });
+
+  it("does not read prior state through a symlinked review-state.json", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "review-prior-guard-"));
+    mkdirSync(path.join(root, ".pi"), { recursive: true });
+    symlinkSync(tmpdir(), path.join(root, ".pi", "review-state.json")); // -> /dev/zero, ~/.ssh, ...
+    const reads: string[] = [];
+    const git = gitFor([
+      { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: `${root}\n`, stderr: "" } },
+      {
+        match: (a) => a[0] === "diff" && a[a.length - 1] === "HEAD",
+        result: { code: 0, stdout: SAMPLE_DIFF, stderr: "" },
+      },
+    ]);
+    const result = await runReview({
+      cwd: root,
+      config: CONFIG({ persist: true }),
+      target: { kind: "uncommitted" },
+      deps: emptyDeps({
+        git,
+        readFile: async (p: string) => {
+          reads.push(p);
+          return `{"findings": [], "target": "uncommitted changes"}`;
+        },
+      }) as never,
+    });
+    expect(reads).not.toContain(path.join(root, ".pi", "review-state.json")); // guarded before the read
+    expect(result.report).not.toContain("Continuing from a previous review"); // no priors injected
+  });
+
+  it("does not read prior state through a symlinked .pi directory either", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "review-prior-dirlink-"));
+    const elsewhere = mkdtempSync(path.join(tmpdir(), "review-prior-else-"));
+    mkdirSync(path.join(elsewhere, ".pi"), { recursive: true });
+    writeFileSync(
+      path.join(elsewhere, ".pi", "review-state.json"),
+      JSON.stringify({ target: "uncommitted changes", findings: [] }),
+    );
+    symlinkSync(path.join(elsewhere, ".pi"), path.join(root, ".pi")); // committed .pi -> elsewhere
+    const reads: string[] = [];
+    const git = gitFor([
+      { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: `${root}\n`, stderr: "" } },
+      {
+        match: (a) => a[0] === "diff" && a[a.length - 1] === "HEAD",
+        result: { code: 0, stdout: SAMPLE_DIFF, stderr: "" },
+      },
+    ]);
+    await runReview({
+      cwd: root,
+      config: CONFIG({ persist: true }),
+      target: { kind: "uncommitted" },
+      deps: emptyDeps({
+        git,
+        readFile: async (p: string) => {
+          reads.push(p);
+          return `{"findings": [], "target": "uncommitted changes"}`;
+        },
+      }) as never,
+    });
+    expect(reads).not.toContain(path.join(root, ".pi", "review-state.json"));
+  });
+
+  it("does not read untracked files through committed symlinks", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "review-untracked-link-"));
+    const secret = mkdtempSync(path.join(tmpdir(), "review-secret-"));
+    writeFileSync(path.join(secret, "id_rsa"), "TOPSECRET-SYMLINK-LEAK");
+    symlinkSync(path.join(secret, "id_rsa"), path.join(root, "leak")); // untracked leak -> secret
+    writeFileSync(path.join(root, "ok.txt"), "legitimate new file\n"); // so a chunk exists to carry the note
+    const git = gitFor([
+      { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: `${root}\n`, stderr: "" } },
+      { match: (a) => a[0] === "diff", result: { code: 0, stdout: "", stderr: "" } },
+      { match: (a) => a[0] === "ls-files", result: { code: 0, stdout: "leak\nok.txt\n", stderr: "" } },
+    ]);
+    const spawn = fakeSpawn(() => "[]");
+    const result = await runReview({
+      cwd: root,
+      config: CONFIG(),
+      target: { kind: "uncommitted" },
+      deps: emptyDeps({ git, spawnFn: spawn, readFile: realReadFile }) as never,
+    });
+    // The symlink target must not ride the synthetic diff into finder tasks —
+    // and the refusal is NAMED with its cause (a guard refusal must not
+    // masquerade as a size-budget skip, which would misdirect the finder).
+    expect(result.report).not.toContain("TOPSECRET-SYMLINK-LEAK");
+    const task = spawn.tasks.join("");
+    expect(task).not.toContain("TOPSECRET-SYMLINK-LEAK");
+    expect(task).toContain("legitimate new file"); // the readable file still rides
+    expect(task).toContain("leak"); // the refused one is named…
+    expect(task).toContain("symlink escape"); // …with its true cause…
+    expect(task).not.toContain("size budget"); // …not the budget label
+  });
+
+  it("discloses all-refused untracked files in pipeline notes, not as reviewable content", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "review-untracked-only-link-"));
+    const secret = mkdtempSync(path.join(tmpdir(), "review-secret-"));
+    writeFileSync(path.join(secret, "id_rsa"), "TOPSECRET-SYMLINK-LEAK");
+    symlinkSync(path.join(secret, "id_rsa"), path.join(root, "leak")); // the ONLY untracked entry
+    const git = gitFor([
+      { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: `${root}\n`, stderr: "" } },
+      { match: (a) => a[0] === "diff", result: { code: 0, stdout: "", stderr: "" } },
+      { match: (a) => a[0] === "ls-files", result: { code: 0, stdout: "leak\n", stderr: "" } },
+    ]);
+    const spawn = fakeSpawn(() => "[]");
+    const result = await runReview({
+      cwd: root,
+      config: CONFIG(),
+      target: { kind: "uncommitted" },
+      deps: emptyDeps({ git, spawnFn: spawn, readFile: realReadFile }) as never,
+    });
+    // No diff to review — but the report must say WHY (read-guard refusal),
+    // not the misleading "all files are excluded" list with nothing in it.
+    expect(result.report).toContain("No changes to review");
+    expect(result.report).not.toContain("All changed files are excluded");
+    expect(result.report).toContain("read guard");
+    expect(result.report).toContain("leak");
+    expect(result.report).not.toContain("TOPSECRET-SYMLINK-LEAK");
+    expect(result.notes.join("\n")).toContain("leak");
+  });
+
+  it("still attaches real on-disk changed files, not just guard refusals", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "review-attach-real-"));
+    mkdirSync(path.join(root, "src"), { recursive: true });
+    writeFileSync(path.join(root, "src", "app.ts"), 'const greet = () => "hello window";\n');
+    const diff = [
+      "diff --git a/src/app.ts b/src/app.ts",
+      "index 111..222 100644",
+      "--- a/src/app.ts",
+      "+++ b/src/app.ts",
+      "@@ -1,1 +1,1 @@",
+      "-const old = 1;",
+      "+const greet = 2;",
+    ].join("\n");
+    const git = gitFor([
+      { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: `${root}\n`, stderr: "" } },
+      {
+        match: (a) => a[0] === "diff" && a[a.length - 1] === "HEAD",
+        result: { code: 0, stdout: diff, stderr: "" },
+      },
+    ]);
+    const spawn = fakeSpawn(() => "[]");
+    await runReview({
+      cwd: root,
+      config: CONFIG(),
+      target: { kind: "uncommitted" },
+      deps: emptyDeps({ git, spawnFn: spawn, readFile: realReadFile }) as never,
+    });
+    // The anchored read must not be over-eager: a legit file on disk still
+    // contributes its window to the task.
+    const task = spawn.tasks.join("");
+    expect(task).toContain("### src/app.ts");
+    expect(task).toContain("hello window");
+  });
+
+  it("does not attach a changed file's body through a committed symlink", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "review-attach-link-"));
+    const secret = mkdtempSync(path.join(tmpdir(), "review-secret-"));
+    writeFileSync(path.join(secret, "id_rsa"), "TOPSECRET-SYMLINK-LEAK");
+    symlinkSync(path.join(secret, "id_rsa"), path.join(root, "leak")); // changed leak -> secret
+    const diff = [
+      "diff --git a/leak b/leak",
+      "index 111..222 100644",
+      "--- a/leak",
+      "+++ b/leak",
+      "@@ -1,2 +1,2 @@",
+      " context",
+      "-old",
+      "+new",
+    ].join("\n");
+    const git = gitFor([
+      { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: `${root}\n`, stderr: "" } },
+      {
+        match: (a) => a[0] === "diff" && a[a.length - 1] === "HEAD",
+        result: { code: 0, stdout: diff, stderr: "" },
+      },
+    ]);
+    const spawn = fakeSpawn(() => "[]");
+    const result = await runReview({
+      cwd: root,
+      config: CONFIG(),
+      target: { kind: "uncommitted" },
+      deps: emptyDeps({ git, spawnFn: spawn, readFile: realReadFile }) as never,
+    });
+    expect(spawn.tasks.length).toBeGreaterThan(0); // finders ran with the diff
+    const task = spawn.tasks.join("");
+    expect(task).not.toContain("TOPSECRET-SYMLINK-LEAK");
+    expect(result.report).not.toContain("TOPSECRET-SYMLINK-LEAK");
+    // The refusal carries its own cause — not the "over budget — read them if
+    // needed" invitation, which would point the child straight at the path
+    // the guard exists to keep out of the prompt.
+    expect(task).toContain("Files not attached — unreadable");
+    expect(task).toContain("leak");
+  });
+
+  it("keeps hunk-centered windows for large-but-windowable changed files", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "review-attach-window-"));
+    // ~300KB source with a 1-line change: over nothing that matters, under
+    // ATTACH_MAX_BYTES — the window, not the whole file, must ride the task.
+    const lines = ["const start = 1;", "WINDOW-MARKER-NEARBY", ...Array.from({ length: 40_000 }, (_, i) => `f${i}`)];
+    writeFileSync(path.join(root, "big.ts"), lines.join("\n"));
+    const diff = [
+      "diff --git a/big.ts b/big.ts",
+      "index 111..222 100644",
+      "--- a/big.ts",
+      "+++ b/big.ts",
+      "@@ -1,1 +1,1 @@",
+      "-const start = 0;",
+      "+const start = 1;",
+    ].join("\n");
+    const git = gitFor([
+      { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: `${root}\n`, stderr: "" } },
+      {
+        match: (a) => a[0] === "diff" && a[a.length - 1] === "HEAD",
+        result: { code: 0, stdout: diff, stderr: "" },
+      },
+    ]);
+    const spawn = fakeSpawn(() => "[]");
+    await runReview({
+      cwd: root,
+      config: CONFIG(),
+      target: { kind: "uncommitted" },
+      deps: emptyDeps({ git, spawnFn: spawn, readFile: realReadFile }) as never,
+    });
+    const task = spawn.tasks.join("");
+    expect(task).toContain("### big.ts");
+    expect(task).toContain("WINDOW-MARKER-NEARBY"); // context near the hunk survives
+    expect(task).not.toContain("f39999"); // the far tail is elided, not the whole file attached
+  });
+
+  it("names changed files the attachment guard refuses in the skipped note", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "review-attach-huge-"));
+    // Over the whole-file read bound (ATTACH_MAX_BYTES): refused before any
+    // read, named in the skipped note. Sub-bound files keep their windows.
+    writeFileSync(path.join(root, "big.ts"), "Z".repeat(4_000_001));
+    const diff = [
+      "diff --git a/big.ts b/big.ts",
+      "index 111..222 100644",
+      "--- a/big.ts",
+      "+++ b/big.ts",
+      "@@ -1,2 +1,2 @@",
+      " context",
+      "-old",
+      "+new",
+    ].join("\n");
+    const git = gitFor([
+      { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: `${root}\n`, stderr: "" } },
+      {
+        match: (a) => a[0] === "diff" && a[a.length - 1] === "HEAD",
+        result: { code: 0, stdout: diff, stderr: "" },
+      },
+    ]);
+    const spawn = fakeSpawn(() => "[]");
+    await runReview({
+      cwd: root,
+      config: CONFIG(),
+      target: { kind: "uncommitted" },
+      deps: emptyDeps({ git, spawnFn: spawn, readFile: realReadFile }) as never,
+    });
+    const task = spawn.tasks.join("");
+    expect(task).toContain("Files not attached"); // the refusal is disclosed…
+    expect(task).toContain("big.ts");
+    expect(task).toContain("read them if needed"); // …as a readable file over budget, not "unreadable"
+    expect(task).not.toContain("ZZZZZZ"); // …and the oversized body never rides along
   });
 
   it("bails out on an abort signal instead of failing open", async () => {
