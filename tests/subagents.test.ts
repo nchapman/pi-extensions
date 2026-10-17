@@ -1571,23 +1571,26 @@ describe("registerSubagentsExtension (full wiring)", () => {
     const dir = mkdtempSync(join(tmpdir(), "pb-wire-spare-"));
     const result = (await wired.tools
       .get("bash")!
-      .execute("1", { command: "sleep 2", wait: "background", persist: true }, undefined, undefined, {
+      .execute("1", { command: "sleep 30", wait: "background", persist: true }, undefined, undefined, {
         sessionManager: { getSessionDir: () => dir },
       })) as { details: { id: string } };
     const id = result.details.id;
-
-    wired.handlers.get("session_shutdown")!({ reason: "quit" });
-    const meta = readTaskMeta(dir, id);
-    expect(meta).toBeDefined(); // the disk state is the single owner now
-    expect(isProcessAlive(meta!.pid)).toBe(true); // spared, not killed
-    expect(wired.notify).toHaveBeenCalledWith(
-      "1 persistent background task keeps running across this restart.",
-      "info",
-    );
-    expect(wired.notify).not.toHaveBeenCalledWith(expect.stringContaining("killed 1"), "warning");
-    expect(wired.sendUserMessage).not.toHaveBeenCalled(); // detach means no wake from this runtime
-
-    await killPersistedTask(meta!, dir); // test cleanup: cross-restart kill path
+    let meta: ReturnType<typeof readTaskMeta>;
+    try {
+      wired.handlers.get("session_shutdown")!({ reason: "quit" });
+      meta = readTaskMeta(dir, id);
+      expect(meta).toBeDefined(); // the disk state is the single owner now
+      expect(isProcessAlive(meta!.pid)).toBe(true); // spared, not killed
+      expect(wired.notify).toHaveBeenCalledWith(
+        "1 persistent background task keeps running across this restart.",
+        "info",
+      );
+      expect(wired.notify).not.toHaveBeenCalledWith(expect.stringContaining("killed 1"), "warning");
+      expect(wired.sendUserMessage).not.toHaveBeenCalled(); // detach means no wake from this runtime
+    } finally {
+      meta = meta ?? readTaskMeta(dir, id);
+      if (meta) await killPersistedTask(meta, dir); // test cleanup: cross-restart kill path
+    }
     await vi.waitFor(() => expect(isProcessAlive(meta!.pid)).toBe(false), { timeout: 5_000 });
   }, 15_000);
 

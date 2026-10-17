@@ -43,7 +43,10 @@
  *   extraParams/prepare): every wait mode, wake, log, and task tool behaves
  *   exactly like bash. The shared task registry is read lazily per call so
  *   extension load order never matters; without it, inline still works and
- *   the background modes fail with an explicit error.
+ *   the background modes fail with an explicit error. Persistent background
+ *   tasks are rejected here (the prepare seam gates them): a remote process
+ *   group cannot be killed from a restarted local pi, so durability would be
+ *   a lie.
  * - Win32-OpenSSH has no multiplexing: ssh still runs there, but every call
  *   reconnects. Unix (macOS/Linux) is the intended host.
  */

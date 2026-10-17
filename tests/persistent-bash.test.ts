@@ -10,6 +10,7 @@ import {
   STATUS_RETRY_BUDGET_MS,
   TASK_COMMAND_VAR,
   TASK_STATUS_VAR,
+  type IdentityVerdict,
   type PersistentTaskMeta,
   decideScan,
   isProcessAlive,
@@ -110,6 +111,12 @@ describe("task metadata", () => {
     expect(readTaskMeta(dir, "t-nopid")).toBeUndefined();
     writeFileSync(taskMetaPath(dir, "t-badto"), JSON.stringify({ ...meta(), timeoutSecs: 0 }));
     expect(readTaskMeta(dir, "t-badto")).toBeUndefined();
+    // Disk-derived ids are path components — traversal payloads read as corrupt
+    // rather than steering artifact paths outside the tasks dir.
+    writeFileSync(taskMetaPath(dir, "t-trav"), JSON.stringify({ ...meta(), id: "../../evil" }));
+    expect(readTaskMeta(dir, "t-trav")).toBeUndefined();
+    writeFileSync(taskMetaPath(dir, "t-trav2"), JSON.stringify({ ...meta(), id: "a/b" }));
+    expect(readTaskMeta(dir, "t-trav2")).toBeUndefined();
     writeFileSync(taskMetaPath(dir, "t-okto"), JSON.stringify({ ...meta(), timeoutSecs: 60 }));
     expect(readTaskMeta(dir, "t-okto")?.timeoutSecs).toBe(60);
   });
@@ -171,15 +178,17 @@ describe("matchesStartTime", () => {
 });
 
 describe("verifyTaskIdentity", () => {
-  it("verifies when ps elapsed matches the recorded start", async () => {
-    expect(await verifyTaskIdentity(meta({ startedAt: 0 }), { now: () => 65_000, runPs: async () => 65 })).toBe(true);
+  it("verifies when ps elapsed matches the recorded start; mismatches mean recycled", async () => {
+    expect(await verifyTaskIdentity(meta({ startedAt: 0 }), { now: () => 65_000, runPs: async () => 65 })).toBe(
+      "verified",
+    );
     expect(await verifyTaskIdentity(meta({ startedAt: 0 }), { now: () => 65_000, runPs: async () => 10_000 })).toBe(
-      false,
+      "mismatched",
     );
   });
 
-  it("is unverifiable when ps cannot answer", async () => {
-    expect(await verifyTaskIdentity(meta(), { now: () => 1000, runPs: async () => undefined })).toBe(false);
+  it("is unknown when ps cannot answer — never 'recycled'", async () => {
+    expect(await verifyTaskIdentity(meta(), { now: () => 1000, runPs: async () => undefined })).toBe("unknown");
   });
 });
 
@@ -201,25 +210,27 @@ describe("decideScan", () => {
   });
 
   it("an empty status defers to the alive path", () => {
-    expect(decideScan(meta(), { status: "", alive: true, identityVerified: true }, now)).toEqual({ action: "adopt" });
+    expect(decideScan(meta(), { status: "", alive: true, identity: "verified" }, now)).toEqual({ action: "adopt" });
   });
 
   it("a live pid must be identity-verified before adoption or deadline", () => {
-    expect(decideScan(meta(), { alive: true, identityVerified: false }, now)).toEqual({ action: "finalize-recycled" });
-    expect(decideScan(meta(), { alive: true }, now)).toEqual({ action: "finalize-recycled" });
-    // Identity gates the deadline: an unverified expired task is never killed.
+    expect(decideScan(meta(), { alive: true, identity: "mismatched" }, now)).toEqual({ action: "finalize-recycled" });
+    expect(decideScan(meta(), { alive: true }, now)).toEqual({ action: "unknown-identity" });
+    expect(decideScan(meta(), { alive: true, identity: "unknown" }, now)).toEqual({ action: "unknown-identity" });
+    // Identity gates the deadline: a mismatched expired task is reported, never killed.
     const expired = meta({ timeoutSecs: 1 });
-    expect(decideScan(expired, { alive: true, identityVerified: false }, now)).toEqual({
+    expect(decideScan(expired, { alive: true, identity: "mismatched" }, now)).toEqual({
       action: "finalize-recycled",
     });
+    expect(decideScan(expired, { alive: true, identity: "unknown" }, now)).toEqual({ action: "unknown-identity" });
   });
 
   it("a verified survivor adopts, or hits its deadline when expired", () => {
-    expect(decideScan(meta(), { alive: true, identityVerified: true }, now)).toEqual({ action: "adopt" });
-    expect(decideScan(meta({ timeoutSecs: 1000 }), { alive: true, identityVerified: true }, now)).toEqual({
+    expect(decideScan(meta(), { alive: true, identity: "verified" }, now)).toEqual({ action: "adopt" });
+    expect(decideScan(meta({ timeoutSecs: 1000 }), { alive: true, identity: "verified" }, now)).toEqual({
       action: "adopt",
     });
-    expect(decideScan(meta({ timeoutSecs: 1 }), { alive: true, identityVerified: true }, now)).toEqual({
+    expect(decideScan(meta({ timeoutSecs: 1 }), { alive: true, identity: "verified" }, now)).toEqual({
       action: "kill-expired",
     });
   });
@@ -277,7 +288,7 @@ describe("scanSessionTasks", () => {
     const readMeta = vi.fn((_dir: string, id: string): PersistentTaskMeta | undefined => metas[id]);
     const readStatus = vi.fn((_dir: string, id: string): string | undefined => statuses[id]);
     const isAlive = vi.fn((_pid: number) => true);
-    const verifyIdentity = vi.fn(async (_meta: PersistentTaskMeta) => true);
+    const verifyIdentity = vi.fn(async (_meta: PersistentTaskMeta): Promise<IdentityVerdict> => "verified");
     const sleep = vi.fn(async (ms: number) => {
       t += ms;
     });
@@ -317,11 +328,14 @@ describe("scanSessionTasks", () => {
     expect(outcomes[0]?.decision).toEqual({ action: "finalize-dead" });
   });
 
-  it("a live unverified pid reads as recycled, never adopted", async () => {
+  it("a live pid with a mismatched identity reads as recycled; an unanswered ps leaves it for the next start", async () => {
     const { deps, verifyIdentity, metas } = makeDeps();
     metas["t-a"] = meta({ id: "t-a" });
-    verifyIdentity.mockResolvedValue(false);
+    verifyIdentity.mockResolvedValue("mismatched");
     expect((await scanSessionTasks("/sess", deps))[0]?.decision).toEqual({ action: "finalize-recycled" });
+
+    verifyIdentity.mockResolvedValue("unknown");
+    expect((await scanSessionTasks("/sess", deps))[0]?.decision).toEqual({ action: "unknown-identity" });
   });
 
   it("a verified survivor adopts, or is expired when past its deadline", async () => {
@@ -364,16 +378,25 @@ describe("killPersistedTask", () => {
     writeFileSync(persistentLogPath(dir, m.id), "out");
   };
 
-  it("never signals an unverified pid and cleans up as already gone", async () => {
+  it("never signals an unverified pid: a mismatch cleans up, an unknown verdict leaves everything", async () => {
     const dir = mkdtempSync(join(tmpdir(), "pb-kill-"));
     const m = meta();
     seedArtifacts(dir, m);
     const killGroup = vi.fn(() => true);
-    const killed = await killPersistedTask(m, dir, { verifyIdentity: async () => false, killGroup });
+    const killed = await killPersistedTask(m, dir, { verifyIdentity: async () => "mismatched", killGroup });
     expect(killed).toBe(false);
     expect(killGroup).not.toHaveBeenCalled();
     expect(existsSync(taskMetaPath(dir, m.id))).toBe(false);
     expect(existsSync(persistentLogPath(dir, m.id))).toBe(false); // kill cleanup takes the log too
+
+    // ps could not answer: "not ours to signal" is not "gone" — a ps blip
+    // must not orphan a healthy task by destroying its durable state.
+    seedArtifacts(dir, m);
+    const unknown = await killPersistedTask(m, dir, { verifyIdentity: async () => "unknown", killGroup });
+    expect(unknown).toBe(false);
+    expect(killGroup).not.toHaveBeenCalled();
+    expect(existsSync(taskMetaPath(dir, m.id))).toBe(true);
+    expect(existsSync(persistentLogPath(dir, m.id))).toBe(true);
   });
 
   it("kills the group by pid after verification and removes everything", async () => {
@@ -381,7 +404,7 @@ describe("killPersistedTask", () => {
     const m = meta();
     seedArtifacts(dir, m);
     const killGroup = vi.fn(() => true);
-    const killed = await killPersistedTask(m, dir, { verifyIdentity: async () => true, killGroup });
+    const killed = await killPersistedTask(m, dir, { verifyIdentity: async () => "verified", killGroup });
     expect(killed).toBe(true);
     expect(killGroup).toHaveBeenCalledWith(m.pid);
     expect(existsSync(taskMetaPath(dir, m.id))).toBe(false);

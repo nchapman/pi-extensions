@@ -32,7 +32,16 @@
  */
 
 import { execFile, spawn } from "node:child_process";
-import { closeSync, mkdirSync, openSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import type { ChildProcess } from "node:child_process";
 
@@ -106,13 +115,18 @@ export interface PersistentTaskMeta {
   cwd: string;
 }
 
+/** Task ids are t-<base36 time>: a safe single path component. Metadata is
+ *  disk-derived input — an id with separators or dots could steer artifact
+ *  paths outside the tasks dir, so anything else reads as corrupt. */
+const SAFE_TASK_ID = /^[A-Za-z0-9_-]{1,64}$/;
+
 function isTaskMeta(v: unknown): v is PersistentTaskMeta {
   if (typeof v !== "object" || v === null) return false;
   const m = v as Record<string, unknown>;
   return (
     m.version === 1 &&
     typeof m.id === "string" &&
-    m.id !== "" &&
+    SAFE_TASK_ID.test(m.id) &&
     typeof m.command === "string" &&
     typeof m.pid === "number" &&
     Number.isInteger(m.pid) &&
@@ -125,10 +139,16 @@ function isTaskMeta(v: unknown): v is PersistentTaskMeta {
   );
 }
 
-/** Persist task metadata (after spawn — the pid must exist by then). */
+/** Persist task metadata (after spawn — the pid must exist by then). Written
+ *  tmp-then-rename: a torn write (SIGKILL mid-write) then reads as missing or
+ *  old, never as a corrupt file the scan would have to discard while the
+ *  spawned wrapper keeps running untracked. */
 export function writeTaskMeta(sessionDir: string, meta: PersistentTaskMeta): void {
   mkdirSync(tasksDir(sessionDir), { recursive: true });
-  writeFileSync(taskMetaPath(sessionDir, meta.id), `${JSON.stringify(meta, null, 2)}\n`, "utf8");
+  const path = taskMetaPath(sessionDir, meta.id);
+  const tmp = `${path}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(meta, null, 2)}\n`, "utf8");
+  renameSync(tmp, path);
 }
 
 /** Read and validate one task's metadata; undefined when missing or corrupt. */
@@ -228,16 +248,23 @@ export function isProcessAlive(pid: number): boolean {
   }
 }
 
+/** ps identity verdict: verified (elapsed matches the recorded start),
+ *  mismatched (a live pid with the wrong age — recycled), or unknown (ps could
+ *  not answer: missing binary, timeout, EPERM, malformed etime). Unknown must
+ *  never be treated as recycled — destroying durable state on a ps blip
+ *  would orphan a healthy task forever. */
+export type IdentityVerdict = "verified" | "mismatched" | "unknown";
+
 /** Verify a re-adopted task's identity: ps elapsed time must match its recorded start. */
 export async function verifyTaskIdentity(
   meta: PersistentTaskMeta,
   opts: { now?: () => number; runPs?: (pid: number) => Promise<number | undefined> } = {},
-): Promise<boolean> {
+): Promise<IdentityVerdict> {
   const now = opts.now ?? Date.now;
   const runPs = opts.runPs ?? psEtime;
   const elapsed = await runPs(meta.pid);
-  if (elapsed === undefined) return false;
-  return matchesStartTime(elapsed, meta.startedAt, now());
+  if (elapsed === undefined) return "unknown";
+  return matchesStartTime(elapsed, meta.startedAt, now()) ? "verified" : "mismatched";
 }
 
 /** Facts a scan gathers; the decision machine itself stays pure over these. */
@@ -245,8 +272,8 @@ export interface ScanFacts {
   /** Status-file content; undefined = missing, "" = exists but empty (truncate-write window). */
   status?: string;
   alive: boolean;
-  /** Identity verdict, meaningful only when alive; undefined counts as unverified. */
-  identityVerified?: boolean;
+  /** Identity verdict, meaningful only when alive; undefined counts as unknown. */
+  identity?: IdentityVerdict;
 }
 
 /** What the session-start wiring must do for one scanned task. */
@@ -254,6 +281,7 @@ export type ScanDecision =
   | { action: "complete"; exitCode: number | null }
   | { action: "finalize-dead" }
   | { action: "finalize-recycled" }
+  | { action: "unknown-identity" }
   | { action: "kill-expired" }
   | { action: "adopt" }
   | { action: "discard" };
@@ -265,7 +293,9 @@ const usableStatus = (s: string | undefined): boolean => s !== undefined && s.tr
  * file settles everything (the wrapper writes it before exiting — a zombie
  * leader still has one); a dead leader without one died unknown; a live pid
  * must be identity-verified before adoption (recycled pids read as gone, never
- * killed); only a verified survivor can hit its deadline.
+ * killed); an unverifiable pid (ps missing/slow) is neither adopted nor
+ * destroyed — the durable state stays for the next start to retry; only a
+ * verified survivor can hit its deadline.
  */
 export function decideScan(meta: PersistentTaskMeta, facts: ScanFacts, nowMs: number): ScanDecision {
   if (usableStatus(facts.status)) {
@@ -273,7 +303,9 @@ export function decideScan(meta: PersistentTaskMeta, facts: ScanFacts, nowMs: nu
     return { action: "complete", exitCode: Number.isInteger(code) ? code : null };
   }
   if (!facts.alive) return { action: "finalize-dead" };
-  if (!facts.identityVerified) return { action: "finalize-recycled" };
+  if (facts.identity !== "verified") {
+    return facts.identity === "mismatched" ? { action: "finalize-recycled" } : { action: "unknown-identity" };
+  }
   if (meta.timeoutSecs !== undefined && nowMs >= meta.startedAt + meta.timeoutSecs * 1000) {
     return { action: "kill-expired" };
   }
@@ -327,7 +359,7 @@ export interface ScanDeps {
   readMeta?: (sessionDir: string, id: string) => PersistentTaskMeta | undefined;
   readStatus?: (sessionDir: string, id: string) => string | undefined;
   isAlive?: (pid: number) => boolean;
-  verifyIdentity?: (meta: PersistentTaskMeta) => Promise<boolean>;
+  verifyIdentity?: (meta: PersistentTaskMeta) => Promise<IdentityVerdict>;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
 }
@@ -377,8 +409,8 @@ export async function scanSessionTasks(sessionDir: string, deps: ScanDeps = {}):
         });
         continue;
       }
-      const identityVerified = await verify(meta);
-      outcomes.push({ id, meta, decision: decideScan(meta, { status, alive, identityVerified }, now()) });
+      const identity = await verify(meta);
+      outcomes.push({ id, meta, decision: decideScan(meta, { status, alive, identity }, now()) });
     } catch {
       // One unreadable task must not sink the rest of the scan.
       outcomes.push({ id, meta: undefined, decision: { action: "discard" } });
@@ -387,12 +419,14 @@ export async function scanSessionTasks(sessionDir: string, deps: ScanDeps = {}):
   return outcomes;
 }
 
-/** Kill a persisted task by process group, after verifying the pid still is ours. */
+/** Kill a persisted task by process group, after verifying the pid still is ours.
+ *  An unverifiable pid is neither signalled nor cleaned — "not ours to signal"
+ *  and "gone" are different facts, and a ps blip must not orphan the task. */
 export async function killPersistedTask(
   meta: PersistentTaskMeta,
   sessionDir: string,
   opts: {
-    verifyIdentity?: (meta: PersistentTaskMeta) => Promise<boolean>;
+    verifyIdentity?: (meta: PersistentTaskMeta) => Promise<IdentityVerdict>;
     killGroup?: (pid: number) => boolean;
     now?: () => number;
   } = {},
@@ -408,10 +442,13 @@ export async function killPersistedTask(
         return false; // already gone (ESRCH) or not ours to signal (EPERM)
       }
     });
-  if (!(await verify(meta))) {
-    // Unverified: never signal — the pid may belong to someone else now.
-    // Clean the artifacts so scans stop considering it.
-    removePersistedArtifacts(sessionDir, meta.id, { keepLog: false });
+  const verdict = await verify(meta);
+  if (verdict !== "verified") {
+    if (verdict === "mismatched") {
+      // Verified as someone else's pid: never signal — clean the artifacts so
+      // scans stop considering it.
+      removePersistedArtifacts(sessionDir, meta.id, { keepLog: false });
+    }
     return false;
   }
   killGroup(meta.pid);

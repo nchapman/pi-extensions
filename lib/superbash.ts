@@ -6,9 +6,10 @@
  * Design (the deliberate cut of a larger plan):
  * - the registry is in-memory and session-scoped: pi reloads and exits run
  *   session_shutdown, which kills running children — an orphaned child burns
- *   API tokens with nobody consuming the result, so nothing outlives the
- *   session (the existing PI_SUBAGENT_TIMEOUT_MS hard kill still applies while
- *   running in the background)
+ *   API tokens with nobody consuming the result (the existing
+ *   PI_SUBAGENT_TIMEOUT_MS hard kill still applies while running in the
+ *   background). The one exception is persistent bash tasks (below), which
+ *   shutdown spares because their state lives on disk
  * - one tool for every CLI task, named `bash` so it replaces the built-in by
  *   name: wait: "inline" (default) delegates to pi's own bash tool (identical
  *   streaming, truncation, temp-file stashing, structured output); wait: "auto"
@@ -42,6 +43,16 @@
  *   to <sessionDir>/tasks/<id>.log (or a temp file with no session dir) from
  *   byte zero — `task <id>` peeks at it while the command runs and it
  *   survives resume; the log is removed on kill
+ * - wait: "background" + persist: true opts a bash task into surviving pi
+ *   itself (lib/persistent-bash holds the design: detached group leader, a
+ *   wrapper that records the exit status, metadata under the session dir).
+ *   Explicit persist that cannot be honored (non-background wait, tools built
+ *   on a prepare seam, no session dir) is a loud error; PI_BG_BASH_PERSIST=1
+ *   defaults background mode to persistent wherever those gates already pass,
+ *   and persist: false overrides it. Shutdown detaches (spares) persistent
+ *   tasks instead of killing them; resumePersistedTasks re-adopts live ones
+ *   under their on-disk id and settles the rest — disk state, not memory, owns
+ *   the outcome, so exactly one runtime ever wakes for a given task
  * - PI_BG_WAKE=0 disables wake messages (completions and reminders); the
  *   terminal notification still fires
  */
@@ -543,13 +554,15 @@ function adoptPersistedMonitor(
     pollTimer = undefined;
     deadlineTimer = undefined;
   };
-  const settle = (status: string, ok: boolean) => {
+  const settle = (status: string, ok: boolean, preread?: { output: string; note?: string }) => {
     if (handedOff || settled) return;
     settled = true;
     stop();
     removePersistedArtifacts(sessionDir, meta.id); // keep the log
     if (!registry.isRunning(id)) return;
-    const chunk = readLogChunk(logPath, undefined, BASH_TAIL_CAP);
+    // A caller that already destroyed the log (deadline kill) passes what it
+    // read beforehand; otherwise read it now.
+    const chunk = preread ? { text: preread.output } : readLogChunk(logPath, undefined, BASH_TAIL_CAP);
     const display = truncateTail(chunk?.text ?? "", { maxLines: DEFAULT_MAX_LINES, maxBytes: WAKE_TEXT_CAP });
     registry.complete(id, {
       ok,
@@ -563,6 +576,14 @@ function adoptPersistedMonitor(
         outputNote: display.truncated ? `[… truncated — full output: ${logPath} …]` : undefined,
       }),
     });
+  };
+  const readTail = () => {
+    const chunk = readLogChunk(logPath, undefined, BASH_TAIL_CAP);
+    const display = truncateTail(chunk?.text ?? "", { maxLines: DEFAULT_MAX_LINES, maxBytes: WAKE_TEXT_CAP });
+    return {
+      output: display.content,
+      note: display.truncated ? `[… truncated — full output: ${logPath} …]` : undefined,
+    };
   };
   const id = registry.adopt(
     {
@@ -584,6 +605,7 @@ function adoptPersistedMonitor(
     deadlineTimer = setTimeout(
       () => {
         if (handedOff || settled) return;
+        const tail = readTail(); // killPersistedTask removes the log — read first
         void killPersistedTask(meta, sessionDir)
           .then((killed) =>
             settle(
@@ -591,9 +613,10 @@ function adoptPersistedMonitor(
                 ? `timed out after ${meta.timeoutSecs}s (deadline passed while pi was away)`
                 : "died while pi was away (pid no longer verified)",
               false,
+              killed ? tail : { output: tail.output }, // no log pointer if it was removed
             ),
           )
-          .catch(() => settle("timed out", false));
+          .catch(() => settle("timed out", false, tail));
       },
       Math.max(0, meta.startedAt + meta.timeoutSecs * 1000 - now()),
     );
@@ -704,12 +727,20 @@ export async function resumePersistedTasks(
                 ? "timed out — deadline passed while pi was away"
                 : "timed out — deadline passed while pi was away (pid no longer verified; not killed)",
               durationMs: now() - meta.startedAt,
-              output: tail.output,
-              outputNote: killed ? undefined : tail.note,
+              output: tail.output, // captured before the kill; the log file may be gone — never point at it
+              outputNote: undefined,
             }),
           });
           break;
         }
+        case "unknown-identity":
+          // ps could not answer: neither adopt (its kill would be a no-op) nor
+          // destroy (the task may be healthy). Leave the durable state for the
+          // next start to retry, and say so.
+          deps.wake?.(
+            `Background task may still be running (${meta.id}): ${head} — its identity could not be verified (is ps available?); left untouched for the next start.`,
+          );
+          break;
         case "adopt":
           adoptPersistedMonitor(registry, sessionDir, meta, deps, now);
           deps.wake?.(
@@ -1148,9 +1179,18 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
           persistent: true,
           progress: logProgressFor(() => logPath),
           kill: () => {
-            // Registry kill (task_kill, /tasks kill): verified group kill; a
-            // killed task leaves no artifacts — the log included.
-            if (meta) void killPersistedTask(meta, dir).catch(() => {});
+            // Registry kill (task_kill, /tasks kill). We hold the child handle,
+            // so the pid cannot have recycled — signal the group directly, no
+            // ps round-trip that a ps-less host would turn into a no-op. A
+            // killed task leaves no artifacts, the log included.
+            if (meta) {
+              try {
+                process.kill(-meta.pid, "SIGKILL");
+              } catch {
+                // already gone
+              }
+              removePersistedArtifacts(dir, id, { keepLog: false });
+            }
           },
           detach: () => {
             handedOff = true;
@@ -1172,6 +1212,11 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
         } catch (err) {
           return failStart(err instanceof Error ? err.message : String(err));
         }
+        // A failed spawn (missing shell, EMFILE) reports pid undefined and emits
+        // "error" on a later tick; an unconsumed "error" event throws uncaught.
+        // Consume it before any early return — on the happy path the real
+        // handler below runs too ("once" listeners are additive).
+        child.once("error", () => {});
         const pid = child.pid;
         if (!pid) return failStart("no pid from spawn");
         meta = {
@@ -1583,14 +1628,21 @@ The command keeps running in the background. When it exits, the exit status, dur
 function logProgressFor(getPath: () => string | undefined): () => string | undefined {
   let offset = 0;
   return () => {
-    const path = getPath();
-    if (!path || !existsSync(path)) return "(no output yet)";
-    const size = statSync(path).size;
-    if (size <= offset) return "no new output since the last look";
-    const chunk = readLogChunk(path, Math.max(offset, size - REMINDER_TAIL_CAP), REMINDER_TAIL_CAP);
-    if (!chunk) return "(no output yet)";
-    offset = size;
-    return `new output since the last look (${formatSize(chunk.bytes)}):\n${chunk.text}`;
+    // Runs from reminder timers (outside deliver's try/catch) and the log has
+    // an asynchronous remover (killPersistedTask); a check-then-stat race must
+    // degrade the check-in text, not escape into the event loop.
+    try {
+      const path = getPath();
+      if (!path || !existsSync(path)) return "(no output yet)";
+      const size = statSync(path).size;
+      if (size <= offset) return "no new output since the last look";
+      const chunk = readLogChunk(path, Math.max(offset, size - REMINDER_TAIL_CAP), REMINDER_TAIL_CAP);
+      if (!chunk) return "(no output yet)";
+      offset = size;
+      return `new output since the last look (${formatSize(chunk.bytes)}):\n${chunk.text}`;
+    } catch {
+      return "(no output yet)";
+    }
   };
 }
 

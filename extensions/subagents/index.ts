@@ -15,7 +15,10 @@
  * powers backgrounding: `background: true` (or PI_SUBAGENT_BG_AFTER_MS)
  * hands the still-running child to the registry and returns a task id; the
  * result is delivered later as a steering wake — turn-boundary delivery that
- * sleep-polling can never beat — and session shutdown kills the orphans.
+ * sleep-polling can never beat — and session shutdown kills the orphans
+ * (persistent bash tasks are the exception: they run detached with their
+ * state on disk, so shutdown spares them and the next session's start scan
+ * re-adopts or settles them — lib/superbash's resumePersistedTasks).
  * Batch calls run with bounded concurrency (PI_SUBAGENT_CONCURRENCY) and sum
  * their per-child usage so cost accounting survives failures. Each agent
  * file also gets a `/name` command (pi built-ins take precedence).
@@ -342,8 +345,20 @@ export function registerSubagentsExtension(
   // model gets the result as its next message, and a sleep-polling model gets
   // it the moment its sleep returns — the livelock is impossible by mechanism,
   // not by instruction.
+  const steer = (text: string) => {
+    // The registry's deliver() and the resume path both swallow rejections —
+    // a rejected steer (session gone) must not become an unhandled rejection.
+    try {
+      const sent = pi.sendUserMessage(text, { deliverAs: "steer" }) as unknown;
+      if (sent != null && typeof (sent as { then?: unknown }).then === "function") {
+        void (sent as Promise<unknown>).catch(() => {});
+      }
+    } catch {
+      // a synchronous failure (session gone) must not surface on the wake path
+    }
+  };
   const registry = createTaskRegistry({
-    sendUserMessage: (text) => pi.sendUserMessage(text, { deliverAs: "steer" }),
+    sendUserMessage: steer,
     notify: (message, level) => ui?.notify(message, level),
     setStatus: (key, text) => ui?.setStatus(key, text),
     wakeEnabled: parseWakeEnabled(process.env),
@@ -360,7 +375,9 @@ export function registerSubagentsExtension(
     // the scan itself never throws (per-task failures are swallowed there).
     const sessionDir = ctx?.sessionManager?.getSessionDir?.();
     if (sessionDir) {
-      void resumePersistedTasks(registry, sessionDir).catch(() => {});
+      // The wake seam carries the resume-time notices (re-adopted,
+      // unverifiable); settled outcomes go through the registry's channels.
+      void resumePersistedTasks(registry, sessionDir, { wake: steer }).catch(() => {});
     }
   });
   pi.on("session_shutdown", (event) => {

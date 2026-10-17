@@ -809,6 +809,27 @@ describe("createBashTool", () => {
     expect(d.registry.running()).toHaveLength(0);
   });
 
+  it("persist: true is rejected on Windows even with everything else in place", async () => {
+    const d = toolDeps();
+    const tool = createBashTool(d.registry, { operations: fakeBashOps() });
+    const realPlatform = process.platform;
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+    try {
+      const result = await tool.execute(
+        "1",
+        { command: "true", wait: "background", persist: true },
+        undefined,
+        undefined,
+        dirCtx(mkdtempSync(join(tmpdir(), "pb-win32-"))),
+      );
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toContain("Persistent background tasks are not supported on Windows");
+      expect(d.registry.running()).toHaveLength(0);
+    } finally {
+      Object.defineProperty(process, "platform", { value: realPlatform, configurable: true });
+    }
+  });
+
   it("persist: true is rejected for prepare-based tools (ssh_bash)", async () => {
     const d = toolDeps();
     const tool = createBashTool(d.registry, {
@@ -2051,6 +2072,10 @@ describe("bash tool persistent background (real)", () => {
     await new Promise((r) => setTimeout(r, 1_600));
     expect(isProcessAlive(meta.pid)).toBe(false); // it ran to completion, unhindered
     expect(d.sendUserMessage).not.toHaveBeenCalled(); // and pi never woke for it
+    // A monitor that detached without stopping would have settled by now:
+    // metadata deleted, log gone, wake fired. None of that happened.
+    expect(readTaskMeta(dir, id)).toBeDefined();
+    expect(existsSync(persistentLogPath(dir, id))).toBe(true);
     await killPersistedTask({ ...meta, startedAt: Date.now() - 500 }, dir); // test cleanup
   }, 15_000);
 
@@ -2080,6 +2105,26 @@ describe("bash tool persistent background (real)", () => {
       );
       expect(textOf(r2)).toContain(`Backgrounded (${idOf(r2)}):`); // plain pipe notice
       expect(readTaskMeta(dir, idOf(r2))).toBeUndefined(); // no durable state
+
+      // auto never persists, with or without the knob: its pipes are pi's own
+      // fds — retro-detaching is impossible — so the knob must not promote it.
+      const autoRt = (() => {
+        const sendUserMessage = vi.fn();
+        const registry = createTaskRegistry({ sendUserMessage, notify: vi.fn(), setStatus: vi.fn() });
+        return { sendUserMessage, registry };
+      })();
+      const ops = {
+        exec: () => new Promise<never>(() => {}), // never resolves: auto promotes around it
+      } as never;
+      const autoTool = createBashTool(autoRt.registry, { operations: ops, waitMs: () => 0 });
+      const r3 = await autoTool.execute("1", { command: "sleep 5", wait: "auto" }, undefined, undefined, {
+        sessionManager: { getSessionDir: () => dir },
+      } as never);
+      const id3 = idOf(r3);
+      expect(textOf(r3)).toContain(`Backgrounded (${id3}):`); // pipe, not persistent
+      expect(readTaskMeta(dir, id3)).toBeUndefined();
+      expect(autoRt.registry.running()[0]?.persistent).toBeUndefined();
+      autoRt.registry.killAll();
     } finally {
       delete process.env.PI_BG_BASH_PERSIST;
     }
