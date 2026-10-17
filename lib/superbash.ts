@@ -157,12 +157,11 @@ export interface TaskRegistry {
       kind: "subagent" | "bash";
       kill: () => void;
       progress?: () => string | undefined;
-      /** Opt the task into surviving restarts; killAll can then spare it. */
       persistent?: boolean;
-      /** Spare-time handoff: drop listeners/timers and flip the settle guard, so
-       *  the in-memory monitor can never again fire for this task — the on-disk
-       *  metadata becomes its single owner. Called by killAll({sparePersistent}). */
       detach?: () => void;
+      /** True start time for re-adopted durable tasks, so elapsed times and
+       *  ordering report since the spawn, not since the restart. */
+      startedAt?: number;
     },
     preferredId?: string,
   ): string;
@@ -176,6 +175,7 @@ export interface TaskRegistry {
       progress?: () => string | undefined;
       persistent?: boolean;
       detach?: () => void;
+      startedAt?: number;
     },
     preferredId: string,
   ): string;
@@ -193,6 +193,11 @@ export interface TaskRegistry {
   get(id: string): BgTask | undefined;
   /** Kill one task by id; true when it existed and was running. Killed tasks never wake. */
   kill(id: string): boolean;
+  /** Undo a kill that never landed: flip a killed task back to running. For a
+   *  re-adopted persistent task whose verified kill was declined (pid not
+   *  verifiable, signal refused) — the process was never signalled, so the
+   *  task must not read as dead for the rest of the session. */
+  revive(id: string): boolean;
   /** Kill every running task and mark it killed — no wakes fire for killed tasks. Returns how many were killed.
    *  sparePersistent: detach persistent tasks instead — hand them to the disk
    *  state (no kill signal, no wake, dropped from the registry) so they keep
@@ -406,7 +411,7 @@ export function createTaskRegistry(deps: TaskDeps = {}): TaskRegistry {
         name: record.name,
         kind: record.kind,
         state: "running",
-        startedAt: now(),
+        startedAt: record.startedAt ?? now(),
         kill: record.kill,
         progress: record.progress,
         persistent: record.persistent,
@@ -442,6 +447,14 @@ export function createTaskRegistry(deps: TaskDeps = {}): TaskRegistry {
     },
     kill(id) {
       return killTask(tasks.get(id));
+    },
+    revive(id) {
+      const task = tasks.get(id);
+      if (!task || task.state !== "killed") return false;
+      task.state = "running";
+      task.endedAt = undefined;
+      refreshStatus();
+      return true;
     },
     killAll(opts = {}) {
       let killed = 0;
@@ -561,7 +574,9 @@ function adoptPersistedMonitor(
     removePersistedArtifacts(sessionDir, meta.id); // keep the log
     if (!registry.isRunning(id)) return;
     // A caller that already destroyed the log (deadline kill) passes what it
-    // read beforehand; otherwise read it now.
+    // read beforehand — including whether the tail pointed at the log file,
+    // which may no longer exist by now. Never recompute that pointer from
+    // logPath for a pre-read tail: it can name a deleted file.
     const chunk = preread ? { text: preread.output } : readLogChunk(logPath, undefined, BASH_TAIL_CAP);
     const display = truncateTail(chunk?.text ?? "", { maxLines: DEFAULT_MAX_LINES, maxBytes: WAKE_TEXT_CAP });
     registry.complete(id, {
@@ -573,7 +588,11 @@ function adoptPersistedMonitor(
         status,
         durationMs: now() - meta.startedAt,
         output: display.content,
-        outputNote: display.truncated ? `[… truncated — full output: ${logPath} …]` : undefined,
+        outputNote: preread
+          ? preread.note
+          : display.truncated
+            ? `[… truncated — full output: ${logPath} …]`
+            : undefined,
       }),
     });
   };
@@ -590,21 +609,25 @@ function adoptPersistedMonitor(
       name: head,
       kind: "bash",
       persistent: true,
+      // The durable record owns the true start time — /tasks and reminders
+      // report since the spawn, not since this restart.
+      startedAt: meta.startedAt,
       progress: logProgressFor(() => logPath),
       kill: () => {
         // Registry kill (task_kill, /tasks kill). The registry already reports
         // success from in-memory state; when the verified kill is declined, the
-        // durable state survives — say so, or the task reads as dead while it
-        // keeps running and the next start re-adopts a "killed" task.
+        // task is revived (it was never signalled — reading as dead while it
+        // runs would lie to /tasks and the next start) and a wake says so.
         void killPersistedTask(meta, sessionDir)
           .then((outcome) => {
             if (!outcome.killed && outcome.reason !== "mismatched") {
+              registry.revive(meta.id);
               deps.wake?.(
                 `Background task kill not confirmed (${meta.id}): ${
                   outcome.reason === "unknown"
-                    ? "its pid could not be verified (ps unavailable?}"
+                    ? "its pid could not be verified (ps unavailable?)"
                     : "the signal was denied"
-                } — left running and re-examined on the next start.`,
+                } — still running (shown as such), re-examined on the next start. Try again: task_kill ${meta.id}`,
               );
             }
           })
@@ -625,7 +648,11 @@ function adoptPersistedMonitor(
         void killPersistedTask(meta, sessionDir)
           .then((outcome) => {
             if (outcome.killed) {
-              settle(`timed out after ${meta.timeoutSecs}s (deadline passed while pi was away)`, false, tail);
+              // The kill removed the log — pass the pre-read output without its
+              // pointer (the file it names is gone).
+              settle(`timed out after ${meta.timeoutSecs}s (deadline passed while pi was away)`, false, {
+                output: tail.output,
+              });
               return;
             }
             if (outcome.reason === "mismatched") {
@@ -696,11 +723,20 @@ export async function resumePersistedTasks(
         };
       };
       // Report a task that no longer runs: register it under its durable id
-      // and settle immediately, so the wake flows through the registry's
-      // channels and /tasks history records what happened.
+      // (the durable record owns the true start time — /tasks and reminders
+      // report since the spawn, not since this restart) and settle immediately,
+      // so the wake flows through the registry's channels and /tasks history
+      // records what happened.
       const reportSettled = (status: string, ok: boolean) => {
         const id = registry.adopt(
-          { name: head, kind: "bash", persistent: true, kill: () => undefined, detach: () => undefined },
+          {
+            name: head,
+            kind: "bash",
+            persistent: true,
+            kill: () => undefined,
+            detach: () => undefined,
+            startedAt: meta.startedAt,
+          },
           meta.id,
         );
         const tail = logTail();
@@ -742,7 +778,14 @@ export async function resumePersistedTasks(
           const tail = logTail(); // read before any kill removes the log
           const outcome = await killPersistedTask(meta, sessionDir);
           const id = registry.adopt(
-            { name: head, kind: "bash", persistent: true, kill: () => undefined, detach: () => undefined },
+            {
+              name: head,
+              kind: "bash",
+              persistent: true,
+              kill: () => undefined,
+              detach: () => undefined,
+              startedAt: meta.startedAt,
+            },
             meta.id,
           );
           const statusText = outcome.killed
@@ -1011,11 +1054,15 @@ export function createBashTool(
     /** Per-call provisioning (ssh_bash resolves the target into operations
      * and a task head); when given it replaces the static operations/inline. */
     prepare?: (params: BashToolCallParams) => BashCallContext;
-    /** Test seam and overrides for the persistent-background spawn. */
+    /** Test seam and overrides for the persistent-background spawn.
+     *  localOperations: declare that an injected `operations` seam still runs
+     *  commands on the local host (the subagents wiring harness) — persistence
+     *  stays available for such tools; other injections are refused. */
     persistent?: {
       shell?: string;
       shellArgs?: string[];
       spawn?: typeof import("node:child_process").spawn;
+      localOperations?: boolean;
     };
   } = {},
 ) {
@@ -1170,10 +1217,20 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
       // durable). The PI_BG_BASH_PERSIST default applies only where the gates
       // already pass, so sibling tools (ssh_bash) and non-background modes
       // silently keep the pipe path.
-      const persistGatesPass = !opts.prepare && process.platform !== "win32" && !!sessionDir && mode === "background";
+      // Persistence runs the command through a local detached spawn — a tool
+      // whose execution backend was replaced (per-call prepare, injected
+      // operations, or an inline executor: container, remote, jailed) must not
+      // silently lose that confinement because the model asked to persist.
+      // localOperations re-enables it for seams that still execute locally.
+      const localBackend =
+        !opts.prepare && !opts.inline && (!opts.operations || opts.persistent?.localOperations === true);
+      const persistGatesPass = localBackend && process.platform !== "win32" && !!sessionDir && mode === "background";
       const persistWanted = params.persist ?? (mode === "background" && parseBashPersist(process.env));
       if (params.persist === true && !persistGatesPass) {
-        if (opts.prepare) return error(`${name}: persistent background tasks are not supported for this tool`);
+        if (!localBackend)
+          return error(
+            `${name}: persistent background tasks are not supported for this tool (custom execution backend)`,
+          );
         if (process.platform === "win32") return error("Persistent background tasks are not supported on Windows");
         return error("Persistent background tasks require a session directory");
       }

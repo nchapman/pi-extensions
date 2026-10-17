@@ -158,7 +158,11 @@ export function writeTaskMeta(sessionDir: string, meta: PersistentTaskMeta): voi
 export function readTaskMeta(sessionDir: string, id: string): PersistentTaskMeta | undefined {
   try {
     const parsed: unknown = JSON.parse(readFileSync(taskMetaPath(sessionDir, id), "utf8"));
-    return isTaskMeta(parsed) ? parsed : undefined;
+    // The directory is untrusted disk state: a file whose content names a
+    // different id than its filename is corrupt or hand-planted — treat it as
+    // unreadable, or its effects (adopt/complete/cleanup under the content id)
+    // would hit a different task's artifacts and never clean the file itself.
+    return isTaskMeta(parsed) && parsed.id === id ? parsed : undefined;
   } catch {
     return undefined;
   }

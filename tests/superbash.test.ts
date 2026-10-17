@@ -796,7 +796,8 @@ describe("createBashTool", () => {
 
   it("persist: true without a session directory is an explicit error", async () => {
     const d = toolDeps();
-    const tool = createBashTool(d.registry, { operations: fakeBashOps() });
+    // No operations injection — an injected backend is its own gate failure.
+    const tool = createBashTool(d.registry, {});
     const result = await tool.execute(
       "1",
       { command: "true", wait: "background", persist: true },
@@ -811,7 +812,8 @@ describe("createBashTool", () => {
 
   it("persist: true is rejected on Windows even with everything else in place", async () => {
     const d = toolDeps();
-    const tool = createBashTool(d.registry, { operations: fakeBashOps() });
+    // No operations injection — an injected backend is its own gate failure.
+    const tool = createBashTool(d.registry, {});
     const realPlatform = process.platform;
     Object.defineProperty(process, "platform", { value: "win32", configurable: true });
     try {
@@ -1665,6 +1667,20 @@ describe("kill and control surfaces", () => {
     expect(d.registry.kill("t-nope")).toBe(false); // unknown
   });
 
+  it("revive flips a killed task back to running — the declined-kill state repair", () => {
+    const d = controlDeps();
+    const startedAt = 1234;
+    const id = d.registry.adopt({ name: "a", kind: "bash", kill: () => undefined, startedAt }, "t-durable");
+    expect(d.registry.get(id)?.startedAt).toBe(startedAt); // the durable start, not adopt time
+    d.registry.kill(id);
+    expect(d.registry.isRunning(id)).toBe(false);
+    expect(d.registry.revive(id)).toBe(true);
+    expect(d.registry.isRunning(id)).toBe(true); // /tasks shows the truth again
+    d.registry.complete(id, { ok: false, text: "late failure" }); // and it can still settle
+    expect(d.registry.revive(id)).toBe(false); // settled tasks stay dead
+    expect(d.registry.revive("t-nope")).toBe(false);
+  });
+
   it("task_kill kills a bash task and never wakes it", async () => {
     const d = controlDeps();
     const child = fakeBashForControl();
@@ -2239,7 +2255,11 @@ describe("resumePersistedTasks (real)", () => {
       expect(existsSync(taskMetaPath(dir, meta.id))).toBe(false);
       expect(existsSync(persistentLogPath(dir, meta.id))).toBe(false);
     } finally {
-      if (isProcessAlive(child.pid!)) process.kill(-child.pid!, "SIGKILL");
+      try {
+        if (isProcessAlive(child.pid!)) process.kill(-child.pid!, "SIGKILL");
+      } catch {
+        // already gone — cleanup must never mask the real result
+      }
     }
   }, 15_000);
 
@@ -2270,7 +2290,10 @@ describe("resumePersistedTasks (real)", () => {
       const outcomes = await resumePersistedTasks(rt.registry, dir, { wake: adoptedWake, pollMs: 25 });
       expect(outcomes[0].decision.action).toBe("adopt");
       expect(adoptedWake).toHaveBeenCalledWith(expect.stringContaining(`Background task still running (${id})`));
+      const metaStartedAt = readTaskMeta(dir, id)!.startedAt;
       expect(rt.registry.running()[0]).toMatchObject({ id, persistent: true }); // same durable id
+      // Elapsed times report since the spawn, not since the re-adoption.
+      expect(rt.registry.get(id)?.startedAt).toBe(metaStartedAt);
       expect(oldRt.sendUserMessage).not.toHaveBeenCalled(); // the old runtime stays silent
 
       // The wrapper's status write (and the log tail it implies) is what the

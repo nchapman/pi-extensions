@@ -70,9 +70,15 @@ started.
   child-side-logged from the start and tail the file during the blocking window,
   unifying both modes. Not now.)
 - **`ssh_bash` excluded** (phase 1): a remote pid is not locally killable and the
-  child-side log trick has no local fd to inherit. `persist` on a `prepare`-based
-  tool is an explicit tool error.
+  child-side log trick has no local fd to inherit. More generally, persistence
+  requires the tool's default local backend: a replaced execution backend
+  (`prepare`, injected `operations`, or an `inline` executor — container,
+  remote, jailed) refuses `persist` loudly, so a model request can't silently
+  bypass a tool's execution confinement. A seam that still executes locally
+  declares `persistent.localOperations`.
 - **Unix only.** `kill(-pgid)` semantics; on win32 `persist` is rejected up front.
+  All resume-time notices (re-adopted, unverifiable, declined kills) honor
+  `PI_BG_WAKE`, exactly like settled wakes.
 - **Forks share their tasks (accepted, documented).** A fork reuses the same
   session dir, so both branches scan and adopt the same persistent tasks: each
   branch's agent gets its own wake once, and a kill from either branch stops the
@@ -192,7 +198,13 @@ with a timeout and capped output — a slow `ps` must never stall TUI startup):
   orphan it forever. A false "died" is the safe direction since an unverified
   pid is never killed.
 - Deadline already passed → kill now, settle `timed out (deadline passed while pi
-  was away)`.
+  was away)`. The kill itself is tri-state: **declined** (ps could not verify the
+  pid, or the signal was refused — EPERM) settles nothing — the durable state
+  stays and the poll keeps monitoring, with a notice saying so. A **mismatched**
+  pid (recycled) is never signalled: settle as timed-out with the note that the
+  pid was reused, and clean up under the filename id. The scan as a whole shares
+  one 10s status-retry budget, so a pile of dead leftovers cannot serialize 2s
+  each ahead of every outcome at session start.
 
 Re-adopted tasks are ordinary registry entries: `task <id>` peeks the log (fresh
 offsets — first peek shows the tail), `task_remind` works again from scratch (old
@@ -200,11 +212,16 @@ reminders were in-memory and are gone, by design), `task_kill` works across the
 restart, and goal's settle check sees them as running work — deferral while a
 persistent task runs is intended; goal's park path already handles never-waking
 tasks and `/tasks kill` reaches persistent ones, so persistence adds holding, not
-livelock.
+livelock. A `task_kill` that is declined (unverifiable pid, refused signal)
+revives the registry entry — the process was never signalled, so the task keeps
+reading as running, with a wake explaining why — rather than reporting dead while
+it runs.
 
 **Kill.** Attached tasks hold the real `ChildProcess` — kill directly. Re-adopted
 tasks kill by `-pgid` after the identity check. Kill also unlinks the metadata and
-the log, matching pipe mode's kill-cleans-up contract.
+the log, matching pipe mode's kill-cleans-up contract — except a declined kill
+keeps them for a retry. Metadata and log files are written `0o600`: the command
+line is where credentials live.
 
 **Wake delivery hardening (required, fixes a latent bug in today's wakes too).**
 `deliver()` is fire-and-forget over `pi.sendUserMessage(..., { deliverAs: "steer"

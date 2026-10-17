@@ -117,7 +117,12 @@ describe("task metadata", () => {
     expect(readTaskMeta(dir, "t-trav")).toBeUndefined();
     writeFileSync(taskMetaPath(dir, "t-trav2"), JSON.stringify({ ...meta(), id: "a/b" }));
     expect(readTaskMeta(dir, "t-trav2")).toBeUndefined();
-    writeFileSync(taskMetaPath(dir, "t-okto"), JSON.stringify({ ...meta(), timeoutSecs: 60 }));
+    // A file whose content names a different id than its filename is corrupt:
+    // honoring the content id would adopt/settle/clean a different task's
+    // artifacts while the file itself never gets cleaned.
+    writeFileSync(taskMetaPath(dir, "t-mism"), JSON.stringify({ ...meta(), id: "t-other" }));
+    expect(readTaskMeta(dir, "t-mism")).toBeUndefined();
+    writeFileSync(taskMetaPath(dir, "t-okto"), JSON.stringify({ ...meta(), id: "t-okto", timeoutSecs: 60 }));
     expect(readTaskMeta(dir, "t-okto")?.timeoutSecs).toBe(60);
   });
 

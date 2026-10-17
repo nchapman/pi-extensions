@@ -377,7 +377,11 @@ export function registerSubagentsExtension(
     if (sessionDir) {
       // The wake seam carries the resume-time notices (re-adopted,
       // unverifiable); settled outcomes go through the registry's channels.
-      void resumePersistedTasks(registry, sessionDir, { wake: steer }).catch(() => {});
+      // Same PI_BG_WAKE gate as the registry: PI_BG_WAKE=0 silences every
+      // resume-time steer, not just the settled wakes — one turn per task at
+      // every session start is exactly what the knob turns off.
+      const wake = parseWakeEnabled(process.env) ? steer : undefined;
+      void resumePersistedTasks(registry, sessionDir, { wake }).catch(() => {});
     }
   });
   pi.on("session_shutdown", (event) => {
@@ -409,7 +413,13 @@ export function registerSubagentsExtension(
   // to pi's own bash tool; auto/background promote to this registry like subagents.
   // The wait window is read per call so PI_BASH_BG_AFTER_MS changes apply live.
   pi.registerTool(
-    createBashTool(registry, { operations: opts.bgOperations?.(), waitMs: () => parseBashBgAfterMs(process.env) }),
+    createBashTool(registry, {
+      // bgOperations is a test harness faking pi's own LOCAL bash operations —
+      // declare it local so the persistence gate keeps passing under tests.
+      operations: opts.bgOperations?.(),
+      persistent: opts.bgOperations ? { localOperations: true } : undefined,
+      waitMs: () => parseBashBgAfterMs(process.env),
+    }),
   );
   // Task management: peek (pull-based check-in), kill, and scheduled check-ins.
   pi.registerTool(createTaskTool(registry));
