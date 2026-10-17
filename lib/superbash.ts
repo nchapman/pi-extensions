@@ -97,6 +97,7 @@ import {
   taskEnv,
   taskStatusPath,
   writeTaskMeta,
+  type KillOutcome,
   type PersistentTaskMeta,
   type ScanDeps,
   type ScanOutcome,
@@ -539,6 +540,10 @@ export interface ResumeDeps {
   scan?: ScanDeps;
   /** Adopted-task monitor poll cadence; default 2s. */
   pollMs?: number;
+  /** Kill seam for adopted tasks (task_kill, the deadline kill); tests fake
+   *  declines (unverifiable pid, refused signal) to exercise the honest
+   *  fallbacks — a real decline can't be scheduled deterministically. */
+  killPersisted?: (meta: PersistentTaskMeta, sessionDir: string) => Promise<KillOutcome>;
 }
 
 /** Re-adopt a durable task after a restart. No child handle exists, so a
@@ -554,6 +559,7 @@ function adoptPersistedMonitor(
 ): void {
   const head = bashCommandHead(meta.command);
   const logPath = persistentLogPath(sessionDir, meta.id);
+  const killTask = deps.killPersisted ?? ((m: PersistentTaskMeta, dir: string) => killPersistedTask(m, dir));
   let handedOff = false;
   let settled = false;
   let pollTimer: ReturnType<typeof setInterval> | undefined;
@@ -618,7 +624,7 @@ function adoptPersistedMonitor(
         // success from in-memory state; when the verified kill is declined, the
         // task is revived (it was never signalled — reading as dead while it
         // runs would lie to /tasks and the next start) and a wake says so.
-        void killPersistedTask(meta, sessionDir)
+        void killTask(meta, sessionDir)
           .then((outcome) => {
             if (!outcome.killed && outcome.reason !== "mismatched") {
               registry.revive(meta.id);
@@ -645,7 +651,7 @@ function adoptPersistedMonitor(
       () => {
         if (handedOff || settled) return;
         const tail = readTail(); // a successful kill removes the log — read first
-        void killPersistedTask(meta, sessionDir)
+        void killTask(meta, sessionDir)
           .then((outcome) => {
             if (outcome.killed) {
               // The kill removed the log — pass the pre-read output without its

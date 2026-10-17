@@ -46,6 +46,7 @@ import {
   taskMetaPath,
   taskStatusPath,
   writeTaskMeta,
+  type KillOutcome,
   type PersistentTaskMeta,
 } from "../lib/persistent-bash";
 
@@ -2323,5 +2324,180 @@ describe("resumePersistedTasks (real)", () => {
     expect(first).toBe("t-durable");
     expect(again).toBe("t-durable");
     expect(registry.running()).toHaveLength(1);
+  });
+
+  // The declined-kill semantics: no real process — the scan deps fake a live
+  // verified task, the kill seam declines, and everything else (files, poll,
+  // registry) is real.
+  const adoptFake = async (
+    dir: string,
+    deps: {
+      killPersisted: (meta: PersistentTaskMeta, dir: string) => Promise<KillOutcome>;
+    },
+  ) => {
+    const rt = newRuntime();
+    const adoptedWake = vi.fn();
+    const outcomes = await resumePersistedTasks(rt.registry, dir, {
+      wake: adoptedWake,
+      pollMs: 25,
+      // A live, verified task without a real process: isAlive/verifyIdentity
+      // are the only ps-touching boundaries in the scan.
+      scan: { isAlive: () => true, verifyIdentity: async () => "verified" },
+      ...deps,
+    });
+    expect(outcomes[0].decision.action).toBe("adopt");
+    // Declines and deadline notices ride the resume wake seam; settled
+    // outcomes go through the registry's channels.
+    const notices = () => adoptedWake.mock.calls.map((c) => c[0] as string).join("\n");
+    return { rt, notices };
+  };
+
+  it("a declined task_kill on a re-adopted task revives it and says so — never reads dead while it runs", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pb-resume-decl-"));
+    const meta = metaOf({ id: "tdeclkill", pid: 1, command: "echo decline-kill-out" });
+    writeTask(dir, meta, { log: "decline-kill-out\n" });
+    const { rt, notices } = await adoptFake(dir, {
+      killPersisted: async () => ({ killed: false, reason: "unknown" }),
+    });
+
+    rt.registry.kill("tdeclkill"); // task_kill: registry says killed synchronously…
+    await vi.waitFor(() => expect(notices()).toContain("kill not confirmed"), { timeout: 10_000 });
+    expect(notices()).toContain("(ps unavailable?)");
+    expect(rt.registry.isRunning("tdeclkill")).toBe(true); // …but the decline revives it
+    expect(existsSync(taskMetaPath(dir, "tdeclkill"))).toBe(true); // durable state survives for a retry
+
+    // And the revived task still settles through the poll like any other.
+    writeFileSync(taskStatusPath(dir, "tdeclkill"), "0");
+    await vi.waitFor(() => expect(wakes(rt.sendUserMessage)).toContain("exited 0"), { timeout: 10_000 });
+  }, 15_000);
+
+  it("a re-adopted deadline kill that is declined settles nothing — the monitor keeps watching", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pb-resume-dldec-"));
+    // Deadline still ahead at scan time (~0.8s), so the scan adopts and the
+    // monitor's own deadline timer fires during the test.
+    const meta = metaOf({
+      id: "tdldecl",
+      pid: 1,
+      command: "echo deadline-declined",
+      startedAt: Date.now() - 1_200,
+      timeoutSecs: 2,
+    });
+    writeTask(dir, meta, { log: "deadline-declined\n" });
+    const { rt, notices } = await adoptFake(dir, {
+      killPersisted: async () => ({ killed: false, reason: "denied" }),
+    });
+
+    await vi.waitFor(() => expect(notices()).toContain("hit its 2s timeout but could not be killed"), {
+      timeout: 10_000,
+    });
+    expect(notices()).toContain("signal denied");
+    expect(rt.registry.isRunning("tdldecl")).toBe(true); // no settle — it may be healthy
+    expect(existsSync(taskMetaPath(dir, "tdldecl"))).toBe(true);
+
+    // The poll is the backstop: a status arriving later still settles.
+    writeFileSync(taskStatusPath(dir, "tdldecl"), "0");
+    await vi.waitFor(() => expect(wakes(rt.sendUserMessage)).toContain("exited 0"), { timeout: 10_000 });
+  }, 15_000);
+
+  it("a re-adopted deadline kill that succeeds settles timed-out with the pre-read output", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pb-resume-dlok-"));
+    const meta = metaOf({
+      id: "tdlok",
+      pid: 1,
+      command: "echo deadline-ok",
+      startedAt: Date.now() - 1_200,
+      timeoutSecs: 2,
+    });
+    writeTask(dir, meta, { log: "deadline-ok-out\n" });
+    const { rt } = await adoptFake(dir, {
+      killPersisted: async () => ({ killed: true }),
+    });
+
+    await vi.waitFor(() => expect(wakes(rt.sendUserMessage)).toContain("timed out after 2s"), {
+      timeout: 10_000,
+    });
+    expect(rt.registry.isRunning("tdlok")).toBe(false);
+    expect(rt.registry.get("tdlok")?.status).toContain("timed out");
+    expect(wakes(rt.sendUserMessage)).toContain("deadline-ok-out"); // captured before the kill
+    expect(existsSync(taskMetaPath(dir, "tdlok"))).toBe(false);
+  }, 15_000);
+
+  it("a re-adopted deadline kill on a recycled pid settles not-killed and spares nothing", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pb-resume-dlmis-"));
+    const meta = metaOf({
+      id: "tdlmis",
+      pid: 1,
+      command: "echo deadline-mismatch",
+      startedAt: Date.now() - 1_200,
+      timeoutSecs: 2,
+    });
+    writeTask(dir, meta, { log: "deadline-mismatch-out\n" });
+    const { rt } = await adoptFake(dir, {
+      killPersisted: async () => ({ killed: false, reason: "mismatched" }),
+    });
+
+    await vi.waitFor(
+      () => expect(wakes(rt.sendUserMessage)).toContain("pid was reused while pi was away; not killed"),
+      {
+        timeout: 10_000,
+      },
+    );
+    expect(rt.registry.isRunning("tdlmis")).toBe(false);
+    expect(wakes(rt.sendUserMessage)).toContain("deadline-mismatch-out"); // the pre-read tail rides along
+    expect(existsSync(taskMetaPath(dir, "tdlmis"))).toBe(false); // settle cleaned it
+  }, 15_000);
+
+  it("a kill seam that rejects outright still settles timed-out — the monitor never hangs", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pb-resume-dlrej-"));
+    const meta = metaOf({
+      id: "tdlrej",
+      pid: 1,
+      command: "echo deadline-reject",
+      startedAt: Date.now() - 1_200,
+      timeoutSecs: 2,
+    });
+    writeTask(dir, meta, { log: "deadline-reject-out\n" });
+    const { rt } = await adoptFake(dir, {
+      killPersisted: () => Promise.reject(new Error("boom")),
+    });
+
+    await vi.waitFor(() => expect(wakes(rt.sendUserMessage)).toContain("timed out after 2s"), {
+      timeout: 10_000,
+    });
+    expect(rt.registry.isRunning("tdlrej")).toBe(false);
+  }, 15_000);
+
+  it("an unverifiable identity at resume wakes a notice and touches nothing", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pb-resume-unk-"));
+    const meta = metaOf({ id: "tunk", pid: 1, command: "echo unknown-identity" });
+    writeTask(dir, meta, { log: "unk-out\n" });
+    const rt = newRuntime();
+    const notice = vi.fn();
+    const outcomes = await resumePersistedTasks(rt.registry, dir, {
+      wake: notice,
+      // Alive, but ps cannot prove the pid is still this task's.
+      scan: { isAlive: () => true, verifyIdentity: async () => "unknown" },
+    });
+    expect(outcomes.map((o) => o.decision.action)).toEqual(["unknown-identity"]);
+    expect(notice.mock.calls.map((c) => c[0] as string).join("\n")).toContain(
+      "identity could not be verified (is ps available?); left untouched",
+    );
+    expect(rt.registry.running()).toHaveLength(0); // neither adopted nor destroyed
+    expect(existsSync(taskMetaPath(dir, "tunk"))).toBe(true);
+    expect(existsSync(persistentLogPath(dir, "tunk"))).toBe(true);
+  });
+
+  it("discards unreadable metadata at resume without waking or adopting", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pb-resume-disc-"));
+    mkdirSync(join(dir, "tasks"), { recursive: true });
+    writeFileSync(join(dir, "tasks", "tdiscard.task.json"), "{not json");
+    writeFileSync(persistentLogPath(dir, "tdiscard"), "forensics\n");
+    const rt = newRuntime();
+    const outcomes = await resumePersistedTasks(rt.registry, dir);
+    expect(outcomes.map((o) => o.decision.action)).toEqual(["discard"]);
+    expect(existsSync(taskMetaPath(dir, "tdiscard"))).toBe(false); // the corrupt file is cleaned
+    expect(existsSync(persistentLogPath(dir, "tdiscard"))).toBe(true); // the log stays for forensics
+    expect(rt.registry.running()).toHaveLength(0);
+    expect(rt.sendUserMessage).not.toHaveBeenCalled();
   });
 });
