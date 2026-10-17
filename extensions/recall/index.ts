@@ -38,9 +38,11 @@
  * - Cache invariants hold by construction: a plain tool whose results ride at
  *   the tail; no context rewrites, no system-prompt churn, one promptSnippet.
  * - The extension owns the context budget and the summary: auto-compaction
- *   fires when projected context exceeds a target — min(80k tokens, 70% of
+ *   fires when projected context exceeds a target — min(128k tokens, 70% of
  *   the model's context window), whichever is reached first, for every model
- *   alike: 80k is the measured cost optimum from issue #3 (PI_RECALL_COMPACT_TARGET
+ *   alike: re-tuned from issue #3's 80k dollar optimum after flash-session
+ *   forensics — cheap-cache models pay cents to carry context, but every
+ *   compaction pays re-reads and latency (PI_RECALL_COMPACT_TARGET
  *   overrides; token cap 0 disables, and so does a target below what
  *   compaction can achieve) —
  *   via a turn_end boundary draft mid-run (a continuously busy agent never
@@ -60,7 +62,7 @@
  *   text when pi's preparation matches the fingerprint the background pass
  *   recorded (stale results are discarded and regenerated, never served).
  *   Idle triggers also fire EARLY, this fraction of the target BELOW it —
- *   PI_RECALL_COMPACT_IDLE_DISCOUNT (default 0.125 — 70k at the 80k
+ *   PI_RECALL_COMPACT_IDLE_DISCOUNT (default 0.1 — 115.2k at the 128k
  *   target). A settled moment right after a run is when the provider's
  *   cache still holds the session prefix, so the summary's input is a cache
  *   read, and spending that cheap summary there keeps mid-run crossings of
