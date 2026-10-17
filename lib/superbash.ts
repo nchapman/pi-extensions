@@ -63,6 +63,7 @@ import { delimiter, join } from "node:path";
 import {
   createBashToolDefinition,
   createLocalBashOperations,
+  getShellConfig,
   truncateTail,
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
@@ -73,6 +74,19 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { TSchema } from "typebox";
+import {
+  isProcessAlive,
+  killPersistedTask,
+  parseBashPersist,
+  persistentLogPath,
+  readStatusSync,
+  removePersistedArtifacts,
+  spawnPersistentTask,
+  taskEnv,
+  taskStatusPath,
+  writeTaskMeta,
+  type PersistentTaskMeta,
+} from "./persistent-bash";
 
 /** Budget (chars for replies, bytes for command output) that rides inline in the wake message. */
 export const WAKE_TEXT_CAP = 4_000;
@@ -625,7 +639,13 @@ export type BashWaitMode = "inline" | "auto" | "background";
 
 /** The unified bash shape plus any params a sibling tool adds (ssh_bash's
  * target/port/key): values of the extras are the extension's to validate. */
-export type BashToolCallParams = { command: string; timeout?: number; wait?: BashWaitMode } & Record<string, unknown>;
+export type BashToolCallParams = {
+  command: string;
+  timeout?: number;
+  wait?: BashWaitMode;
+  /** Opt the background command into surviving pi restarts (background mode only). */
+  persist?: boolean;
+} & Record<string, unknown>;
 
 /** Per-call provisioning from a `prepare` hook: the operations this call runs
  * through, an optional inline executor over them, and the one-line task name
@@ -679,6 +699,12 @@ export function createBashTool(
     /** Per-call provisioning (ssh_bash resolves the target into operations
      * and a task head); when given it replaces the static operations/inline. */
     prepare?: (params: BashToolCallParams) => BashCallContext;
+    /** Test seam and overrides for the persistent-background spawn. */
+    persistent?: {
+      shell?: string;
+      shellArgs?: string[];
+      spawn?: typeof import("node:child_process").spawn;
+    };
   } = {},
 ) {
   const operations = opts.operations ?? createLocalBashOperations();
@@ -722,6 +748,7 @@ export function createBashTool(
       opts.description ??
       `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first); when truncated, the full output is saved to a file whose path the result includes.
 wait: "inline" (default) blocks until the command finishes and returns its output — waiting on a tool call costs nothing, so this is the normal choice; pass a timeout to bound a command you're unsure about. wait: "auto" blocks up to ~${formatDuration(descWindowMs)} — a command that finishes in time returns its output inline, one that doesn't move to the background and return a task id (t-xxxxx). "background" returns a task id immediately — for work you'll do other things while it runs. A backgrounded command's result (exit status, duration, output tail) is delivered to you automatically as your next message, even mid-run — if you have nothing else to do, end your turn and the wake re-engages you; never sleep or poll to wait. Peek at a running task with task <id> only when its new output would change what you do; stop it with task_kill.
+persist: true (wait: "background" only) detaches the command from pi entirely: it keeps running across pi exits and restarts, logs to the session's tasks directory, and its outcome is reported when the session resumes. The default is non-persistent; PI_BG_BASH_PERSIST=1 flips the default for background mode.
 Timeout is in seconds, optional, no default — a command without a timeout runs until it finishes or is killed (0 also means no timeout).`,
     promptSnippet: opts.promptSnippet ?? "Execute bash commands (ls, grep, find, etc.)",
     promptGuidelines: opts.promptGuidelines ?? [
@@ -740,6 +767,11 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
       wait: Type.Optional(
         Type.Union([Type.Literal("inline"), Type.Literal("auto"), Type.Literal("background")], {
           description: `inline (default): block and return output. auto: block up to ~${formatDuration(descWindowMs)}, then move to the background. background: return a task id immediately.`,
+        }),
+      ),
+      persist: Type.Optional(
+        Type.Boolean({
+          description: `With wait: "background" only: keep the command running across pi restarts (outcome reported on session resume).`,
         }),
       ),
       ...(opts.extraParams ?? {}),
@@ -772,6 +804,11 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
           );
         }
         timeoutSecs = params.timeout;
+      }
+      // persist composes only with background — reject before any execution leg
+      // (inline would otherwise delegate to pi's built-in and fail differently).
+      if (params.persist === true && mode !== "background") {
+        return error(`persist: true requires wait: "background" (got "${mode}")`);
       }
       // Per-call provisioning: a prepare hook (sibling tools) supplies the
       // operations this call runs through, an inline executor over them, and
@@ -815,6 +852,174 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
         model: ctx?.model?.id,
         thinkingLevel: ctx?.thinkingLevel,
       });
+      // ---- persistent background leg ----
+      // Explicit persistence must pass every gate loudly (an explicit request
+      // that silently downgraded would strand a task the agent believes is
+      // durable). The PI_BG_BASH_PERSIST default applies only where the gates
+      // already pass, so sibling tools (ssh_bash) and non-background modes
+      // silently keep the pipe path.
+      const persistGatesPass = !opts.prepare && process.platform !== "win32" && !!sessionDir && mode === "background";
+      const persistWanted = params.persist ?? (mode === "background" && parseBashPersist(process.env));
+      if (params.persist === true && !persistGatesPass) {
+        if (opts.prepare) return error(`${name}: persistent background tasks are not supported for this tool`);
+        if (process.platform === "win32") return error("Persistent background tasks are not supported on Windows");
+        return error("Persistent background tasks require a session directory");
+      }
+      // The persistent leg: spawn the wrapper detached (own process group,
+      // stdio straight to the append-mode log), write the durable metadata
+      // that a later session scans for, and monitor to a single settle. Full
+      // rationale in lib/persistent-bash.ts and the design doc.
+      const runPersistent = (): BashToolResult => {
+        const dir = sessionDir as string; // gates guaranteed it
+        let logPath: string | undefined;
+        let meta: PersistentTaskMeta | undefined;
+        let child: ReturnType<typeof spawnPersistentTask> | undefined;
+        let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+        let pollTimer: ReturnType<typeof setInterval> | undefined;
+        // Single settle + handoff guard: after detach() the on-disk metadata
+        // owns the outcome and nothing in this runtime may fire for the task.
+        let handedOff = false;
+        let settled = false;
+        const stopMonitor = () => {
+          if (deadlineTimer) clearTimeout(deadlineTimer);
+          if (pollTimer) clearInterval(pollTimer);
+          deadlineTimer = undefined;
+          pollTimer = undefined;
+          if (child) {
+            child.removeAllListeners("exit");
+            child.removeAllListeners("error");
+          }
+        };
+        const failStart = (message: string): BashToolResult => {
+          reg.complete(id, { ok: false, status: "failed to start", text: `failed: ${message}`, wake: false });
+          return error(`Failed to start command: ${message}`);
+        };
+        const id = reg.adopt({
+          name: taskHead,
+          kind: "bash",
+          persistent: true,
+          progress: logProgressFor(() => logPath),
+          kill: () => {
+            // Registry kill (task_kill, /tasks kill): verified group kill; a
+            // killed task leaves no artifacts — the log included.
+            if (meta) void killPersistedTask(meta, dir).catch(() => {});
+          },
+          detach: () => {
+            handedOff = true;
+            stopMonitor();
+          },
+        });
+        logPath = persistentLogPath(dir, id);
+        const statusPath = taskStatusPath(dir, id);
+        const startedAt = now();
+        try {
+          child = spawnPersistentTask({
+            shell: opts.persistent?.shell ?? getShellConfig().shell,
+            ...(opts.persistent?.shellArgs ? { shellArgs: opts.persistent.shellArgs } : {}),
+            cwd,
+            env: taskEnv(env, command, statusPath),
+            logPath,
+            ...(opts.persistent?.spawn ? { spawnFn: opts.persistent.spawn } : {}),
+          });
+        } catch (err) {
+          return failStart(err instanceof Error ? err.message : String(err));
+        }
+        const pid = child.pid;
+        if (!pid) return failStart("no pid from spawn");
+        meta = {
+          version: 1,
+          id,
+          command,
+          pid,
+          startedAt,
+          ...(timeoutSecs !== undefined ? { timeoutSecs } : {}),
+          cwd,
+        };
+        try {
+          writeTaskMeta(dir, meta); // after spawn — the pid must exist by now
+        } catch (err) {
+          // The command runs but a restart would never report it (nothing to
+          // scan). Fail closed: kill the group, leave no artifacts.
+          const message = err instanceof Error ? err.message : String(err);
+          try {
+            process.kill(-pid, "SIGKILL");
+          } catch {
+            // already gone
+          }
+          removePersistedArtifacts(dir, id, { keepLog: false });
+          return failStart(`could not persist task metadata: ${message}`);
+        }
+        const settle = (status: string, ok: boolean, options: { dropLog?: boolean } = {}) => {
+          if (handedOff || settled) return; // fire-once, and never after handoff
+          settled = true;
+          stopMonitor();
+          // Settle invariant: metadata exists ⇔ outcome unreported — deleted on
+          // any settle; the log stays for peeking (dropped only when nothing ran).
+          removePersistedArtifacts(dir, id, { keepLog: !options.dropLog });
+          if (!reg.isRunning(id)) return; // killed via the registry: no wake
+          const chunk = readLogChunk(logPath as string, undefined, BASH_TAIL_CAP);
+          const display = truncateTail(chunk?.text ?? "", { maxLines: DEFAULT_MAX_LINES, maxBytes: WAKE_TEXT_CAP });
+          reg.complete(id, {
+            ok,
+            status,
+            text: formatBashWake({
+              command: taskHead,
+              id,
+              status,
+              durationMs: now() - startedAt,
+              output: display.content,
+              outputNote: display.truncated ? `[… truncated — full output: ${logPath} …]` : undefined,
+            }),
+          });
+        };
+        // The wrapper writes its status file before exiting, but a bare `exit N`
+        // skips that write (documented degradation) — the event code wins.
+        child.once("exit", (code: number | null) =>
+          settle(code === null ? "terminated without an exit code" : `exited ${code}`, code === 0),
+        );
+        child.once("error", (err: Error) => settle(`failed: ${err.message}`, false, { dropLog: true }));
+        if (timeoutSecs !== undefined) {
+          // We hold the child handle, so the pid cannot have recycled — signal
+          // the group directly, no ps verification needed.
+          deadlineTimer = setTimeout(() => {
+            try {
+              process.kill(-pid, "SIGKILL");
+            } catch {
+              // already gone — the exit event settles
+            }
+            settle(`timed out after ${timeoutSecs}s`, false);
+          }, timeoutSecs * 1000);
+          deadlineTimer.unref();
+        }
+        // Backstop poll: the exit event is the fast path; this catches a status
+        // file that landed (or a leader that died) without the event firing.
+        pollTimer = setInterval(() => {
+          const status = readStatusSync(dir, id);
+          if (status !== undefined && status.trim() !== "") {
+            const code = Number.parseInt(status.trim(), 10);
+            settle(
+              Number.isInteger(code) ? `exited ${code}` : "terminated without an exit code",
+              Number.isInteger(code) && code === 0,
+            );
+            return;
+          }
+          if (!isProcessAlive(pid)) settle("terminated without an exit code", false);
+        }, 2_000);
+        pollTimer.unref();
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Backgrounded (${id}, persistent): ${taskHead}
+The command keeps running in its own process group, detached from pi — it survives pi exiting and restarting, and its outcome is reported when the session resumes. In this session the exit status, duration, and output tail are delivered to you automatically as your next message when it exits — even mid-run. If you have nothing else to do, end your turn: the wake re-engages you, so waiting is never your job. Never sleep or poll to wait, and don't arm a check-in just to wait — the result arrives on its own. Peek at it with task ${id}; stop it with task_kill ${id}. Any timeout you passed still applies.`,
+            },
+          ],
+          details: { kind: "bash", mode, id },
+          structuredContent: { backgrounded: true, task_id: id, persistent: true },
+        };
+      };
+      if (persistWanted && persistGatesPass) return runPersistent();
+      // ---- pipe leg (default) ----
       // One controller per task: registry kills (task_kill, /tasks, shutdown)
       // and the tool call's own abort both funnel into it. pi's local ops kill
       // the whole process tree on abort, like the built-in bash tool.
@@ -834,9 +1039,6 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
       let logStream: import("node:fs").WriteStream | undefined;
       let logPath: string | undefined;
       let logFailed = false;
-      // Read offset for check-in wake progress lines (independent of the task
-      // tool's peek offsets, which live in that tool's closure).
-      let remindReadOffset = 0;
       const ensureLog = () => {
         if (logStream || logFailed) return;
         logPath = sessionDir ? outputLogPath(sessionDir, id) : tempOutputLogPath(id);
@@ -903,17 +1105,7 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
         // Check-in wakes read the log from their own offset, so each wake
         // carries the output that appeared since the last look — the wake is
         // content-bearing, never just an elapsed-time nag.
-        progress: () => {
-          if (!logPath || !existsSync(logPath)) return "(no output yet)";
-          const size = statSync(logPath).size;
-          if (size <= remindReadOffset) return "no new output since the last look";
-          // Show the tail of the delta, like a first peek does — the head of a
-          // large delta (build banners) is the least informative slice.
-          const chunk = readLogChunk(logPath, Math.max(remindReadOffset, size - REMINDER_TAIL_CAP), REMINDER_TAIL_CAP);
-          if (!chunk) return "(no output yet)";
-          remindReadOffset = size;
-          return `new output since the last look (${formatSize(chunk.bytes)}):\n${chunk.text}`;
-        },
+        progress: logProgressFor(() => logPath),
         kill: () => {
           controller.abort();
           // A killed task leaves no orphaned log: stop writes, remove the
@@ -1133,6 +1325,24 @@ The command keeps running in the background. When it exits, the exit status, dur
       }
       return { content: [{ type: "text", text }], details: { kind: "bash", mode, id }, structuredContent };
     },
+  };
+}
+
+/** Check-in progress over a log file: each call reads the delta since the
+ *  last look (tail-biased, like a first peek), so every check-in wake carries
+ *  new output rather than an elapsed-time nag. Shared by the pipe and
+ *  persistent background paths. */
+function logProgressFor(getPath: () => string | undefined): () => string | undefined {
+  let offset = 0;
+  return () => {
+    const path = getPath();
+    if (!path || !existsSync(path)) return "(no output yet)";
+    const size = statSync(path).size;
+    if (size <= offset) return "no new output since the last look";
+    const chunk = readLogChunk(path, Math.max(offset, size - REMINDER_TAIL_CAP), REMINDER_TAIL_CAP);
+    if (!chunk) return "(no output yet)";
+    offset = size;
+    return `new output since the last look (${formatSize(chunk.bytes)}):\n${chunk.text}`;
   };
 }
 

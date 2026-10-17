@@ -422,6 +422,8 @@ export async function killPersistedTask(
 /** Options for spawnPersistentTask; the shell comes resolved (pi's getShellConfig). */
 export interface PersistentSpawnOptions {
   shell: string;
+  /** Invocation args ahead of the script ("-c" for POSIX shells). */
+  shellArgs?: string[];
   cwd: string;
   /** Already carries the two task vars (taskEnv). */
   env: NodeJS.ProcessEnv;
@@ -447,7 +449,7 @@ export function spawnPersistentTask(opts: PersistentSpawnOptions): ChildProcess 
   const logFd = openSync(opts.logPath, "a");
   let child: ChildProcess;
   try {
-    child = doSpawn(opts.shell, ["-c", PERSISTENT_WRAPPER_SCRIPT], {
+    child = doSpawn(opts.shell, [...(opts.shellArgs ?? ["-c"]), PERSISTENT_WRAPPER_SCRIPT], {
       cwd: opts.cwd,
       detached: true,
       stdio: ["ignore", logFd, logFd],

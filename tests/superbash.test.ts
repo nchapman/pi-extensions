@@ -37,6 +37,15 @@ import {
   tempOutputLogPath,
   WAKE_TEXT_CAP,
 } from "../lib/superbash";
+import {
+  isProcessAlive,
+  killPersistedTask,
+  persistentLogPath,
+  readTaskMeta,
+  taskMetaPath,
+  taskStatusPath,
+  type PersistentTaskMeta,
+} from "../lib/persistent-bash";
 
 /** First content block of these tools' results is always text. */
 const textOf = (r: { content: readonly unknown[] }): string => (r.content[0] as { text: string }).text;
@@ -767,6 +776,53 @@ describe("createBashTool", () => {
       expect(d.registry.running()).toHaveLength(0);
       expect(d.sendUserMessage).not.toHaveBeenCalled();
     }
+  });
+
+  it("persist: true rejects non-background modes loudly, before any task exists", async () => {
+    const d = toolDeps();
+    const ops = fakeBashOps();
+    const tool = createBashTool(d.registry, { operations: ops });
+    for (const wait of ["inline", "auto"] as const) {
+      const result = await tool.execute("1", { command: "true", wait, persist: true }, undefined, undefined, CTX);
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toContain(`persist: true requires wait: "background" (got "${wait}")`);
+    }
+    expect(ops.last).toBeUndefined();
+    expect(d.registry.running()).toHaveLength(0);
+    expect(d.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("persist: true without a session directory is an explicit error", async () => {
+    const d = toolDeps();
+    const tool = createBashTool(d.registry, { operations: fakeBashOps() });
+    const result = await tool.execute(
+      "1",
+      { command: "true", wait: "background", persist: true },
+      undefined,
+      undefined,
+      CTX, // no session dir
+    );
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain("Persistent background tasks require a session directory");
+    expect(d.registry.running()).toHaveLength(0);
+  });
+
+  it("persist: true is rejected for prepare-based tools (ssh_bash)", async () => {
+    const d = toolDeps();
+    const tool = createBashTool(d.registry, {
+      operations: fakeBashOps(),
+      prepare: () => ({ operations: fakeBashOps(), head: "ssh true" }),
+    });
+    const result = await tool.execute(
+      "1",
+      { command: "true", wait: "background", persist: true },
+      undefined,
+      undefined,
+      dirCtx(mkdtempSync(join(tmpdir(), "pb-gate-"))),
+    );
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain("persistent background tasks are not supported for this tool");
+    expect(d.registry.running()).toHaveLength(0);
   });
 
   it("reports timeout rejections in the wake", async () => {
@@ -1908,4 +1964,122 @@ describe("clampTimeoutMs", () => {
     expect(clampTimeoutMs(Number.NaN, 1_000)).toBe(1_000);
     expect(clampTimeoutMs(undefined, 1_000)).toBe(1_000);
   });
+});
+
+describe("bash tool persistent background (real)", () => {
+  // Real wrapper spawns against the local bash — same philosophy as "bash tool
+  // with real commands": the wrapper's shell semantics are the risk under test.
+  function realPersistentTool(sessionDir: string) {
+    const sendUserMessage = vi.fn();
+    const notify = vi.fn();
+    const registry = createTaskRegistry({ sendUserMessage, notify, setStatus: vi.fn() });
+    const tool = createBashTool(registry, {});
+    const ctx = { sessionManager: { getSessionDir: () => sessionDir } } as never;
+    return { sendUserMessage, notify, registry, tool, ctx };
+  }
+
+  const runPersist = (d: ReturnType<typeof realPersistentTool>, command: string, extra = {}) =>
+    d.tool.execute("1", { command, wait: "background", persist: true, ...extra }, undefined, undefined, d.ctx);
+
+  it("backgrounds persistently: durable state while running, wake on exit, settled artifacts", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pb-tool-"));
+    const d = realPersistentTool(dir);
+    const result = await runPersist(d, "echo persist-hi; exit 3");
+    const id = idOf(result);
+    expect(textOf(result)).toContain(`Backgrounded (${id}, persistent)`);
+    expect(textOf(result)).toContain("survives pi exiting and restarting");
+    expect(result.structuredContent).toEqual({ backgrounded: true, task_id: id, persistent: true });
+    expect(d.registry.running()[0]).toMatchObject({ id, kind: "bash", persistent: true });
+    const meta = readTaskMeta(dir, id);
+    expect(meta).toMatchObject({ version: 1, id, command: "echo persist-hi; exit 3", cwd: process.cwd() });
+    expect(typeof meta?.pid).toBe("number");
+    await vi.waitFor(() => expect(d.sendUserMessage).toHaveBeenCalledTimes(1), { timeout: 10_000 });
+    const wake = d.sendUserMessage.mock.calls[0][0] as string;
+    expect(wake).toContain("exited 3");
+    expect(wake).toContain("persist-hi");
+    // Settle invariant: metadata gone, log kept for peeking.
+    expect(readTaskMeta(dir, id)).toBeUndefined();
+    expect(existsSync(taskStatusPath(dir, id))).toBe(false);
+    expect(readFileSync(persistentLogPath(dir, id), "utf8")).toContain("persist-hi");
+    expect(d.registry.running()).toHaveLength(0);
+  }, 15_000);
+
+  it("a killed persistent task loses its group and every artifact, and never wakes", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pb-toolkill-"));
+    const d = realPersistentTool(dir);
+    const result = await runPersist(d, "sleep 30");
+    const id = idOf(result);
+    const pid = readTaskMeta(dir, id)?.pid as number;
+    expect(d.registry.kill(id)).toBe(true);
+    await vi.waitFor(() => expect(isProcessAlive(pid)).toBe(false), { timeout: 5_000 });
+    expect(existsSync(taskMetaPath(dir, id))).toBe(false);
+    expect(existsSync(taskStatusPath(dir, id))).toBe(false);
+    expect(existsSync(persistentLogPath(dir, id))).toBe(false);
+    expect(d.sendUserMessage).not.toHaveBeenCalled(); // killed tasks never wake
+  }, 15_000);
+
+  it("a deadline kill wakes 'timed out' and leaves no running group", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pb-toolto-"));
+    const d = realPersistentTool(dir);
+    const result = await runPersist(d, "sleep 30", { timeout: 1 });
+    const id = idOf(result);
+    const pid = readTaskMeta(dir, id)?.pid as number;
+    expect(readTaskMeta(dir, id)?.timeoutSecs).toBe(1);
+    await vi.waitFor(() => expect(d.sendUserMessage).toHaveBeenCalledTimes(1), { timeout: 10_000 });
+    const wake = d.sendUserMessage.mock.calls[0][0] as string;
+    expect(wake).toContain("timed out after 1s");
+    expect(wake).toContain("sleep 30");
+    await vi.waitFor(() => expect(isProcessAlive(pid)).toBe(false), { timeout: 5_000 });
+    expect(readTaskMeta(dir, id)).toBeUndefined(); // settle cleaned up
+    expect(existsSync(persistentLogPath(dir, id))).toBe(true); // log kept on timeout
+  }, 15_000);
+
+  it("spare detaches: the command keeps running under the disk state's ownership, no wake ever fires", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pb-toolspare-"));
+    const d = realPersistentTool(dir);
+    const result = await runPersist(d, "sleep 1");
+    const id = idOf(result);
+    const meta = readTaskMeta(dir, id) as PersistentTaskMeta;
+    d.registry.killAll({ sparePersistent: true });
+    expect(d.registry.get(id)).toBeUndefined(); // handed off, unknown here
+    expect(readTaskMeta(dir, id)).toBeDefined(); // the disk state is the owner now
+    // Let the command finish and pass the 2s monitor tick: a leftover monitor
+    // would have settled and woken by now.
+    await vi.waitFor(() => expect(existsSync(taskStatusPath(dir, id))).toBe(true), { timeout: 10_000 });
+    await new Promise((r) => setTimeout(r, 1_600));
+    expect(isProcessAlive(meta.pid)).toBe(false); // it ran to completion, unhindered
+    expect(d.sendUserMessage).not.toHaveBeenCalled(); // and pi never woke for it
+    await killPersistedTask({ ...meta, startedAt: Date.now() - 500 }, dir); // test cleanup
+  }, 15_000);
+
+  it("PI_BG_BASH_PERSIST=1 defaults background mode to persistent; persist: false overrides it", async () => {
+    process.env.PI_BG_BASH_PERSIST = "1";
+    try {
+      const dir = mkdtempSync(join(tmpdir(), "pb-envdef-"));
+      const defaulted = realPersistentTool(dir);
+      const r1 = await defaulted.tool.execute(
+        "1",
+        { command: "true", wait: "background" },
+        undefined,
+        undefined,
+        defaulted.ctx,
+      );
+      const id1 = idOf(r1);
+      expect(textOf(r1)).toContain(`Backgrounded (${id1}, persistent)`);
+      expect(readTaskMeta(dir, id1)).toBeDefined();
+
+      const explicitOff = realPersistentTool(dir);
+      const r2 = await explicitOff.tool.execute(
+        "1",
+        { command: "true", wait: "background", persist: false },
+        undefined,
+        undefined,
+        explicitOff.ctx,
+      );
+      expect(textOf(r2)).toContain(`Backgrounded (${idOf(r2)}):`); // plain pipe notice
+      expect(readTaskMeta(dir, idOf(r2))).toBeUndefined(); // no durable state
+    } finally {
+      delete process.env.PI_BG_BASH_PERSIST;
+    }
+  }, 15_000);
 });
