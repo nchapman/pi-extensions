@@ -87,6 +87,8 @@ export interface BgTask {
   endedAt?: number;
   /** Short terminal status line ("exited 0", "completed", …) recorded on complete. */
   status?: string;
+  /** True for tasks that outlive pi: spared by killAll({sparePersistent}), shown with a marker. */
+  persistent?: boolean;
   /** Live progress line for check-in wakes; undefined when the kind has nothing to report.
    *  Consuming: calling it advances the reminder channel's read offset — the
    *  delta it reports is one-shot, so call it exactly once per wake. */
@@ -126,6 +128,12 @@ export interface TaskRegistry {
     kind: "subagent" | "bash";
     kill: () => void;
     progress?: () => string | undefined;
+    /** Opt the task into surviving restarts; killAll can then spare it. */
+    persistent?: boolean;
+    /** Spare-time handoff: drop listeners/timers and flip the settle guard, so
+     *  the in-memory monitor can never again fire for this task — the on-disk
+     *  metadata becomes its single owner. Called by killAll({sparePersistent}). */
+    detach?: () => void;
   }): string;
   /**
    * Record the outcome and deliver the wake exactly once; a no-op for unknown
@@ -141,8 +149,11 @@ export interface TaskRegistry {
   get(id: string): BgTask | undefined;
   /** Kill one task by id; true when it existed and was running. Killed tasks never wake. */
   kill(id: string): boolean;
-  /** Kill every running task and mark it killed — no wakes fire for killed tasks. Returns how many were killed. */
-  killAll(): number;
+  /** Kill every running task and mark it killed — no wakes fire for killed tasks. Returns how many were killed.
+   *  sparePersistent: detach persistent tasks instead — hand them to the disk
+   *  state (no kill signal, no wake, dropped from the registry) so they keep
+   *  running across the restart. */
+  killAll(opts?: { sparePersistent?: boolean }): number;
   /** Arm (or re-arm) a one-shot check-in on a running task; false when the task is unknown or settled. */
   remind(id: string, ms: number, note?: string): boolean;
   /** Cancel the task's pending check-in; true when one was pending. */
@@ -262,12 +273,17 @@ export function describeReminders(reminders: { id: string; ms: number; note?: st
     .join("\n")}`;
 }
 
+/** Minimal thenable check — deliver only needs to know "has a .catch to silence". */
+function isPromiseLike(v: unknown): v is { catch: (onRejected: (reason: unknown) => void) => unknown } {
+  return typeof v === "object" && v !== null && typeof (v as { catch?: unknown }).catch === "function";
+}
+
 /** Create a session-scoped registry. Pure over its injected channels. */
 export function createTaskRegistry(deps: TaskDeps = {}): TaskRegistry {
   const now = deps.now ?? Date.now;
   const schedule = deps.schedule ?? ((fn: () => void, ms: number) => setTimeout(fn, ms));
   const unschedule = deps.unschedule ?? ((handle: unknown) => clearTimeout(handle as ReturnType<typeof setTimeout>));
-  const tasks = new Map<string, BgTask & { kill: () => void }>();
+  const tasks = new Map<string, BgTask & { kill: () => void; detach?: () => void }>();
   const reminders = new Map<string, { handle: unknown; ms: number; note?: string }>();
   // Ids are "t-" + base36 millisecond timestamp, monotonic within the session.
   // Time-based so ids are unique across resumes and parallel sessions: a long
@@ -285,7 +301,14 @@ export function createTaskRegistry(deps: TaskDeps = {}): TaskRegistry {
   // reject unhandled and crash the host.
   const deliver = (text: string, ok: boolean) => {
     try {
-      if (deps.wakeEnabled !== false) deps.sendUserMessage?.(text);
+      if (deps.wakeEnabled !== false) {
+        const sent = deps.sendUserMessage?.(text) as unknown;
+        // The channel is async (pi's sendUserMessage returns a promise) and pi
+        // installs no unhandledRejection handler — a late rejection would
+        // crash the host after this call already returned. Swallow it: the
+        // wake is lost, the session survives (mirrors the sync case below).
+        if (isPromiseLike(sent)) void sent.catch(() => {});
+      }
       deps.notify?.(text.split("\n")[0], ok ? "info" : "error");
     } catch {
       // Delivery failed after the fire-once flip — the wake is lost, but the
@@ -334,6 +357,8 @@ export function createTaskRegistry(deps: TaskDeps = {}): TaskRegistry {
         startedAt: now(),
         kill: record.kill,
         progress: record.progress,
+        persistent: record.persistent,
+        detach: record.detach,
       });
       refreshStatus();
       return id;
@@ -351,7 +376,7 @@ export function createTaskRegistry(deps: TaskDeps = {}): TaskRegistry {
     running() {
       return [...tasks.values()]
         .filter((t) => t.state === "running")
-        .map(({ kill: _kill, ...rest }) => rest)
+        .map(({ kill: _kill, detach: _detach, ...rest }) => rest)
         .sort((a, b) => a.startedAt - b.startedAt);
     },
     isRunning(id) {
@@ -360,15 +385,29 @@ export function createTaskRegistry(deps: TaskDeps = {}): TaskRegistry {
     get(id) {
       const task = tasks.get(id);
       if (!task) return undefined;
-      const { kill: _kill, ...rest } = task;
+      const { kill: _kill, detach: _detach, ...rest } = task;
       return rest;
     },
     kill(id) {
       return killTask(tasks.get(id));
     },
-    killAll() {
+    killAll(opts = {}) {
       let killed = 0;
-      for (const task of tasks.values()) {
+      for (const [id, task] of tasks) {
+        if (opts.sparePersistent && task.persistent) {
+          // Spare = detach, not abandon: cancel the pending check-in, hand the
+          // monitor its goodbye (listeners off, settle guard up), then drop the
+          // task entirely — as if never adopted. No kill signal, no wake; the
+          // on-disk metadata is the single owner of its outcome now.
+          cancelReminder(id);
+          try {
+            task.detach?.();
+          } catch {
+            // teardown is best-effort; the scan on next start is the backstop
+          }
+          tasks.delete(id);
+          continue;
+        }
         if (killTask(task)) killed++;
       }
       refreshStatus();
@@ -1100,7 +1139,12 @@ The command keeps running in the background. When it exits, the exit status, dur
 /** One line of the /tasks listing and the kill/peek error hints. */
 export function describeRunningTasks(tasks: BgTask[], nowMs: number = Date.now()): string {
   if (tasks.length === 0) return "No background tasks running.";
-  return tasks.map((t) => `${t.id} (${t.kind}, ${formatDuration(nowMs - t.startedAt)}) ${t.name}`).join("\n");
+  return tasks
+    .map(
+      (t) =>
+        `${t.id} (${t.kind}${t.persistent ? ", persistent" : ""}, ${formatDuration(nowMs - t.startedAt)}) ${t.name}`,
+    )
+    .join("\n");
 }
 
 /** A bounded slice of a task log from a byte offset (undefined = the tail). */

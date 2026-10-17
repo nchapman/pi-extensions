@@ -20,6 +20,8 @@ import {
   DEFAULT_BASH_BG_AFTER_MS,
   NEVER_ADOPT_MS,
   describeReminders,
+  describeRunningTasks,
+  type BgTask,
   formatDuration,
   formatReminderWake,
   formatSubagentWake,
@@ -266,6 +268,22 @@ describe("describeReminders", () => {
   });
 });
 
+describe("describeRunningTasks", () => {
+  it("lists nothing when idle, and marks persistent tasks", () => {
+    expect(describeRunningTasks([])).toBe("No background tasks running.");
+    const p: BgTask = {
+      id: "t-a",
+      name: "npm run build",
+      kind: "bash",
+      state: "running",
+      startedAt: 1_000,
+      persistent: true,
+    };
+    const f: BgTask = { id: "t-b", name: "vitest", kind: "bash", state: "running", startedAt: 1_000 };
+    expect(describeRunningTasks([p, f], 4_000)).toBe("t-a (bash, persistent, 3s) npm run build\nt-b (bash, 3s) vitest");
+  });
+});
+
 describe("shared task registry holder", () => {
   it("connects a writer and a reader holding separate module instances (pi's per-extension jiti loader)", async () => {
     // The query makes Vite evaluate a second, independent copy of the module —
@@ -318,6 +336,20 @@ describe("createTaskRegistry", () => {
     const id = registry.adopt({ name: "a", kind: "subagent", kill: () => undefined });
     expect(() => registry.complete(id, { ok: true, text: "wake" })).not.toThrow();
     expect(registry.running()).toHaveLength(0); // still consumed fire-once
+  });
+
+  it("swallows an async wake-channel rejection instead of crashing the host late", async () => {
+    const registry = createTaskRegistry({
+      sendUserMessage: () => Promise.reject(new Error("channel down late")),
+      notify: vi.fn(),
+      setStatus: vi.fn(),
+      now: () => 1000,
+    });
+    const id = registry.adopt({ name: "a", kind: "subagent", kill: () => undefined });
+    expect(() => registry.complete(id, { ok: true, text: "wake" })).not.toThrow();
+    // Flush the microtask queue: an unsilenced rejection fails the test run.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(registry.running()).toHaveLength(0);
   });
 
   it("adopts with time-based ids, unique even for same-millisecond tasks", () => {
@@ -406,6 +438,70 @@ describe("createTaskRegistry", () => {
     registry.complete(id1, { ok: false, text: "a was killed" });
     expect(sendUserMessage).toHaveBeenCalledTimes(1);
     expect(registry.killAll()).toBe(0); // nothing left running
+  });
+
+  it("killAll({sparePersistent:true}) detaches persistent tasks — no kill, no wake, gone from the registry", () => {
+    const { registry, sendUserMessage } = makeDeps();
+    const kills: string[] = [];
+    const detach = vi.fn();
+    const pid = registry.adopt({
+      name: "persist",
+      kind: "bash",
+      kill: () => kills.push("p"),
+      persistent: true,
+      detach,
+    });
+    registry.adopt({ name: "plain", kind: "bash", kill: () => kills.push("f") });
+    expect(registry.killAll({ sparePersistent: true })).toBe(1); // only the plain one killed
+    expect(kills).toEqual(["f"]);
+    expect(detach).toHaveBeenCalledTimes(1);
+    expect(registry.get(pid)).toBeUndefined(); // spared = unknown to this registry
+    expect(registry.running()).toHaveLength(0);
+    expect(sendUserMessage).not.toHaveBeenCalled();
+    // A late settle attempt after detach is a no-op for an unknown task.
+    expect(() => registry.complete(pid, { ok: true, text: "late" })).not.toThrow();
+    expect(sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("plain killAll still kills persistent tasks — sparing is opt-in per call", () => {
+    const registry = createTaskRegistry({ now: () => 1000 });
+    const kills: string[] = [];
+    registry.adopt({
+      name: "persist",
+      kind: "bash",
+      kill: () => kills.push("p"),
+      persistent: true,
+      detach: () => undefined,
+    });
+    expect(registry.killAll()).toBe(1);
+    expect(kills).toEqual(["p"]);
+  });
+
+  it("spare cancels the task's pending check-in before detaching", () => {
+    const timers: Array<{ fn: () => void; cancelled: boolean }> = [];
+    const registry = createTaskRegistry({
+      sendUserMessage: vi.fn(),
+      notify: vi.fn(),
+      now: () => 1000,
+      schedule: (fn, _ms) => {
+        const t = { fn, cancelled: false };
+        timers.push(t);
+        return t;
+      },
+      unschedule: (h) => {
+        (h as { cancelled: boolean }).cancelled = true;
+      },
+    });
+    const id = registry.adopt({
+      name: "p",
+      kind: "bash",
+      kill: () => undefined,
+      persistent: true,
+      detach: () => undefined,
+    });
+    registry.remind(id, 5_000);
+    registry.killAll({ sparePersistent: true });
+    expect(timers[0]?.cancelled).toBe(true);
   });
 
   it("maintains the footer status across transitions", () => {
