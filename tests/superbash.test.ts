@@ -1,4 +1,4 @@
-import { execSync } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -33,6 +33,7 @@ import {
   parseBgAfterMs,
   parseWakeEnabled,
   piAgentDir,
+  resumePersistedTasks,
   stashPath,
   tempOutputLogPath,
   WAKE_TEXT_CAP,
@@ -44,6 +45,7 @@ import {
   readTaskMeta,
   taskMetaPath,
   taskStatusPath,
+  writeTaskMeta,
   type PersistentTaskMeta,
 } from "../lib/persistent-bash";
 
@@ -2082,4 +2084,152 @@ describe("bash tool persistent background (real)", () => {
       delete process.env.PI_BG_BASH_PERSIST;
     }
   }, 15_000);
+});
+
+describe("resumePersistedTasks (real)", () => {
+  // Restart simulation: a fresh registry whose wake channels stand in for the
+  // new runtime's. Files are real; dead-pid cases fake only the retry clock.
+  const newRuntime = () => {
+    const sendUserMessage = vi.fn();
+    const registry = createTaskRegistry({ sendUserMessage, notify: vi.fn(), setStatus: vi.fn() });
+    return { sendUserMessage, registry };
+  };
+  const metaOf = (over: Partial<PersistentTaskMeta> & Pick<PersistentTaskMeta, "id" | "pid">): PersistentTaskMeta => ({
+    version: 1,
+    command: over.command ?? "true",
+    cwd: process.cwd(),
+    startedAt: over.startedAt ?? Date.now(),
+    ...over,
+  });
+  const writeTask = (dir: string, meta: PersistentTaskMeta, files: { status?: string; log?: string }) => {
+    mkdirSync(join(dir, "tasks"), { recursive: true });
+    writeTaskMeta(dir, meta);
+    if (files.status !== undefined) writeFileSync(taskStatusPath(dir, meta.id), files.status);
+    if (files.log !== undefined) writeFileSync(persistentLogPath(dir, meta.id), files.log);
+  };
+  const wakes = (sendUserMessage: ReturnType<typeof vi.fn>) =>
+    sendUserMessage.mock.calls.map((c) => c[0] as string).join("\n");
+
+  it("reports finished tasks with their output, overrun or not, and settles the artifacts", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pb-resume-done-"));
+    const onTime = metaOf({ id: "tresdone1", pid: 1, command: "echo done-out" });
+    const overran = metaOf({
+      id: "tresdone2",
+      pid: 1,
+      command: "sleep 5",
+      startedAt: Date.now() - 10_000,
+      timeoutSecs: 1,
+    });
+    writeTask(dir, onTime, { status: "0", log: "done-out\n" });
+    writeTask(dir, overran, { status: "0", log: "late\n" });
+    const rt = newRuntime();
+    const outcomes = await resumePersistedTasks(rt.registry, dir);
+    expect(outcomes.map((o) => o.decision.action)).toEqual(["complete", "complete"]);
+    const text = wakes(rt.sendUserMessage);
+    expect(text).toContain("exited 0 (finished while pi was away)");
+    expect(text).toContain("done-out");
+    expect(text).toContain("exited 0 (finished while pi was away; overran its timeout)");
+    for (const meta of [onTime, overran]) {
+      expect(existsSync(taskMetaPath(dir, meta.id))).toBe(false); // settled: state gone, log kept
+      expect(existsSync(taskStatusPath(dir, meta.id))).toBe(false);
+      expect(existsSync(persistentLogPath(dir, meta.id))).toBe(true);
+    }
+  });
+
+  it("reports dead tasks as exit-code-unknown without the 2s retry stall", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pb-resume-dead-"));
+    // 2^22 is beyond pid_max: no ps output, not alive — but present in the dir.
+    const meta = metaOf({ id: "tresdead1", pid: 4_194_304, command: "echo lost" });
+    writeTask(dir, meta, { log: "partial\n" });
+    const rt = newRuntime();
+    // Fake only the retry clock so the truncate-write over-wait elapses instantly.
+    let fakeNow = 0;
+    const outcomes = await resumePersistedTasks(rt.registry, dir, {
+      scan: { now: () => fakeNow, sleep: async (ms) => void (fakeNow += ms) },
+    });
+    expect(outcomes[0].decision).toEqual({ action: "finalize-dead" });
+    const text = wakes(rt.sendUserMessage);
+    expect(text).toContain("died while pi was away (exit code unknown)");
+    expect(text).toContain("partial");
+    expect(existsSync(taskMetaPath(dir, meta.id))).toBe(false);
+  });
+
+  it("reports pid-recycled tasks as lost", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pb-resume-recyc-"));
+    // This very test process is alive — but a 10-day-old startedAt cannot match
+    // its etime, so identity verification fails the way a recycled pid would.
+    const meta = metaOf({ id: "tresrecyc", pid: process.pid, startedAt: Date.now() - 10 * 86_400_000 });
+    writeTask(dir, meta, { log: "" });
+    const rt = newRuntime();
+    const outcomes = await resumePersistedTasks(rt.registry, dir);
+    expect(outcomes[0].decision.action).toBe("finalize-recycled");
+    expect(wakes(rt.sendUserMessage)).toContain("lost while pi was away (its pid was reused; exit code unknown)");
+  });
+
+  it("kills tasks whose deadline passed while pi was away, reporting the partial output", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pb-resume-exp-"));
+    const child = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
+    child.unref();
+    const meta = metaOf({
+      id: "tresexp",
+      pid: child.pid!,
+      command: "sleep 30",
+      startedAt: Date.now() - 1_100,
+      timeoutSecs: 1,
+    });
+    writeTask(dir, meta, { log: "partial-out\n" });
+    const rt = newRuntime();
+    try {
+      const outcomes = await resumePersistedTasks(rt.registry, dir);
+      expect(outcomes[0].decision.action).toBe("kill-expired");
+      await vi.waitFor(() => expect(isProcessAlive(child.pid!)).toBe(false), { timeout: 5_000 });
+      const text = wakes(rt.sendUserMessage);
+      expect(text).toContain("timed out — deadline passed while pi was away");
+      expect(text).toContain("partial-out");
+      // kill-expired removes everything, log included (the log is captured in the wake).
+      expect(existsSync(taskMetaPath(dir, meta.id))).toBe(false);
+      expect(existsSync(persistentLogPath(dir, meta.id))).toBe(false);
+    } finally {
+      if (isProcessAlive(child.pid!)) process.kill(-child.pid!, "SIGKILL");
+    }
+  }, 15_000);
+
+  it("re-adopts live tasks under their durable id and wakes their outcome through the new runtime", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pb-resume-adopt-"));
+    // Simulate the real flow: old runtime spares (shutdown), new one scans.
+    const oldRt = newRuntime();
+    const oldTool = createBashTool(oldRt.registry, {});
+    const oldCtx = { sessionManager: { getSessionDir: () => dir } } as never;
+    const result = await oldTool.execute(
+      "1",
+      { command: "sleep 0.4 && echo re-adopted-out", wait: "background", persist: true },
+      undefined,
+      undefined,
+      oldCtx,
+    );
+    const id = idOf(result);
+    oldRt.registry.killAll({ sparePersistent: true }); // shutdown detach — old monitor silent forever
+
+    const rt = newRuntime();
+    const adoptedWake = vi.fn();
+    const outcomes = await resumePersistedTasks(rt.registry, dir, { wake: adoptedWake, pollMs: 25 });
+    expect(outcomes[0].decision.action).toBe("adopt");
+    expect(adoptedWake).toHaveBeenCalledWith(expect.stringContaining(`Background task still running (${id})`));
+    expect(rt.registry.running()[0]).toMatchObject({ id, persistent: true }); // same durable id
+    expect(oldRt.sendUserMessage).not.toHaveBeenCalled(); // the old runtime stays silent
+
+    await vi.waitFor(() => expect(wakes(rt.sendUserMessage)).toContain("exited 0"), { timeout: 10_000 });
+    expect(wakes(rt.sendUserMessage)).toContain("re-adopted-out");
+    expect(existsSync(taskMetaPath(dir, id))).toBe(false); // settled by the new monitor
+    expect(existsSync(persistentLogPath(dir, id))).toBe(true);
+  }, 15_000);
+
+  it("adopt is idempotent under the durable id — a second resume never duplicates a task", async () => {
+    const registry = createTaskRegistry({ sendUserMessage: vi.fn(), notify: vi.fn(), setStatus: vi.fn() });
+    const first = registry.adopt({ name: "bash", kind: "bash", kill: () => undefined }, "t-durable");
+    const again = registry.adopt({ name: "bash", kind: "bash", kill: () => undefined }, "t-durable");
+    expect(first).toBe("t-durable");
+    expect(again).toBe("t-durable");
+    expect(registry.running()).toHaveLength(1);
+  });
 });

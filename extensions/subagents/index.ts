@@ -44,6 +44,7 @@ import {
   parseBgAfterMs,
   parseWakeEnabled,
   publishSharedTaskRegistry,
+  resumePersistedTasks,
 } from "../../lib/superbash";
 import {
   AGENTS_DIR,
@@ -353,18 +354,36 @@ export function registerSubagentsExtension(
   publishSharedTaskRegistry(registry);
   pi.on("session_start", (_event, ctx) => {
     ui = ctx.ui;
+    // Reconcile durable background tasks with this fresh runtime: finished
+    // ones wake with their outcome, expired ones die, live ones are re-adopted.
+    // Floating and fail-open — session start must never block on disk I/O, and
+    // the scan itself never throws (per-task failures are swallowed there).
+    const sessionDir = ctx?.sessionManager?.getSessionDir?.();
+    if (sessionDir) {
+      void resumePersistedTasks(registry, sessionDir).catch(() => {});
+    }
   });
   pi.on("session_shutdown", (event) => {
     // Every shutdown reason converges here — quit, reload, and session
     // replacement (new/resume/fork): the registry and its children belong to
     // the runtime being torn down, and an orphaned subagent burns tokens with
     // nobody consuming the result. Replacement kills break the promised wake,
-    // so they say so; quit and reload need no explanation.
-    const killed = registry.killAll();
+    // so they say so; quit and reload need no explanation. Persistent bash
+    // tasks are the exception: they were spawned detached with their state on
+    // disk, so they are spared (handed off, not killed) — the next session's
+    // scan re-adopts or settles them.
+    const persistent = registry.running().filter((t) => t.persistent).length;
+    const killed = registry.killAll({ sparePersistent: true });
     if (killed > 0 && (event.reason === "new" || event.reason === "resume" || event.reason === "fork")) {
       ui?.notify(
         `Background tasks killed (${event.reason}): killed ${killed}, their results will not arrive.`,
         "warning",
+      );
+    }
+    if (persistent > 0) {
+      ui?.notify(
+        `${persistent} persistent background task${persistent === 1 ? "" : "s"} keep${persistent === 1 ? "s" : ""} running across this restart.`,
+        "info",
       );
     }
   });

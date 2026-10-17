@@ -81,11 +81,14 @@ import {
   persistentLogPath,
   readStatusSync,
   removePersistedArtifacts,
+  scanSessionTasks,
   spawnPersistentTask,
   taskEnv,
   taskStatusPath,
   writeTaskMeta,
   type PersistentTaskMeta,
+  type ScanDeps,
+  type ScanOutcome,
 } from "./persistent-bash";
 
 /** Budget (chars for replies, bytes for command output) that rides inline in the wake message. */
@@ -137,18 +140,34 @@ export interface TaskDeps {
 /** The session-scoped background task registry interface. */
 export interface TaskRegistry {
   /** Register a running task; returns its id (t-<base36 time>, e.g. t-1134z8v). */
-  adopt(record: {
-    name: string;
-    kind: "subagent" | "bash";
-    kill: () => void;
-    progress?: () => string | undefined;
-    /** Opt the task into surviving restarts; killAll can then spare it. */
-    persistent?: boolean;
-    /** Spare-time handoff: drop listeners/timers and flip the settle guard, so
-     *  the in-memory monitor can never again fire for this task — the on-disk
-     *  metadata becomes its single owner. Called by killAll({sparePersistent}). */
-    detach?: () => void;
-  }): string;
+  adopt(
+    record: {
+      name: string;
+      kind: "subagent" | "bash";
+      kill: () => void;
+      progress?: () => string | undefined;
+      /** Opt the task into surviving restarts; killAll can then spare it. */
+      persistent?: boolean;
+      /** Spare-time handoff: drop listeners/timers and flip the settle guard, so
+       *  the in-memory monitor can never again fire for this task — the on-disk
+       *  metadata becomes its single owner. Called by killAll({sparePersistent}). */
+      detach?: () => void;
+    },
+    preferredId?: string,
+  ): string;
+  /** Re-adopt a durable task under its on-disk id (persistent tasks resuming
+   *  after a restart); idempotent when that id is already registered. */
+  adopt(
+    record: {
+      name: string;
+      kind: "subagent" | "bash";
+      kill: () => void;
+      progress?: () => string | undefined;
+      persistent?: boolean;
+      detach?: () => void;
+    },
+    preferredId: string,
+  ): string;
   /**
    * Record the outcome and deliver the wake exactly once; a no-op for unknown
    * or non-running tasks. wake: false records without messaging — the tool
@@ -359,10 +378,18 @@ export function createTaskRegistry(deps: TaskDeps = {}): TaskRegistry {
   };
 
   return {
-    adopt(record) {
+    adopt(record, preferredId) {
       const ts = Math.max(now(), lastTs + 1);
       lastTs = ts;
-      const id = `t-${ts.toString(36)}`;
+      let id = `t-${ts.toString(36)}`;
+      if (preferredId) {
+        // Re-adoption under the durable id: time-based ids stay unique across
+        // sessions; fold the old timestamp into the monotonic guard anyway.
+        const prefTs = Number.parseInt(preferredId.slice(2), 36);
+        if (Number.isFinite(prefTs)) lastTs = Math.max(lastTs, prefTs);
+        if (tasks.has(preferredId)) return preferredId; // idempotent re-adopt
+        id = preferredId;
+      }
       tasks.set(id, {
         id,
         name: record.name,
@@ -477,6 +504,227 @@ const SHARED_REGISTRY_KEY = Symbol.for("pi-extensions.superbash.registry");
 function sharedHolder(): { current?: TaskRegistry } {
   const globals = globalThis as Record<symbol, { current?: TaskRegistry } | undefined>;
   return (globals[SHARED_REGISTRY_KEY] ??= {});
+}
+
+/** Injectable seams for resumePersistedTasks (tests); production defaults are real. */
+export interface ResumeDeps {
+  /** Adoption notice channel; settled outcomes wake through the registry. */
+  wake?: (text: string) => void;
+  now?: () => number;
+  /** Passed to the scan (tests fake the fs/ps boundaries). */
+  scan?: ScanDeps;
+  /** Adopted-task monitor poll cadence; default 2s. */
+  pollMs?: number;
+}
+
+/** Re-adopt a durable task after a restart. No child handle exists, so a
+ *  status-first poll with a liveness backstop replaces the exit event, and the
+ *  deadline kill verifies the pid first — it may have recycled since the scan.
+ *  detach() (spare) stops every timer; the disk metadata owns the outcome. */
+function adoptPersistedMonitor(
+  registry: TaskRegistry,
+  sessionDir: string,
+  meta: PersistentTaskMeta,
+  deps: ResumeDeps,
+  now: () => number,
+): void {
+  const head = bashCommandHead(meta.command);
+  const logPath = persistentLogPath(sessionDir, meta.id);
+  let handedOff = false;
+  let settled = false;
+  let pollTimer: ReturnType<typeof setInterval> | undefined;
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  // A dead leader gets one extra poll cycle for its status write to land
+  // (the wrapper writes before exiting, but a kill does not).
+  let deadTicks = 0;
+  const stop = () => {
+    if (pollTimer) clearInterval(pollTimer);
+    if (deadlineTimer) clearTimeout(deadlineTimer);
+    pollTimer = undefined;
+    deadlineTimer = undefined;
+  };
+  const settle = (status: string, ok: boolean) => {
+    if (handedOff || settled) return;
+    settled = true;
+    stop();
+    removePersistedArtifacts(sessionDir, meta.id); // keep the log
+    if (!registry.isRunning(id)) return;
+    const chunk = readLogChunk(logPath, undefined, BASH_TAIL_CAP);
+    const display = truncateTail(chunk?.text ?? "", { maxLines: DEFAULT_MAX_LINES, maxBytes: WAKE_TEXT_CAP });
+    registry.complete(id, {
+      ok,
+      status,
+      text: formatBashWake({
+        command: head,
+        id,
+        status,
+        durationMs: now() - meta.startedAt,
+        output: display.content,
+        outputNote: display.truncated ? `[… truncated — full output: ${logPath} …]` : undefined,
+      }),
+    });
+  };
+  const id = registry.adopt(
+    {
+      name: head,
+      kind: "bash",
+      persistent: true,
+      progress: logProgressFor(() => logPath),
+      kill: () => {
+        void killPersistedTask(meta, sessionDir).catch(() => {});
+      },
+      detach: () => {
+        handedOff = true;
+        stop();
+      },
+    },
+    meta.id,
+  );
+  if (meta.timeoutSecs !== undefined) {
+    deadlineTimer = setTimeout(
+      () => {
+        if (handedOff || settled) return;
+        void killPersistedTask(meta, sessionDir)
+          .then((killed) =>
+            settle(
+              killed
+                ? `timed out after ${meta.timeoutSecs}s (deadline passed while pi was away)`
+                : "died while pi was away (pid no longer verified)",
+              false,
+            ),
+          )
+          .catch(() => settle("timed out", false));
+      },
+      Math.max(0, meta.startedAt + meta.timeoutSecs * 1000 - now()),
+    );
+    deadlineTimer.unref();
+  }
+  pollTimer = setInterval(() => {
+    const status = readStatusSync(sessionDir, meta.id);
+    if (status !== undefined && status.trim() !== "") {
+      const code = Number.parseInt(status.trim(), 10);
+      settle(Number.isInteger(code) ? `exited ${code}` : "finished while pi was away (exit code unknown)", code === 0);
+      return;
+    }
+    if (!isProcessAlive(meta.pid)) {
+      if (++deadTicks >= 2) settle("died while pi was away (exit code unknown)", false);
+    } else {
+      deadTicks = 0;
+    }
+  }, deps.pollMs ?? 2_000);
+  pollTimer.unref();
+}
+
+/** Reconcile a session's durable task state with a fresh runtime: scan the
+ *  tasks directory and apply every decision — report finished/dead/recycled
+ *  outcomes, kill expired survivors, re-adopt live ones under their on-disk ids.
+ *  Never throws (session start must not block on disk I/O); per-task failures
+ *  fail open so one bad metadata file cannot hide the other tasks' outcomes. */
+export async function resumePersistedTasks(
+  registry: TaskRegistry,
+  sessionDir: string,
+  deps: ResumeDeps = {},
+): Promise<ScanOutcome[]> {
+  const now = deps.now ?? Date.now;
+  const outcomes = await scanSessionTasks(sessionDir, deps.scan ?? {});
+  for (const outcome of outcomes) {
+    try {
+      if (outcome.meta === undefined) {
+        removePersistedArtifacts(sessionDir, outcome.id); // discard; keep log for forensics
+        continue;
+      }
+      const meta = outcome.meta;
+      const head = bashCommandHead(meta.command);
+      const logPath = persistentLogPath(sessionDir, meta.id);
+      const logTail = () => {
+        const chunk = readLogChunk(logPath, undefined, BASH_TAIL_CAP);
+        const display = truncateTail(chunk?.text ?? "", { maxLines: DEFAULT_MAX_LINES, maxBytes: WAKE_TEXT_CAP });
+        return {
+          output: display.content,
+          note: display.truncated ? `[… truncated — full output: ${logPath} …]` : undefined,
+        };
+      };
+      // Report a task that no longer runs: register it under its durable id
+      // and settle immediately, so the wake flows through the registry's
+      // channels and /tasks history records what happened.
+      const reportSettled = (status: string, ok: boolean) => {
+        const id = registry.adopt(
+          { name: head, kind: "bash", persistent: true, kill: () => undefined, detach: () => undefined },
+          meta.id,
+        );
+        const tail = logTail();
+        registry.complete(id, {
+          ok,
+          status,
+          text: formatBashWake({
+            command: head,
+            id,
+            status,
+            durationMs: now() - meta.startedAt,
+            output: tail.output,
+            outputNote: tail.note,
+          }),
+        });
+      };
+      switch (outcome.decision.action) {
+        case "complete": {
+          const code = outcome.decision.exitCode;
+          const overran = meta.timeoutSecs !== undefined && now() >= meta.startedAt + meta.timeoutSecs * 1000;
+          removePersistedArtifacts(sessionDir, meta.id);
+          reportSettled(
+            code === null
+              ? "finished while pi was away (exit code unknown)"
+              : `exited ${code} (finished while pi was away${overran ? "; overran its timeout" : ""})`,
+            code === 0,
+          );
+          break;
+        }
+        case "finalize-dead":
+          removePersistedArtifacts(sessionDir, meta.id);
+          reportSettled("died while pi was away (exit code unknown)", false);
+          break;
+        case "finalize-recycled":
+          removePersistedArtifacts(sessionDir, meta.id);
+          reportSettled("lost while pi was away (its pid was reused; exit code unknown)", false);
+          break;
+        case "kill-expired": {
+          const tail = logTail(); // read before the kill removes the log
+          const killed = await killPersistedTask(meta, sessionDir);
+          const id = registry.adopt(
+            { name: head, kind: "bash", persistent: true, kill: () => undefined, detach: () => undefined },
+            meta.id,
+          );
+          registry.complete(id, {
+            ok: false,
+            status: "timed out",
+            text: formatBashWake({
+              command: head,
+              id,
+              status: killed
+                ? "timed out — deadline passed while pi was away"
+                : "timed out — deadline passed while pi was away (pid no longer verified; not killed)",
+              durationMs: now() - meta.startedAt,
+              output: tail.output,
+              outputNote: killed ? undefined : tail.note,
+            }),
+          });
+          break;
+        }
+        case "adopt":
+          adoptPersistedMonitor(registry, sessionDir, meta, deps, now);
+          deps.wake?.(
+            `Background task still running (${meta.id}): ${head} — it survived the restart and was re-adopted; its outcome will be delivered when it exits. Peek: task ${meta.id}`,
+          );
+          break;
+        case "discard":
+          removePersistedArtifacts(sessionDir, meta.id);
+          break;
+      }
+    } catch {
+      // One task's resume must not sink the rest — fail open per task.
+    }
+  }
+  return outcomes;
 }
 
 /** Publish the session's registry for cross-extension readers (goal's settle check). */

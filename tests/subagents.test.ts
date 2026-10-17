@@ -1,8 +1,16 @@
 import { EventEmitter } from "node:events";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import {
+  isProcessAlive,
+  killPersistedTask,
+  persistentLogPath,
+  readTaskMeta,
+  taskStatusPath,
+  writeTaskMeta,
+} from "../lib/persistent-bash";
 import {
   adoptSubagentTask,
   agentFromText,
@@ -1557,6 +1565,58 @@ describe("registerSubagentsExtension (full wiring)", () => {
     expect(wired.children[0].killed).toBe(true);
     expect(wired.notify).not.toHaveBeenCalled();
   });
+
+  it("spares persistent bash tasks on shutdown, notifying instead of killing", async () => {
+    const wired = wireUp();
+    const dir = mkdtempSync(join(tmpdir(), "pb-wire-spare-"));
+    const result = (await wired.tools
+      .get("bash")!
+      .execute("1", { command: "sleep 2", wait: "background", persist: true }, undefined, undefined, {
+        sessionManager: { getSessionDir: () => dir },
+      })) as { details: { id: string } };
+    const id = result.details.id;
+
+    wired.handlers.get("session_shutdown")!({ reason: "quit" });
+    const meta = readTaskMeta(dir, id);
+    expect(meta).toBeDefined(); // the disk state is the single owner now
+    expect(isProcessAlive(meta!.pid)).toBe(true); // spared, not killed
+    expect(wired.notify).toHaveBeenCalledWith(
+      "1 persistent background task keeps running across this restart.",
+      "info",
+    );
+    expect(wired.notify).not.toHaveBeenCalledWith(expect.stringContaining("killed 1"), "warning");
+    expect(wired.sendUserMessage).not.toHaveBeenCalled(); // detach means no wake from this runtime
+
+    await killPersistedTask(meta!, dir); // test cleanup: cross-restart kill path
+    await vi.waitFor(() => expect(isProcessAlive(meta!.pid)).toBe(false), { timeout: 5_000 });
+  }, 15_000);
+
+  it("resumes durable tasks on session start: a finished task wakes through the steer channel", async () => {
+    const wired = wireUp();
+    const dir = mkdtempSync(join(tmpdir(), "pb-wire-resume-"));
+    mkdirSync(join(dir, "tasks"), { recursive: true });
+    const meta = {
+      version: 1 as const,
+      id: "twireresume",
+      command: "echo wire-resume-out",
+      pid: 4_194_304, // beyond pid_max: dead, so the scan settles it
+      startedAt: Date.now() - 60_000,
+      cwd: process.cwd(),
+    };
+    writeTaskMeta(dir, meta);
+    writeFileSync(taskStatusPath(dir, meta.id), "0");
+    writeFileSync(persistentLogPath(dir, meta.id), "wire-resume-out\n");
+
+    wired.handlers.get("session_start")!(undefined, {
+      ui: { notify: wired.notify, setStatus: wired.setStatus },
+      sessionManager: { getSessionDir: () => dir },
+    });
+    await vi.waitFor(() => expect(wired.sendUserMessage).toHaveBeenCalledTimes(1), { timeout: 10_000 });
+    const [text, options] = wired.sendUserMessage.mock.calls[0] as [string, { deliverAs?: string }];
+    expect(text).toContain("finished while pi was away");
+    expect(text).toContain("wire-resume-out");
+    expect(options?.deliverAs).toBe("steer");
+  }, 15_000);
 });
 
 describe("sumUsages", () => {
