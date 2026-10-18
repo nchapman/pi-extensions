@@ -3,7 +3,7 @@
  * persistence, and the agent-facing summary. */
 
 import { execFile } from "node:child_process";
-import { lstat, mkdir, readFile, writeFile } from "node:fs/promises";
+import { lstat, mkdir, opendir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   defaultSpawn,
@@ -59,20 +59,60 @@ export interface ReviewDeps {
   /** Session model for child inheritance. */
   sessionModel?: { provider?: string; id?: string } | null;
   now?: () => number;
+  /** Directory listing for the non-git tree walk; injected so tests walk
+   * fakes instead of disk. Optional — treeSection falls back to the default. */
+  listDir?: (dir: string) => Promise<TreeEntry[]>;
 }
+
+/** A flattened directory entry: enough shape for the walk's decisions
+ * (recurse, skip, collect) without dragging node's Dirent into the dep. */
+export interface TreeEntry {
+  name: string;
+  isDirectory: boolean;
+  isSymbolicLink: boolean;
+}
+
+/** Default listing: opendir(3) streaming iteration, not readdir — a huge
+ * directory is detected at the cap instead of being fully materialized
+ * first. Over the cap the walk treats it as an unreadable directory (a
+ * named skip for nested paths, a loud root failure); the custom code is
+ * what walkTree absorbs — see ABSORBABLE_LIST_ERRORS. */
+export const MAX_DIR_ENTRIES = 10_000;
+export const MANY_ENTRIES = "EMANYENTRIES";
+export const defaultListDir = async (dir: string): Promise<TreeEntry[]> => {
+  const out: TreeEntry[] = [];
+  const dh = await opendir(dir);
+  try {
+    for await (const e of dh) {
+      if (out.length >= MAX_DIR_ENTRIES) {
+        const err = new Error(
+          `${dir}: over ${MAX_DIR_ENTRIES} entries — directory too large to walk`,
+        ) as NodeJS.ErrnoException;
+        err.code = MANY_ENTRIES;
+        throw err;
+      }
+      out.push({ name: e.name, isDirectory: e.isDirectory(), isSymbolicLink: e.isSymbolicLink() });
+    }
+  } finally {
+    await dh.close().catch(() => {}); // already closed after full iteration
+  }
+  return out;
+};
 
 const GIT_MAX_BYTES = 8 * 1024 * 1024;
 const CHECK_MAX_CHARS = 64 * 1024;
 
 /** Default git runner: execFile with a hard timeout and capped buffers. Paths
- * pass through unquoted (core.quotePath=false) so non-ASCII filenames parse. */
+ * pass through unquoted (core.quotePath=false) so non-ASCII filenames parse,
+ * and LC_ALL=C pins git's stderr to English — the pipeline branches on git's
+ * "not a git repository" message, which gettext would otherwise translate. */
 export function defaultGit(cwd: string): (args: string[]) => Promise<GitResult> {
   return (args) =>
     new Promise((resolve) => {
       execFile(
         "git",
         ["-c", "core.quotePath=false", ...args],
-        { cwd, timeout: 30_000, maxBuffer: GIT_MAX_BYTES },
+        { cwd, timeout: 30_000, maxBuffer: GIT_MAX_BYTES, env: { ...process.env, LC_ALL: "C" } },
         (err, stdout, stderr) => {
           const cap = (b?: Buffer | string) => {
             const s = typeof b === "string" ? b : (b?.toString("utf8") ?? "");
@@ -193,24 +233,25 @@ async function resolveDiffSections(
   return { sections };
 }
 
-/** Untracked files as synthetic new-file diffs, within the byte budget.
+/** Shared body behind untracked and whole-tree sections: eligible paths →
+ * guarded reads → synthetic new-file diffs, within the byte budget.
  * Guard refusals ride the section note when there is a section to carry
- * them (the finder sees what it is missing); when every untracked file was
- * refused there is no diff to review, and the refusals come back as
- * `notes` instead — runReview surfaces them in the report's pipeline notes
- * rather than letting a note-only section masquerade as reviewable content
+ * them (the finder sees what it is missing); when every file was refused
+ * there is no diff to review, and the refusals come back as `notes`
+ * instead — runReview surfaces them in the report's pipeline notes rather
+ * than letting a note-only section masquerade as reviewable content
  * (splitDiffFiles would parse zero files out of it). */
-async function untrackedSection(
+async function syntheticFileSection(
   repoRoot: string,
+  paths: string[],
   deps: ReviewDeps,
   maxBytes: number,
+  /** Section label in the assembled diff. */
+  label: string,
+  /** Noun for refusal notes — "untracked" vs "tree", so the report says
+   * which population a refused file belongs to. */
+  what: string,
 ): Promise<{ section: DiffSection | null; notes: string[] }> {
-  const listing = await deps.git(["ls-files", "--others", "--exclude-standard"]);
-  if (listing.code !== 0) return { section: null, notes: [] };
-  const paths = listing.stdout
-    .split("\n")
-    .map((s) => s.trim())
-    .filter(Boolean);
   const eligible = paths.filter((p) => !isExcludedPath(p));
   const blocks: string[] = [];
   const refused: string[] = [];
@@ -239,7 +280,7 @@ async function untrackedSection(
     return {
       section: null,
       notes: [
-        `untracked file(s) skipped by the read guard (oversized, not a plain file, or a symlink escape) and not reviewed: ${refused.join(", ")}`,
+        `${what} file(s) skipped by the read guard (oversized, not a plain file, or a symlink escape) and not reviewed: ${refused.join(", ")}`,
       ],
     };
   }
@@ -252,7 +293,169 @@ async function untrackedSection(
     notes.push(`${refused.length} skipped — oversized, not a plain file, or a symlink escape: ${refused.join(", ")}`);
   if (skippedByBudget > 0 && budgetExhausted) notes.push(`${skippedByBudget} skipped: size budget`);
   const note = notes.length > 0 ? `\n(${notes.join("; ")})` : "";
-  return { section: { label: "untracked (new) files", text: blocks.join("\n") + note }, notes: [] };
+  return { section: { label, text: blocks.join("\n") + note }, notes: [] };
+}
+
+/** Untracked files (git listing) as synthetic new-file diffs. */
+async function untrackedSection(
+  repoRoot: string,
+  deps: ReviewDeps,
+  maxBytes: number,
+): Promise<{ section: DiffSection | null; notes: string[] }> {
+  const listing = await deps.git(["ls-files", "--others", "--exclude-standard"]);
+  if (listing.code !== 0) return { section: null, notes: [] };
+  const paths = listing.stdout
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return syntheticFileSection(repoRoot, paths, deps, maxBytes, "untracked (new) files", "untracked");
+}
+
+/** Credential-shaped filenames never read in whole-tree mode: a git'd
+ * tree inherits this protection from .gitignore (`git ls-files` honors it),
+ * but a plain tree has no such signal, so the walk applies a denylist and
+ * names what it skipped — the contents never reach a finder task. */
+const SECRET_FILE = [
+  /(^|\/)\.env(\.[\w-]+)*$/i,
+  /(^|\/)id_(rsa|dsa|ecdsa|ed25519)(\.[\w-]+)?$/i,
+  /\.(pem|key|p12|pfx)$/i,
+  /(^|\/)\.(npmrc|netrc|git-credentials|pgpass|my\.cnf|htpasswd)$/i,
+  /(^|\/)(credentials|secrets?)\.json$/i,
+];
+
+/** Hard cap on files collected from a non-git tree: the walk stops and the
+ * overage is disclosed, so a stray home directory cannot balloon a review.
+ * MAX_TREE_ENTRIES bounds total WORK — a tree of directories holding only
+ * excluded files would never advance the file cap, so the file cap alone
+ * does not bound the walk. */
+export const MAX_TREE_FILES = 5_000;
+export const MAX_TREE_ENTRIES = 50_000;
+
+/** Listing failures that are per-directory facts, safe to absorb as a named
+ * skip. Anything else (EMFILE/EIO/ENOMEM, a broken injected dep) is systemic:
+ * absorbing it would let a partial tree masquerade as the whole review. */
+const ABSORBABLE_LIST_ERRORS = new Set(["EACCES", "EPERM", "ENOENT", "ENOTDIR", MANY_ENTRIES]);
+
+/** Bounded recursive walk of a non-git tree: eligible plain files as
+ * relative POSIX paths, deterministic (sorted, depth-first) order. Skips
+ * dot-directories (`.git`, `.venv`, …), paths matching the exclusion list
+ * (node_modules, build output, lockfiles, binaries — same list the diff
+ * stage applies), credential-shaped files (SECRET_FILE, named in the notes),
+ * and every symlink (named, not followed — following would duplicate content
+ * and admit cycles; naming keeps every omission disclosed). A listing
+ * failure that is a per-directory fact is skipped and named; a failed ROOT
+ * listing throws ("could not list the tree" must not masquerade as "tree is
+ * empty"), and so does any non-absorbable failure one level down. The abort
+ * signal is honored mid-walk: a cancelled review must not finish the walk.
+ * `truncated` says WHICH cap stopped the walk so the disclosure names it. */
+export async function walkTree(
+  root: string,
+  listDir: (dir: string) => Promise<TreeEntry[]>,
+  opts: { maxFiles?: number; maxEntries?: number; signal?: AbortSignal } = {},
+): Promise<{
+  paths: string[];
+  truncated: null | "files" | "entries";
+  skippedDirs: string[];
+  skippedSymlinks: string[];
+  skippedSecrets: string[];
+}> {
+  const maxFiles = opts.maxFiles ?? MAX_TREE_FILES;
+  const maxEntries = opts.maxEntries ?? MAX_TREE_ENTRIES;
+  const signal = opts.signal;
+  const paths: string[] = [];
+  const skippedDirs: string[] = [];
+  const skippedSymlinks: string[] = [];
+  const skippedSecrets: string[] = [];
+  let truncated: null | "files" | "entries" = null;
+  let visited = 0;
+  const visit = async (rel: string): Promise<void> => {
+    if (signal?.aborted) throw new Error("review aborted");
+    if (truncated) return;
+    let entries: TreeEntry[];
+    try {
+      entries = await listDir(rel ? path.join(root, rel) : root);
+    } catch (err) {
+      const dir = rel ? path.join(root, rel) : root;
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (rel && ABSORBABLE_LIST_ERRORS.has(String(code))) {
+        // EACCES, a vanished race, or the entry cap — name it, keep walking.
+        skippedDirs.push(rel);
+        return;
+      }
+      throw new Error(`cannot list ${dir}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    for (const e of entries) {
+      if (++visited > maxEntries) {
+        truncated = "entries";
+        return;
+      }
+      if (signal?.aborted) throw new Error("review aborted");
+      const childRel = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory) {
+        if (e.name.startsWith(".") || isExcludedPath(`${childRel}/`)) continue;
+        await visit(childRel);
+      } else {
+        if (isExcludedPath(childRel)) continue;
+        if (e.isSymbolicLink) {
+          skippedSymlinks.push(childRel);
+          continue;
+        }
+        if (SECRET_FILE.some((re) => re.test(childRel))) {
+          skippedSecrets.push(childRel);
+          continue;
+        }
+        if (paths.length >= maxFiles) {
+          truncated = "files";
+          return;
+        }
+        paths.push(childRel);
+      }
+    }
+  };
+  await visit("");
+  return { paths, truncated, skippedDirs, skippedSymlinks, skippedSecrets };
+}
+
+/** Bounded listing: a pathological tree can skip thousands of entries by any
+ * one cause, and a disclosure note must not become the biggest thing in the
+ * report — first 50 named, the rest counted. */
+function cappedJoin(items: string[]): string {
+  const shown = items.slice(0, 50);
+  const more = items.length - shown.length;
+  return `${shown.join(", ")}${more > 0 ? ` …and ${more} more` : ""}`;
+}
+
+/** A non-git tree's whole contents as the diff under review: every walked
+ * file is "new", exactly like untracked files in a repo. */
+async function treeSection(
+  repoRoot: string,
+  deps: ReviewDeps,
+  maxBytes: number,
+  signal?: AbortSignal,
+): Promise<{ section: DiffSection | null; notes: string[] }> {
+  const walk = await walkTree(repoRoot, deps.listDir ?? defaultListDir, { signal });
+  const { skippedDirs, skippedSymlinks, skippedSecrets } = walk;
+  const out = await syntheticFileSection(
+    repoRoot,
+    walk.paths,
+    deps,
+    maxBytes,
+    "whole tree (no git repository)",
+    "tree",
+  );
+  const notes = [...out.notes];
+  // The note names the cap that fired — "stopped at N files" would misreport
+  // an entries-cap stop (which can hit with zero files collected).
+  if (walk.truncated === "files") notes.push(`tree walk stopped at ${MAX_TREE_FILES} files — later files not reviewed`);
+  else if (walk.truncated === "entries")
+    notes.push(`tree walk stopped at ${MAX_TREE_ENTRIES} visited entries — later entries not reviewed`);
+  if (skippedDirs.length > 0) notes.push(`unreadable directories skipped: ${cappedJoin(skippedDirs)}`);
+  if (skippedSymlinks.length > 0)
+    notes.push(`${skippedSymlinks.length} symlink(s) skipped (not followed): ${cappedJoin(skippedSymlinks)}`);
+  if (skippedSecrets.length > 0)
+    notes.push(`likely-credential file(s) skipped and not reviewed: ${cappedJoin(skippedSecrets)}`);
+  return { section: out.section, notes };
 }
 
 /** Assign (lens × chunk) pairs under the child cap: chunks shed lenses, correctness first. */
@@ -536,31 +739,55 @@ export async function runReview(opts: {
   let sections: DiffSection[];
   let repoRoot: string;
   let label: string;
+  let nonRepo = false;
   if (opts.provided) {
     sections = opts.provided.sections;
     repoRoot = opts.provided.repoRoot;
     label = opts.provided.targetLabel;
   } else {
     const rootResult = await deps.git(["rev-parse", "--show-toplevel"]);
-    if (rootResult.code !== 0) {
-      throw new Error(`Not a git repository: ${rootResult.stderr.trim() || "git rev-parse failed"}`);
+    // A directory with no .git is still reviewable — as its whole tree. Only
+    // git's explicit "not a git repository" takes that path; a missing git
+    // binary or a permissions failure is a real error, not a plain tree.
+    if (rootResult.code !== 0 && !rootResult.stderr.toLowerCase().includes("not a git repository")) {
+      throw new Error(`git rev-parse failed: ${rootResult.stderr.trim() || "unknown git failure"}`);
     }
-    repoRoot = rootResult.stdout.trim();
-    label = targetLabel(opts.target);
-    const resolved = await resolveDiffSections(opts.target, deps);
-    if (resolved.error) throw new Error(resolved.error);
-    sections = resolved.sections;
-    const extraNotes: string[] = [];
-    if (opts.target.kind !== "staged") {
-      const untracked = await untrackedSection(repoRoot, deps, config.untrackedMaxBytes);
-      if (untracked.section) sections.push(untracked.section);
-      extraNotes.push(...untracked.notes);
+    const isNonRepo = rootResult.code !== 0;
+    // readRepoFile realpaths both sides, so a symlink-spelled cwd anchors fine.
+    repoRoot = isNonRepo ? opts.cwd : rootResult.stdout.trim();
+    label = isNonRepo ? "whole tree (no git repository)" : targetLabel(opts.target);
+    if (isNonRepo) {
+      nonRepo = true;
+      // staged/ref/range targets have no meaning without git history — say
+      // so instead of failing later with a confusing diff error.
+      if (opts.target.kind !== "default" && opts.target.kind !== "uncommitted") {
+        throw new Error(
+          `no git repository — "${targetLabel(opts.target)}" needs git history; review the whole tree instead (no target, or "tree")`,
+        );
+      }
+      const tree = await treeSection(repoRoot, deps, config.untrackedMaxBytes, signal);
+      sections = [];
+      if (tree.section) sections.push(tree.section);
+      pipelineNotes.push(...tree.notes);
+    } else {
+      const resolved = await resolveDiffSections(opts.target, deps);
+      if (resolved.error) throw new Error(resolved.error);
+      sections = resolved.sections;
+      const extraNotes: string[] = [];
+      if (opts.target.kind !== "staged") {
+        const untracked = await untrackedSection(repoRoot, deps, config.untrackedMaxBytes);
+        if (untracked.section) sections.push(untracked.section);
+        extraNotes.push(...untracked.notes);
+      }
+      if (extraNotes.length > 0) pipelineNotes.push(...extraNotes);
     }
-    if (extraNotes.length > 0) pipelineNotes.push(...extraNotes);
   }
   if (sections.length === 0) {
-    const emptyNote =
-      opts.target.kind === "default" ? " (nothing ahead of upstream, uncommitted, or untracked)" : " for this target";
+    const emptyNote = nonRepo
+      ? " (no reviewable files in the tree)"
+      : opts.target.kind === "default"
+        ? " (nothing ahead of upstream, uncommitted, or untracked)"
+        : " for this target";
     return {
       report: `# Code review\n\nNo changes to review${emptyNote}.` + pipelineNotesBlock(pipelineNotes),
       findings: [],
@@ -939,6 +1166,7 @@ export function reviewDeps(cwd: string, overrides?: Partial<ReviewDeps>): Review
     notify: () => {},
     spawnFn: defaultSpawn,
     sessionModel: null,
+    listDir: defaultListDir,
     ...overrides,
   };
 }

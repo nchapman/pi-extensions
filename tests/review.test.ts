@@ -42,6 +42,8 @@ import {
   verifyAgent,
   verifyTask,
   type Verdict,
+  walkTree,
+  MANY_ENTRIES,
   withStallRetry,
   FINDER_LENSES,
 } from "../extensions/review";
@@ -794,6 +796,138 @@ describe("exclusions", () => {
   it("excludes our own persisted state so re-reviews do not ingest it as a new file", () => {
     expect(isExcludedPath(".pi/review-state.json")).toBe(true);
     expect(isExcludedPath(".pi/anything")).toBe(true);
+  });
+});
+
+/** Fake directory listing for walkTree: dir path -> entries as
+ * [name, kind] with f=file, d=directory, l=symlink. */
+const listDirFor = (tree: Record<string, Array<[string, "f" | "d" | "l"]>>) => async (dir: string) => {
+  const entries = tree[dir];
+  if (!entries) {
+    const err = new Error(`ENOENT: ${dir}`) as NodeJS.ErrnoException;
+    err.code = "ENOENT";
+    throw err;
+  }
+  return entries.map(([name, kind]) => ({
+    name,
+    isDirectory: kind === "d",
+    isSymbolicLink: kind === "l",
+  }));
+};
+
+describe("walkTree", () => {
+  const TREE: Record<string, Array<[string, "f" | "d" | "l"]>> = {
+    "/repo": [
+      [".git", "d"],
+      [".hidden", "d"],
+      ["node_modules", "d"],
+      ["dist", "d"],
+      ["src", "d"],
+      ["README.md", "f"],
+      ["a.ts", "f"],
+      ["z.ts", "f"],
+      ["out.log", "f"],
+      ["img.png", "f"],
+      ["link.ts", "l"],
+      [".env", "f"],
+      [".env.production.local", "f"],
+      ["id_RSA", "f"],
+      ["server.pem", "f"],
+    ],
+    "/repo/.hidden": [["h.ts", "f"]],
+    "/repo/node_modules": [["m.js", "f"]],
+    "/repo/dist": [["b.js", "f"]],
+    "/repo/src": [
+      ["b.ts", "f"],
+      ["gen", "d"],
+    ],
+    "/repo/src/gen": [["g.ts", "f"]],
+  };
+
+  it("collects eligible files deterministically, skipping dot-dirs, excluded paths, and symlinks", async () => {
+    const { paths, truncated, skippedDirs } = await walkTree("/repo", listDirFor(TREE));
+    expect(paths).toEqual(["README.md", "a.ts", "src/b.ts", "z.ts"]); // byte-sorted per directory
+    expect(truncated).toBe(null);
+    expect(skippedDirs).toEqual([]);
+    expect(paths).not.toContain("out.log"); // exclusion list applies to files
+    expect(paths).not.toContain("h.ts"); // dot-directory skipped entirely
+    expect(paths).not.toContain("g.ts"); // src/gen is on the exclusion list
+  });
+
+  it("skips and names symlinks and credential-shaped files instead of reading them", async () => {
+    const out = await walkTree("/repo", listDirFor(TREE));
+    expect(out.skippedSymlinks).toEqual(["link.ts"]); // named, not silently dropped
+    expect(out.skippedSecrets).toEqual([".env", ".env.production.local", "id_RSA", "server.pem"]); // case/suffix-insensitive
+    expect(out.paths).not.toContain(".env");
+    expect(out.paths).not.toContain(".env.production.local");
+  });
+
+  it("stops at the file cap and reports truncation", async () => {
+    const { paths, truncated } = await walkTree("/repo", listDirFor(TREE), { maxFiles: 2 });
+    expect(paths).toEqual(["README.md", "a.ts"]);
+    expect(truncated).toBe("files");
+  });
+
+  it("names unreadable directories instead of failing the walk", async () => {
+    const errnoThrower = (code: string) => {
+      const err = new Error(code) as NodeJS.ErrnoException;
+      err.code = code;
+      throw err;
+    };
+    const listing = listDirFor({
+      "/repo": [
+        ["a.ts", "f"],
+        ["locked", "d"],
+        ["toobig", "d"],
+      ],
+    });
+    const broken = async (dir: string) => {
+      if (dir === "/repo/locked") throw errnoThrower("EACCES");
+      if (dir === "/repo/toobig") throw errnoThrower(MANY_ENTRIES); // the opendir cap marker
+      return listing(dir);
+    };
+    const out = await walkTree("/repo", broken);
+    expect(out.paths).toEqual(["a.ts"]);
+    expect(out.skippedDirs).toEqual(["locked", "toobig"]); // per-directory facts are named skips
+  });
+
+  it("rethrows systemic listing failures instead of recasting them as skips", async () => {
+    const listing = listDirFor({
+      "/repo": [
+        ["a.ts", "f"],
+        ["dying", "d"],
+      ],
+    });
+    const broken = async (dir: string) => {
+      if (dir === "/repo/dying") {
+        const err = new Error("EMFILE") as NodeJS.ErrnoException;
+        err.code = "EMFILE";
+        throw err;
+      }
+      return listing(dir);
+    };
+    await expect(walkTree("/repo", broken)).rejects.toThrow("cannot list /repo/dying");
+  });
+
+  it("fails loudly when the ROOT listing fails — an unreadable tree is not an empty tree", async () => {
+    const noAccess = async () => {
+      const err = new Error("EACCES") as NodeJS.ErrnoException;
+      err.code = "EACCES";
+      throw err;
+    };
+    await expect(walkTree("/repo", noAccess)).rejects.toThrow("cannot list /repo");
+  });
+
+  it("stops on the visited-entries bound even when nothing is collected", async () => {
+    const { paths, truncated } = await walkTree("/repo", listDirFor(TREE), { maxEntries: 3 });
+    expect(paths).toEqual([]); // first three entries are secrets/dot-dirs — no files collected
+    expect(truncated).toBe("entries"); // but the WORK was bounded
+  });
+
+  it("honors the abort signal mid-walk", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    await expect(walkTree("/repo", listDirFor(TREE), { signal: controller.signal })).rejects.toThrow("review aborted");
   });
 });
 
@@ -1784,6 +1918,127 @@ describe("runReview", () => {
     expect(result.report).toContain("Verification skipped (PI_REVIEW_VERIFY=0)");
   });
 
+  const NOT_A_REPO = {
+    code: 128,
+    stdout: "",
+    stderr: "fatal: not a git repository (or any of the parent directories): .git\n",
+  };
+
+  it("reviews a non-git tree as its whole tree", async () => {
+    const spawn = fakeSpawn(() => "[]");
+    const listDir = listDirFor({
+      "/repo": [
+        ["a.ts", "f"],
+        ["src", "d"],
+        ["package-lock.json", "f"],
+        [".env", "f"],
+        ["link.ts", "l"],
+      ],
+      "/repo/src": [["b.ts", "f"]],
+    });
+    const readFile = async (p: string): Promise<string | undefined> =>
+      p === "/repo/a.ts" ? "const a = 1;\n" : p === "/repo/src/b.ts" ? "const b = 2;\n" : undefined;
+    const result = await runReview({
+      cwd: "/repo",
+      config: CONFIG({ verify: false }),
+      target: { kind: "default" },
+      deps: emptyDeps({
+        git: async () => NOT_A_REPO,
+        spawnFn: spawn,
+        readFile,
+        listDir,
+      }) as never,
+    });
+    expect(result.report).toContain("# Code review — whole tree (no git repository)");
+    expect(result.report).toContain("- Files: a.ts, src/b.ts"); // walked tree is the review scope
+    expect(result.report).not.toContain("package-lock.json"); // exclusion list applies
+    // credential-shaped files and symlinks are skipped and the omission disclosed
+    expect(result.report).toContain("likely-credential file(s) skipped and not reviewed: .env");
+    expect(result.report).toContain("1 symlink(s) skipped (not followed): link.ts");
+    // the finder children saw the synthetic new-file diffs
+    expect(spawn.tasks.some((t) => t.includes("diff --git a/a.ts b/a.ts"))).toBe(true);
+    expect(spawn.tasks.some((t) => t.includes("diff --git a/src/b.ts b/src/b.ts"))).toBe(true);
+    // no git listing is attempted for untracked files — there is no git
+    expect(result.report).not.toContain("untracked");
+  });
+
+  it("reports an empty non-git tree cleanly", async () => {
+    const result = await runReview({
+      cwd: "/repo",
+      config: CONFIG({ verify: false }),
+      target: { kind: "uncommitted" },
+      deps: emptyDeps({
+        git: async () => NOT_A_REPO,
+        listDir: listDirFor({ "/repo": [] }),
+      }) as never,
+    });
+    expect(result.report).toContain("No changes to review (no reviewable files in the tree).");
+  });
+
+  it("rejects git-only targets in a non-git tree with a pointer to whole-tree mode", async () => {
+    await expect(
+      runReview({
+        cwd: "/repo",
+        config: CONFIG({ verify: false }),
+        target: { kind: "staged" },
+        deps: emptyDeps({ git: async () => NOT_A_REPO }) as never,
+      }),
+    ).rejects.toThrow('no git repository — "staged changes" needs git history');
+    await expect(
+      runReview({
+        cwd: "/repo",
+        config: CONFIG({ verify: false }),
+        target: { kind: "range", base: "a", head: "b" },
+        deps: emptyDeps({ git: async () => NOT_A_REPO }) as never,
+      }),
+    ).rejects.toThrow("no git repository");
+  });
+
+  it("still fails loudly when git breaks for a reason other than a missing repo", async () => {
+    await expect(
+      runReview({
+        cwd: "/repo",
+        config: CONFIG({ verify: false }),
+        target: { kind: "default" },
+        deps: emptyDeps({ git: async () => ({ code: 1, stdout: "", stderr: "spawn git ENOENT" }) }) as never,
+      }),
+    ).rejects.toThrow("git rev-parse failed: spawn git ENOENT");
+  });
+
+  it("names the cap that truncated a tree walk, and bounds the name lists in notes", async () => {
+    // Files cap: 5_100 collectable files — the walk stops at 5_000 and says so.
+    // readFile reports every file missing, so the section is empty and the
+    // early-return report carries the pipeline notes (which is what we assert).
+    const many = Array.from({ length: 5_100 }, (_, i) => [`f${i}.ts`, "f"] as [string, "f"]);
+    const byFiles = await runReview({
+      cwd: "/repo",
+      config: CONFIG({ verify: false }),
+      target: { kind: "default" },
+      deps: emptyDeps({
+        git: async () => NOT_A_REPO,
+        listDir: listDirFor({ "/repo": many }),
+      }) as never,
+    });
+    expect(byFiles.report).toContain("tree walk stopped at 5000 files — later files not reviewed");
+
+    // Entries cap: 50_050 secret-shaped files — nothing is ever collected, so
+    // only the WORK bound can fire; the note names entries, not files, and the
+    // skipped-secret name list is capped at 50 with the remainder counted.
+    const secrets = Array.from({ length: 50_050 }, (_, i) => [`.env.${i}`, "f"] as [string, "f"]);
+    const byEntries = await runReview({
+      cwd: "/repo",
+      config: CONFIG({ verify: false }),
+      target: { kind: "default" },
+      deps: emptyDeps({
+        git: async () => NOT_A_REPO,
+        listDir: listDirFor({ "/repo": secrets }),
+      }) as never,
+    });
+    expect(byEntries.report).toContain("tree walk stopped at 50000 visited entries — later entries not reviewed");
+    expect(byEntries.report).toContain("likely-credential file(s) skipped and not reviewed: .env.");
+    expect(byEntries.report).toContain("…and 49950 more"); // 50_000 visited secrets, 50 named
+  });
+
   it("runs finder and verifier children with cwd at the reviewed repo root, not the session cwd", async () => {
     const cwds: Array<string | undefined> = [];
     const spawn = ((_command: string, args: string[], options: unknown) => {
@@ -2588,17 +2843,6 @@ describe("runReview", () => {
     });
     expect(result.report).toContain("excluded from review");
     expect(result.report).toContain("package-lock.json");
-  });
-
-  it("throws a useful error outside a git repository", async () => {
-    await expect(
-      runReview({
-        cwd: "/nope",
-        config: CONFIG(),
-        target: { kind: "default" },
-        deps: emptyDeps({ git: async () => ({ code: 128, stdout: "", stderr: "not a git repository" }) }) as never,
-      }),
-    ).rejects.toThrow(/git/);
   });
 
   it("feeds the check command output to the verifier", async () => {
