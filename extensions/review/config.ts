@@ -13,16 +13,17 @@ import path from "node:path";
 // Config
 // ---------------------------------------------------------------------------
 
-/** Default finder model. Thinking-off is the load-bearing part of the
- * original benchmark (100% recall, 31/31 on code-review-bench, at ~1/4 the
- * wall time of default thinking — which needs >6 minutes per finder child;
- * the production hard cap is 20m, so thinking-on means reviews measured in
- * many minutes). pi's `provider/id:thinking` suffix means PI_REVIEW_MODEL and
- * --model still override model and level together. muse-spark-1.2-contributor
- * supersedes the benchmarked deepseek-v4.1-flash — re-run
- * scripts/bench-review-models.ts before trusting the old recall numbers for
- * it. */
-export const DEFAULT_REVIEW_MODEL = "opencode-go/muse-spark-1.2-contributor:off";
+/** Default finder model. Thinking-off is load-bearing: deepseek at :off
+ * measured 100% recall (31/31 on code-review-bench) at ~1/4 the wall time of
+ * default thinking (>6 min per finder child — the production hard cap is
+ * 20m, so thinking-on means reviews measured in many minutes). pi's
+ * `provider/id:thinking` suffix means PI_REVIEW_MODEL and --model still
+ * override model and level together. muse-spark-1.3 was tried as a
+ * successor — 67.7% recall at :off, ~61% ceiling with default thinking, at
+ * 2× tokens and 4× wall — a finder-capability gap, not a thinking-budget one,
+ * so deepseek stays (see README for the numbers). Re-run npm run eval:review
+ * whenever this changes. */
+export const DEFAULT_REVIEW_MODEL = "opencode-go/deepseek-v4.1-flash:off";
 
 export interface ReviewConfig {
   /** Characters of diff per finder chunk (file-boundary aligned). */

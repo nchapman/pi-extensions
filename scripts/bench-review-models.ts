@@ -25,6 +25,7 @@ const execFileAsync = promisify(execFile);
 const DEFAULT_MODELS = [
   "opencode-go/mimo-v2.6-flash",
   DEFAULT_REVIEW_MODEL,
+  "opencode-go/muse-spark-1.2-contributor",
   "opencode-go/muse-spark-1.3-contributor",
   "opencode-go/glm-5.3-flash",
   "opencode-go/qwen3.8-flash",

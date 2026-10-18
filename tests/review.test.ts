@@ -567,7 +567,7 @@ describe("parseReviewConfig", () => {
     expect(c.attachChars).toBe(64_000);
     expect(c.maxChildren).toBe(8);
     expect(c.concurrency).toBe(8);
-    expect(c.model).toBe("opencode-go/muse-spark-1.2-contributor:off");
+    expect(c.model).toBe("opencode-go/deepseek-v4.1-flash:off");
     expect(c.checkCmd).toBe("");
     expect(c.persist).toBe(true);
     expect(c.idleTimeoutMs).toBe(5 * 60_000);
