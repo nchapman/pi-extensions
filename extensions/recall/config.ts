@@ -13,7 +13,7 @@ export interface RecallConfig {
   halfLifeHours: number;
   /** Minimum recency factor so old content fades but never vanishes (1 disables decay). */
   recencyFloor: number;
-  /** Auto-compact when projected context exceeds this many tokens (0 disables) — min of this cap and the window ratio, for every model alike. 128k, re-tuned from issue #3's 80k dollar optimum: flash-session forensics showed the every-~36-turn churn cost more in re-reads and latency than cheap-cache models pay to carry the context. */
+  /** Auto-compact when projected context exceeds this many tokens (0 disables) — min of this cap and the window ratio, for every model alike. 100k, between issue #3's 80k dollar optimum (919f372) and the 128k carry-cheap re-tune (8d68305). */
   compactTargetTokens: number;
   /** Also bound the target to this fraction of the model's context window — the smaller of token cap and ratio wins (0 disables the ratio). */
   compactTargetRatio: number;
@@ -50,7 +50,7 @@ export const DEFAULTS: RecallConfig = {
   foreignWeight: 0.5,
   halfLifeHours: 4,
   recencyFloor: 0.25,
-  compactTargetTokens: 128_000,
+  compactTargetTokens: 100_000,
   compactTargetRatio: 0.7,
   compactIdleDiscount: 0.1,
   ownSummaries: true,
