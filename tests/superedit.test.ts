@@ -19,6 +19,7 @@ import {
   TABSTOP,
   type EditSpec,
 } from "../lib/superedit";
+import type { SyntaxLoader } from "../lib/superedit-syntax";
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -53,11 +54,14 @@ const apply = (content: string, edits: EditSpec[], allCap = DEFAULT_ALL_CAP) =>
 async function runEdit(
   files: Record<string, string>,
   input: { path: string; edits: EditSpec[] },
-  opts: { allCap?: () => number } = {},
+  opts: { allCap?: () => number; syntax?: { enabled?: () => boolean; loader?: SyntaxLoader } } = {},
 ) {
   const stored = Object.fromEntries(Object.entries(files).map(([k, v]) => [k.startsWith("/") ? k : `${CWD}/${k}`, v]));
   const fs = fakeFs(stored);
-  const tool = createSuperEditTool(CWD, { operations: fs.ops, ...opts });
+  // Syntax checking defaults OFF here: this suite asserts edit semantics with
+  // tiny fixtures, and the native tree-sitter boundary (with its own fakes
+  // and real-grammar smoke tests) belongs to superedit-syntax.test.ts.
+  const tool = createSuperEditTool(CWD, { operations: fs.ops, syntax: { enabled: () => false }, ...opts });
   const result = await tool.execute("1", input, undefined, undefined, { cwd: CWD } as never);
   const text = (result.content as Array<{ type: string; text: string }>)
     .filter((c) => c.type === "text")
@@ -74,11 +78,11 @@ async function runEdit(
 async function runEditError(
   files: Record<string, string>,
   input: { path: string; edits: EditSpec[] },
-  opts: { allCap?: () => number } = {},
+  opts: { allCap?: () => number; syntax?: { enabled?: () => boolean; loader?: SyntaxLoader } } = {},
 ) {
   const stored = Object.fromEntries(Object.entries(files).map(([k, v]) => [k.startsWith("/") ? k : `${CWD}/${k}`, v]));
   const fs = fakeFs(stored);
-  const tool = createSuperEditTool(CWD, { operations: fs.ops, ...opts });
+  const tool = createSuperEditTool(CWD, { operations: fs.ops, syntax: { enabled: () => false }, ...opts });
   try {
     await tool.execute("1", input, undefined, undefined, { cwd: CWD } as never);
   } catch (e) {

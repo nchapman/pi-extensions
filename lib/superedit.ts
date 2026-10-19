@@ -36,6 +36,11 @@
  *   never floods context
  * - BOM and line endings round-trip exactly like the built-in: edits are
  *   LF-normalized for matching, the original ending style is restored on write
+ * - after the write commits, a tree-sitter syntax check (see
+ *   ./superedit-syntax.ts) appends a capped advisory warning to the result
+ *   when the lines this call rewrote now hold ERROR/MISSING nodes — never a
+ *   refusal, always fail-open, opt-in via `syntax` (the extension entry
+ *   enables it; PI_SUPEREDIT_SYNTAX=0 disables it per call)
  */
 
 import { constants } from "node:fs";
@@ -54,6 +59,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { createRealSyntaxLoader, runSyntaxCheck, type EditSplice, type SyntaxLoader } from "./superedit-syntax";
 
 /** Tab expansion width for comparing indentation between tabs and spaces. */
 export const TABSTOP = 4;
@@ -78,6 +84,13 @@ const MAX_SITES_SHOWN = 5;
 const SITE_CONTEXT_LINES = 2;
 const MAX_DIAG_LINES = 40;
 const MAX_SHIFT_LINES = 6;
+/**
+ * Wall-clock budget for the advisory post-edit syntax check. The parse is
+ * size-capped, but a first-use native grammar import on a slow or network
+ * filesystem is not; expiry yields no warning (fail-open) so the advisory
+ * check can never gate delivery of a committed edit result.
+ */
+const SYNTAX_CHECK_BUDGET_MS = 5_000;
 
 // ---------------------------------------------------------------------------
 // Environment knobs (invalid values fall back to defaults, house style)
@@ -558,6 +571,7 @@ function applyNormalizedTier(
   matches: TierMatch[],
   newText: string,
   map: OffsetMap,
+  splices: EditSplice[],
 ): { content: string; changed: boolean; origSpan: { origStart: number; origEnd: number } } {
   const contentLines = getLines(content);
   const fuzzyLines = getLines(fuzzyContent);
@@ -603,7 +617,10 @@ function applyNormalizedTier(
         .slice(group.l2 + 1)
         .map(fullText)
         .join("");
-    if (rebuilt !== current) changed = true;
+    if (rebuilt !== current) {
+      changed = true;
+      splices.push({ start: curStart, end: curEnd, insertLen: groupText.length });
+    }
     const span = map.splice(curStart, curEnd - curStart, groupText.length);
     if (group === groups[0]) origSpan = span; // groups[0] is the lowest line range
     current = rebuilt;
@@ -622,7 +639,7 @@ export function applyEdits(
   content: string,
   edits: EditSpec[],
   opts: { path: string; allCap: number },
-): { newContent: string; applied: AppliedEdit[] } {
+): { newContent: string; applied: AppliedEdit[]; splices: EditSplice[] } {
   const normalized = edits.map((e) => ({
     oldText: normalizeToLF(e.oldText),
     newText: normalizeToLF(e.newText),
@@ -652,6 +669,9 @@ export function applyEdits(
   let current = content;
   const map = new OffsetMap(content.length);
   const applied: AppliedEdit[] = [];
+  // Replacements that changed bytes, in application order — the input to the
+  // post-edit syntax check's edited-line attribution.
+  const splices: EditSplice[] = [];
 
   for (let i = 0; i < normalized.length; i++) {
     const edit = normalized[i];
@@ -692,7 +712,7 @@ export function applyEdits(
     let changed = false;
     let origSpan = { origStart: 0, origEnd: 0 };
     if (ladder.space === "fuzzy") {
-      const res = applyNormalizedTier(current, ladder.fuzzyContent!, chosen, edit.newText, map);
+      const res = applyNormalizedTier(current, ladder.fuzzyContent!, chosen, edit.newText, map, splices);
       current = res.content;
       changed = res.changed;
       origSpan = res.origSpan;
@@ -704,7 +724,10 @@ export function applyEdits(
       origSpan = { origStart: map.origOf(first.start), origEnd: map.origOf(first.end) };
       for (const m of ordered) {
         const replacement = ladder.tier === "indent-elastic" ? shiftText(edit.newText, m.indentShift) : edit.newText;
-        if (replacement !== current.slice(m.start, m.end)) changed = true;
+        if (replacement !== current.slice(m.start, m.end)) {
+          changed = true;
+          splices.push({ start: m.start, end: m.end, insertLen: replacement.length });
+        }
         current = spliceContent(current, m.start, m.end, replacement, map);
       }
     }
@@ -717,7 +740,7 @@ export function applyEdits(
       ...origSpan,
     });
   }
-  return { newContent: current, applied };
+  return { newContent: current, applied, splices };
 }
 
 // ---------------------------------------------------------------------------
@@ -1245,6 +1268,8 @@ export interface SuperEditInput {
 export interface SuperEditDetails extends EditToolDetails {
   /** Human-readable notes for every non-exact or multi-occurrence application. */
   notes: string[];
+  /** Advisory post-edit syntax warning text, present iff the check flagged the edited lines. */
+  syntaxWarning?: string;
 }
 
 const editSchema = Type.Object({
@@ -1297,10 +1322,23 @@ const defaultOperations: EditOperations = {
 /**
  * The forgiving-matcher edit tool, named `edit` so it replaces pi's built-in
  * by name. See the file header for the semantics; `operations` is injected in
- * tests, `allCap` is read per call so the env knob applies live.
+ * tests, `allCap` is read per call so the env knob applies live, and `syntax`
+ * injects the syntax-check boundary (enabled knob + grammar loader). The
+ * check is opt-in at this layer — default off — so vendored copies without
+ * the tree-sitter deps stay silent; the extension entry turns it on.
  */
-export function createSuperEditTool(cwd: string, opts: { operations?: EditOperations; allCap?: () => number } = {}) {
+export function createSuperEditTool(
+  cwd: string,
+  opts: {
+    operations?: EditOperations;
+    allCap?: () => number;
+    syntax?: { enabled?: () => boolean; loader?: SyntaxLoader; budgetMs?: number };
+  } = {},
+) {
   const ops = opts.operations ?? defaultOperations;
+  const syntaxLoader = opts.syntax?.loader ?? createRealSyntaxLoader();
+  const syntaxEnabled = opts.syntax?.enabled;
+  const syntaxBudgetMs = opts.syntax?.budgetMs ?? SYNTAX_CHECK_BUDGET_MS;
   return defineTool({
     name: "edit",
     label: "edit",
@@ -1352,7 +1390,7 @@ export function createSuperEditTool(cwd: string, opts: { operations?: EditOperat
     async execute(_toolCallId, input, signal, _onUpdate, ctx): Promise<AgentToolResult<SuperEditDetails>> {
       const { path, edits } = validateEditInput(input);
       const absolutePath = resolveToCwd(path, ctx?.cwd || cwd);
-      return withFileMutationQueue(absolutePath, async () => {
+      const written = await withFileMutationQueue(absolutePath, async () => {
         // Do not reject from an abort listener: that would release the
         // mutation queue while an in-flight write may still land. Checking
         // after each await observes the same aborts with the queue held.
@@ -1391,7 +1429,7 @@ export function createSuperEditTool(cwd: string, opts: { operations?: EditOperat
         const ending = detectLineEnding(text);
         const normalized = normalizeToLF(text);
         const allCap = opts.allCap?.() ?? DEFAULT_ALL_CAP;
-        const { newContent, applied } = applyEdits(normalized, edits, { path, allCap });
+        const { newContent, applied, splices } = applyEdits(normalized, edits, { path, allCap });
         throwIfAborted();
         if (newContent === normalized) {
           const notes = applied
@@ -1417,15 +1455,72 @@ export function createSuperEditTool(cwd: string, opts: { operations?: EditOperat
         // No abort check here: the write has committed, and reporting a landed
         // edit as "aborted" would send the model to re-apply it and hit a
         // confusing no-change error on the next call.
-        const diffResult = generateDiffString(normalized, newContent);
-        const patch = generateUnifiedPatch(path, normalized, newContent);
-        const notes = applied.map((a) => describeApplied(a, edits.length)).filter((n) => n !== "");
-        const summary = `Applied ${edits.length} edit${edits.length === 1 ? "" : "s"} to ${path}.${notes.length > 0 ? `\n${notes.join("\n")}` : ""}`;
-        return {
-          content: [{ type: "text", text: summary }],
-          details: { diff: diffResult.diff, patch, firstChangedLine: diffResult.firstChangedLine, notes },
-        };
+        return { normalized, newContent, applied, splices };
       });
+      // Outside the per-path mutation queue: the write has committed and the
+      // remaining steps are read-only over in-memory content. Holding the
+      // lock through the syntax check (a first-use grammar load plus a parse
+      // of up to MAX_SYNTAX_BYTES) would stall concurrent edits of the same
+      // path for no correctness gain. runSyntaxCheck is fail-open by
+      // contract — a checker hiccup can never turn a landed edit into an
+      // error result.
+      // An already-aborted call skips the advisory check — the write has
+      // landed and the result is about to be discarded, so there is no point
+      // parsing. The wait itself is bounded: this budget covers the async
+      // grammar load (first use only; a slow or network filesystem is the
+      // stall risk), while the parse is synchronous and bounded by the
+      // 512 KB size guard instead — a race cannot cut a sync parse short.
+      // Expiry or an abort mid-wait yields no warning (fail-open). The catch lives at
+      // this boundary, not in trust in runSyntaxCheck's internal one: a
+      // checker hiccup must never turn a landed edit into an error result.
+      let syntaxWarning: string | null = null;
+      if (!signal?.aborted) {
+        let settled = false;
+        let budget: ReturnType<typeof setTimeout> | undefined;
+        let onAbort: (() => void) | undefined;
+        try {
+          syntaxWarning = await Promise.race([
+            runSyntaxCheck({
+              path,
+              content: written.newContent,
+              splices: written.splices,
+              loader: syntaxLoader,
+              enabled: syntaxEnabled?.() ?? false,
+              cancelled: () => settled,
+            }).catch(() => null),
+            new Promise<null>((resolve) => {
+              onAbort = () => resolve(null);
+              budget = setTimeout(() => resolve(null), syntaxBudgetMs);
+              signal?.addEventListener("abort", onAbort, { once: true });
+            }),
+          ]);
+        } finally {
+          // A race-lost check re-polls `cancelled` before its synchronous
+          // parse and bails, so no discarded result ever runs the parse. The
+          // abort listener is removed by name (the goal/verify.ts pattern) —
+          // a per-edit leak would accumulate on a caller-owned signal and
+          // trip Node's MaxListenersExceededWarning past 10 edits.
+          settled = true;
+          clearTimeout(budget); // a live timer would outlive the call and pin the loop
+          if (onAbort) signal?.removeEventListener("abort", onAbort);
+        }
+      }
+      const diffResult = generateDiffString(written.normalized, written.newContent);
+      const patch = generateUnifiedPatch(path, written.normalized, written.newContent);
+      const notes = written.applied.map((a) => describeApplied(a, edits.length)).filter((n) => n !== "");
+      const summary = `Applied ${edits.length} edit${edits.length === 1 ? "" : "s"} to ${path}.${
+        notes.length > 0 ? `\n${notes.join("\n")}` : ""
+      }${syntaxWarning ? `\n${syntaxWarning}` : ""}`;
+      return {
+        content: [{ type: "text", text: summary }],
+        details: {
+          diff: diffResult.diff,
+          patch,
+          firstChangedLine: diffResult.firstChangedLine,
+          notes,
+          ...(syntaxWarning ? { syntaxWarning } : {}),
+        },
+      };
     },
   });
 }
