@@ -23,9 +23,14 @@
  *   recovery on a large mangled file is the slow path — measured 23 ms for
  *   483 KB clean but 6× that when every parse error fires; the 512 KB cap
  *   keeps the worst-case synchronous parse near 150 ms), kept diagnostics
- *   cap at 50 with early exit, and the walk itself caps at 500 visited
+ *   cap at 50 with early exit, and the walk itself caps at 5_000 visited
  *   diagnostics so a pre-broken file whose errors are all filtered out
- *   cannot drag the advisory check past its bounds
+ *   cannot drag the advisory check past its bounds. The differential
+ *   (pre-existing-damage suppression) needs BOTH parses and gates on the
+ *   SUM — above ~512 KB combined (one MAX_SYNTAX_BYTES) it is skipped
+ *   while the check still runs: surfacing a mangled edit outranks
+ *   attribution at that size, which can produce an undifferentiated
+ *   (blame-shifted) warning
  * - self-contained: no imports from superedit.ts (which imports this
  *   module), so either file can be vendored alone; tests inject fake trees
  *   through the SyntaxTree/SyntaxLanguage shapes, which the real tree-sitter
@@ -36,19 +41,19 @@
  * leniencies are invisible to it (e.g. the Python grammar accepts broken
  * indentation). What a mangled edit actually produces is exactly the former.
  *
- * Position handling: tree-sitter rows/columns/indexes are UTF-8 byte-based.
- * Rows are always exact (newline is one byte in UTF-8) and rows drive
- * filtering; byte columns are converted to code-unit indexes (exactly for
- * well-formed text, clamped for malformed surrogates) before display or
- * excerpt slicing, so excerpts quote the right text and printed columns
+ * Position handling: tree-sitter 0.25's native binding reports rows and
+ * columns in UTF-16 code units (verified empirically: a 2-byte é shifts a
+ * reported column by 1, not 2) — the same coordinates as JS string
+ * indexing, so rows/columns/splice offsets are used verbatim, no
+ * conversion anywhere. Excerpts quote the right text and printed columns
  * match what a re-reading model sees.
  */
 
-/** PI_SUPEREDIT_SYNTAX=0|false disables the post-edit syntax check. */
+/** PI_SUPEREDIT_SYNTAX=0|false (or off/no) disables the post-edit syntax check. */
 export function parseSyntaxEnabled(env: Record<string, string | undefined>): boolean {
-  const raw = env["PI_SUPEREDIT_SYNTAX"];
+  const raw = env["PI_SUPEREDIT_SYNTAX"]?.trim().toLowerCase();
   if (raw === undefined || raw === "") return true;
-  return !(raw === "0" || raw.toLowerCase() === "false");
+  return !(raw === "0" || raw === "false" || raw === "off" || raw === "no");
 }
 
 /** File extensions checked, mapped to tree-sitter grammar names. */
@@ -66,6 +71,11 @@ const LANGUAGE_BY_EXTENSION: Record<string, string> = {
   json: "json",
   go: "go",
   rs: "rust",
+  yaml: "yaml",
+  yml: "yaml",
+  html: "html",
+  htm: "html",
+  css: "css",
 };
 
 /** Grammar name for a path's extension, or null when the check does not apply. */
@@ -73,7 +83,10 @@ export function languageNameForPath(path: string): string | null {
   const dot = path.lastIndexOf(".");
   if (dot <= 0) return null; // no extension, or a dotfile like ".gitignore"
   const ext = path.slice(dot + 1).toLowerCase();
-  return LANGUAGE_BY_EXTENSION[ext] ?? null;
+  // hasOwn, not plain indexing: `path` is model-supplied, and extensions
+  // like "constructor" or "toString" would otherwise inherit a function
+  // off Object.prototype and flow into the loader as a bogus language.
+  return Object.hasOwn(LANGUAGE_BY_EXTENSION, ext) ? LANGUAGE_BY_EXTENSION[ext] : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -119,7 +132,14 @@ export interface SyntaxDiagnostic {
 
 /** Caps: kept diagnostics, diagnostics visited (see below), lines shown. */
 const MAX_COLLECTED_DIAGS = 50;
-const MAX_VISITED_DIAGS = 500;
+// Walk ceilings. Diagnostics are the expensive visits (detail formatting);
+// plain nodes inside a pre-broken ERROR subtree cost only a pop, so their
+// ceiling is higher but still absolute — a wide ERROR node swallowing most
+// of a 512 KB file must not make the walk unbounded. Both are high enough
+// that a pre-existing cluster above the edited lines cannot starve the
+// walk before it reaches them (the silence direction).
+const MAX_WALK_VISITS = 5_000;
+const MAX_WALK_NODES = 50_000;
 const MAX_SHOWN_DIAGS = 5;
 const MAX_EXCERPT_CHARS = 40;
 
@@ -144,35 +164,55 @@ export function collectSyntaxDiagnostics(
   tree: SyntaxTree,
   source: string,
   keep?: (row: number, kind: "error" | "missing") => boolean,
-): { diagnostics: SyntaxDiagnostic[]; truncated: boolean } {
+  maxDiags: number = MAX_COLLECTED_DIAGS,
+): { diagnostics: SyntaxDiagnostic[]; truncated: boolean; reachedRow: number } {
   const lines = source.split("\n"); // once — never re-split per diagnostic
   const out: SyntaxDiagnostic[] = [];
   let visited = 0;
+  let walked = 0;
+  // Document frontier of the walk (highest row popped so far). The walk
+  // is document-ordered, so everything at or before this row was visited:
+  // a caller can tell a cap that fired BEFORE the edited lines (their
+  // damage was never seen) from one that fired later, in unrelated damage.
+  let reachedRow = -1;
   const stack: Array<{ node: SyntaxNode; inError: boolean }> = [{ node: tree.rootNode, inError: false }];
   while (stack.length > 0) {
     const { node, inError } = stack.pop()!;
+    const nodeRow = node.startPosition.row;
+    if (nodeRow > reachedRow) reachedRow = nodeRow;
+    if (++walked > MAX_WALK_NODES) return { diagnostics: out.sort(byPosition), truncated: true, reachedRow };
     const kind: SyntaxDiagnostic["kind"] | null =
       node.type === "ERROR" && !inError ? "error" : node.isMissing ? "missing" : null;
     if (kind !== null) {
       visited++;
       const row = node.startPosition.row;
-      if (!keep || keep(row, kind)) {
+      const kept = !keep || keep(row, kind);
+      if (kept && out.length < maxDiags) {
         out.push({
           kind,
           row,
-          // tree-sitter columns are UTF-8 bytes; convert to code units before
-          // anything string-visible (printed column, excerpt slicing). The
-          // conversion is O(column), so it runs only for kept diagnostics.
-          column: byteColumnToUnits(lines[row] ?? "", node.startPosition.column),
+          // tree-sitter 0.25 native columns are UTF-16 code units (see
+          // EditSplice) — exactly what printing and slicing want. Clamped
+          // to the line's text length so every consumer — excerpt, offset
+          // identity, printed location — sees the same normalized value
+          // (ERROR recovery routinely reports columns past the line end,
+          // and a printed column that does not exist misdirects a
+          // re-reading model; the differential's compare-time clamps are
+          // idempotent under this).
+          column: Math.min(node.startPosition.column, lines[row]?.length ?? 0),
           detail: kind === "error" ? errorDetail(node, lines) : `missing "${node.type}"`,
         });
+      } else if (kept) {
+        // A kept diagnostic exists past the cap — the list really is
+        // truncated. Exactly-at-cap files report truncated: false instead.
+        return { diagnostics: out.sort(byPosition), truncated: true, reachedRow };
       }
-      if (out.length >= MAX_COLLECTED_DIAGS) {
-        return { diagnostics: out.sort(byPosition), truncated: true };
-      }
-      // Nothing-kept files would otherwise walk and count unbounded.
-      if (visited >= MAX_VISITED_DIAGS) {
-        return { diagnostics: out.sort(byPosition), truncated: true };
+      // Nothing-kept files would otherwise walk and count unbounded. Strict
+      // >, not >=: visiting exactly the cap is complete, not truncated — the
+      // first visit past MAX_WALK_VISITS is what gets dropped, and only then
+      // do we claim it.
+      if (visited > MAX_WALK_VISITS) {
+        return { diagnostics: out.sort(byPosition), truncated: true, reachedRow };
       }
     }
     if (!node.hasError) continue; // clean subtree
@@ -182,7 +222,7 @@ export function collectSyntaxDiagnostics(
       if (child) stack.push({ node: child, inError: childInError });
     }
   }
-  return { diagnostics: out.sort(byPosition), truncated: false };
+  return { diagnostics: out.sort(byPosition), truncated: false, reachedRow };
 }
 
 function byPosition(a: SyntaxDiagnostic, b: SyntaxDiagnostic): number {
@@ -190,11 +230,11 @@ function byPosition(a: SyntaxDiagnostic, b: SyntaxDiagnostic): number {
 }
 
 function errorDetail(node: SyntaxNode, lines: string[]): string {
-  // Index the split lines by row, never the raw string by byte index:
-  // startIndex is UTF-8 bytes and the source is code units, so byte slicing
-  // would quote text from past the error on any non-ASCII line above it.
+  // Index the split lines by row, never the raw string by byte index, and
+  // clamp at the line end: columns past it (a common ERROR-recovery shape)
+  // must yield an empty excerpt, not a slice from the next line.
   const line = lines[node.startPosition.row] ?? "";
-  const start = byteColumnToUnits(line, node.startPosition.column);
+  const start = Math.min(node.startPosition.column, line.length);
   const excerpt = line.slice(start, start + MAX_EXCERPT_CHARS);
   let detail = `unexpected ${JSON.stringify(excerpt)}`;
   if (node.endPosition.row > node.startPosition.row + 2) {
@@ -203,39 +243,16 @@ function errorDetail(node: SyntaxNode, lines: string[]): string {
   return detail;
 }
 
-/**
- * UTF-8 byte column → code-unit index within a line. Exact for well-formed
- * text; tolerates lone surrogates (they cannot round-trip UTF-8 anyway) and
- * clamps at the line end.
- */
-function byteColumnToUnits(line: string, byteColumn: number): number {
-  let units = 0;
-  let bytes = 0;
-  while (units < line.length && bytes < byteColumn) {
-    const code = line.charCodeAt(units);
-    if (code >= 0xd800 && code <= 0xdbff) {
-      units += 2; // surrogate pair: 4 bytes across 2 code units
-      bytes += 4;
-    } else if (code >= 0xdc00 && code <= 0xdfff) {
-      units += 1; // lone low surrogate: count something, stay clamped
-      bytes += 3;
-    } else {
-      units += 1;
-      bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : 3;
-    }
-  }
-  return units;
-}
-
 // ---------------------------------------------------------------------------
 // Edited line ranges (splice positions → final-content line numbers)
 // ---------------------------------------------------------------------------
 
 /**
  * One replacement applied in memory: a UTF-16 code-unit span at application
- * time (JS string offsets from indexOf matching) and the inserted length in
- * code units. Not comparable with tree-sitter's UTF-8 byte indexes — only
- * line numbers cross that boundary.
+ * time (JS string offsets from indexOf matching). tree-sitter 0.25's native
+ * binding also reports columns in UTF-16 code units (verified empirically:
+ * a 2-byte é shifts the reported column by 1, not 2), so columns and splice
+ * offsets are directly comparable — no conversion anywhere in this module.
  */
 export interface EditSplice {
   start: number;
@@ -263,6 +280,60 @@ function forwardThrough(splices: EditSplice[], after: number, p: number): number
   return p;
 }
 
+/**
+ * Map a position recorded when splice `after` applied back through every
+ * earlier splice, yielding pre-edit (original-file) coordinates — the exact
+ * inverse of forwardThrough: positions inside an earlier insertion clamp
+ * into that splice's old span, preserving distance from the end.
+ */
+function backwardThrough(splices: EditSplice[], before: number, p: number): number {
+  for (let j = before - 1; j >= 0; j--) {
+    const s = splices[j];
+    if (p < s.start) continue;
+    if (p >= s.start + s.insertLen) {
+      p += s.end - s.start - s.insertLen;
+      continue;
+    }
+    // p === s.start is the BEFORE-edge of the splice (forwardThrough maps
+    // it to itself), so only strictly-inside positions clamp into the old
+    // span — preserving distance from the end keeps the mapping monotone.
+    if (p === s.start) continue;
+    p = Math.max(s.start, s.end - (s.start + s.insertLen - p));
+  }
+  return p;
+}
+
+/**
+ * Map a FINAL-content offset back to its pre-edit (original-file) offset
+ * by inverting every splice in reverse application order. Positions past a
+ * splice shift by its delta; anything inside a splice's inserted text has
+ * no pre-image (-1): inserted text is new, and no prior diagnostic may
+ * speak for it. The BEFORE-EDGE (the first position, which is also where
+ * the old span began) keeps its pre-image — see the inline rationale.
+ */
+function toPreOffset(splices: EditSplice[], p: number): number {
+  for (let j = splices.length - 1; j >= 0; j--) {
+    const s = splices[j];
+    if (p < s.start) continue;
+    if (p >= s.start + s.insertLen) {
+      p += s.end - s.start - s.insertLen;
+      continue;
+    }
+    // Everything strictly inside a splice's inserted text is new — no
+    // pre-image. The BEFORE-EDGE (p === s.start) is the exception, but
+    // ONLY for splices that replaced existing text: it is also the first
+    // position of the old span, and statement-level MISSING damage
+    // reports exactly there — a same-length rewrite of a damaged line
+    // must still recognize its own pre-existing damage (the 50+
+    // diagnostics test is that shape). A PURE INSERTION (s.end ===
+    // s.start) replaced nothing, so its first position is as new as the
+    // rest and gets no pre-image. Definitive either way: earlier splices
+    // cannot restore a pre-image.
+    if (p > s.start || s.end === s.start) return -1;
+  }
+  return p;
+}
+
 function lineStarts(content: string): number[] {
   const starts = [0];
   for (let i = content.indexOf("\n"); i !== -1; i = content.indexOf("\n", i + 1)) starts.push(i + 1);
@@ -279,6 +350,29 @@ function lineOf(starts: number[], offset: number): number {
     else hi = mid - 1;
   }
   return lo + 1;
+}
+
+/**
+ * Per-splice PRE-EDIT line ranges, for scoping the prior collection to
+ * the lines the edit family touched. Splice i's offsets live in the
+ * content after edits 0..i-1, so the pre side inverse-maps through the
+ * earlier splices. The union of these ranges is what the caller uses;
+ * which splice a line came from does not matter, because the suppression
+ * decision itself is offset-exact (see runSyntaxCheck).
+ */
+function pairedSpliceRanges(previous: string, splices: EditSplice[]): Array<{ pre: [number, number] }> {
+  if (splices.length === 0) return [];
+  const preStarts = lineStarts(previous);
+  return splices.map((s, i) => {
+    const pa = backwardThrough(splices, i, s.start);
+    const pb = backwardThrough(splices, i, s.end);
+    return {
+      // The upper bound includes the line AT pb: a whole-line edit's old
+      // span ends exactly at the next line's start, and a post diagnostic
+      // mapping back to that offset must find its prior candidate there.
+      pre: [lineOf(preStarts, pa), lineOf(preStarts, Math.max(pa, pb))],
+    };
+  });
 }
 
 /**
@@ -346,6 +440,12 @@ export function formatSyntaxWarning(path: string, diagnostics: SyntaxDiagnostic[
  * generated; they simply lose the advisory check — fail-open.
  */
 const MAX_SYNTAX_BYTES = 512_000;
+// Ceiling on the splice lists this module will build offset maps from:
+// every consumer (editedLineRanges, pairedSpliceRanges, the pre/post
+// inversion) is quadratic in the list length. The producer (applyEdits)
+// caps its own output at the same number; this bound guards the exported
+// runSyntaxCheck against callers that are not the producer.
+export const MAX_TOTAL_SPLICES = 512;
 
 interface TreeSitterParser {
   setLanguage(language: unknown): void;
@@ -369,6 +469,17 @@ async function importGrammar(language: string): Promise<unknown> {
       return (await import("tree-sitter-go")).default;
     case "rust":
       return (await import("tree-sitter-rust")).default;
+    // YAML: the npm "tree-sitter-yaml" name is a 2023 ABI-13 build that
+    // core 0.25 rejects; the tree-sitter-grammars fork ships ABI-14 prebuilds.
+    case "yaml":
+      return (await import("@tree-sitter-grammars/tree-sitter-yaml")).default;
+    // HTML/CSS bindings predate the "module.exports = Language" convention:
+    // they export { language, nodeTypeInfo }, and core 0.25 needs the whole
+    // object — passing just .language crashes node-class lookup on walk.
+    case "html":
+      return (await import("tree-sitter-html")).default;
+    case "css":
+      return (await import("tree-sitter-css")).default;
     default:
       throw new Error(`No grammar configured for ${language}`);
   }
@@ -378,34 +489,152 @@ async function importGrammar(language: string): Promise<unknown> {
  * The production loader: dynamic-imports the core and per-language grammar
  * on first use (a ~1 ms cold load), caches one parser per language, and
  * returns null on any failure — missing deps after vendoring, incompatible
- * ABI, anything. Load failures are NOT cached — a transient EMFILE or an
- * in-flight prebuild extraction self-heals on the next edit — and the first
- * failure per language leaves one breadcrumb, so "checker dead" is
- * distinguishable from an intentional PI_SUPEREDIT_SYNTAX=0. The `as unknown
- * as` casts are the honest boundary: the ambient grammar declarations only
- * say "object", and Node's CJS-ESM interop puts module.exports on `.default`.
+ * ABI, anything. Load failures are retried, never cached: without a
+ * cooldown, a failing import costs one throw per edit and a HANGING one
+ * (NFS home, stuck prebuild) costs the caller's full 5 s budget on every
+ * single edit, all session. So each failed attempt parks its language for
+ * LOAD_RETRY_MS, and an attempt still pending after PENDING_PARK_MS is
+ * presumed hung and parked too — a hang costs one stall per edit inside
+ * the (budget-sized) window plus the parking edit's one fresh attempt,
+ * then every call fails open instantly for the cooldown — and each
+ * failure mode leaves one breadcrumb per language, so "checker dead" is
+ * distinguishable from an intentional PI_SUPEREDIT_SYNTAX=0. Settled
+ * (thrown) failures are NOT parked — they retry on the next edit, since
+ * their common causes are transient. The
+ * `as unknown as` casts are the honest boundary: the ambient grammar
+ * declarations only say "object", and Node's CJS-ESM interop puts
+ * module.exports on `.default`.
  */
-export function createRealSyntaxLoader(): SyntaxLoader {
+const LOAD_RETRY_MS = 60_000;
+// An in-flight import older than this is presumed hung (healthy grammar
+// loads take ~1 ms; the caller-side budget is 5 s) — sharing it further
+// would burn that budget on every edit, so it gets parked like a failure.
+// Aligned with the caller budget: an import that has outlived one full
+// budget has already cost some edit its whole stall. Realistic cost of a
+// hang: one stall per edit arriving inside the window (usually one —
+// edits are spaced by tool-call latency), plus the parking edit's single
+// fresh attempt; after that every call fails open instantly for the
+// cooldown. A legitimately slow import that settles between one and two
+// budgets old is the accepted loss — healthy loads are ~1 ms, not 5 s.
+const PENDING_PARK_MS = 5_000;
+
+interface InflightAttempt {
+  startedAt: number;
+  promise: Promise<SyntaxLanguage | null>;
+  /**
+   * Resolves the EXPOSED promise as null. A hung import never settles, so
+   * parking must release the old attempt's awaiters itself — each holds an
+   * edit's content — instead of pinning them (and it) for the process
+   * lifetime. Null, not a rejection: every awaiter fails open the same way
+   * the settled-failure path does, with no unhandled-rejection surface.
+   */
+  abandon: () => void;
+}
+
+export function createRealSyntaxLoader(
+  deps: {
+    importCore?: () => Promise<{ default: new () => TreeSitterParser }>;
+    importGrammar?: typeof importGrammar;
+    now?: () => number;
+  } = {},
+): SyntaxLoader {
+  const importCore =
+    deps.importCore ?? (() => import("tree-sitter") as unknown as Promise<{ default: new () => TreeSitterParser }>);
+  const loadGrammar = deps.importGrammar ?? importGrammar;
+  const now = deps.now ?? Date.now;
   const cache = new Map<string, SyntaxLanguage>();
   const complained = new Set<string>();
+  const parkedUntil = new Map<string, number>(); // language → retry-not-before (parked hangs; settled failures retry next edit)
+  const inflight = new Map<string, InflightAttempt>();
+  // Park-and-release a pending attempt: shared by the caller that finds it
+  // stale and the abandon timer, so both paths behave identically.
+  const park = (language: string, attempt: InflightAttempt): void => {
+    parkedUntil.set(language, now() + LOAD_RETRY_MS);
+    if (inflight.get(language) === attempt) inflight.delete(language);
+    attempt.abandon();
+    if (!complained.has(`pending:${language}`)) {
+      complained.add(`pending:${language}`);
+      console.error(
+        `superedit syntax check: grammar load for ${language} still pending after ${PENDING_PARK_MS / 1000}s — parking it`,
+      );
+    }
+  };
   return async (language) => {
     const cached = cache.get(language);
     if (cached !== undefined) return cached;
-    try {
-      const core = (await import("tree-sitter")) as unknown as { default: new () => TreeSitterParser };
-      const parser = new core.default();
-      parser.setLanguage(await importGrammar(language));
-      const result: SyntaxLanguage = { parse: (source) => parser.parse(source) as SyntaxTree };
-      cache.set(language, result);
-      return result;
-    } catch (error) {
-      if (!complained.has(language)) {
-        complained.add(language);
-        const detail = error instanceof Error ? error.message : String(error);
-        console.error(`superedit syntax check unavailable for ${language}: ${detail}`);
+    const parked = parkedUntil.get(language);
+    if (parked !== undefined && now() < parked) return null;
+    const existing = inflight.get(language);
+    if (existing !== undefined) {
+      if (now() - existing.startedAt < PENDING_PARK_MS) {
+        // A concurrent edit shares the in-flight load instead of stacking a
+        // second import; each caller's own budget race bounds its wait.
+        return existing.promise;
       }
-      return null;
+      // Pending past PENDING_PARK_MS and still unsettled: a hung import
+      // (NFS home, stuck prebuild). It never rejects, so it can never reach
+      // the catch below — park it here so later edits fail open instantly
+      // instead of burning their budget on the same dead promise (only the
+      // caller that hit this branch funds the one fresh attempt per
+      // window), and release the dead attempt's awaiters. Breadcrumb once,
+      // or the hang is invisible.
+      park(language, existing);
     }
+    const attempt: InflightAttempt = { startedAt: now(), promise: null!, abandon: null! };
+    // Register before starting the attempt: a synchronously-throwing import
+    // (only possible with an injected fake — dynamic imports return
+    // promises) must find itself registered so the finally clears only its
+    // own marker and the catch breadcrumbs once instead of silently
+    // bypassing both. (Settled failures do not park — see the catch.)
+    inflight.set(language, attempt);
+    // Abandon timer: a follow-up loader call is what normally notices a
+    // hung import, but if none comes the awaiters (each holding an edit's
+    // content) stay pinned until process end — so every attempt also parks
+    // itself on the clock. unref'd: an advisory check must never hold the
+    // process open; cleared on settle in the attempt's finally.
+    const parkTimer = setTimeout(() => {
+      if (inflight.get(language) === attempt) park(language, attempt);
+    }, PENDING_PARK_MS);
+    parkTimer.unref?.();
+    const runAttempt = async (): Promise<SyntaxLanguage | null> => {
+      try {
+        const core = await importCore();
+        const parser = new core.default();
+        parser.setLanguage(await loadGrammar(language));
+        const result: SyntaxLanguage = { parse: (source) => parser.parse(source) as SyntaxTree };
+        cache.set(language, result);
+        return result;
+      } catch (error) {
+        // Settled failures do NOT park: transient causes (EMFILE under
+        // parallel workers, a prebuild extraction still in flight, a brief
+        // mount hiccup) self-heal on the next edit, and a rejected import
+        // is cheap — the cooldown is for imports that never settle (the
+        // PENDING_PARK machinery above). The once-per-language breadcrumb
+        // below is the operator signal; the check fails open either way.
+        if (!complained.has(`failed:${language}`)) {
+          complained.add(`failed:${language}`);
+          const detail = error instanceof Error ? error.message : String(error);
+          console.error(`superedit syntax check unavailable for ${language}: ${detail}`);
+        }
+        return null;
+      } finally {
+        clearTimeout(parkTimer);
+        // Only the registered attempt may clear its marker — a stale attempt
+        // settling late must not un-park a newer one.
+        if (inflight.get(language) === attempt) inflight.delete(language);
+      }
+    };
+    // The exposed promise wraps the attempt so parking can settle it as
+    // null without the (possibly hung) import's cooperation: awaiters each
+    // hold an edit's content, and a never-settling import would pin them
+    // for the process lifetime. A late real settle after abandonment is
+    // dropped here but still lands in the cache, where the next call finds
+    // it before the parked check.
+    attempt.promise = new Promise<SyntaxLanguage | null>((resolve) => {
+      attempt.abandon = () => resolve(null);
+      void runAttempt().then(resolve, resolve.bind(null, null));
+    });
+    return attempt.promise;
   };
 }
 
@@ -423,7 +652,19 @@ export function createRealSyntaxLoader(): SyntaxLoader {
 export async function runSyntaxCheck(opts: {
   path: string;
   content: string;
+  /** Pre-edit content for the differential pass; optional, callers without it skip the refinement. */
+  previous?: string;
   splices: EditSplice[];
+  /**
+   * Whole replaced ranges for line ATTRIBUTION, in the same per-frame
+   * convention as `splices`. When omitted, `splices` doubles for it.
+   * The two serve different masters: attribution wants the whole match
+   * (damage can surface on byte-identical lines inside a rewritten
+   * block), while the differential wants the minimal changed runs
+   * (unchanged bytes keep their pre-image). Callers that record minimal
+   * runs in `splices` pass the whole-match list here.
+   */
+  edited?: EditSplice[];
   loader: SyntaxLoader;
   enabled: boolean;
   cancelled?: () => boolean;
@@ -438,19 +679,174 @@ export async function runSyntaxCheck(opts: {
     if (!grammar || opts.cancelled?.()) return null;
     const tree = grammar.parse(opts.content);
     if (!tree.rootNode.hasError) return null;
-    const exact = editedLineRanges(opts.content, opts.splices, 0);
+    // Boundary guard: the maps below are quadratic in the splice lists, and
+    // this entry point is exported — a caller that is not applyEdits is not
+    // bound by the producer-side cap. Past it, attribution and the
+    // differential give way to the whole-file scope: every diagnostic is
+    // reported (maximally conservative — nothing suppressed) at linear
+    // cost, instead of seconds of blocked event loop on unbounded input.
+    if (opts.splices.length > MAX_TOTAL_SPLICES || (opts.edited ?? opts.splices).length > MAX_TOTAL_SPLICES) {
+      const all = collectSyntaxDiagnostics(tree, opts.content);
+      return formatSyntaxWarning(opts.path, all.diagnostics, all.truncated);
+    }
+    const exact = editedLineRanges(opts.content, opts.edited ?? opts.splices, 0);
     if (exact.length === 0) return null;
     // ±1 line of slack applies to MISSING tokens only: they are zero-width
     // and often sit just past the replacement. An ERROR node starts inside
     // the rewritten text, so widening for it would blame a pre-existing
-    // error on the adjacent line for an edit that introduced nothing.
-    const widened = editedLineRanges(opts.content, opts.splices);
+    // error on the adjacent line for an edit that introduced nothing. The
+    // scope is the same whole replaced span as ERROR attribution (`edited`):
+    // a MISSING at a statement anchor can sit on a byte-identical line deep
+    // inside a rewritten block — scoping it to the minimal changed runs
+    // would drop such damage at collection and report a broken edit clean.
+    const widened = editedLineRanges(opts.content, opts.edited ?? opts.splices);
     // Filter inside collection, not after: with a post-filter, ~50
     // pre-existing errors before the edited region would exhaust the cap
     // and hide the error the edit actually introduced.
     const mine = (row: number, kind: "error" | "missing") =>
       (kind === "missing" ? widened : exact).some(([a, b]) => row + 1 >= a && row + 1 <= b);
-    const { diagnostics, truncated } = collectSyntaxDiagnostics(tree, opts.content, mine);
+    const { diagnostics, truncated, reachedRow } = collectSyntaxDiagnostics(tree, opts.content, mine);
+    if (diagnostics.length === 0) {
+      // A capped walk that did not get PAST the edited scope is not a
+      // clean bill of health — say so, or the silence would be
+      // indistinguishable from a clean parse and hide exactly the
+      // wide-mangled-file damage the check exists to surface. The gate is
+      // deliberately conservative in the warn direction: `widened` is
+      // 1-based and includes the ±1 MISSING slack while `reachedRow` is a
+      // 0-based frontier, so a cap firing ON — or one row short of — the
+      // last in-scope line still warns. The alternative (silence unless
+      // the region is entirely beyond the frontier) would drop partially
+      // walked lines, and a cap that fires mid-line has not seen that
+      // line's deeper diagnostics. A cap that fired further down, in
+      // unrelated pre-existing damage, clears the gate and stays silent.
+      return truncated && widened.some(([, b]) => b > reachedRow)
+        ? `warning: the syntax check's diagnostic walk capped before clearing the edited lines of ${opts.path} — re-read the changed region.`
+        : null;
+    }
+    // Differential vs the pre-edit content: suppress diagnostics that
+    // already existed before the edit. The line filter above cannot help
+    // when the pre-existing damage sits ON an edited line — the canonical
+    // case is JSONC (tsconfig.json): a `// comment` or trailing comma on the
+    // edited line is a strict-JSON ERROR the edit did not introduce, and
+    // warning on it would send the model to delete valid config.
+    // Identity is OFFSET-EXACT: the post-edit diagnostic's line+column is
+    // one code-unit offset in the final content; inverting the splices maps
+    // it to the pre-edit offset it came from, and only a prior diagnostic
+    // at that exact offset — same kind — is the same damage. No covering
+    // check is needed on top: `mine` already kept only diagnostics near an
+    // edit, and kind + exact offset cannot coincide across different
+    // damage — this also covers MISSING tokens reported one line past their
+    // home (kept by the ±1 slack, suppressed when their offset maps onto a
+    // prior). Offsets inside inserted text have no pre-image — an edit owns
+    // the text it inserted. Both sides' collections must be complete: a
+    // truncated walk means partial data, and suppressing on partial data
+    // could hide real new damage — so any truncation disables the
+    // refinement. Runs only on the about-to-warn path (and never once the
+    // caller stopped waiting): clean edits pay one parse, never two, and an
+    // oversize `previous` skips the refinement.
+    if (opts.previous !== undefined && opts.previous !== opts.content && !truncated) {
+      try {
+        // Combined budget: the post-edit parse already ran, so a second
+        // ~512 KB parse would double the documented worst-case stall. The
+        // guard is on content + previous together, keeping the total
+        // synchronous parse work near one file cap.
+        if (
+          Buffer.byteLength(opts.content, "utf8") + Buffer.byteLength(opts.previous, "utf8") <= MAX_SYNTAX_BYTES &&
+          !opts.cancelled?.()
+        ) {
+          const before = grammar.parse(opts.previous);
+          if (before.rootNode.hasError) {
+            // The prior scope must mirror ATTRIBUTION, not the minimal
+            // runs: post diagnostics are kept from the whole replaced
+            // range (`edited`), so pre-existing damage on an unchanged
+            // line inside that range needs its prior collected or it
+            // would be re-reported as new. Suppression stays offset-exact
+            // against the minimal `splices`, so the wider scope only adds
+            // candidates that can never coincide with fresh text.
+            const pairs = pairedSpliceRanges(opts.previous, opts.edited ?? opts.splices);
+            const postStarts = lineStarts(opts.content);
+            const preStarts = lineStarts(opts.previous);
+            // Merge the per-splice pre ranges (and a MISSING-widened copy —
+            // the same ±1 slack the attribution filter gives MISSING tokens,
+            // whose home line is one past where they report) so the prior
+            // walk's keep predicate checks a handful of merged intervals
+            // instead of every splice per visit. Scope still matters: a
+            // rewritten block can hold hundreds of pre-existing diagnostics,
+            // and dropping the one being diffed against would blame the edit
+            // for damage it did not introduce.
+            const merged = (widen: number): Array<[number, number]> => {
+              const sorted = [...pairs]
+                .map((c) => [c.pre[0] - widen, c.pre[1] + widen] as [number, number])
+                .sort((x, y) => x[0] - y[0]);
+              const out: Array<[number, number]> = [];
+              for (const r of sorted) {
+                const last = out[out.length - 1];
+                if (last && r[0] <= last[1] + 1) last[1] = Math.max(last[1], r[1]);
+                else out.push([r[0], r[1]]);
+              }
+              return out;
+            };
+            const errorScope = merged(0);
+            const missingScope = merged(1);
+            const inScope = (row: number, kind: "error" | "missing"): boolean =>
+              (kind === "missing" ? missingScope : errorScope).some(([a, b]) => row + 1 >= a && row + 1 <= b);
+            const prior = collectSyntaxDiagnostics(before, opts.previous, inScope, MAX_WALK_VISITS);
+            if (!prior.truncated) {
+              // Precompute the insertion before-edges once: forwarding every
+              // splice start is O(splices²), and occurrence:"all" edits can
+              // push close to a thousand splices — per-diagnostic recomputes
+              // would dominate the filter.
+              const insertedStarts = new Set(
+                opts.splices.flatMap((s, i) => (s.insertLen > 0 ? [forwardThrough(opts.splices, i, s.start)] : [])),
+              );
+              // Precompute the prior side's offsets with the SAME
+              // end-of-line clamp the post side applies: past-EOL recovery
+              // columns are as common before the edit as after, and an
+              // unclamped prior offset spills into the next line — unable
+              // to equal its own clamped pre-image (false blame) yet able
+              // to collide with that line's real damage (false silence).
+              const priorOffsets = prior.diagnostics.map((p) => {
+                const start = preStarts[p.row] ?? 0;
+                const next = preStarts[p.row + 1];
+                const len = (next === undefined ? opts.previous!.length : next - 1) - start;
+                return { kind: p.kind, offset: start + Math.min(p.column, len) };
+              });
+              let cancelledMidFilter = false;
+              const fresh = diagnostics.filter((d) => {
+                if (opts.cancelled?.()) {
+                  cancelledMidFilter = true;
+                  return true;
+                }
+                // Columns past end-of-line are a common ERROR-recovery
+                // shape (see errorDetail): clamp to the line's text end —
+                // newline excluded, matching errorDetail — before inverting,
+                // or the offset spills into the next line's first character
+                // and could suppress — or fabricate — a pre-image there.
+                const lineStart = postStarts[d.row] ?? 0;
+                const next = postStarts[d.row + 1];
+                const lineLen = (next === undefined ? opts.content.length : next - 1) - lineStart;
+                const at = lineStart + Math.min(d.column, lineLen);
+                const origin = toPreOffset(opts.splices, at);
+                if (origin < 0) return true; // inside an insertion: no pre-image, never suppressible
+                // The BEFORE-EDGE of an insertion is ambiguous (it is also
+                // the old span's first position): only MISSING damage may
+                // claim it — MISSING reports at statement anchors, while an
+                // ERROR at the first character of fresh text is new damage
+                // in text the edit just wrote.
+                if (d.kind === "error" && insertedStarts.has(at)) return true;
+                return !priorOffsets.some((p) => p.kind === d.kind && p.offset === origin);
+              });
+              // Suppression on partial filtering could hide real damage:
+              // fall through to the undifferentiated warning instead.
+              if (!cancelledMidFilter) return formatSyntaxWarning(opts.path, fresh, truncated);
+            }
+            // prior collection truncated: fall through undifferentiated
+          }
+        }
+      } catch {
+        // fail-open: fall through to the undifferentiated warning
+      }
+    }
     return formatSyntaxWarning(opts.path, diagnostics, truncated);
   } catch {
     return null;

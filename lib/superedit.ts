@@ -59,7 +59,13 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { createRealSyntaxLoader, runSyntaxCheck, type EditSplice, type SyntaxLoader } from "./superedit-syntax";
+import {
+  createRealSyntaxLoader,
+  MAX_TOTAL_SPLICES,
+  runSyntaxCheck,
+  type EditSplice,
+  type SyntaxLoader,
+} from "./superedit-syntax";
 
 /** Tab expansion width for comparing indentation between tabs and spaces. */
 export const TABSTOP = 4;
@@ -91,6 +97,18 @@ const MAX_SHIFT_LINES = 6;
  * check can never gate delivery of a committed edit result.
  */
 const SYNTAX_CHECK_BUDGET_MS = 5_000;
+/**
+ * Splice-count guards for the syntax check's offset maps. Every splice
+ * consumer (editedLineRanges, pairedSpliceRanges, toPreOffset helpers) is
+ * O(splices²) by design — fine at the old whole-match ceiling (allCap ≤
+ * 1000) but not for per-changed-run splices: a fragmented rewrite of a
+ * large block can produce tens of thousands of runs inside the 512 KB
+ * syntax gate. Past the per-match cap the whole replaced range stands in
+ * for its runs (the differential turns conservative — unchanged bytes
+ * inside lose their pre-image and stay reported); past the total cap the
+ * run list collapses to the whole-match list entirely.
+ */
+const MAX_RUN_SPLICES_PER_MATCH = 64;
 
 // ---------------------------------------------------------------------------
 // Environment knobs (invalid values fall back to defaults, house style)
@@ -572,6 +590,7 @@ function applyNormalizedTier(
   newText: string,
   map: OffsetMap,
   splices: EditSplice[],
+  spans: EditSplice[],
 ): { content: string; changed: boolean; origSpan: { origStart: number; origEnd: number } } {
   const contentLines = getLines(content);
   const fuzzyLines = getLines(fuzzyContent);
@@ -619,7 +638,23 @@ function applyNormalizedTier(
         .join("");
     if (rebuilt !== current) {
       changed = true;
-      splices.push({ start: curStart, end: curEnd, insertLen: groupText.length });
+      // Record each maximal changed RUN inside the group (see changedRuns):
+      // unchanged text — head, tail, and gaps between runs — keeps its
+      // pre-image against the syntax check's differential. Past the
+      // per-group cap the whole group stands in (see
+      // MAX_RUN_SPLICES_PER_MATCH): the offset maps are O(splices²).
+      const runs = changedRuns(current.slice(curStart, curEnd), groupText);
+      if (runs.length > MAX_RUN_SPLICES_PER_MATCH) {
+        splices.push({ start: curStart, end: curEnd, insertLen: groupText.length });
+      } else {
+        for (const r of runs) {
+          splices.push({ start: curStart + r.start, end: curStart + r.end, insertLen: r.insertLen });
+        }
+      }
+      // The whole rebuilt group is the ATTRIBUTION span: damage can
+      // surface on byte-identical lines inside a rewritten block, and the
+      // syntax check's line filter must still see them.
+      spans.push({ start: curStart, end: curEnd, insertLen: groupText.length });
     }
     const span = map.splice(curStart, curEnd - curStart, groupText.length);
     if (group === groups[0]) origSpan = span; // groups[0] is the lowest line range
@@ -639,7 +674,7 @@ export function applyEdits(
   content: string,
   edits: EditSpec[],
   opts: { path: string; allCap: number },
-): { newContent: string; applied: AppliedEdit[]; splices: EditSplice[] } {
+): { newContent: string; applied: AppliedEdit[]; splices: EditSplice[]; spans: EditSplice[] } {
   const normalized = edits.map((e) => ({
     oldText: normalizeToLF(e.oldText),
     newText: normalizeToLF(e.newText),
@@ -672,6 +707,9 @@ export function applyEdits(
   // Replacements that changed bytes, in application order — the input to the
   // post-edit syntax check's edited-line attribution.
   const splices: EditSplice[] = [];
+  // Whole replaced ranges, same order and frame convention — the
+  // ATTRIBUTION side of the syntax check (see runSyntaxCheck's `edited`).
+  const spans: EditSplice[] = [];
 
   for (let i = 0; i < normalized.length; i++) {
     const edit = normalized[i];
@@ -712,7 +750,7 @@ export function applyEdits(
     let changed = false;
     let origSpan = { origStart: 0, origEnd: 0 };
     if (ladder.space === "fuzzy") {
-      const res = applyNormalizedTier(current, ladder.fuzzyContent!, chosen, edit.newText, map, splices);
+      const res = applyNormalizedTier(current, ladder.fuzzyContent!, chosen, edit.newText, map, splices, spans);
       current = res.content;
       changed = res.changed;
       origSpan = res.origSpan;
@@ -724,9 +762,23 @@ export function applyEdits(
       origSpan = { origStart: map.origOf(first.start), origEnd: map.origOf(first.end) };
       for (const m of ordered) {
         const replacement = ladder.tier === "indent-elastic" ? shiftText(edit.newText, m.indentShift) : edit.newText;
-        if (replacement !== current.slice(m.start, m.end)) {
+        const oldSpan = current.slice(m.start, m.end);
+        if (replacement !== oldSpan) {
           changed = true;
-          splices.push({ start: m.start, end: m.end, insertLen: replacement.length });
+          // Minimal changed runs, same as the normalized tier: a wide exact
+          // match must not swallow unchanged bytes into its inserted text.
+          // Past the per-match run cap the whole span stands in (see
+          // MAX_RUN_SPLICES_PER_MATCH): the offset maps are O(splices²).
+          const runs = changedRuns(oldSpan, replacement);
+          if (runs.length > MAX_RUN_SPLICES_PER_MATCH) {
+            splices.push({ start: m.start, end: m.end, insertLen: replacement.length });
+          } else {
+            for (const r of runs) {
+              splices.push({ start: m.start + r.start, end: m.start + r.end, insertLen: r.insertLen });
+            }
+          }
+          // The whole match is the ATTRIBUTION span (see spans above).
+          spans.push({ start: m.start, end: m.end, insertLen: replacement.length });
         }
         current = spliceContent(current, m.start, m.end, replacement, map);
       }
@@ -740,12 +792,96 @@ export function applyEdits(
       ...origSpan,
     });
   }
-  return { newContent: current, applied, splices };
+  // Total-count guard (see MAX_TOTAL_SPLICES): the syntax check's offset
+  // maps are quadratic in the splice list, and occurrence:"all" edits can
+  // stack many matches' runs. Collapsing to the whole-match list makes the
+  // differential conservative (more diagnostics reported, none hidden).
+  // Both lists are then capped at MAX_TOTAL_SPLICES — as a real ceiling,
+  // not a swap for another unbounded list — but attribution must survive
+  // the cap: `edited` (the spans) decides which lines' damage is kept at
+  // all, so dropping matches from it would silently report their edits
+  // clean. The dropped tail therefore merges into one span (identity
+  // length: line-range coverage is all attribution needs), keeping every
+  // replaced line in scope while the list stays bounded; only the
+  // differential degrades (fail-open toward reporting).
+  if (splices.length > MAX_TOTAL_SPLICES) {
+    splices.length = 0;
+    if (spans.length > MAX_TOTAL_SPLICES) {
+      const kept = spans.slice(0, MAX_TOTAL_SPLICES - 1);
+      // Fold the dropped tail with a loop, not Math.min/max spreads: the
+      // tail is model-sized (edits × allCap) and spread argument lists
+      // throw past ~10⁵ entries — a RangeError inside the edit path is
+      // neither explainable nor actionable.
+      const tail = spans.slice(MAX_TOTAL_SPLICES - 1);
+      let start = tail[0].start;
+      let end = tail[0].end;
+      for (const s of tail) {
+        if (s.start < start) start = s.start;
+        if (s.end > end) end = s.end;
+      }
+      kept.push({ start, end, insertLen: end - start });
+      spans.length = 0;
+      spans.push(...kept);
+    }
+    splices.push(...spans);
+  }
+  return { newContent: current, applied, splices, spans };
 }
 
 // ---------------------------------------------------------------------------
 // Error messages — diagnostics, not dead ends
 // ---------------------------------------------------------------------------
+
+/**
+ * The changed sub-runs of a replacement, relative to the OLD text: the
+ * identical head/tail and equal gaps keep their pre-image so the syntax
+ * check's differential does not treat untouched bytes as freshly inserted
+ * (pre-existing damage there would be blamed on this edit). Runs are
+ * returned descending so callers pushing them into a descending splice
+ * list keep every start valid in the frame of the splices before it.
+ */
+function changedRuns(oldS: string, newS: string): EditSplice[] {
+  let head = 0;
+  while (head < oldS.length && head < newS.length && oldS[head] === newS[head]) head++;
+  let tail = 0;
+  while (
+    tail < oldS.length - head &&
+    tail < newS.length - head &&
+    oldS[oldS.length - 1 - tail] === newS[newS.length - 1 - tail]
+  )
+    tail++;
+  const oldEnd = oldS.length - tail;
+  const newEnd = newS.length - tail;
+  const runs: EditSplice[] = [];
+  let i = head;
+  let j = head;
+  while (i < oldEnd && j < newEnd) {
+    if (oldS[i] === newS[j]) {
+      i++;
+      j++;
+      continue;
+    }
+    const runOld = i;
+    const runNew = j;
+    while (i < oldEnd && j < newEnd && oldS[i] !== newS[j]) {
+      i++;
+      j++;
+    }
+    // A run that reaches either boundary absorbs the rest of both —
+    // the trailing differ tail belongs to it, not to the equal gaps.
+    if (i === oldEnd || j === newEnd) {
+      i = oldEnd;
+      j = newEnd;
+    }
+    runs.push({ start: runOld, end: i, insertLen: j - runNew });
+  }
+  // Pure insertion (no old counterpart) or pure deletion (no new one) in
+  // the middle: still a splice, so later offsets map correctly.
+  if (i < oldEnd || j < newEnd) {
+    runs.push({ start: i, end: oldEnd, insertLen: newEnd - j });
+  }
+  return runs.reverse();
+}
 
 function lineRangeDesc(path: string, lines: Line[], m: TierMatch): string {
   const l1 = lineOfOffset(lines, m.start);
@@ -1429,7 +1565,7 @@ export function createSuperEditTool(
         const ending = detectLineEnding(text);
         const normalized = normalizeToLF(text);
         const allCap = opts.allCap?.() ?? DEFAULT_ALL_CAP;
-        const { newContent, applied, splices } = applyEdits(normalized, edits, { path, allCap });
+        const { newContent, applied, splices, spans } = applyEdits(normalized, edits, { path, allCap });
         throwIfAborted();
         if (newContent === normalized) {
           const notes = applied
@@ -1455,7 +1591,7 @@ export function createSuperEditTool(
         // No abort check here: the write has committed, and reporting a landed
         // edit as "aborted" would send the model to re-apply it and hit a
         // confusing no-change error on the next call.
-        return { normalized, newContent, applied, splices };
+        return { normalized, newContent, applied, splices, spans };
       });
       // Outside the per-path mutation queue: the write has committed and the
       // remaining steps are read-only over in-memory content. Holding the
@@ -1483,7 +1619,9 @@ export function createSuperEditTool(
             runSyntaxCheck({
               path,
               content: written.newContent,
+              previous: written.normalized,
               splices: written.splices,
+              edited: written.spans,
               loader: syntaxLoader,
               enabled: syntaxEnabled?.() ?? false,
               cancelled: () => settled,
@@ -1494,6 +1632,11 @@ export function createSuperEditTool(
               signal?.addEventListener("abort", onAbort, { once: true });
             }),
           ]);
+        } catch {
+          // The catch lives HERE, at the boundary: anything that throws
+          // synchronously while assembling the race (an injected enabled()
+          // callback, say) must never turn a landed edit into an error.
+          syntaxWarning = null;
         } finally {
           // A race-lost check re-polls `cancelled` before its synchronous
           // parse and bails, so no discarded result ever runs the parse. The

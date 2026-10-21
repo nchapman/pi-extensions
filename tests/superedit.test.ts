@@ -567,11 +567,79 @@ describe("normalized matching", () => {
     expect(r.newContent).toBe("STOP ; STOP ;\n");
   });
 
+  it("rebuilds with a splice covering only the changed subrange", () => {
+    // A smart-quoted line with an unrelated stray token on it: the rebuild
+    // must record only the changed middle, not the whole line group — a
+    // whole-line splice would make unchanged text (the stray token) look
+    // like inserted text to the syntax check's differential, blaming
+    // pre-existing damage on this edit.
+    const content = "const s = \u201Chi\u201D; @\n";
+    const r = apply(content, [{ oldText: 'const s = "hi";', newText: 'const s = "bye";' }]);
+    expect(r.newContent).toBe('const s = "bye"; @\n');
+    expect(r.splices).toEqual([{ start: 10, end: 14, insertLen: 5 }]);
+  });
+
   it("handles a mid-line normalized match with NBSP", () => {
     const content = "let x = f(a\u00A0b);\n";
     const r = apply(content, [{ oldText: "f(a b)", newText: "g()" }]);
     expect(r.newContent).toBe("let x = g();\n");
     expect(r.applied[0].tier).toBe("normalized");
+  });
+
+  it("records one splice per changed run inside a rebuilt group", () => {
+    // Two smart-quoted matches on one line, occurrence all: the group is
+    // rebuilt in one pass, but the unchanged ` @ ` between the matches
+    // must fall OUTSIDE every splice — inside one, it would look like
+    // inserted text to the syntax check's differential, and pre-existing
+    // damage there would be blamed on this edit.
+    const content = "x = \u201Ca\u201D @ \u201Ca\u201D\n";
+    const r = apply(content, [{ oldText: '"a"', newText: '"b"', occurrence: "all" }]);
+    expect(r.newContent).toBe('x = "b" @ "b"\n');
+    expect(r.splices).toEqual([
+      { start: 10, end: 13, insertLen: 3 },
+      { start: 4, end: 7, insertLen: 3 },
+    ]);
+  });
+
+  it("records minimal runs for exact-tier replacements too", () => {
+    // A wide exact match where only `aaa` changes must not swallow the
+    // untouched tail into the inserted text — pre-existing damage on the
+    // rest of the line would lose its pre-image and be blamed on the edit.
+    const r = apply("const aaa = 1; // x\n", [{ oldText: "const aaa = 1; // x", newText: "const bbb = 1; // x" }]);
+    expect(r.newContent).toBe("const bbb = 1; // x\n");
+    expect(r.splices).toEqual([{ start: 6, end: 9, insertLen: 3 }]);
+  });
+
+  it("stands the whole span in for a match with too many runs", () => {
+    // 65 alternating one-char differences: past MAX_RUN_SPLICES_PER_MATCH
+    // the run list would explode, and the offset maps that consume splices
+    // are quadratic — so the whole span stands in and the differential
+    // turns conservative for that match.
+    const oldText = "ab".repeat(65);
+    const newText = "aB".repeat(65);
+    const r = apply(oldText, [{ oldText, newText }]);
+    expect(r.newContent).toBe(newText);
+    expect(r.splices).toEqual([{ start: 0, end: 130, insertLen: 130 }]);
+    expect(r.spans).toEqual([{ start: 0, end: 130, insertLen: 130 }]);
+  });
+
+  it("collapses the run list entirely past the total splice cap", () => {
+    // 513 two-line matches, each one changed byte (513 runs > the 512
+    // total cap): the run list collapses to the whole-match list, itself
+    // capped — the guard is a real ceiling on every consumer (the spans
+    // double as the checker's `edited` attribution list). Attribution
+    // survives the cap: the dropped tail (the lowest matches, starts 4 and
+    // 0) merges into ONE identity-length span, so every replaced line
+    // stays in scope while the list holds 512 entries.
+    const content = "x\ny\n".repeat(513);
+    const r = apply(content, [{ oldText: "x\ny", newText: "X\ny", occurrence: "all" }], 1_000);
+    expect(r.newContent).toBe("X\ny\n".repeat(513));
+    expect(r.splices.length).toBe(512);
+    // Whole-match shape (3 wide), not the 1-wide run shape — and the tail
+    // merge: the last entry covers matches at 0..7 as one identity span.
+    expect(r.splices[0]).toEqual({ start: 2048, end: 2051, insertLen: 3 });
+    expect(r.splices.at(-1)).toEqual({ start: 0, end: 7, insertLen: 7 });
+    expect(r.splices).toEqual(r.spans);
   });
 
   it("rebuilds multi-line groups when newText adds lines", () => {
