@@ -579,6 +579,28 @@ export function describeConnection(conn: SshConnection): string {
 }
 
 /**
+ * Detects shell detachment patterns (trailing `&`, `nohup`, `disown`, or `& echo $!`)
+ * where the remote shell exits immediately with code 0, orphaning the process outside
+ * pi's task registry, output streaming, and task_kill cleanup.
+ */
+export function detectManualBackgrounding(command: string): { detected: boolean; reason?: string } {
+  const trimmed = command.trim();
+  if (/(?:^|[^&])&\s*$/.test(trimmed)) {
+    return { detected: true, reason: "trailing &" };
+  }
+  if (/(?:^|[;&|])\s*nohup\s+/i.test(trimmed)) {
+    return { detected: true, reason: "nohup" };
+  }
+  if (/(?:^|[;&|])\s*disown(?:\s|$|[;&|])/i.test(trimmed)) {
+    return { detected: true, reason: "disown" };
+  }
+  if (/(?:^|[^&])&\s*(?:echo\s+\$!|pid=\S+)/i.test(trimmed)) {
+    return { detected: true, reason: "& with PID tracking" };
+  }
+  return { detected: false };
+}
+
+/**
  * Registers the `ssh_bash` tool with pi, wiring up connection multiplexing,
  * background task lifecycle handling, and session shutdown cleanup.
  */
@@ -602,13 +624,20 @@ export function registerSshBashExtension(
     label: "SSH bash",
     description: `Execute a shell command on a remote machine over SSH and get stdout/stderr. The connection is reused across calls (OpenSSH multiplexing): the first call to a destination pays the full handshake; later calls connect in milliseconds without re-authenticating. The command runs through the remote shell in the login directory — cd yourself as needed. Prefer this over bash with a raw ssh command for any remote machine.
 target: user@host, host, an ~/.ssh/config alias, ssh://user@host:port, or a connection id (ssh-N) named in an earlier result; port and key refine it. Auth must be non-interactive (identity file, ssh-agent, or ssh config) — there are no password prompts; a destination that cannot authenticate fails fast with ssh's error.
-wait and timeout behave exactly like the bash tool: inline (default) blocks until the command finishes; auto blocks ~2m then moves to the background; background returns a task id immediately and the result (exit status, duration, output tail) arrives as your next message — end your turn instead of sleeping or polling. Killing a task terminates the remote process group (SIGKILL by session id, over the still-open connection) — reliable even under remote shells that ignore HUP.`,
+wait: "inline" (default) blocks until completion; "auto" blocks ~2m then backgrounds; "background" returns a task id immediately and the result arrives automatically as your next message.
+Run commands in the foreground — do not use nohup, trailing &, disown, screen, or tmux; pass wait: "background" instead. Backgrounding inside the shell exits immediately with code 0, breaking task tracking, log streaming, completion wakes, and task_kill (which cleanly SIGKILLs the remote session group).
+Never sleep or poll remote commands in a loop — output streams automatically (peek with task <id>).`,
     promptSnippet: "Execute commands on a remote machine over SSH",
     promptGuidelines: [
       "Use ssh_bash (not bash + raw ssh) for remote machines: connections are multiplexed so repeated calls are cheap. Later calls can pass target: the connection id (ssh-1) an earlier result named.",
-      "For long remote jobs (training runs, tailing logs), use wait: background and let the wake re-engage you — never sleep locally or re-poll in a loop; task_remind schedules a check if you need one.",
+      "For long remote jobs (training runs, dev servers), use wait: 'background' with a foreground command. Do not use nohup, trailing &, disown, screen, or tmux — backgrounding in the remote shell exits immediately with code 0, breaking task tracking and task_kill.",
+      "Never sleep or poll remote commands in a loop. Output streams automatically (peek with task <id>), and completion wakes you automatically when the command finishes.",
     ],
     extraParams: {
+      command: Type.String({
+        description:
+          "Shell command to execute on the remote machine in the foreground. Do not append & or use nohup/disown/tmux — pass wait: 'background' for background execution.",
+      }),
       target: Type.String({
         description:
           "Destination: user@host, host, ssh://user@host:port, an ~/.ssh/config alias, or a connection id (ssh-N) from an earlier call",
@@ -642,6 +671,21 @@ wait and timeout behave exactly like the bash tool: inline (default) blocks unti
     onUpdate: Parameters<typeof baseExecute>[3],
     ctx: Parameters<typeof baseExecute>[4],
   ) => {
+    const bgCheck = detectManualBackgrounding(params.command ?? "");
+    if (bgCheck.detected) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error: Manual backgrounding (${bgCheck.reason}) is not supported in ssh_bash.
+Run the command in the foreground (remove nohup, disown, and trailing &) and pass wait: "background" instead.
+ssh_bash tracks the process group, streams output to task <id>, and wakes you on completion.`,
+          },
+        ],
+        details: { kind: "bash", mode: params.wait ?? "inline" },
+        isError: true,
+      };
+    }
     const resolved = connections.resolve(params.target, params.port, params.key);
     if (resolved.error || !resolved.conn) {
       return {

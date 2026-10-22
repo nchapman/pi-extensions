@@ -305,7 +305,7 @@ export function formatUsageLine(u: ChildUsage): string {
  * arrives on its own and that sleep-polling is pure waste (the wake would
  * land when the sleep returns; the sleep just burns its whole duration). */
 export function backgroundedNotice(agentName: string, id: string): string {
-  return `Subagent "${agentName}" is still running — moved to the background (${id}). When it completes, its result is delivered to you automatically as your next message — even mid-run. If you have nothing else to do, end your turn: the wake re-engages you, so waiting is never your job. Never sleep or poll to wait, and don't arm a check-in just to wait — the result arrives on its own. Peek with task ${id}; stop it with task_kill ${id} if the result is no longer wanted. The hard timeout still applies.`;
+  return `Subagent "${agentName}" is still running — moved to the background (${id}). When it completes, its result is delivered to you automatically as your next message — even mid-run. If you have nothing else to do, end your turn: the wake re-engages you. Never sleep or poll to wait, and don't arm a check-in just to wait — the result arrives on its own. Peek with task ${id}; stop it with task_kill ${id} if the result is no longer wanted. The hard timeout still applies.`;
 }
 
 /** Adopt a still-running child into the registry and wire its wake. Returns the task id. */

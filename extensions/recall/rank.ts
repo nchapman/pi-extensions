@@ -357,6 +357,9 @@ export function formatSearchResult(
   const skipped = meta.skippedFiles
     ? ` (${meta.skippedFiles} unreadable session file${meta.skippedFiles === 1 ? "" : "s"} skipped)`
     : "";
+  if (hits.length === 0) {
+    return `${lines.join("\n")}${skipped}`;
+  }
   const limited = (meta.totalMatches ?? hits.length) > hits.length ? "results limited; " : "";
   return `${lines.join("\n")}${skipped}\n(${limited}verbatim excerpts — older context may have changed since)`;
 }

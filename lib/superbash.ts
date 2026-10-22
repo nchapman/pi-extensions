@@ -1112,7 +1112,7 @@ export function createBashTool(
     description:
       opts.description ??
       `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first); when truncated, the full output is saved to a file whose path the result includes.
-wait: "inline" (default) blocks until the command finishes and returns its output — waiting on a tool call costs nothing, so this is the normal choice; pass a timeout to bound a command you're unsure about. wait: "auto" blocks up to ~${formatDuration(descWindowMs)} — a command that finishes in time returns its output inline, one that doesn't move to the background and return a task id (t-xxxxx). "background" returns a task id immediately — for work you'll do other things while it runs. A backgrounded command's result (exit status, duration, output tail) is delivered to you automatically as your next message, even mid-run — if you have nothing else to do, end your turn and the wake re-engages you; never sleep or poll to wait. Peek at a running task with task <id> only when its new output would change what you do; stop it with task_kill.
+wait: "inline" (default) blocks until the command finishes and returns its output — waiting on a tool call costs nothing, so this is the normal choice; pass a timeout to bound a command you're unsure about. wait: "auto" blocks up to ~${formatDuration(descWindowMs)} — a command that finishes in time returns its output inline, one that exceeds it moves to the background and returns a task id (t-xxxxx). "background" returns a task id immediately — for work you'll do other things while it runs. A backgrounded command's result (exit status, duration, output tail) is delivered to you automatically as your next message, even mid-run — if you have nothing else to do, end your turn and the wake re-engages you; never sleep or poll to wait. Peek at a running task with task <id> only when its new output would change what you do; stop it with task_kill.
 persist: true (wait: "background" only) detaches the command from pi entirely: it keeps running across pi exits and restarts, logs to the session's tasks directory, and its outcome is reported when the session resumes. The default is non-persistent; PI_BG_BASH_PERSIST=1 flips the default for background mode.
 Timeout is in seconds, optional, no default — a command without a timeout runs until it finishes or is killed (0 also means no timeout).`,
     promptSnippet: opts.promptSnippet ?? "Execute bash commands (ls, grep, find, etc.)",
@@ -1400,7 +1400,7 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
             {
               type: "text",
               text: `Backgrounded (${id}, persistent): ${taskHead}
-The command keeps running in its own process group, detached from pi — it survives pi exiting and restarting, and its outcome is reported when the session resumes. In this session the exit status, duration, and output tail are delivered to you automatically as your next message when it exits — even mid-run. If you have nothing else to do, end your turn: the wake re-engages you, so waiting is never your job. Never sleep or poll to wait, and don't arm a check-in just to wait — the result arrives on its own. Peek at it with task ${id}; stop it with task_kill ${id}. Any timeout you passed still applies.`,
+The command keeps running in its own process group, detached from pi — it survives pi exiting and restarting, and its outcome is reported when the session resumes. In this session the exit status, duration, and output tail are delivered to you automatically as your next message when it exits — even mid-run. If you have nothing else to do, end your turn: the wake re-engages you. Never sleep or poll to wait, and don't arm a check-in just to wait — the result arrives on its own. Peek at it with task ${id}; stop it with task_kill ${id}. Any timeout you passed still applies.`,
             },
           ],
           details: { kind: "bash", mode, id },
@@ -1587,7 +1587,7 @@ The command keeps running in its own process group, detached from pi — it surv
           {
             type: "text",
             text: `Backgrounded (${id}): ${taskHead}
-The command keeps running in the background. When it exits, the exit status, duration, and output tail are delivered to you automatically as your next message — even mid-run. If you have nothing else to do, end your turn: the wake re-engages you, so waiting is never your job. Never sleep or poll to wait, and don't arm a check-in just to wait — the result arrives on its own. Peek at it with task ${id}; stop it with task_kill ${id}. Any timeout you passed still applies.`,
+The command keeps running in the background. When it exits, the exit status, duration, and output tail are delivered to you automatically as your next message — even mid-run. If you have nothing else to do, end your turn: the wake re-engages you. Never sleep or poll to wait, and don't arm a check-in just to wait — the result arrives on its own. Peek at it with task ${id}; stop it with task_kill ${id}. Any timeout you passed still applies.`,
           },
         ],
         details: { kind: "bash", mode, id },

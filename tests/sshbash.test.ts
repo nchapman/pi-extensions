@@ -14,6 +14,7 @@ import {
   defaultControlDir,
   describeConnection,
   destinationArg,
+  detectManualBackgrounding,
   parseSshConnectTimeoutSecs,
   parseSshIdleSecs,
   parseSshTarget,
@@ -225,6 +226,50 @@ describe("remote script + kill script", () => {
     expect(groupKill).toBeLessThan(elseBranch);
     expect(elseBranch).toBeLessThan(fallback);
     expect(script.endsWith("exit 0\n")).toBe(true);
+  });
+});
+
+describe("detectManualBackgrounding", () => {
+  it("detects trailing single ampersands", () => {
+    expect(detectManualBackgrounding("python train.py &")).toEqual({ detected: true, reason: "trailing &" });
+    expect(detectManualBackgrounding("python train.py > out.log 2>&1 &")).toEqual({
+      detected: true,
+      reason: "trailing &",
+    });
+    expect(detectManualBackgrounding("cmd &   ")).toEqual({ detected: true, reason: "trailing &" });
+  });
+
+  it("detects nohup invocations", () => {
+    expect(detectManualBackgrounding("nohup python train.py")).toEqual({ detected: true, reason: "nohup" });
+    expect(detectManualBackgrounding("cd /app && nohup ./run.sh")).toEqual({ detected: true, reason: "nohup" });
+  });
+
+  it("detects disown invocations", () => {
+    expect(detectManualBackgrounding("python train.py & disown")).toEqual({ detected: true, reason: "disown" });
+    expect(detectManualBackgrounding("disown -a")).toEqual({ detected: true, reason: "disown" });
+  });
+
+  it("detects & with PID tracking", () => {
+    expect(detectManualBackgrounding("python train.py & echo $!")).toEqual({
+      detected: true,
+      reason: "& with PID tracking",
+    });
+    expect(detectManualBackgrounding("python train.py & pid=$!")).toEqual({
+      detected: true,
+      reason: "& with PID tracking",
+    });
+  });
+
+  it("ignores legitimate foreground commands with ampersands or flags", () => {
+    expect(detectManualBackgrounding("git checkout -b feature && git status")).toEqual({ detected: false });
+    expect(detectManualBackgrounding("make -j4")).toEqual({ detected: false });
+    expect(detectManualBackgrounding("curl 'https://api.example.com?a=1&b=2'")).toEqual({ detected: false });
+    expect(detectManualBackgrounding("cmd &> out.log")).toEqual({ detected: false });
+    expect(detectManualBackgrounding("(sleep 1; echo hi) & wait")).toEqual({ detected: false });
+    expect(detectManualBackgrounding("grep -r nohup /etc/systemd")).toEqual({ detected: false });
+    expect(detectManualBackgrounding("history | grep disown")).toEqual({ detected: false });
+    expect(detectManualBackgrounding("man disown")).toEqual({ detected: false });
+    expect(detectManualBackgrounding('echo "a disown b"')).toEqual({ detected: false });
   });
 });
 
@@ -635,7 +680,36 @@ describe("registerSshBashExtension", () => {
     );
     expect(tool.description).toContain("multiplex");
     expect(tool.description).toContain("non-interactive");
+    expect(tool.description).toContain("foreground");
     expect(tool.promptGuidelines?.join("\n")).toContain("ssh-1");
+    expect(tool.promptGuidelines?.join("\n")).toContain("nohup");
+    expect(tool.promptGuidelines?.join("\n")).toContain("trailing &");
+  });
+
+  it("rejects manual shell backgrounding with an actionable error", async () => {
+    const { pi, tools } = makePi();
+    registerSshBashExtension(pi, { spawnFn: fakeSpawn().spawnFn });
+    const tool = tools.get(SSH_TOOL_NAME)!;
+    const r1 = (await tool.execute(
+      "1",
+      { command: "python train.py &", target: "root@1.2.3.4" },
+      undefined,
+      undefined,
+      CTX,
+    )) as { content: Array<{ type: string; text: string }>; isError?: boolean };
+    expect(r1.isError).toBe(true);
+    expect(r1.content[0].text).toContain("Manual backgrounding (trailing &) is not supported");
+    expect(r1.content[0].text).toContain('wait: "background"');
+
+    const r2 = (await tool.execute(
+      "2",
+      { command: "nohup ./server > out.log 2>&1", target: "root@1.2.3.4" },
+      undefined,
+      undefined,
+      CTX,
+    )) as { content: Array<{ type: string; text: string }>; isError?: boolean };
+    expect(r2.isError).toBe(true);
+    expect(r2.content[0].text).toContain("Manual backgrounding (nohup) is not supported");
   });
 
   it("runs inline commands through the ssh ops and names the connection", async () => {
