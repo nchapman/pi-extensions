@@ -12,6 +12,7 @@ import {
   formatSyntaxWarning,
   languageNameForPath,
   parseSyntaxEnabled,
+  PENDING_PARK_MS,
   runSyntaxCheck,
   type SyntaxDiagnostic,
   type SyntaxLanguage,
@@ -157,6 +158,92 @@ describe("collectSyntaxDiagnostics", () => {
     ]);
   });
 
+  it("reports damage hidden in an error leaf the binding cannot enumerate", () => {
+    // tree-sitter-css shape: `color: ;` recovers into a childless
+    // integer_value with hasError=true — the MISSING token shows in
+    // toString but is never yielded by child(). The leaf is the only
+    // visible witness; without this rule the damage is invisible to the
+    // walk and a broken edit reports clean.
+    const source = "a {\n  color: ;\n}\n";
+    const tree = fakeTree({
+      type: "stylesheet",
+      hasError: true,
+      children: [
+        {
+          type: "rule_set",
+          hasError: true,
+          children: [
+            {
+              type: "block",
+              hasError: true,
+              children: [
+                {
+                  type: "declaration",
+                  hasError: true,
+                  children: [
+                    { type: "property_name", start: [1, 2, 0], end: [1, 7, 0], children: [] },
+                    { type: "integer_value", hasError: true, start: [1, 8, 0], end: [1, 8, 0], children: [] },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+    const { diagnostics } = collectSyntaxDiagnostics(tree, source);
+    // MISSING kind: zero-width damage needs the ±1-line widened scope
+    expect(diagnostics).toEqual([{ kind: "missing", row: 1, column: 8, detail: 'error inside "integer_value"' }]);
+  });
+
+  it("keeps a hidden-error leaf one line past the spliced line", async () => {
+    // A deletion at the end of a run leaves the missing token's insertion
+    // point on the FOLLOWING line (editedLineRanges attributes a pure
+    // deletion only up to its start line). The hidden-leaf diagnostic is
+    // zero-width, so it must ride the MISSING ±1-line widened scope —
+    // exact error-scope would drop it and the broken edit report clean.
+    const content = "a {\n  color: ;\n}\n";
+    const loader: SyntaxLoader = async () => ({
+      parse: () =>
+        fakeTree({
+          type: "stylesheet",
+          hasError: true,
+          children: [
+            { type: "rule", hasError: true, start: [0, 0, 0], end: [2, 1, 10], children: [] },
+            { type: "integer_value", hasError: true, start: [1, 2, 4], end: [1, 2, 4], children: [] },
+          ],
+        }),
+    });
+    const warning = await runSyntaxCheck({
+      path: "f.css",
+      content,
+      splices: [{ start: 0, end: 1, insertLen: 1 }], // line 1 only; leaf is line 2
+      loader,
+      enabled: true,
+    });
+    expect(warning).toContain('error inside "integer_value"');
+  });
+
+  it("does not double-report an invisible leaf under a visible ERROR", () => {
+    // inError guard: the outer ERROR anchors the region; a childless
+    // hasError leaf inside it must not add a second diagnostic.
+    const tree = fakeTree({
+      type: "program",
+      hasError: true,
+      children: [
+        {
+          type: "ERROR",
+          hasError: true,
+          start: [0, 0, 0],
+          end: [1, 0, 10],
+          children: [{ type: "value", hasError: true, start: [0, 5, 0], end: [0, 5, 0], children: [] }],
+        },
+      ],
+    });
+    const { diagnostics } = collectSyntaxDiagnostics(tree, "aa\nbb\n");
+    expect(diagnostics.map((d) => d.row)).toEqual([0]);
+  });
+
   it("prunes subtrees without hasError", () => {
     const tree = fakeTree({
       type: "program",
@@ -202,7 +289,8 @@ describe("collectSyntaxDiagnostics", () => {
     });
     const { diagnostics } = collectSyntaxDiagnostics(tree, "");
     expect(diagnostics.map((d) => d.row)).toEqual([2, 9]);
-    expect(diagnostics[1].detail).toContain("spans lines 10–42");
+    // End [41, 0] is exclusive: the node covers through line 41, not 42.
+    expect(diagnostics[1].detail).toContain("spans lines 10–41");
   });
 
   it("stops collecting at the cap", () => {
@@ -453,7 +541,7 @@ describe("collectSyntaxDiagnostics", () => {
     const out = collectSyntaxDiagnostics(
       fakeTree({ type: "program", hasError: true, children: [...junk, kept] }),
       source,
-      (row, kind) => kind === "missing" && row === 4_999,
+      (row, _endRow, kind) => kind === "missing" && row === 4_999,
     );
     expect(out.truncated).toBe(false);
     expect(out.diagnostics).toHaveLength(1);
@@ -653,6 +741,76 @@ describe("runSyntaxCheck", () => {
     });
     expect(warning).toContain("tsconfig.json:2:19:");
     expect(warning).not.toContain(":2:12:"); // the pre-existing comment ERROR is gone
+  });
+
+  it("attributes a multi-line ERROR node by span, not start line", async () => {
+    // yaml shape (`b: [unclosed`): recovery starts the ERROR on the line
+    // BEFORE the damage, swallowing the preceding sibling — start-line
+    // attribution would drop a node whose span covers the edited line.
+    // The position still reports the span start (the excerpt anchors
+    // there); what must change is whether it is KEPT at all.
+    const previous = "a: 1\nb: 2\n";
+    const content = "a: 1\nb: [unclosed\n";
+    const loader: SyntaxLoader = async () => ({
+      parse: (source: string) =>
+        source === previous
+          ? fakeTree({ type: "block_mapping", children: [] })
+          : fakeTree({
+              type: "block_mapping",
+              hasError: true,
+              children: [{ type: "ERROR", hasError: true, start: [0, 0, 0], end: [1, 11, 17], children: [] }],
+            }),
+    });
+    const warning = await runSyntaxCheck({
+      path: "f.yaml",
+      content,
+      previous,
+      splices: [{ start: 8, end: 9, insertLen: 9 }], // run: 2 -> [unclosed on line 2
+      loader,
+      enabled: true,
+    });
+    expect(warning).toContain("f.yaml:1:1:");
+    expect(warning).toContain("unexpected");
+  });
+
+  it("does not attribute a node that merely ends at a line boundary", async () => {
+    // tree-sitter endPosition is exclusive: a node ending at [2, 0]
+    // covers nothing on line 3. Attribution must treat that end as
+    // row 1 — claiming row 3 would let pre-existing damage blame an edit
+    // on the next line when the differential is skipped (no `previous`,
+    // oversize, or truncated prior).
+    const content = "aa\nbb\ncc\n";
+    const loader: SyntaxLoader = async () => ({
+      parse: () =>
+        fakeTree({
+          type: "program",
+          hasError: true,
+          children: [{ type: "ERROR", hasError: true, start: [0, 0, 0], end: [2, 0, 4], children: [] }],
+        }),
+    });
+    const boundary = await runSyntaxCheck({
+      path: "f.ts",
+      content,
+      splices: [{ start: 6, end: 8, insertLen: 2 }], // line 3 only
+      loader,
+      enabled: true,
+    });
+    expect(boundary).toBeNull(); // ends AT line 3's start: covers nothing there
+    const covering = await runSyntaxCheck({
+      path: "f.ts",
+      content,
+      splices: [{ start: 6, end: 8, insertLen: 2 }],
+      loader: async () => ({
+        parse: () =>
+          fakeTree({
+            type: "program",
+            hasError: true,
+            children: [{ type: "ERROR", hasError: true, start: [0, 0, 0], end: [2, 2, 6], children: [] }],
+          }),
+      }),
+      enabled: true,
+    });
+    expect(covering).toContain("f.ts:1:1:"); // ends INSIDE line 3: covers it
   });
 
   it("suppresses when a length-changing edit shifts the column", async () => {
@@ -1617,6 +1775,11 @@ describe("createRealSyntaxLoader failure handling", () => {
   });
 
   it("parks and replaces a hung import, saying so once", async () => {
+    // Fake timers: the second attempt also hangs, and its 5 s park timer
+    // must fire INSIDE the test — a real timer would park (and log) after
+    // the test ended, bleeding a fake hang breadcrumb into whatever test
+    // runs next.
+    vi.useFakeTimers();
     let clock = 0;
     let calls = 0;
     const errors: string[] = [];
@@ -1651,10 +1814,17 @@ describe("createRealSyntaxLoader failure handling", () => {
       clock = 6_500;
       void loader("typescript");
       expect(calls).toBe(2);
+      // Dispose the hanging second attempt: advance past its park timer
+      // so it parks (and is released) here — and pins that the breadcrumb
+      // stays once-per-language even on the timer path.
+      await vi.advanceTimersByTimeAsync(PENDING_PARK_MS);
+      expect(calls).toBe(2);
+      expect(errors.length).toBe(1); // deduped: "pending" said it already
     } finally {
       // Restore even on assertion failure: a leaked spy would swallow
       // later tests' legitimate console.error output.
       spy.mockRestore();
+      vi.useRealTimers();
     }
   });
 
@@ -1719,25 +1889,38 @@ describe("createRealSyntaxLoader failure handling", () => {
 // these tests with null-deref noise instead of skipping. Direct imports, not
 // the loader, so a missing package skips quietly instead of logging
 // breadcrumbs through the loader's fail-open path.
-const GRAMMAR_PACKAGES = [
-  "tree-sitter",
-  "tree-sitter-typescript",
-  "tree-sitter-javascript",
-  "tree-sitter-python",
-  "tree-sitter-json",
-  "tree-sitter-go",
-  "tree-sitter-rust",
-];
+// The core set is what the suite's end-to-end tests (TypeScript/TSX/JS/
+// Python) actually parse; the rest gate their own tests below so a
+// missing prebuild for one language skips only that language's coverage,
+// not the whole suite.
+const GRAMMAR_PACKAGES = ["tree-sitter", "tree-sitter-typescript", "tree-sitter-javascript", "tree-sitter-python"];
+// These probes run as top-level awaits during collection, where vitest's
+// testTimeout cannot reach them: a HANGING native import (the exact
+// failure mode the production loader parks) would block the whole file —
+// including the pure fake-tree unit tests — until the outer CI timeout.
+// Racing a short timer turns a hang into an ordinary skip. The timer is
+// unref'd so it can never hold the process open.
 const packageAvailable = async (pkg: string): Promise<boolean> =>
-  import(pkg).then(
-    () => true,
-    () => false,
-  );
+  Promise.race([
+    import(pkg).then(
+      () => true,
+      () => false,
+    ),
+    new Promise<boolean>((resolve) => {
+      const t = setTimeout(() => resolve(false), 2_000);
+      t.unref?.();
+    }),
+  ]);
 // All-or-nothing gating silently disarms the suite when any ONE grammar is
 // missing, so availability is probed per group: the core languages (the
 // only real-tree-sitter coverage of the production path) must not lose
 // their tests because an unrelated new grammar failed to import.
 const realAvailable = await Promise.all(GRAMMAR_PACKAGES.map(packageAvailable)).then((loaded) => loaded.every(Boolean));
+const jsonAvailable = await packageAvailable("tree-sitter-json");
+const goRustAvailable = await Promise.all([
+  packageAvailable("tree-sitter-go"),
+  packageAvailable("tree-sitter-rust"),
+]).then((loaded) => loaded.every(Boolean));
 const newGrammarAvailable = {
   yaml: await packageAvailable("@tree-sitter-grammars/tree-sitter-yaml"),
   html: await packageAvailable("tree-sitter-html"),
@@ -1752,10 +1935,10 @@ const coreAvailable = await packageAvailable("tree-sitter");
 // the TypeScript grammar — not the full set. A vendored copy missing one
 // unrelated grammar must not lose coverage of the only production
 // enablement path.
-const tsAvailable = await Promise.all([import("tree-sitter"), import("tree-sitter-typescript")]).then(
-  () => true,
-  () => false,
-);
+const tsAvailable = await Promise.all([
+  packageAvailable("tree-sitter"),
+  packageAvailable("tree-sitter-typescript"),
+]).then((loaded) => loaded.every(Boolean));
 
 describe.skipIf(!realAvailable)("superedit-syntax with real grammars", () => {
   const loader = createRealSyntaxLoader();
@@ -1830,7 +2013,7 @@ describe.skipIf(!realAvailable)("superedit-syntax with real grammars", () => {
     expect(await check("f.ts", newContent, splices)).toBeNull();
   });
 
-  it("stays silent for a JSONC edit under the strict JSON grammar", async () => {
+  it.skipIf(!jsonAvailable)("stays silent for a JSONC edit under the strict JSON grammar", async () => {
     // tsconfig.json reality: comments and trailing commas are strict-JSON
     // ERRORs that predate the edit. The differential parse must suppress
     // them; warning would send the model to delete valid config.
@@ -1842,7 +2025,7 @@ describe.skipIf(!realAvailable)("superedit-syntax with real grammars", () => {
     expect(await check("tsconfig.json", newContent, splices, previous)).toBeNull();
   });
 
-  it("warns for JSON the edit actually broke", async () => {
+  it.skipIf(!jsonAvailable)("warns for JSON the edit actually broke", async () => {
     const previous = '{\n  "name": "pi",\n  "version": "1.0.0"\n}\n';
     const { newContent, splices } = applyEdits(
       previous,
@@ -1880,7 +2063,7 @@ describe.skipIf(!realAvailable)("superedit-syntax with real grammars", () => {
     expect(warning).toContain("f.py:1:");
   });
 
-  it("catches broken JSON, Go, and Rust", async () => {
+  it.skipIf(!jsonAvailable || !goRustAvailable)("catches broken JSON, Go, and Rust", async () => {
     const json = applyEdits('{"a": 1}\n', [{ oldText: '"a": 1', newText: '"a": 1,' }], { path: "f.json", allCap: 20 });
     expect(await check("f.json", json.newContent, json.splices)).toContain("f.json:1:");
 
@@ -1947,6 +2130,17 @@ describe.skipIf(!coreAvailable)("superedit-syntax with the added grammars", () =
     expect(warning).toContain("f.yaml:1:");
   });
 
+  it.skipIf(!newGrammarAvailable.yaml)("attributes an unclosed flow sequence by span, not start line", async () => {
+    // Live-found shape: recovery starts the ERROR on line 1 while the
+    // damage is line 2 — the edited line is INSIDE the node's span.
+    const broken = applyEdits("a: 1\nb: 2\n", [{ oldText: "b: 2", newText: "b: [unclosed" }], {
+      path: "f.yaml",
+      allCap: 20,
+    });
+    const warning = await check("f.yaml", broken.newContent, broken.splices, "a: 1\nb: 2\n");
+    expect(warning).toContain("f.yaml:1:"); // span start — see the span-attribution unit test
+  });
+
   it.skipIf(!newGrammarAvailable.html)("parses HTML with the html grammar", async () => {
     // The grammar is lenient about tag mismatches; it flags unterminated
     // attribute quotes and stray close tags. Break the quote.
@@ -1965,6 +2159,19 @@ describe.skipIf(!coreAvailable)("superedit-syntax with the added grammars", () =
     });
     const warning = await check("f.css", broken.newContent, broken.splices);
     expect(warning).toContain("f.css:1:");
+  });
+
+  it.skipIf(!newGrammarAvailable.css)("reports damage the css grammar hides in a childless error leaf", async () => {
+    // Live-found shape: `color: ;` recovers into a zero-width integer_value
+    // whose MISSING token the native binding never yields via child() —
+    // without the invisible-leaf rule this edit reports clean.
+    const broken = applyEdits("a {\n  color: red;\n}\n", [{ oldText: "red", newText: "" }], {
+      path: "f.css",
+      allCap: 40,
+    });
+    const warning = await check("f.css", broken.newContent, broken.splices);
+    expect(warning).toContain("f.css:2:");
+    expect(warning).toContain("integer_value");
   });
 });
 

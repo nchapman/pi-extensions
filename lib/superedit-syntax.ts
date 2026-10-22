@@ -151,19 +151,23 @@ const MAX_EXCERPT_CHARS = 40;
  * inside an ERROR are suppressed (sub-noise) while MISSING tokens inside one
  * are still surfaced — they name what to re-insert.
  *
- * `keep(row, kind)` filters (and counts against the kept cap) so that
- * pre-existing errors earlier in the file cannot consume the cap before the
- * walk reaches the lines the edit rewrote — a half-mangled file with 60 old
- * errors must not hide the one error the edit introduced. `detail` is
- * formatted only for kept diagnostics (it splits the source; formatting it
- * for filtered ones would be the expensive part of walking a pre-broken
- * file), and a separate visited cap bounds the walk itself for the case
- * where nothing is kept at all.
+ * `keep(startRow, endRow, kind)` filters (and counts against the kept
+ * cap) — the span end lets callers attribute multi-line ERROR nodes by
+ * ANY line they cover (recovery can start an ERROR far before the actual
+ * damage), while zero-width nodes (MISSING) keep start-line-only
+ * semantics. Filtering DURING the walk, not after, is what keeps a kept
+ * cap meaningful: pre-existing errors earlier in the file cannot consume
+ * the cap before the walk reaches the lines the edit rewrote — a
+ * half-mangled file with 60 old errors must not hide the one error the
+ * edit introduced. `detail` is formatted only for kept diagnostics (it
+ * splits the source; formatting it for filtered ones would be the
+ * expensive part of walking a pre-broken file), and a separate visited
+ * cap bounds the walk itself for the case where nothing is kept at all.
  */
 export function collectSyntaxDiagnostics(
   tree: SyntaxTree,
   source: string,
-  keep?: (row: number, kind: "error" | "missing") => boolean,
+  keep?: (startRow: number, endRow: number, kind: "error" | "missing") => boolean,
   maxDiags: number = MAX_COLLECTED_DIAGS,
 ): { diagnostics: SyntaxDiagnostic[]; truncated: boolean; reachedRow: number } {
   const lines = source.split("\n"); // once — never re-split per diagnostic
@@ -175,18 +179,45 @@ export function collectSyntaxDiagnostics(
   // a caller can tell a cap that fired BEFORE the edited lines (their
   // damage was never seen) from one that fired later, in unrelated damage.
   let reachedRow = -1;
-  const stack: Array<{ node: SyntaxNode; inError: boolean }> = [{ node: tree.rootNode, inError: false }];
+  const stack: Array<{ node: SyntaxNode; inError: boolean; root: boolean }> = [
+    { node: tree.rootNode, inError: false, root: true },
+  ];
   while (stack.length > 0) {
-    const { node, inError } = stack.pop()!;
+    const { node, inError, root } = stack.pop()!;
     const nodeRow = node.startPosition.row;
     if (nodeRow > reachedRow) reachedRow = nodeRow;
     if (++walked > MAX_WALK_NODES) return { diagnostics: out.sort(byPosition), truncated: true, reachedRow };
+    // ERROR-inside-ERROR stays sub-noise, but a childless NON-ERROR node
+    // carrying hasError is damage the binding cannot enumerate: some
+    // grammars (tree-sitter-css's `color: ;` → integer_value) hide a
+    // MISSING token that appears in toString but is never yielded by
+    // child(). The leaf itself is the only visible witness, so report it
+    // with the MISSING kind: the damage is zero-width (the absent token
+    // had no extent), and zero-width diagnostics get the ±1-line widened
+    // attribution scope — a hidden leaf sits at the missing token's
+    // insertion point, which for a deletion at the end of a run is often
+    // the line after the splice's terminal, and exact-scope would drop it
+    // exactly there. Its detail distinguishes it from token reports. Not
+    // under a visible ERROR ancestor (inError): there the outer node
+    // already anchors the region. Not the root either: a childless
+    // hasError root is the whole-file shape (empty or all-garbage), and
+    // `error inside "program"` at line 1 would be pure noise — the
+    // visible ERROR/MISSING children carry whatever is reportable.
+    const hiddenLeaf =
+      !root && node.type !== "ERROR" && !inError && node.hasError && node.childCount === 0 && !node.isMissing;
     const kind: SyntaxDiagnostic["kind"] | null =
-      node.type === "ERROR" && !inError ? "error" : node.isMissing ? "missing" : null;
+      node.type === "ERROR" && !inError ? "error" : node.isMissing || hiddenLeaf ? "missing" : null;
     if (kind !== null) {
       visited++;
       const row = node.startPosition.row;
-      const kept = !keep || keep(row, kind);
+      // tree-sitter endPosition is EXCLUSIVE: an end at [R, 0] stops at the
+      // line boundary and covers nothing on line R+1 (editedLineRanges
+      // encodes the same convention for its terminals). The keep predicate
+      // receives this inclusive last-covered row so a boundary-ended node
+      // cannot claim the next line.
+      const lastRow =
+        node.endPosition.row > row && node.endPosition.column === 0 ? node.endPosition.row - 1 : node.endPosition.row;
+      const kept = !keep || keep(row, lastRow, kind);
       if (kept && out.length < maxDiags) {
         out.push({
           kind,
@@ -200,7 +231,11 @@ export function collectSyntaxDiagnostics(
           // re-reading model; the differential's compare-time clamps are
           // idempotent under this).
           column: Math.min(node.startPosition.column, lines[row]?.length ?? 0),
-          detail: kind === "error" ? errorDetail(node, lines) : `missing "${node.type}"`,
+          detail: hiddenLeaf
+            ? `error inside "${node.type}"`
+            : kind === "missing"
+              ? `missing "${node.type}"`
+              : errorDetail(node, lines),
         });
       } else if (kept) {
         // A kept diagnostic exists past the cap — the list really is
@@ -219,7 +254,7 @@ export function collectSyntaxDiagnostics(
     const childInError = inError || node.type === "ERROR";
     for (let i = node.childCount - 1; i >= 0; i--) {
       const child = node.child(i);
-      if (child) stack.push({ node: child, inError: childInError });
+      if (child) stack.push({ node: child, inError: childInError, root: false });
     }
   }
   return { diagnostics: out.sort(byPosition), truncated: false, reachedRow };
@@ -237,8 +272,16 @@ function errorDetail(node: SyntaxNode, lines: string[]): string {
   const start = Math.min(node.startPosition.column, line.length);
   const excerpt = line.slice(start, start + MAX_EXCERPT_CHARS);
   let detail = `unexpected ${JSON.stringify(excerpt)}`;
-  if (node.endPosition.row > node.startPosition.row + 2) {
-    detail += ` (spans lines ${node.startPosition.row + 1}–${node.endPosition.row + 1})`;
+  // endPosition rows are exclusive: an end at [R, 0] stops before line
+  // R+1. Print the inclusive last covered line (same rule as
+  // collectSyntaxDiagnostics) — the range is the model's only repair
+  // hint, and overshooting sends it to a line the node never touched.
+  const lastRow =
+    node.endPosition.row > node.startPosition.row && node.endPosition.column === 0
+      ? node.endPosition.row - 1
+      : node.endPosition.row;
+  if (lastRow > node.startPosition.row + 2) {
+    detail += ` (spans lines ${node.startPosition.row + 1}–${lastRow + 1})`;
   }
   return detail;
 }
@@ -516,7 +559,7 @@ const LOAD_RETRY_MS = 60_000;
 // fresh attempt; after that every call fails open instantly for the
 // cooldown. A legitimately slow import that settles between one and two
 // budgets old is the accepted loss — healthy loads are ~1 ms, not 5 s.
-const PENDING_PARK_MS = 5_000;
+export const PENDING_PARK_MS = 5_000;
 
 interface InflightAttempt {
   startedAt: number;
@@ -702,9 +745,14 @@ export async function runSyntaxCheck(opts: {
     const widened = editedLineRanges(opts.content, opts.edited ?? opts.splices);
     // Filter inside collection, not after: with a post-filter, ~50
     // pre-existing errors before the edited region would exhaust the cap
-    // and hide the error the edit actually introduced.
-    const mine = (row: number, kind: "error" | "missing") =>
-      (kind === "missing" ? widened : exact).some(([a, b]) => row + 1 >= a && row + 1 <= b);
+    // and hide the error the edit actually introduced. Span-intersection
+    // for ERROR kinds: recovery routinely starts an ERROR node on a line
+    // BEFORE the damage (yaml's `b: [unclosed` reports at the block's
+    // first line) — attribution must keep a node whose span covers an
+    // edited line even when its start line is not one. MISSING tokens are
+    // zero-width, so the same formula degenerates to start-line-only.
+    const mine = (startRow: number, endRow: number, kind: "error" | "missing") =>
+      (kind === "missing" ? widened : exact).some(([a, b]) => endRow + 1 >= a && startRow + 1 <= b);
     const { diagnostics, truncated, reachedRow } = collectSyntaxDiagnostics(tree, opts.content, mine);
     if (diagnostics.length === 0) {
       // A capped walk that did not get PAST the edited scope is not a
@@ -788,8 +836,8 @@ export async function runSyntaxCheck(opts: {
             };
             const errorScope = merged(0);
             const missingScope = merged(1);
-            const inScope = (row: number, kind: "error" | "missing"): boolean =>
-              (kind === "missing" ? missingScope : errorScope).some(([a, b]) => row + 1 >= a && row + 1 <= b);
+            const inScope = (startRow: number, endRow: number, kind: "error" | "missing"): boolean =>
+              (kind === "missing" ? missingScope : errorScope).some(([a, b]) => endRow + 1 >= a && startRow + 1 <= b);
             const prior = collectSyntaxDiagnostics(before, opts.previous, inScope, MAX_WALK_VISITS);
             if (!prior.truncated) {
               // Precompute the insertion before-edges once: forwarding every

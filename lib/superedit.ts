@@ -800,26 +800,58 @@ export function applyEdits(
   // not a swap for another unbounded list — but attribution must survive
   // the cap: `edited` (the spans) decides which lines' damage is kept at
   // all, so dropping matches from it would silently report their edits
-  // clean. The dropped tail therefore merges into one span (identity
-  // length: line-range coverage is all attribution needs), keeping every
+  // clean. The dropped tail therefore merges into one span that carries
+  // the tail's combined delta (insertLen − (end − start) = Σ delta — the
+  // kept-prefix entries forward through it into the final frame; `end` is
+  // derived from the coverage terminal for exactly that reason, NOT
+  // identity-length: a deletion-heavy tail's negative delta would then
+  // shrink the span short of the tail's old extent and drop those lines
+  // from attribution), keeping every
   // replaced line in scope while the list stays bounded; only the
   // differential degrades (fail-open toward reporting).
   if (splices.length > MAX_TOTAL_SPLICES) {
     splices.length = 0;
     if (spans.length > MAX_TOTAL_SPLICES) {
       const kept = spans.slice(0, MAX_TOTAL_SPLICES - 1);
-      // Fold the dropped tail with a loop, not Math.min/max spreads: the
-      // tail is model-sized (edits × allCap) and spread argument lists
-      // throw past ~10⁵ entries — a RangeError inside the edit path is
-      // neither explainable nor actionable.
       const tail = spans.slice(MAX_TOTAL_SPLICES - 1);
-      let start = tail[0].start;
-      let end = tail[0].end;
-      for (const s of tail) {
-        if (s.start < start) start = s.start;
-        if (s.end > end) end = s.end;
+      // Fold the dropped tail in one backward pass, not Math.min/max
+      // spreads: the tail is model-sized (edits × allCap) and spread
+      // argument lists throw past ~10⁵ entries — and each entry must be
+      // mapped into the final content frame (the merged span sits last in
+      // the list, so nothing downstream forwards it). Entries are in
+      // application order; the running suffix delta (shifts from every
+      // entry applied after i) forwards coordinates in O(1) total — a
+      // forwardThrough call per entry would be O(tail²), a synchronous
+      // wedge exactly like the one the splice caps exist to prevent.
+      // Exact forwarding only shifts a position past each later entry's
+      // end; the suffix delta shifts unconditionally — which is only the
+      // conservative direction for POSITIVE deltas (growth can only push
+      // coordinates the entries will really reach, so the hull may keep
+      // them), while a negative suffix delta applied to an entry that
+      // sits ABOVE a later deletion subtracts shifts that position never
+      // receives, driving the hull start negative and attributing the
+      // head of the file to the edit. So: hull starts over raw
+      // coordinates only, and terminals over raw and positively-shifted
+      // ones. Over-covering is safe here (the span exists for line
+      // attribution and raw coordinates always exist in some real frame);
+      // under-covering — the exact failure for deletion-heavy tails —
+      // would silently drop the dropped matches' lines from scope and let
+      // their damage report clean. `end` is derived, not hulled: the
+      // kept-prefix entries forward through this span using
+      // insertLen − (end − start) as the tail's true combined delta, while
+      // start + insertLen must still reach the tail's coverage terminal —
+      // the two constraints pin end given start, terminal, and delta.
+      let start = Infinity;
+      let terminal = -Infinity;
+      let delta = 0;
+      for (let i = tail.length - 1; i >= 0; i--) {
+        const t = tail[i];
+        start = Math.min(start, t.start);
+        terminal = Math.max(terminal, t.start + t.insertLen);
+        if (delta > 0) terminal = Math.max(terminal, t.start + t.insertLen + delta);
+        delta += t.insertLen - (t.end - t.start);
       }
-      kept.push({ start, end, insertLen: end - start });
+      kept.push({ start, end: terminal - delta, insertLen: terminal - start });
       spans.length = 0;
       spans.push(...kept);
     }

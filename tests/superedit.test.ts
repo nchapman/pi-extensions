@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { EditOperations } from "@earendil-works/pi-coding-agent";
+import { editedLineRanges } from "../lib/superedit-syntax";
 import {
   applyEdits,
   createSuperEditTool,
@@ -640,6 +641,59 @@ describe("normalized matching", () => {
     expect(r.splices[0]).toEqual({ start: 2048, end: 2051, insertLen: 3 });
     expect(r.splices.at(-1)).toEqual({ start: 0, end: 7, insertLen: 7 });
     expect(r.splices).toEqual(r.spans);
+  });
+
+  it("forwards tail spans through later entries before the cap fold", () => {
+    // Length-changing matches past the cap: each span is recorded in the
+    // content frame of the moment it applied, so the dropped tail's fold
+    // must forward every entry through the LATER entries (final frame)
+    // before min/max — a raw fold mixes frames and under-covers the
+    // dropped matches' lines, silently un-attributing damage there.
+    // 513 matches, each x -> XXXX (+3 units): every line must stay covered.
+    const content = "x\n".repeat(513);
+    const r = apply(content, [{ oldText: "x", newText: "XXXX", occurrence: "all" }], 1_000);
+    expect(r.newContent).toBe("XXXX\n".repeat(513));
+    expect(r.splices.length).toBe(512);
+    expect(editedLineRanges(r.newContent, r.spans, 0)).toEqual([[1, 513]]);
+  });
+
+  it("keeps deletion-heavy tails' lines in the cap fold", () => {
+    // 513 deletion matches: every dropped match's line must stay covered
+    // by the merged tail span even though the summed delta is negative —
+    // a terminal that shrinks with the deletions drops the join lines
+    // those deletions created, silently un-attributing damage there.
+    const content = "a\ny\n".repeat(513);
+    const r = apply(content, [{ oldText: "y\n", newText: "", occurrence: "all" }], 1_000);
+    expect(r.newContent).toBe("a\n".repeat(513));
+    expect(r.splices.length).toBe(512);
+    // Lines 2..514 = exactly what the 513 unfolded spans would attribute
+    // (every deleted y-line and its join; line 1's "a" was never edited).
+    expect(editedLineRanges(r.newContent, r.spans, 0)).toEqual([[2, 514]]);
+  });
+
+  it("never folds the tail span to a negative offset across edits", () => {
+    // Cross-edit shape: 600 equal-length sites recorded descending, then a
+    // later edit deleting a large block ABOVE them. The tail's suffix
+    // delta is that big negative deletion, and an unconditional shift
+    // would subtract it from spans the deletion never touches — driving
+    // the merged span negative and attributing the unedited head of the
+    // file to the edit (lineOf clamps negatives to line 1).
+    const content = "P\n".repeat(10) + "q\n".repeat(600) + "B".repeat(2000) + "\n";
+    const r = apply(
+      content,
+      [
+        { oldText: "q", newText: "r", occurrence: "all" },
+        { oldText: "B".repeat(2000), newText: "" },
+      ],
+      1_000,
+    );
+    expect(r.splices.length).toBe(512); // 601 spans folded to the cap
+    const merged = r.splices.at(-1)!;
+    expect(merged.start).toBeGreaterThanOrEqual(0);
+    // The tail's true region starts at the first folded q-site (line 11):
+    // the unedited P-head (lines 1-10) must stay out of attribution.
+    const ranges = editedLineRanges(r.newContent, r.spans, 0);
+    expect(ranges[0][0]).toBeGreaterThanOrEqual(11);
   });
 
   it("rebuilds multi-line groups when newText adds lines", () => {
