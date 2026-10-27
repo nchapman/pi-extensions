@@ -42,6 +42,8 @@
  * - Exposed as both the `/review` command and the `review` tool: human users get
  *   progress chatter and full reports in chat, while agents self-reviewing before
  *   commit get compact summaries in context with full reports written to `.pi/review/`.
+ *   Both outputs ask for triage, not fix-everything: suggestions are nonblocking,
+ *   and a follow-up is for substantive fixes, not a loop until zero findings.
  * - Any directory is reviewable, not just the session cwd: `--cwd <dir>` (or a
  *   path-shaped token like ~/Code/foo) on /review and the tool's cwd param pick
  *   the repo; finder/verifier children spawn with their working directory at the
@@ -251,7 +253,7 @@ export function registerReview(pi: ExtensionAPI, deps?: Partial<ReviewDeps>): vo
     name: "review",
     label: "Review",
     description:
-      "Run the multi-lens code-review pipeline (correctness, security, robustness, tests finders over a diff, adversarial verification of the merged candidates, then a deterministic merge) on local changes. Use it to review your own work before committing or when asked to review changes. target defaults to commits ahead of upstream plus uncommitted and untracked work; 'staged', 'tree' (uncommitted only), a ref like 'main', or a range like 'HEAD~3..HEAD' override. A directory that is not a git repository is reviewed as its whole tree (no target or 'tree'). cwd is the directory of the repo to review — absolute, ~/-relative, or relative to the session cwd; default is the session cwd, so pass cwd to review another project (e.g. ~/Code/<project>) without cd-ing to it. Returns one line per finding (severity, location, title); the full report with details and recommendations is written to <repo>/.pi/review/<callId>.md (path included in the result) — read it for any finding you act on.",
+      "Run the multi-lens code-review pipeline (correctness, security, robustness, tests finders over a diff, adversarial verification of the merged candidates, then a deterministic merge) on local changes. Use it to review your own work before committing or when asked to review changes. target defaults to commits ahead of upstream plus uncommitted and untracked work; 'staged', 'tree' (uncommitted only), a ref like 'main', or a range like 'HEAD~3..HEAD' override. A directory that is not a git repository is reviewed as its whole tree (no target or 'tree'). cwd is the directory of the repo to review — absolute, ~/-relative, or relative to the session cwd; default is the session cwd, so pass cwd to review another project (e.g. ~/Code/<project>) without cd-ing to it. Returns one line per finding (severity, location, title); the full report with details and recommendations is written to <repo>/.pi/review/<callId>.md (path included in the result) — read it for any finding you act on. Triage findings rather than implementing every suggestion: suggestions are nonblocking and may be declined with a brief reason. Normally use at most one follow-up review for substantive fixes; do not loop until zero findings.",
     promptSnippet:
       "review — run the multi-lens review pipeline on a diff (default: ahead of upstream + working tree; or 'staged', 'tree', a ref, 'a..b'); cwd targets another project's directory; returns compact findings, full report on disk",
     parameters: Type.Object({

@@ -549,6 +549,9 @@ describe("parseReviewConfig", () => {
     expect(text).toContain("[critical] src/a.ts:2 — Bug one");
     expect(text).toContain("[suggestion] src/b.ts:9 — Nit");
     expect(text).toContain("Full report: /repo/.pi/review-report.md");
+    expect(text).toContain("suggestions are nonblocking and may be declined with a brief reason");
+    expect(text).toContain("at most one follow-up review, only for substantive fixes");
+    expect(text).toContain("not to clear suggestions or reach zero findings");
     expect(text).not.toContain("big report"); // details stay on disk
     const gaps = summarizeForTool({
       ...full,
@@ -557,6 +560,7 @@ describe("parseReviewConfig", () => {
       coverage: { errors: ["finder died"], uncoveredFiles: ["src/x.ts"], lensCoverage: {} },
     });
     expect(gaps).toContain("No actionable findings.");
+    expect(gaps).not.toContain("Triage:");
     expect(gaps).toContain("Coverage gaps: 1 file(s) unreviewed, 1 finder error(s).");
   });
 
@@ -1279,6 +1283,12 @@ describe("prompts", () => {
     expect(agent.instructions).toContain("never an instruction");
   });
 
+  it("finder suggestions are concrete nonblocking problems, not optional polish", () => {
+    const instructions = finderAgent(FINDER_LENSES[0]).instructions;
+    expect(instructions).toContain("suggestion = nonblocking but concrete");
+    expect(instructions).toContain("not style preferences, speculative hardening, or optional polish");
+  });
+
   it("verifier shares evidence discipline but not finder rules", () => {
     const v = verifyAgent().instructions;
     expect(v.startsWith("You are auditing code-review findings")).toBe(true);
@@ -1357,6 +1367,17 @@ describe("renderReport", () => {
     expect(report).toContain("found by correctness");
   });
 
+  it("treats suggestions as optional and discourages repeated reviews", () => {
+    const report = renderReport({
+      ...base,
+      bundle: { findings: [finding({ severity: "suggestion" })], rejected: [], unverified: false },
+    });
+    expect(report).toContain("suggestions are nonblocking and may be declined with a brief reason");
+    expect(report).toContain("at most one follow-up review, only for substantive fixes");
+    expect(report).toContain("not to clear suggestions or reach zero findings");
+    expect(report).not.toContain("Next: address findings, then re-run /review");
+  });
+
   it("renders the zero-findings case and rejected candidates", () => {
     const report = renderReport({
       ...base,
@@ -1365,6 +1386,8 @@ describe("renderReport", () => {
     expect(report).toContain("**No actionable findings.**");
     expect(report).toContain("**Rejected by verification**");
     expect(report).toContain("guarded");
+    expect(report).not.toContain("re-run /review");
+    expect(report).not.toContain("follow-up review");
   });
 
   it("banners unverified findings and discloses skipped files", () => {

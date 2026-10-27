@@ -481,6 +481,11 @@ export function planFinderRuns(
   return kept;
 }
 
+// Findings inform the author's judgment; they are not a fix-all queue. Keep
+// the same stopping guidance in human reports and compact agent summaries.
+const TRIAGE_GUIDANCE =
+  "Triage: fix valid critical/important issues introduced by this change; suggestions are nonblocking and may be declined with a brief reason. Normally use at most one follow-up review, only for substantive fixes — not to clear suggestions or reach zero findings. Surface unresolved blockers.";
+
 /** Render the final markdown report. */
 export function renderReport(opts: {
   targetLabel: string;
@@ -560,10 +565,8 @@ export function renderReport(opts: {
   const usageNote = opts.usage
     ? `, ${(opts.usage.totalTokens / 1000).toFixed(1)}k tokens ($${opts.usage.cost.total.toFixed(3)})`
     : "";
-  lines.push(
-    "",
-    `_Reviewed ${opts.reviewedFiles.length} file(s) in ${secs}s${usageNote}. Next: address findings, then re-run /review — still-valid findings repeat verbatim, resolved ones stay gone._`,
-  );
+  lines.push("", `_Reviewed ${opts.reviewedFiles.length} file(s) in ${secs}s${usageNote}._`);
+  if (bundle.findings.length > 0) lines.push("", TRIAGE_GUIDANCE);
   return lines.join("\n");
 }
 
@@ -1197,5 +1200,6 @@ export function summarizeForTool(result: ReviewResult, reportPath?: string): str
     lines.push(`Coverage gaps: ${gaps.length} file(s) unreviewed, ${result.coverage.errors.length} finder error(s).`);
   }
   if (reportPath) lines.push(`Full report: ${reportPath}`);
+  if (result.findings.length > 0) lines.push(TRIAGE_GUIDANCE);
   return lines.join("\n");
 }

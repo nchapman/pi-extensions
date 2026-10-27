@@ -1,5 +1,6 @@
 /** Reviewer prompts: the finder lens set, the evidence/turn-economy rules
- * they share, and the finder/verifier agent and task builders. */
+ * they share, and the finder/verifier agent and task builders. Suggestions
+ * still need concrete impact — optional polish is not a review defect. */
 
 import type { AgentDef } from "../subagents";
 import type { Finding } from "./findings";
@@ -67,7 +68,8 @@ Your generated tokens are the wall-clock cost of this review. In intermediate tu
 const FINDER_RULES = `## Deciding what to report
 
 - Substantiate every finding: trace the triggering input, state, or execution path to a consequence, and check existing guards, callers, and tests before concluding something is broken. If you cannot substantiate it, do not report it.
-- Scope: the diff is the review. Report issues this change introduces or aggravates; skip pre-existing problems it merely passes by.`;
+- Scope: the diff is the review. Report issues this change introduces or aggravates; skip pre-existing problems it merely passes by.
+- Suggestions must identify concrete low-impact problems, not style preferences, speculative hardening, or optional polish. Do not invent work to fill a severity bucket.`;
 
 /** Construct the AgentDef configuration for a finder child specialized to the given lens. */
 export function finderAgent(lens: Lens): AgentDef {

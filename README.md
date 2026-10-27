@@ -143,6 +143,8 @@ Every child run is protected by an idle watchdog (`PI_SUBAGENT_IDLE_TIMEOUT_MS`,
 3. **Verify** (default on; `PI_REVIEW_VERIFY=0` opts out): An adversarial subagent re-traces candidates against the repo, rejecting findings that lack evidence or fail mechanism checks.
 4. **Report**: Deduplicates findings, orders by severity, and posts a markdown report. Results persist to `<repo>/.pi/review-state.json` so repeat reviews skip resolved findings.
 
+**Triage, not a fix-all queue:** Fix valid critical/important issues introduced by the change. Suggestions are nonblocking, must identify concrete problems rather than optional polish, and may be declined with a brief reason even when valid. Normally use one initial review and at most one follow-up, only for substantive fixes — not to clear suggestions or reach zero findings. Re-run required checks after fixes; surface unresolved blockers rather than declaring completion. Persisted findings are reviewer context, not a mandatory backlog; a declined suggestion may repeat without requiring a fix or another review.
+
 ### Usage and Options
 
 - Command: `/review [target] [--cwd <dir>] [--model <m>] [--verify-model <m>]`
