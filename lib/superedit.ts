@@ -36,7 +36,9 @@
  *   line matched exactly has no honest pairing — there the oldText side is
  *   dropped for a plain listing of the file's bytes (the caller holds its own
  *   oldText; single-line oldText or any exact line match keeps the diff).
- *   Every message is capped so a failure never floods context
+ *   Every message is capped so a failure never floods context, and states
+ *   facts only — what matched, where, and why it failed — never instructions:
+ *   deciding what to do with the facts is the caller's job
  * - BOM and line endings round-trip exactly like the built-in: edits are
  *   LF-normalized for matching, the original ending style is restored on write
  * - after the write commits, a tree-sitter syntax check (see
@@ -686,9 +688,7 @@ export function applyEdits(
   for (let i = 0; i < normalized.length; i++) {
     const e = normalized[i];
     if (e.oldText.length === 0) {
-      throw new Error(
-        `${label(i, normalized.length)}: oldText is empty in ${opts.path}. To insert text, include the surrounding lines in oldText and place the insertion in newText.`,
-      );
+      throw new Error(`${label(i, normalized.length)}: oldText is empty in ${opts.path}.`);
     }
     if (e.oldText === e.newText) {
       throw new Error(
@@ -737,7 +737,7 @@ export function applyEdits(
         const firstDropped = ladder.matches.find((m) => !keptSet.has(m))!;
         const conflict = [...chosen].reverse().find((m) => m.start < firstDropped.start) ?? chosen[0];
         throw new Error(
-          `${label(i, normalized.length)}: its ${ladder.matches.length} matches overlap (${lineRangeDesc(opts.path, lines, conflict)} and ${lineRangeDesc(opts.path, lines, firstDropped)}), so occurrence: "all" cannot replace every site unambiguously — oldText repeats across consecutive lines. Use an oldText with distinct lines, or replace occurrences one at a time.`,
+          `${label(i, normalized.length)}: its ${ladder.matches.length} matches overlap (${lineRangeDesc(opts.path, lines, conflict)} and ${lineRangeDesc(opts.path, lines, firstDropped)}), so occurrence: "all" cannot replace every site unambiguously — oldText repeats across consecutive lines.`,
         );
       }
     } else if (typeof edit.occurrence === "number") {
@@ -949,12 +949,10 @@ function multiMatchError(
   });
   const more = ladder.matches.length - shown.length;
   const head =
-    `Found ${ladder.matches.length}${ladder.truncated ? "+" : ""} matches of ${label(editIndex, totalEdits)} in ${path}${tierNote(ladder.tier)}.\n` +
+    `Found ${ladder.matches.length}${ladder.truncated ? "+" : ""} matches of ${label(editIndex, totalEdits)} in ${path}${tierNote(ladder.tier)} — a unique match is required.\n` +
     parts.join("\n") +
     (more > 0 ? `\n  …and ${more} more` : "");
-  return new Error(
-    `${head}\nPass occurrence: N (1-based, in file order) to replace a specific match, occurrence: "all" to replace every match, or extend oldText with surrounding lines so it is unique.`,
-  );
+  return new Error(head);
 }
 
 function tooManyForAllError(
@@ -971,8 +969,7 @@ function tooManyForAllError(
     .map((m) => lineRangeDesc(path, lines, m))
     .join(", ");
   return new Error(
-    `${label(editIndex, totalEdits)} with occurrence: "all" would replace ${ladder.matches.length}${ladder.truncated ? "+" : ""} locations in ${path} (cap: ${cap}). ` +
-      `oldText is too generic to replace everywhere — extend it with more surrounding lines, or replace specific matches with occurrence: N. First sites: ${sample}.`,
+    `${label(editIndex, totalEdits)} with occurrence: "all" matches ${ladder.matches.length}${ladder.truncated ? "+" : ""} locations in ${path}; the cap is ${cap}. First sites: ${sample}.`,
   );
 }
 
@@ -1023,7 +1020,7 @@ function notFoundError(
       if (culprit) {
         return new Error(
           `Could not find ${name} in ${path}: its oldText matched the file as it was before edits[${culprit.editIndex}] was applied (original lines ${l1}–${l2}), but edits[${culprit.editIndex}] rewrote that region. ` +
-            `Edits apply in order and each matches the file as it stands after the earlier edits — merge this edit into edits[${culprit.editIndex}], or target the text now in the file.`,
+            `Edits apply in order and each matches the file as it stands after the earlier edits.`,
         );
       }
     }
@@ -1033,7 +1030,7 @@ function notFoundError(
   //    the region diagnostics would scan the same content and mostly bail.
   if (searchTruncated) {
     return new Error(
-      `Could not find ${name} in ${path}: the flexible search was cut short — the file is too large or oldText too repetitive to scan within the search budget. Narrow oldText to a few distinctive lines, or copy the exact bytes from the file.`,
+      `Could not find ${name} in ${path}: the flexible search was cut short — the file is too large or oldText too repetitive to scan within the search budget.`,
     );
   }
   // 3. Diagnostics against the current content.
@@ -1050,7 +1047,7 @@ function notFoundError(
       diag.shifts.length > MAX_SHIFT_LINES ? `\n  …and ${diag.shifts.length - MAX_SHIFT_LINES} more lines` : "";
     return new Error(
       `Could not find ${name} in ${path}, but lines ${diag.startLine}–${diag.endLine} match modulo indentation and the shift is not uniform (most lines shift ${diag.modal >= 0 ? "+" : ""}${diag.modal}):\n${shifts}${more}\n` +
-        `Indentation-elastic matching requires every non-blank line to shift by the same amount. Read ${path} around line ${diag.startLine} and copy its exact indentation into oldText.`,
+        `Indentation-elastic matching requires every non-blank line to shift by the same amount.`,
     );
   }
   if (diag.kind === "region") {
@@ -1068,7 +1065,7 @@ function notFoundError(
       current.length === 0
         ? "the file is empty"
         : `file has ${getLines(current).length} line${getLines(current).length === 1 ? "" : "s"}`
-    }). ` + `Re-read ${path} around where you expect this text and copy the exact bytes into oldText.`,
+    }).`,
   );
 }
 
@@ -1406,8 +1403,7 @@ function renderRegionDiag(
       "note: no line of your oldText matched exactly, so it is not shown side-by-side — the region was likely rewritten or reformatted; (blank) is an empty line, (whitespace only: N cols) is a line of invisible whitespace, a line ending in … is cut at 100 columns, and a truncated listing shows only its first lines",
     );
   } else {
-    if (similarity)
-      notes.push("note: region located by fuzzy similarity — check the diff above for typos or drifted text");
+    if (similarity) notes.push("note: region located by fuzzy similarity — the line pairing is approximate");
     let notesAdded = 0;
     for (let i = 0; i < k && notesAdded < 3; i++) {
       const row = rows[i];
@@ -1508,7 +1504,7 @@ const editSchema = Type.Object({
     Type.Object({
       oldText: Type.String({
         description:
-          "Exact text for one targeted replacement, matched against the file as it stands after the previous edits. Must be unique unless occurrence is given.",
+          "Exact text for one targeted replacement, matched against the file as it stands after the previous edits. Must be non-empty and unique unless occurrence is given; express an insertion by including the surrounding lines here and placing the new text in newText.",
       }),
       newText: Type.String({ description: "Replacement text for this targeted edit." }),
       occurrence: Type.Optional(
@@ -1634,9 +1630,7 @@ export function createSuperEditTool(
           throwIfAborted();
           const code = fsErrorCode(error);
           if (code === "ENOENT") {
-            throw new Error(
-              `Could not edit ${path}: file not found. edit cannot create files — use write to create it first.`,
-            );
+            throw new Error(`Could not edit ${path}: file not found. edit does not create files.`);
           }
           const detail = error instanceof Error ? error.message : String(error);
           throw new Error(`Could not edit file: ${path}. ${code ? `Error code: ${code}. ` : ""}${detail}`);
@@ -1667,9 +1661,7 @@ export function createSuperEditTool(
             .map((a) => describeApplied(a, edits.length))
             .filter((n) => n !== "");
           const why = notes.length > 0 ? ` ${notes.join("; ")}.` : "";
-          throw new Error(
-            `No changes made to ${path}: the replacement(s) produced identical content.${why} This might indicate special characters or the text not being what you expect — re-read the region and adjust.`,
-          );
+          throw new Error(`No changes made to ${path}: the replacement(s) produced identical content.${why}`);
         }
         const finalContent = bom + restoreLineEndings(newContent, ending);
         try {
@@ -1679,7 +1671,7 @@ export function createSuperEditTool(
           const code = fsErrorCode(error);
           const detail = error instanceof Error ? error.message : String(error);
           throw new Error(
-            `Could not write file: ${path}. ${code ? `Error code: ${code}. ` : ""}${detail} The file may be unchanged or partially written — re-read it before retrying.`,
+            `Could not write file: ${path}. ${code ? `Error code: ${code}. ` : ""}${detail} The file may be unchanged or partially written.`,
           );
         }
         // No abort check here: the write has committed, and reporting a landed

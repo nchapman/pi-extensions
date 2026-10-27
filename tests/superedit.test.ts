@@ -341,7 +341,8 @@ describe("sequential edits", () => {
     expect(err).toContain("edits[1]");
     expect(err).toContain("before edits[0] was applied");
     expect(err).toContain("original lines 2–3");
-    expect(err).toContain("merge this edit into edits[0]");
+    expect(err).toContain("edits[0] rewrote that region");
+    expect(err).toContain("Edits apply in order");
   });
 
   it("counts occurrences against the content after earlier edits", () => {
@@ -503,7 +504,7 @@ describe("indentation-elastic matching (heredoc repair)", () => {
     expect(err).toContain("(matched with indentation flexibility)");
     expect(err).toContain("f.rs:2");
     expect(err).toContain("f.rs:5");
-    expect(err).toContain("occurrence");
+    expect(err).toContain("a unique match is required");
   });
 
   it("disambiguates elastic twins with occurrence", () => {
@@ -716,8 +717,7 @@ describe("duplicate matches and occurrence", () => {
     expect(err).toContain("f.rs:2");
     expect(err).toContain("f.rs:4");
     expect(err).toContain("f.rs:6");
-    expect(err).toContain("occurrence: N (1-based, in file order)");
-    expect(err).toContain('occurrence: "all"');
+    expect(err).toContain("a unique match is required");
   });
 
   it("replaces the chosen occurrence", () => {
@@ -734,9 +734,8 @@ describe("duplicate matches and occurrence", () => {
   it("refuses replace-all over the cap", () => {
     const many = Array.from({ length: 25 }, (_, i) => `x = ${i};`).join("\n") + "\n";
     const err = applyError(many, [{ oldText: "x = ", newText: "y = ", occurrence: "all" }], 20);
-    expect(err).toContain("would replace 25 locations");
-    expect(err).toContain("cap: 20");
-    expect(err).toContain("too generic");
+    expect(err).toContain("matches 25 locations");
+    expect(err).toContain("the cap is 20");
   });
 
   it("rejects an occurrence index past the match count, listing sites", () => {
@@ -780,7 +779,7 @@ describe("duplicate matches and occurrence", () => {
     expect(err).toContain("Found 1001+ matches");
     // With occurrence: "all" past the cap: refuse instead of partially rewriting.
     const errAll = applyError(many, [{ oldText: "a", newText: "b", occurrence: "all" }], 1000);
-    expect(errAll).toContain("would replace 1001+ locations");
+    expect(errAll).toContain("matches 1001+ locations");
     // An occurrence index past the truncated collection is still out of range.
     const errIdx = applyError(many, [{ oldText: "a", newText: "b", occurrence: 1002 }]);
     expect(errIdx).toContain("only 1001+");
@@ -876,7 +875,7 @@ describe("not-found diagnostics", () => {
     expect(err).toContain("lines 2–4 match modulo indentation and the shift is not uniform");
     expect(err).toContain("line 3: file 8 cols, you sent 0 cols (shift +8)");
     expect(err).toContain("← breaks the uniform shift");
-    expect(err).toContain("Read f.rs around line 2");
+    expect(err).toContain("every non-blank line to shift by the same amount");
   });
 
   it("locates typo'd text by similarity when no line matches exactly", () => {
@@ -1026,7 +1025,7 @@ describe("not-found diagnostics", () => {
     const err = applyError(content, [{ oldText, newText: "y" }]);
     expect(err).toContain("cut short");
     expect(err).toContain("too large or oldText too repetitive");
-    expect(err).toContain("Narrow oldText");
+    expect(err).toContain("search budget");
   });
 
   it("still matches elastically in a large non-repetitive file (size must not eat the window budget)", () => {
@@ -1062,7 +1061,7 @@ describe("not-found diagnostics", () => {
     const err = applyError(content, [{ oldText, newText: "x" }]);
     expect(err).toContain("Closest region (found by fuzzy similarity): lines 2–2");
     expect(err).toContain("precisely like the built-in");
-    expect(err).toContain("check the diff above for typos or drifted text");
+    expect(err).toContain("the line pairing is approximate");
   });
 
   describe("adversarial inputs", () => {
@@ -1228,11 +1227,153 @@ describe("not-found diagnostics", () => {
 // Validation and no-ops
 // ---------------------------------------------------------------------------
 
+describe("message discipline", () => {
+  // Every failure message states facts — what matched, where, why it failed —
+  // and leaves what to do about them to the caller. The pattern is the union
+  // of the imperatives the pre-sweep messages carried, plus the imperative
+  // wording that still lives in the tool's description/prompt strings ("merge
+  // them into one", "read the listed lines and fix oldText") — the likeliest
+  // source of a regression. Extend it if one creeps back under new wording.
+  const INSTRUCTION =
+    /\b(re-read|read the|read \S+ around|copy|use|pass|extend|narrow|merge this|merge|check the|include|insert|place|target|adjust|fix|replace (?:occurrences|specific matches|every match))\b/i;
+
+  it("states facts only across the exercised failure paths", async () => {
+    // The regex matches the tool's own voice: listing rows ("- "/"+ ",
+    // numbered context, indented site excerpts) echo file bytes and can carry
+    // any word as data — a Rust "use" line must not trip the guard.
+    const prose = (message: string): string =>
+      message
+        .split("\n")
+        .filter((l) => l.trim() !== "")
+        .filter((l) => !/^[-+]/.test(l))
+        .filter((l) => !/^ *\d+ {2}/.test(l))
+        .filter((l) => !/^ {4}/.test(l))
+        .join("\n");
+    const zipContent =
+      "# intro\nBOM and line endings round-trip exactly like the built-in. The whole search runs under one comparison budget.\n# outro\n";
+    const compact = [
+      "",
+      "DENSE = {",
+      '    "d16": {"name": "Qwen3.8-16B-d", "layers": 56, "hidden_size": 4096},',
+      '    "d12": {"name": "Qwen3.8-11B-d", "layers": 56, "hidden_size": 3072},',
+      "}",
+      "",
+      "# next section",
+    ].join("\n");
+    const stale = [
+      "    # Dense flagship — 16GB card",
+      '    "d16": {',
+      '        "name": "Qwen3.8-16B-d",',
+      '        "layers": 56,  # 14 of 16 superblocks',
+      '        "hidden_size": 4096,',
+      "    },",
+    ].join("\n");
+    const messages: string[] = [
+      applyError("a\n", [{ oldText: "", newText: "b" }]),
+      applyError("a\n", [{ oldText: "a", newText: "a" }]),
+      applyError("a\n", [{ oldText: "a", newText: "b", occurrence: 0 }]),
+      applyError("use a::b;\nuse a::b;\n", [{ oldText: "use a::b;", newText: "x" }]),
+      applyError("dup\ndup\ndup\n", [{ oldText: "dup", newText: "x", occurrence: "all" }], 2),
+      applyError("dup\ndup\n", [{ oldText: "dup", newText: "x", occurrence: 3 }]),
+      applyError("    a\n    a\n    a\n", [{ oldText: "a\na", newText: "b", occurrence: "all" }]),
+      applyError("let x = 1;\nlet y = 2;\n", [
+        { oldText: "let x = 1;", newText: "let a = 1;" },
+        { oldText: "let x = 1;\nlet y = 2;", newText: "block" },
+      ]),
+      applyError(" x\n".repeat(30_000), [{ oldText: "x\n  x\n".repeat(50), newText: "y" }]),
+      applyError("fn main() {\n    let a = 1;\n        let b = 2;\n    let c = 3;\n}\n", [
+        { oldText: "let a = 1;\nlet b = 2;\nlet c = 3;", newText: "x" },
+      ]),
+      applyError(zipContent, [
+        { oldText: "BOM and line endings round-trip precisely like the built-in.", newText: "x" },
+      ]),
+      applyError(compact, [{ oldText: stale, newText: "x" }]),
+      applyError("one\ntwo\nthree\n", [{ oldText: "totally different\nmulti line", newText: "x" }]),
+      await runEditError({}, { path: "new.rs", edits: [{ oldText: "a", newText: "b" }] }),
+      await runEditError(
+        { "f.rs": "        let x = 1;\n" },
+        { path: "f.rs", edits: [{ oldText: "\t\tlet x = 1;", newText: "        let x = 1;" }] },
+      ),
+    ];
+    // Write failure: access and read succeed, the write rejects. The
+    // .then(onFulfilled, onRejected) split keeps the sentinel outside the
+    // catch — a call that resolves must fail the test, not feed the loop.
+    const failing = fakeFs({ [`${CWD}/f.rs`]: "a\n" });
+    const failTool = createSuperEditTool(CWD, {
+      operations: {
+        ...failing.ops,
+        writeFile: async () => {
+          throw Object.assign(new Error("EACCES: permission denied, open 'f.rs'"), { code: "EACCES" });
+        },
+      },
+    });
+    messages.push(
+      await failTool
+        .execute("1", { path: "f.rs", edits: [{ oldText: "a", newText: "b" }] }, undefined, undefined, {
+          cwd: CWD,
+        } as never)
+        .then(
+          () => {
+            throw new Error("expected the edit to fail");
+          },
+          (e: unknown) => (e instanceof Error ? e.message : String(e)),
+        ),
+    );
+    for (const message of messages) {
+      expect(prose(message), `instructing message: ${message}`).not.toMatch(INSTRUCTION);
+    }
+    // Branch signatures: each fixture must have produced the message it was
+    // built for — a changed branch fails here loudly instead of passing the
+    // word guard while covering nothing.
+    const all = messages.join("\n");
+    for (const signature of [
+      "oldText is empty",
+      "identical in f.rs",
+      "must be a positive integer",
+      "a unique match is required",
+      "the cap is 2",
+      "only 2 match(es) exist",
+      "cannot replace every site unambiguously",
+      "rewrote that region",
+      "cut short",
+      "the shift is not uniform",
+      "Closest region (found by fuzzy similarity)",
+      "The file has",
+      "no region looks similar",
+      "file not found",
+      "No changes made",
+      "Could not write file",
+    ]) {
+      expect(all, `missing branch signature: ${signature}`).toContain(signature);
+    }
+    // The filter drops by shape (listing rows), not provenance — pin its
+    // boundary so tool prose moving into an indented block visibly narrows
+    // what the guard scans.
+    expect(prose("    use std::fs;")).toBe("");
+    expect(prose("  12  use std::fs;")).toBe("");
+    expect(prose("- use std::fs;")).toBe("");
+    expect(prose("note: a factual note")).toBe("note: a factual note");
+    // Positive control — the guard must bite on the deleted imperatives and
+    // on the description strings' wording, not just pass on today's messages.
+    for (const relic of [
+      "merge them into one",
+      "read the listed lines and fix oldText",
+      "To insert text, include the surrounding lines in oldText",
+      "replace occurrences one at a time",
+    ]) {
+      expect(relic).toMatch(INSTRUCTION);
+    }
+    // The echoed listing rows themselves do carry the word as data — the
+    // filter, not the fixture, is what keeps the guard honest.
+    const rustErr = messages.find((m) => m.includes("Found 2 matches"))!;
+    expect(rustErr).toMatch(/\buse\b/);
+  });
+});
+
 describe("validation and no-ops", () => {
-  it("rejects empty oldText with the insert idiom", () => {
+  it("rejects empty oldText", () => {
     const err = applyError("a\n", [{ oldText: "", newText: "b" }]);
     expect(err).toContain("oldText is empty");
-    expect(err).toContain("include the surrounding lines in oldText");
   });
 
   it("rejects identical oldText and newText", () => {
@@ -1285,6 +1426,10 @@ describe("the edit tool", () => {
     expect(tool.name).toBe("edit");
     expect(tool.description).toContain("apply in order");
     expect(tool.description).toContain("occurrence");
+    // The insert idiom lives in the schema, not the error: the empty-oldText
+    // rejection stays fact-only, so this is the surface that documents it.
+    expect(JSON.stringify(tool.parameters)).toContain("Must be non-empty");
+    expect(JSON.stringify(tool.parameters)).toContain("express an insertion");
     expect(tool.promptGuidelines?.join(" ")).toContain("Never rewrite files through a shell script");
   });
 
@@ -1348,10 +1493,10 @@ describe("the edit tool", () => {
     ).rejects.toThrow("Could not read file: somedir. Error code: EISDIR");
   });
 
-  it("suggests write for a missing file", async () => {
+  it("states that edit does not create files when the file is missing", async () => {
     const err = await runEditError({}, { path: "new.rs", edits: [{ oldText: "a", newText: "b" }] });
     expect(err).toContain("file not found");
-    expect(err).toContain("use write to create it first");
+    expect(err).toContain("edit does not create files");
   });
 
   it("preserves a UTF-8 BOM on write", async () => {
@@ -1436,7 +1581,7 @@ describe("the edit tool", () => {
       { path: "f.rs", edits: [{ oldText: "dup", newText: "x", occurrence: "all" }] },
       { allCap: () => 3 },
     );
-    expect(err).toContain("cap: 3");
+    expect(err).toContain("the cap is 3");
   });
 });
 
