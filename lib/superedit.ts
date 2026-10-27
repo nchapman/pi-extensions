@@ -32,8 +32,11 @@
  * - not-found errors carry diagnostics instead of dead ends: the closest
  *   region as a line-numbered diff (anchor search, with a bigram-similarity
  *   seed for drifted text), whitespace forensics, and an honest "nothing
- *   similar" with the file's line count. Every message is capped so a failure
- *   never floods context
+ *   similar" with the file's line count. A similarity-seeded region where no
+ *   line matched exactly has no honest pairing — there the oldText side is
+ *   dropped for a plain listing of the file's bytes (the caller holds its own
+ *   oldText; single-line oldText or any exact line match keeps the diff).
+ *   Every message is capped so a failure never floods context
  * - BOM and line endings round-trip exactly like the built-in: edits are
  *   LF-normalized for matching, the original ending style is restored on write
  * - after the write commits, a tree-sitter syntax check (see
@@ -1054,8 +1057,9 @@ function notFoundError(
     const head = diag.similarity
       ? `Closest region (found by fuzzy similarity): lines ${diag.startLine}–${diag.endLine} (${diag.matched} of ${diag.total} lines match exactly).`
       : `Closest region: lines ${diag.startLine}–${diag.endLine} (${diag.matched} of ${diag.total} lines match).`;
+    const legend = diag.fileOnly ? "The file has" : `"-" is your oldText, "+" is the file`;
     return new Error(
-      `Could not find ${name} in ${path}. ${head} "-" is your oldText, "+" is the file:\n${diag.lines.join("\n")}` +
+      `Could not find ${name} in ${path}. ${head} ${legend}:\n${diag.lines.join("\n")}` +
         (diag.notes.length > 0 ? `\n${diag.notes.join("\n")}` : ""),
     );
   }
@@ -1089,6 +1093,13 @@ interface RegionDiag {
   total: number;
   /** True when the window was located by similarity rather than exact lines. */
   similarity: boolean;
+  /**
+   * True when no row pairs at all (similarity-seeded, not even blank↔blank,
+   * multi-line oldText): lines hold a plain listing of the file's bytes only.
+   * A zip of non-corresponding lines misleads more than it informs, and the
+   * caller already holds its own oldText in the tool call it just made.
+   */
+  fileOnly: boolean;
   lines: string[];
   notes: string[];
 }
@@ -1190,7 +1201,7 @@ function diagnose(oldText: string, content: string): Diagnosis {
     }
   }
   if (bestW >= 0 && bestScore >= threshold) {
-    return renderRegionDiag(contentLines, oldLines, bestW, k, bestScore, false);
+    return renderRegionDiag(contentLines, oldLines, bestW, k, false);
   }
 
   // Similarity seed: no line matches exactly, so find the most similar line
@@ -1220,7 +1231,7 @@ function diagnose(oldText: string, content: string): Diagnosis {
   if (bestSeed && bestSeed.sim >= 0.55) {
     const w = bestSeed.contentIdx - bestSeed.oldIdx;
     if (w >= 0 && w + k <= contentLines.length) {
-      return renderRegionDiag(contentLines, oldLines, w, k, scoreWindow(w), true);
+      return renderRegionDiag(contentLines, oldLines, w, k, true);
     }
   }
   return { kind: "none" };
@@ -1293,13 +1304,29 @@ function containment(a: Set<string>, b: Set<string>): number {
   return shared / a.size;
 }
 
+/**
+ * Leading-whitespace columns for display, counting every code point that
+ * String#trim() treats as whitespace — not just space and tab. The
+ * whitespace-only marker classifies with trim(), so a line of NBSP or Ogham
+ * spaces must not classify as invisible while its column count says zero.
+ */
+function whitespaceCols(line: string): number {
+  let col = 0;
+  for (const ch of line) {
+    if (ch === " ") col += 1;
+    else if (ch === "\t") col = Math.ceil((col + 1) / TABSTOP) * TABSTOP;
+    else if (ch.trim() === "") col += 1;
+    else break;
+  }
+  return col;
+}
+
 /** Render the closest-region diagnostic: a capped, line-numbered diff plus whitespace notes. */
 function renderRegionDiag(
   contentLines: Line[],
   oldLines: string[],
   w: number,
   k: number,
-  score: number,
   similarity: boolean,
 ): RegionDiag {
   const width = String(contentLines.length).length;
@@ -1312,67 +1339,102 @@ function renderRegionDiag(
     if (lineKey(oldText) === lineKey(fileText)) rows.push({ kind: "ctx", fileLine: w + i + 1 });
     else rows.push({ kind: "diff", fileLine: w + i + 1, old: oldText, file: fileText });
   }
-  // Keep context around the first three difference clusters; elide the rest.
-  const keep = new Set<number>();
-  let clusters = 0;
-  let lastDiff = -2;
-  for (let i = 0; i < k; i++) {
-    if (rows[i].kind !== "diff") continue;
-    if (i > lastDiff + 1) clusters++;
-    if (clusters <= 3) {
-      for (let j = Math.max(0, i - 2); j <= Math.min(k - 1, i + 2); j++) keep.add(j);
-    }
-    lastDiff = i;
-  }
-  if (keep.size === 0) {
-    // No differing lines (a wildly non-uniform window that failed the modal
-    // test): still show the region's edges instead of a bare ellipsis.
-    for (let i = 0; i < Math.min(2, k); i++) keep.add(i);
-    for (let i = Math.max(0, k - 2); i < k; i++) keep.add(i);
-  }
+  // A similarity-seeded region where no row pairs — not even blank with
+  // blank (score alone ignores blank-line pairs, but a blank↔blank ctx row is
+  // an honest alignment) — has no honest pairing: the zip would juxtapose
+  // non-corresponding lines (a stale expanded block against compacted
+  // one-liners). Single-line oldText keeps the zip — one pair is trivially
+  // aligned, and the side-by-side is the typo tell.
+  const fileOnly = similarity && k > 1 && rows.every((row) => row.kind === "diff");
+  // The reported match count is every aligned row of the region — blank↔blank
+  // pairs included, elided or not — so the head describes the region (as its
+  // wording scopes it), never just the rendered slice; the elision marker
+  // accounts for rows the diff does not show. scoreWindow alone would skip
+  // blank-line pairs and contradict a rendered ctx row.
+  const matched = rows.filter((row) => row.kind === "ctx").length;
   const lines: string[] = [];
-  let elided = 0;
-  for (let i = 0; i < k; i++) {
-    if (!keep.has(i)) {
-      elided++;
-      if (elided === 1) lines.push(`  ${" ".repeat(width)} …`);
-      continue;
+  if (fileOnly) {
+    for (let i = 0; i < k; i++) {
+      const text = contentLines[w + i].text;
+      // Substituted and cut lines are marked so "copy the exact bytes" never
+      // means "copy the marker or the sliced 100 columns".
+      const shown =
+        text === ""
+          ? "(blank)"
+          : text.trim() === ""
+            ? `(whitespace only: ${whitespaceCols(text)} cols)`
+            : text.slice(0, 100) + (text.length > 100 ? " …" : "");
+      lines.push(`  ${num(w + i + 1)}  ${shown}`);
     }
-    const row = rows[i];
-    if (row.kind === "ctx") lines.push(`  ${num(row.fileLine!)}  ${contentLines[w + i].text.slice(0, 100)}`);
-    else {
-      lines.push(`- ${" ".repeat(width)}  ${(row.old ?? "").slice(0, 100)}`);
-      lines.push(`+ ${num(row.fileLine!)}  ${(row.file ?? "").slice(0, 100)}`);
+  } else {
+    // Keep context around the first three difference clusters; elide the rest.
+    const keep = new Set<number>();
+    let clusters = 0;
+    let lastDiff = -2;
+    for (let i = 0; i < k; i++) {
+      if (rows[i].kind !== "diff") continue;
+      if (i > lastDiff + 1) clusters++;
+      if (clusters <= 3) {
+        for (let j = Math.max(0, i - 2); j <= Math.min(k - 1, i + 2); j++) keep.add(j);
+      }
+      lastDiff = i;
+    }
+    if (keep.size === 0) {
+      // No differing lines (a wildly non-uniform window that failed the modal
+      // test): still show the region's edges instead of a bare ellipsis.
+      for (let i = 0; i < Math.min(2, k); i++) keep.add(i);
+      for (let i = Math.max(0, k - 2); i < k; i++) keep.add(i);
+    }
+    let elided = 0;
+    for (let i = 0; i < k; i++) {
+      if (!keep.has(i)) {
+        elided++;
+        if (elided === 1) lines.push(`  ${" ".repeat(width)} …`);
+        continue;
+      }
+      const row = rows[i];
+      if (row.kind === "ctx") lines.push(`  ${num(row.fileLine!)}  ${contentLines[w + i].text.slice(0, 100)}`);
+      else {
+        lines.push(`- ${" ".repeat(width)}  ${(row.old ?? "").slice(0, 100)}`);
+        lines.push(`+ ${num(row.fileLine!)}  ${(row.file ?? "").slice(0, 100)}`);
+      }
     }
   }
   const notes: string[] = [];
-  if (similarity)
-    notes.push("note: region located by fuzzy similarity — check the diff above for typos or drifted text");
-  let notesAdded = 0;
-  for (let i = 0; i < k && notesAdded < 3; i++) {
-    const row = rows[i];
-    if (row.kind !== "diff") continue;
-    const oldLead = (row.old ?? "").match(/^[\t ]*/)?.[0] ?? "";
-    const fileLead = (row.file ?? "").match(/^[\t ]*/)?.[0] ?? "";
-    if (oldLead.includes("\t") !== fileLead.includes("\t")) {
-      notes.push(
-        `note: line ${row.fileLine} — file uses ${fileLead.includes("\t") ? "tabs" : "spaces"}, you sent ${oldLead.includes("\t") ? "tabs" : "spaces"}`,
-      );
-      notesAdded++;
-    } else if (oldLead !== fileLead) {
-      notes.push(
-        `note: line ${row.fileLine} — you sent ${expandIndent(oldLead)} leading columns, file has ${expandIndent(fileLead)}`,
-      );
-      notesAdded++;
+  if (fileOnly) {
+    notes.push(
+      "note: no line of your oldText matched exactly, so it is not shown side-by-side — the region was likely rewritten or reformatted; copy oldText from the exact bytes above ((blank) is an empty line, (whitespace only: N cols) is a line of invisible whitespace, a line ending in … is cut at 100 columns, and a truncated listing is partial — re-read the file for those)",
+    );
+  } else {
+    if (similarity)
+      notes.push("note: region located by fuzzy similarity — check the diff above for typos or drifted text");
+    let notesAdded = 0;
+    for (let i = 0; i < k && notesAdded < 3; i++) {
+      const row = rows[i];
+      if (row.kind !== "diff") continue;
+      const oldLead = (row.old ?? "").match(/^[\t ]*/)?.[0] ?? "";
+      const fileLead = (row.file ?? "").match(/^[\t ]*/)?.[0] ?? "";
+      if (oldLead.includes("\t") !== fileLead.includes("\t")) {
+        notes.push(
+          `note: line ${row.fileLine} — file uses ${fileLead.includes("\t") ? "tabs" : "spaces"}, you sent ${oldLead.includes("\t") ? "tabs" : "spaces"}`,
+        );
+        notesAdded++;
+      } else if (oldLead !== fileLead) {
+        notes.push(
+          `note: line ${row.fileLine} — you sent ${expandIndent(oldLead)} leading columns, file has ${expandIndent(fileLead)}`,
+        );
+        notesAdded++;
+      }
     }
   }
   return {
     kind: "region",
     startLine: w + 1,
     endLine: w + k,
-    matched: score,
+    matched,
     total: k,
     similarity,
+    fileOnly,
     lines: lines.length > MAX_DIAG_LINES ? [...lines.slice(0, MAX_DIAG_LINES), "  … (diagnostic truncated)"] : lines,
     notes,
   };

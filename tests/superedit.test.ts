@@ -886,6 +886,128 @@ describe("not-found diagnostics", () => {
     expect(err).toContain("let drift = mean_abs(&p, &d);");
   });
 
+  it("renders a similarity region with zero matching lines as a plain file listing", () => {
+    // The compacted-dict case: multi-line oldText from a stale revision — no
+    // line matches exactly, so a line-by-line zip would juxtapose lines that
+    // do not correspond (comment↔blank, "d16": {↔header). The caller already
+    // holds its own oldText; the diagnostic shows only the file's bytes.
+    const compact = [
+      "",
+      "DENSE = {",
+      '    "d16": {"name": "Qwen3.8-16B-d", "layers": 56, "hidden_size": 4096},',
+      '    "d12": {"name": "Qwen3.8-11B-d", "layers": 56, "hidden_size": 3072},',
+      "}",
+      "",
+      "# next section",
+    ].join("\n");
+    const stale = [
+      "    # Dense flagship — 16GB card",
+      '    "d16": {',
+      '        "name": "Qwen3.8-16B-d",',
+      '        "layers": 56,  # 14 of 16 superblocks',
+      '        "hidden_size": 4096,',
+      "    },",
+    ].join("\n");
+    const err = applyError(compact, [{ oldText: stale, newText: "x" }]);
+    expect(err).toContain("Closest region (found by fuzzy similarity): lines 1–6 (0 of 6 lines match exactly)");
+    expect(err).toContain("The file has:");
+    expect(err).not.toContain("has::");
+    expect(err).not.toContain('"-" is your oldText');
+    // The oldText is not echoed back — the caller has it in its tool call.
+    expect(err).not.toContain("# Dense flagship");
+    expect(err).toContain("DENSE = {");
+    expect(err).toContain('    "d16": {"name": "Qwen3.8-16B-d"');
+    // Blank file lines render explicitly instead of a bare line number.
+    expect(err).toContain("(blank)");
+    // Whitespace forensics compare zip-paired lines; with no pairing they
+    // would be noise.
+    expect(err).not.toContain("leading columns");
+    expect(err).not.toContain("file uses tabs");
+    expect(err).toContain("copy oldText from the exact bytes above");
+    expect(err).toContain("(blank) is an empty line");
+  });
+
+  it("keeps the side-by-side diff when only blank lines aligned", () => {
+    // score counts non-blank matches only, but a blank↔blank row is an honest
+    // pair: the window is correctly aligned, so the zip — not the file-only
+    // listing — is the truthful rendering.
+    const alignedBlanks = "const x = 1;\nconst y = 2;\n\nconst z = 3;\n";
+    const stale = "const x = 10;\nconst y = 20;\n\nconst z = 30;";
+    const err = applyError(alignedBlanks, [{ oldText: stale, newText: "x" }]);
+    expect(err).toContain('"-" is your oldText, "+" is the file');
+    expect(err).not.toContain("The file has");
+    expect(err).not.toContain("no line of your oldText matched exactly");
+    // The head's count is every aligned row of the window, elided or not —
+    // here that is exactly the blank pair (scoreWindow alone would say 0).
+    expect(err).toContain("(1 of 4 lines match exactly)");
+  });
+
+  it("marks file lines cut at 100 columns in the file-only listing", () => {
+    // A compacted long line is sliced to 100 columns, and a whitespace-only
+    // line is named — both marked so the "copy the exact bytes" instruction
+    // stays honest.
+    const long = '    "key": "' + "a".repeat(120) + '"},';
+    const content = ["", "CFG = {", long, "\u00A0\u1680\uFEFF\u00A0", "}", "", "# tail"].join("\n");
+    const stale = ["    # the key block", '    "key": "' + "a".repeat(30) + '",', '    "other": 1,', "    },"].join(
+      "\n",
+    );
+    const err = applyError(content, [{ oldText: stale, newText: "x" }]);
+    expect(err).toContain("The file has");
+    expect(err).toContain("a …");
+    // NBSP indentation must count as columns, not report a bogus 0; exotic
+    // trim-whitespace (Ogham space, ZWNBSP) counts too — one char per column.
+    expect(err).toContain("(whitespace only: 4 cols)");
+    expect(err).not.toContain("(diagnostic truncated)");
+  });
+
+  it("reports every aligned row of the region, including ones cluster elision hides", () => {
+    // Four diff clusters: only the first three keep context, so rows 12–15
+    // are elided — yet two of those (c12, c13) are aligned ctx rows. The
+    // head must count all twelve aligned rows (it scopes the region, not the
+    // rendered slice); the elision marker accounts for what is not shown.
+    const file = [
+      "d0",
+      "c1",
+      "c2",
+      "c3",
+      "c4",
+      "d5",
+      "c6",
+      "c7",
+      "c8",
+      "d9",
+      "c10",
+      "c11",
+      "c12",
+      "c13",
+      "d14",
+      "c15",
+    ].join("\n");
+    const old = [
+      "x0",
+      "c1",
+      "c2",
+      "c3",
+      "c4",
+      "x5",
+      "c6",
+      "c7",
+      "c8",
+      "x9",
+      "c10",
+      "c11",
+      "c12",
+      "c13",
+      "x14",
+      "c15",
+    ].join("\n");
+    const err = applyError(file, [{ oldText: old, newText: "y" }]);
+    expect(err).toContain("(12 of 16 lines match)");
+    expect(err).toContain("…");
+    // The rendered slice shows only nine ctx rows — the count is not that.
+    expect(err).not.toContain("(9 of 16 lines match)");
+  });
+
   it("notes tab-vs-space confusion in the closest region", () => {
     const tabbed = 'fn main() {\n\tassert!(x > 1e-6, "m");\n}\n';
     const err = applyError(tabbed, [{ oldText: '    assert!(x > 1e-5, "m");', newText: "x" }]);
