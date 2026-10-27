@@ -923,7 +923,9 @@ describe("not-found diagnostics", () => {
     // would be noise.
     expect(err).not.toContain("leading columns");
     expect(err).not.toContain("file uses tabs");
-    expect(err).toContain("copy oldText from the exact bytes above");
+    // The note reports facts and rendering conventions only — no instruction
+    // telling the caller what to do with them.
+    expect(err).not.toContain("copy oldText");
     expect(err).toContain("(blank) is an empty line");
   });
 

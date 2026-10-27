@@ -1403,7 +1403,7 @@ function renderRegionDiag(
   const notes: string[] = [];
   if (fileOnly) {
     notes.push(
-      "note: no line of your oldText matched exactly, so it is not shown side-by-side — the region was likely rewritten or reformatted; copy oldText from the exact bytes above ((blank) is an empty line, (whitespace only: N cols) is a line of invisible whitespace, a line ending in … is cut at 100 columns, and a truncated listing is partial — re-read the file for those)",
+      "note: no line of your oldText matched exactly, so it is not shown side-by-side — the region was likely rewritten or reformatted; (blank) is an empty line, (whitespace only: N cols) is a line of invisible whitespace, a line ending in … is cut at 100 columns, and a truncated listing shows only its first lines",
     );
   } else {
     if (similarity)
