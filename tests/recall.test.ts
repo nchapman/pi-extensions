@@ -3239,16 +3239,16 @@ describe("background idle compaction", () => {
     expect(quiet.completeCalls).toHaveLength(0);
   });
 
-  it("ships the tuned defaults: strict 128k, opportunistic 115.2k (10% off)", async () => {
-    const shipped: RecallConfig = { ...CONFIG, compactTargetTokens: 128_000, compactIdleDiscount: 0.1 };
+  it("ships the tuned defaults: strict 256k, opportunistic 230.4k (10% off)", async () => {
+    const shipped: RecallConfig = { ...CONFIG, compactTargetTokens: 256_000, compactIdleDiscount: 0.1 };
     const armed = makePi();
     registerRecallTool(armed.pi, shipped);
-    const atIdleBound = settledCtx({ usage: { tokens: 115_500, contextWindow: 1_000_000 } });
+    const atIdleBound = settledCtx({ usage: { tokens: 230_500, contextWindow: 1_000_000 } });
     await fire(armed.events, "agent_settled", atIdleBound.ctx);
     await vi.waitFor(() => expect(atIdleBound.completeCalls).toHaveLength(1)); // over the discounted bound, under strict
     const quiet = makePi();
     registerRecallTool(quiet.pi, shipped);
-    const below = settledCtx({ usage: { tokens: 114_500, contextWindow: 1_000_000 } });
+    const below = settledCtx({ usage: { tokens: 229_500, contextWindow: 1_000_000 } });
     await fire(quiet.events, "agent_settled", below.ctx);
     await new Promise((r) => setTimeout(r, 5));
     expect(below.completeCalls).toHaveLength(0);
@@ -4187,7 +4187,7 @@ describe("compaction summary ownership", () => {
   it("config parses the budget knobs", () => {
     expect(configFromEnv({ PI_RECALL_COMPACT_TARGET: "60000" }).compactTargetTokens).toBe(60000);
     expect(configFromEnv({ PI_RECALL_COMPACT_TARGET: "0" }).compactTargetTokens).toBe(0);
-    expect(configFromEnv({ PI_RECALL_COMPACT_TARGET: "nope" }).compactTargetTokens).toBe(128_000);
+    expect(configFromEnv({ PI_RECALL_COMPACT_TARGET: "nope" }).compactTargetTokens).toBe(256_000);
     expect(configFromEnv({ PI_RECALL_COMPACT_RATIO: "0.8" }).compactTargetRatio).toBe(0.8);
     expect(configFromEnv({ PI_RECALL_COMPACT_RATIO: "0" }).compactTargetRatio).toBe(0); // ratio off
     expect(configFromEnv({ PI_RECALL_COMPACT_RATIO: "3" }).compactTargetRatio).toBe(1); // clamped

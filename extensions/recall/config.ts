@@ -13,7 +13,7 @@ export interface RecallConfig {
   halfLifeHours: number;
   /** Minimum recency factor so old content fades but never vanishes (1 disables decay). */
   recencyFloor: number;
-  /** Auto-compact when projected context exceeds this many tokens (0 disables) — min of this cap and the window ratio, for every model alike. 128k, restored after the 100k interlude (f5b6c18) compacted often enough to cost more in agent continuity than the context it saved. */
+  /** Auto-compact when projected context exceeds this many tokens (0 disables) — min of this cap and the window ratio, for every model alike. 256k, the 2089ea2 ceiling restored after every lower target (100k f5b6c18, 128k 9a34f1c) cost more in agent continuity than the context it saved. */
   compactTargetTokens: number;
   /** Also bound the target to this fraction of the model's context window — the smaller of token cap and ratio wins (0 disables the ratio). */
   compactTargetRatio: number;
@@ -50,7 +50,7 @@ export const DEFAULTS: RecallConfig = {
   foreignWeight: 0.5,
   halfLifeHours: 4,
   recencyFloor: 0.25,
-  compactTargetTokens: 128_000,
+  compactTargetTokens: 256_000,
   compactTargetRatio: 0.7,
   compactIdleDiscount: 0.1,
   ownSummaries: true,
