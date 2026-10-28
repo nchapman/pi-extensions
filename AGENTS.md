@@ -1,46 +1,38 @@
 # AGENTS.md
 
-Personal [pi](https://pi.dev) coding-agent extension package. pi loads this directory in-place (`pi install ~/Code/pi-extensions`, verify with `pi list`), so **there is no build step** — pi runs the TypeScript directly and edits go live on `/reload`. Extension API types come from `@earendil-works/pi-coding-agent`, pinned in devDependencies to the installed pi version.
+## Project
+
+Personal [pi](https://pi.dev) coding-agent extension package: extensions in `extensions/` plus shared core in `lib/`, TypeScript, no build step. pi loads this directory in-place (`pi install ~/Code/pi-extensions`, verify with `pi list`), so edits go live on `/reload`.
+
+Extension API types come from `@earendil-works/pi-coding-agent`, pinned in devDependencies — keep the pin aligned with the installed pi (`pi --version`); it drifts when pi auto-updates.
+
+Deeper docs: `README.md` (per-extension behavior, configuration), `docs/` (design specs).
 
 ## Commands
 
 ```sh
-npm run check      # typecheck + full test suite — the gate to run before every commit
-npm test           # vitest only
-npx tsc --noEmit   # typecheck only
-npm run format     # prettier --write extensions lib scripts tests
-npm run check:format
-npm run test:coverage  # vitest with V8 coverage report
+npm run check                # tsc --noEmit + vitest — must pass before reporting any change done
+npm test                     # vitest only
+npx tsc --noEmit             # typecheck only
+npm run format               # prettier --write (run before committing; check:format to verify)
+npm run test:coverage
+npm run bench:recall         # benchmarks; bench:review-models for the review-model sweep
+npm run eval:review          # review eval
+npm run warm:store           # pre-warm recall's vector store
 ```
 
-`npm run check` must pass before reporting any change done.
+`npm install` runs a postinstall (`scripts/fetch-model.mjs`) that downloads recall's embedding model into `PI_RECALL_MODEL_DIR` (default `~/.pi/agent/models`). It is fail-soft: an offline install still succeeds, and recall fail-opens to BM25-only search until you run `node scripts/fetch-model.mjs` manually.
 
-## Layout
+## Conventions
 
-- `extensions/<name>/` — one directory per extension, `index.ts` as the entry pi loads (a subdirectory with an `index.ts` registers as ONE extension; sibling modules are never loaded separately). Pure layers live in sibling modules and `index.ts` re-exports their surfaces, so `import … from "../extensions/<name>"` keeps working for tests and cross-extension importers (see `extensions/goal/` for the fullest example; small extensions like `superedit/` may be index-only until they grow). Cross-extension imports exist — e.g. `recall/render.ts` imports plan rendering from `../todo`, so vendoring one directory can pull in another
-- `lib/` — shared core modules (e.g. the task registry) imported by extensions and tests alike
-- `tests/*.test.ts` — one vitest suite per module/extension; keep new tests in the matching file
-- `scripts/` — benchmarks (`bench-recall`, `bench-review-models`), evaluations (`eval-review`), and dataset utilities
-- `docs/` — design documents and architecture specifications
+- **One extension per directory.** `extensions/<name>/index.ts` is the only entry pi loads; sibling modules are never loaded separately. Pure layers live in siblings and `index.ts` re-exports their surfaces, so `import … from "../extensions/<name>"` keeps working for tests and cross-extension importers. Cross-extension imports exist (`recall` imports plan rendering from `../todo`): vendoring one directory can pull in another.
+- **Config is `PI_*` env knobs** parsed through small pure `parse*` helpers; invalid values fall back to documented defaults (range-clamped), never throw. Match the surrounding read timing — at registration (recall) or per-call (subagents).
+- **Every network fetch and child process is bounded** (timeout, capped buffers). Errors must carry enough detail to act on; choose fail-open vs fail-closed deliberately and say which in a comment.
+- **Comment the why** — file headers record each mechanism's deliberate design cuts (see `lib/superbash.ts` for the pattern); read them before changing a mechanism, and update them plus the extension's README section when behavior changes.
+- **Tests**: one vitest suite per module in `tests/<module>.test.ts`. Pure logic is exported separately from the extension entry so vitest covers it directly; boundaries (child spawn, fetch, filesystem) are injected as deps and replaced with hand-rolled fakes — prefer that over `vi.mock`. Bug fix workflow: failing test first, then fix, then `npm run check`.
+- **Commits**: imperative subject, no scope tags (see `git log --oneline`); the subject says what and why in one line.
 
-## Code conventions
+## Boundaries
 
-- TypeScript with lint-grade strictness beyond `strict: true` (`noUnusedLocals`, `noUnusedParameters`, `noImplicitReturns`, `noFallthroughCasesInSwitch`, `verbatimModuleSyntax`, and more). No unused anything; type-only imports use `import type`.
-- Prettier enforced: double quotes, semicolons, 2-space indent, 120-col width, trailing commas. Run `npm run format` before committing.
-- Comment the _why_ — file headers explain the deliberate design cut (see `lib/superbash.ts` for the pattern), not a narration of the code.
-- Configuration is environment knobs (`PI_*`) parsed through small pure `parse*` helpers; invalid values fall back to documented defaults (range-clamped), never throw. Read timing varies — at registration (recall) or per-call (subagents) — match the surrounding code.
-- Every network fetch and child process is bounded (timeout, capped buffers). Errors must carry enough detail to act on; choose fail-open vs fail-closed deliberately and say which in a comment.
-
-## Testing conventions
-
-- Pure logic (config parsing, name resolution, formatting, serialization) is exported separately from the extension entry so vitest can cover it directly.
-- Boundaries (child spawn, fetch, filesystem) are injected as deps and replaced with hand-rolled fakes in tests — the house pattern; there is no `vi.mock` in the suite, prefer injected fakes over it. Tests never launch pi or hit the network.
-- Bug fix workflow: write the failing test first, then fix, then re-run `npm run check`.
-
-## Design through-line
-
-**Keep the parent agent's context small; fail explicitly.** Extensions add capability without bloating the tool surface the main agent sees. Before adding a tool, message, or wake, justify its context cost. The file-header comments record the deliberate design cuts for each mechanism (see `lib/superbash.ts` for the pattern) — read them before changing one, and update both the header comments and the relevant extension's README section when behavior changes.
-
-## Commit messages
-
-Imperative subject, no scope tags (see `git log --oneline`): "Add a bg tool for backgrounding shell commands". Subject says what and why in one line; bullets below for anything non-obvious.
+- Design through-line: **keep the parent agent's context small; fail explicitly.** Extensions add capability without bloating the tool surface the main agent sees — before adding a tool, message, or wake, justify its context cost.
+- Tests never launch pi or hit the network.
