@@ -2,9 +2,14 @@
  * Subagents extension — delegate focused, isolated work to child pi sessions.
  *
  * Design: a subagent is a fresh pi run (`-p --mode json --no-session`, no
- * extensions/skills/prompt-templates) with the agent definition's system
- * prompt and tool restrictions; the parent sees only the child's final text,
- * so every task must carry its own context. The child binary matches the
+ * skills/prompt-templates/MCP) with the agent definition's system prompt and
+ * tool restrictions. Extensions are opt-in per agent (`extensions:`
+ * frontmatter, or PI_SUBAGENT_EXTENSIONS as the default-for-all knob):
+ * named extensions load into the child via explicit `-e` paths — discovery
+ * stays off, so the default child remains fully isolated and deterministic,
+ * while an agent can be granted capabilities like ssh_bash or gateway
+ * providers. The parent sees only the child's final text, so every task must
+ * carry its own context. The child binary matches the
  * parent's (pi-bolt spawns pi-bolt; PI_SUBAGENT_BIN overrides). Runs are
  * bounded by a hard timeout (PI_SUBAGENT_TIMEOUT_MS) plus an idle watchdog
  * (PI_SUBAGENT_IDLE_TIMEOUT_MS, on by default at 5 minutes) that kills a
@@ -51,6 +56,7 @@ import {
 } from "../../lib/superbash";
 import {
   AGENTS_DIR,
+  effectiveAgent,
   extractAssistantText,
   loadAgents,
   refLabel,
@@ -192,7 +198,14 @@ By default the call blocks until the subagent finishes — waiting on a tool cal
         options.onAdopted = (handle: AdoptedHandle<ChildRun>) =>
           adoptSubagentTask(registry, agent.name, handle, ctx?.sessionManager?.getSessionDir());
       }
-      const run = await runChild(agent, params.task, resolveChildModel(agent.model, ctx?.model), options, spawnFn);
+      // Read per call so PI_SUBAGENT_EXTENSIONS changes apply live.
+      const run = await runChild(
+        effectiveAgent(agent),
+        params.task,
+        resolveChildModel(agent.model, ctx?.model),
+        options,
+        spawnFn,
+      );
       if ("adopted" in run) {
         return {
           content: [{ type: "text", text: backgroundedNotice(agent.name, run.id) }],
@@ -284,7 +297,7 @@ By default the call blocks until every subagent finishes — waiting on a tool c
             options.onAdopted = (handle: AdoptedHandle<ChildRun>) =>
               adoptSubagentTask(registry, agent.name, handle, sessionDir);
           }
-          return runChild(agent, t.task, resolveChildModel(agent.model, ctx?.model), options, spawnFn);
+          return runChild(effectiveAgent(agent), t.task, resolveChildModel(agent.model, ctx?.model), options, spawnFn);
         }),
         parseConcurrency(process.env),
       );

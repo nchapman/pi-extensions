@@ -4,7 +4,9 @@
  * bounded-concurrency driver for batch calls. */
 
 import { spawn as nodeSpawn } from "node:child_process";
-import { basename } from "node:path";
+import { existsSync } from "node:fs";
+import { basename, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { AgentToolResult } from "@earendil-works/pi-coding-agent";
 import {
   type AdoptedHandle,
@@ -52,8 +54,26 @@ export interface AgentDef {
   description: string;
   instructions: string;
   tools: string[];
+  /** The raw frontmatter `tools:` value, kept so tools can be re-resolved
+   * when env-default extensions (PI_SUBAGENT_EXTENSIONS) fill in for a file
+   * that declared none — extension tools in the allowlist would otherwise
+   * have been dropped at parse time as non-builtin names. */
+  toolsSpec?: unknown;
   model?: string;
   thinking?: string;
+  /** Sibling-extension names loaded into the child via `-e` despite
+   * `--no-extensions` (pi honors explicit -e paths even with discovery off).
+   * Empty/undefined = fully isolated child, the default: loading the
+   * parent's extensions by default would bloat every child's tool surface,
+   * risk recursion (subagents spawning subagents), and make runs depend on
+   * whatever happens to be installed. Only agent files under the agents dir
+   * set this — inline agent_md is model-authored and gets none. */
+  extensions?: string[];
+  /** True only for definitions parsed from agent files under the agents dir
+   * — human-authored config, the only source allowed to grant extensions
+   * (inline agent_md is model-authored; its grants are stripped). Gates
+   * effectiveAgent's tools re-resolution, never the spawn itself. */
+  trusted?: boolean;
 }
 
 /** Parse PI_SUBAGENT_TIMEOUT_MS: maximum milliseconds allowed for a child run before killing it. */
@@ -199,15 +219,100 @@ export function resolveChildThinking(param: string | undefined, agentThinking: s
   return param ?? agentThinking ?? DEFAULT_SUBAGENT_THINKING;
 }
 
-/** Construct CLI argv array for launching a pi subprocess in print/json mode with isolated configuration. */
-export function buildChildArgs(agent: AgentDef, task: string, model?: string, thinking?: string): string[] {
+/** Extension names are directory names of sibling extensions — one word of
+ * letters/digits/hyphens/underscores. Anything else (dots, slashes, absolute
+ * paths) is rejected so a frontmatter typo can never walk the filesystem. */
+export const EXTENSION_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+
+/** Parse PI_SUBAGENT_EXTENSIONS: comma/space-separated sibling-extension names
+ * applied to agents that declare none of their own — one knob to give every
+ * subagent a capability (e.g. gateway providers) without editing each agent
+ * file. Invalid-shaped names are dropped, never thrown (knob convention). */
+export function parseExtensionsEnv(env: NodeJS.ProcessEnv): string[] {
+  const raw = env.PI_SUBAGENT_EXTENSIONS;
+  if (typeof raw !== "string" || !raw.trim()) return [];
+  return [
+    ...new Set(
+      raw
+        .split(/[,\s]+/)
+        .map((s) => s.trim())
+        .filter((s) => EXTENSION_NAME_RE.test(s)),
+    ),
+  ];
+}
+
+/** The extensions an agent's children load: the agent file's list wins, else
+ * the env default; empty means fully isolated (the default). */
+export function resolveChildExtensions(agent: Pick<AgentDef, "extensions">, env: NodeJS.ProcessEnv): string[] {
+  return agent.extensions?.length ? agent.extensions : parseExtensionsEnv(env);
+}
+
+/** The package's `extensions/` directory (this module's parent), where
+ * sibling extension directories live. import.meta.url can be unavailable
+ * under some loaders — fall back to a best-effort cwd-relative path and let
+ * the per-name existence check skip cleanly (same cut as recall's worker
+ * path). Evaluated lazily so mocking fs in tests never touches this. */
+function defaultExtensionsRoot(): string {
+  try {
+    return fileURLToPath(new URL("../", import.meta.url));
+  } catch {
+    return join(process.cwd(), "extensions");
+  }
+}
+
+/** Build the `-e <path>` argv pairs for an agent's extensions. Names are
+ * resolved against the package's extensions/ root and must exist as
+ * `<name>/index.ts` (pi loads extension directories through their entry
+ * file); invalid or missing names warn and skip so one typo can't kill the
+ * child — the run degrades to isolation, not to a crash. */
+export function resolveExtensionArgs(
+  names: readonly string[],
+  opts: { root?: string; exists?: (path: string) => boolean } = {},
+): string[] {
+  const root = opts.root ?? defaultExtensionsRoot();
+  const exists = opts.exists ?? ((p: string) => existsSync(p));
+  const args: string[] = [];
+  for (const name of [...new Set(names)]) {
+    if (!EXTENSION_NAME_RE.test(name)) {
+      console.warn(`subagents: skipping extension "${name}": not a plain extension directory name`);
+      continue;
+    }
+    const entry = join(root, name, "index.ts");
+    if (!exists(entry)) {
+      console.warn(`subagents: skipping extension "${name}": no ${entry}`);
+      continue;
+    }
+    args.push("-e", entry);
+  }
+  return args;
+}
+
+/** Construct CLI argv array for launching a pi subprocess in print/json mode
+ * with isolated configuration. `extensionArgs` are pre-resolved `-e <path>`
+ * pairs (see resolveExtensionArgs); they load named extensions despite
+ * `--no-extensions` — pi honors explicit paths even with discovery off —
+ * while every other isolation flag stays. `--tools` is always emitted with
+ * the agent's explicit allowlist: omitting it would hand the child pi's
+ * settings-dependent default tool selection (neither the builtin set nor
+ * necessarily smaller), and the allowlist doubles as the MCP filter.
+ * `--no-mcp` keeps children off MCP servers in every mode. Pure over its
+ * inputs — no filesystem. */
+export function buildChildArgs(
+  agent: AgentDef,
+  task: string,
+  model?: string,
+  thinking?: string,
+  extensionArgs: readonly string[] = [],
+): string[] {
   const args = [
     "-p",
     "--mode",
     "json",
     "--no-session",
     "--no-extensions",
+    "--no-mcp",
     "--no-skills",
+    ...extensionArgs,
     "--no-prompt-templates",
     "--no-context-files",
     "--system-prompt",
@@ -399,9 +504,13 @@ export function runChild(
     // only requests again after every tool of the turn has finished) or when
     // the stdout cap discards data — both fail toward detection, never away.
     const openToolRuns = new Set<string>();
+    // -e pairs are resolved once here so the exit-error hint can say whether
+    // the child truly ran extensionless (env folding happened earlier, in
+    // effectiveAgent — a definition concern, not a runner concern).
+    const extensionArgs = agent.extensions?.length ? resolveExtensionArgs(agent.extensions) : [];
     const child = spawnFn(
       resolveChildCommand(process.env, process.execPath),
-      buildChildArgs(agent, task, model, options.thinking),
+      buildChildArgs(agent, task, model, options.thinking, extensionArgs),
       { stdio: ["ignore", "pipe", "pipe"], ...(options.cwd ? { cwd: options.cwd } : {}) },
     );
     let stdoutBuf = "";
@@ -601,8 +710,20 @@ export function runChild(
     ) => {
       if (code === 0) fulfill({ text: lastText || "(no output)", usage: lastUsage });
       else {
+        // A model the child cannot resolve is the extension-isolation trap —
+        // but only claim it when the child truly ran extensionless; with -e
+        // args present the miss has another cause (gateway down, typo'd id).
+        // Declared-but-skipped extensions (resolveExtensionArgs warned which
+        // at spawn) get their own wording: telling that user to "declare
+        // extensions:" points at a fix they already applied.
+        let hint = "";
+        if (extensionArgs.length === 0 && /Model ".*" not found/.test(stderrBuf)) {
+          hint = agent.extensions?.length
+            ? " — the declared extension(s) failed to load (see the warning at spawn), so the child ran extensionless; check the names exist under extensions/"
+            : " — the child runs without extensions, so providers registered by an extension are invisible to it; declare `extensions:` in the agent file (e.g. openai-gateways for gateway models) or set PI_SUBAGENT_EXTENSIONS";
+        }
         const error = new Error(
-          `Subagent "${agent.name}" exited with code ${code}: ${stderrBuf.slice(-500) || "no stderr"}`,
+          `Subagent "${agent.name}" exited with code ${code}: ${stderrBuf.slice(-500) || "no stderr"}${hint}`,
         );
         if (lastUsage) Object.assign(error, { usage: lastUsage });
         fail(error);

@@ -19,14 +19,19 @@ import {
   BUILTIN_TOOLS,
   buildChildArgs,
   DEFAULT_AGENT_MD,
+  effectiveAgent,
   extractAssistantText,
   formatUsageLine,
   isValidCommandName,
   loadAgents,
   parseConcurrency,
+  parseExtensionsEnv,
+  parseExtensions,
   parseIdleTimeoutMs,
   parseTimeoutMs,
   resolveChildCommand,
+  resolveChildExtensions,
+  resolveExtensionArgs,
   resolveIdleTimeoutMs,
   DEFAULT_IDLE_TIMEOUT_MS,
   refLabel,
@@ -300,6 +305,15 @@ describe("loadAgents", () => {
     warn.mockRestore();
   });
 
+  it("honors extensions: in agent files — the only trusted source", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-agents-"));
+    writeFileSync(join(dir, "wired.md"), "---\nextensions: [sshbash]\ntools: [read, ssh_bash]\n---\nBody");
+    const agents = loadAgents(dir);
+    expect(agents[0].extensions).toEqual(["sshbash"]);
+    expect(agents[0].tools).toEqual(["read", "ssh_bash"]);
+    expect(agents[0].trusted).toBe(true);
+  });
+
   it("returns empty for a missing dir", () => {
     expect(loadAgents("/nonexistent/pi-agents")).toEqual([]);
   });
@@ -383,6 +397,209 @@ describe("buildChildArgs", () => {
     expect(pinned[pinned.indexOf("--thinking") + 1]).toBe("off");
     expect(buildChildArgs(AGENT, "t")).not.toContain("--thinking");
     expect(args[args.indexOf("--thinking") + 1]).toBe("high");
+  });
+
+  it("never connects MCP servers and keeps isolation flags", () => {
+    const args = buildChildArgs(AGENT, "do it", undefined);
+    expect(args).toContain("--no-extensions");
+    expect(args).toContain("--no-mcp");
+    expect(args).toContain("--no-skills");
+  });
+});
+
+describe("extensions opt-in", () => {
+  it("parseExtensions accepts strings and arrays, rejects path shapes and dedupes", () => {
+    expect(parseExtensions({ extensions: "sshbash, openai-gateways" })).toEqual(["sshbash", "openai-gateways"]);
+    expect(parseExtensions({ extensions: ["sshbash", "sshbash"] })).toEqual(["sshbash"]);
+    expect(parseExtensions({ extensions: "../lib x/y .hidden" })).toEqual([]);
+    expect(parseExtensions({ extensions: 42 })).toEqual([]);
+    expect(parseExtensions({})).toEqual([]);
+  });
+
+  it("parseExtensionsEnv parses the knob and drops invalid names", () => {
+    expect(parseExtensionsEnv({ PI_SUBAGENT_EXTENSIONS: "sshbash, openai-gateways" })).toEqual([
+      "sshbash",
+      "openai-gateways",
+    ]);
+    expect(parseExtensionsEnv({ PI_SUBAGENT_EXTENSIONS: "../evil ok" })).toEqual(["ok"]);
+    expect(parseExtensionsEnv({})).toEqual([]);
+    expect(parseExtensionsEnv({ PI_SUBAGENT_EXTENSIONS: "   " })).toEqual([]);
+  });
+
+  it("resolveChildExtensions lets the agent file win over the env knob", () => {
+    const env = { PI_SUBAGENT_EXTENSIONS: "recall" };
+    expect(resolveChildExtensions({ extensions: ["sshbash"] }, env)).toEqual(["sshbash"]);
+    expect(resolveChildExtensions({ extensions: [] }, env)).toEqual(["recall"]);
+    expect(resolveChildExtensions({}, env)).toEqual(["recall"]);
+    expect(resolveChildExtensions({ extensions: ["sshbash"] }, {})).toEqual(["sshbash"]);
+    expect(resolveChildExtensions({}, {})).toEqual([]);
+  });
+
+  it("resolveExtensionArgs emits -e pairs for existing siblings and skips the rest", () => {
+    const args = resolveExtensionArgs(["sshbash", "nope", "../evil"], {
+      root: "/pkg/extensions",
+      exists: (p) => p === "/pkg/extensions/sshbash/index.ts",
+    });
+    expect(args).toEqual(["-e", "/pkg/extensions/sshbash/index.ts"]);
+  });
+
+  it("buildChildArgs loads declared extensions while keeping discovery off", () => {
+    const agent: AgentDef = { ...AGENT, extensions: ["sshbash"], tools: ["read", "ssh_bash"] };
+    const args = buildChildArgs(agent, "t", undefined, undefined, ["-e", "/pkg/extensions/sshbash/index.ts"]);
+    expect(args).toContain("--no-extensions"); // discovery stays off; -e is the exception
+    const e = args.indexOf("-e");
+    expect(args[e + 1]).toBe("/pkg/extensions/sshbash/index.ts");
+    // --tools is always an explicit allowlist — never inherited from settings
+    expect(args[args.indexOf("--tools") + 1]).toBe("read,ssh_bash");
+    expect(buildChildArgs(AGENT, "t")).toContain("--tools");
+  });
+
+  it("agentFromText carries extensions and toolsSpec only for trusted sources", () => {
+    const trusted = agentFromText("---\nextensions: [sshbash]\ntools: [read, ssh_bash]\n---\nBody", "x", {
+      trusted: true,
+    });
+    expect(trusted.extensions).toEqual(["sshbash"]);
+    expect(trusted.tools).toEqual(["read", "ssh_bash"]); // passthrough with extensions declared
+    expect(trusted.toolsSpec).toEqual(["read", "ssh_bash"]);
+
+    // inline agent_md (default: untrusted) cannot grant itself extensions
+    const inline = agentFromText("---\nextensions: [sshbash]\ntools: [read, ssh_bash]\n---\nBody", "x");
+    expect(inline.extensions).toEqual([]);
+    expect(inline.tools).toEqual(["read"]); // ssh_bash dropped — no extension declared
+
+    // without extensions, unknown tool names are still dropped (typo guard)
+    const typo = agentFromText("---\ntools: [read, ssh_bash]\n---\nBody", "x", { trusted: true });
+    expect(typo.tools).toEqual(["read"]);
+    expect(typo.extensions).toEqual([]);
+  });
+
+  it("resolveTools drops modifier entries that would break or bypass --tools", () => {
+    // pi's --tools treats +name/-name/* as modifiers on the default set: mixed
+    // entries make the child exit(1), all-modifier entries silently swap the
+    // explicit allowlist for the settings default. Never forward them.
+    const agent = agentFromText("---\nextensions: [sshbash]\ntools: [read, +codemode]\n---\nBody", "x", {
+      trusted: true,
+    });
+    expect(agent.tools).toEqual(["read"]);
+    const star = agentFromText("---\nextensions: [sshbash]\ntools: [-bash]\n---\nBody", "x", {
+      trusted: true,
+    });
+    expect(star.tools).toEqual([]); // nothing grantable — never a modifier passthrough
+  });
+
+  it("parseExtensions warns on wrong-shaped values instead of silently isolating", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      expect(parseExtensions({ extensions: { sshbash: true } })).toEqual([]);
+      expect(parseExtensions({ extensions: 7 })).toEqual([]);
+      expect(warn).toHaveBeenCalledTimes(2);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("effectiveAgent folds env extensions in and re-resolves tools from the raw spec", () => {
+    const env = { PI_SUBAGENT_EXTENSIONS: "sshbash" };
+    // allowlist form: the knob-granted extension tool survives re-resolution
+    const allowlisted = agentFromText("---\ntools: [read, ssh_bash]\n---\nBody", "f", { trusted: true });
+    const folded = effectiveAgent(allowlisted, env);
+    expect(folded.extensions).toEqual(["sshbash"]);
+    expect(folded.tools).toEqual(["read", "ssh_bash"]);
+    // no tools key: still every builtin, never a settings-dependent default
+    expect(effectiveAgent(agentFromText("---\n---\nBody", "f", { trusted: true }), env).tools).toEqual(BUILTIN_TOOLS);
+    // map form restricts builtins and cannot grant extension tools
+    const mapped = agentFromText("---\ntools:\n  write: false\n---\nBody", "f", { trusted: true });
+    expect(effectiveAgent(mapped, env).tools).toEqual(BUILTIN_TOOLS.filter((t) => t !== "write"));
+    // agents that declared their own extensions are untouched by the knob
+    const own = agentFromText("---\nextensions: [recall]\n---\nBody", "f", { trusted: true });
+    expect(effectiveAgent(own, env)).toBe(own);
+    // and without the knob nothing changes
+    expect(effectiveAgent(allowlisted, {})).toBe(allowlisted);
+  });
+
+  it("effectiveAgent never re-grants extension tools to untrusted inline definitions", () => {
+    const env = { PI_SUBAGENT_EXTENSIONS: "sshbash" };
+    // inline agent_md: extensions stripped at parse, ssh_bash dropped from tools
+    const inline = agentFromText("---\nextensions: [sshbash]\ntools: [read, ssh_bash]\n---\nBody", "x");
+    expect(inline.trusted).toBeUndefined();
+    const folded = effectiveAgent(inline, env);
+    // the human-set knob still loads the extension into the child…
+    expect(folded.extensions).toEqual(["sshbash"]);
+    // …but the model-authored definition cannot grant itself the tool
+    expect(folded.tools).toEqual(["read"]);
+  });
+
+  it("children with env-folded extensions spawn with -e and an explicit tool allowlist", async () => {
+    const saved = process.env.PI_SUBAGENT_EXTENSIONS;
+    process.env.PI_SUBAGENT_EXTENSIONS = "sshbash";
+    try {
+      const seen: string[][] = [];
+      const child = fakeChild();
+      const agent = effectiveAgent(agentFromText("---\ntools: [read, ssh_bash]\n---\nBody", "f", { trusted: true }));
+      const p = runChild(agent, "task", undefined, { timeoutMs: 5000 }, (_c, args) => {
+        seen.push(args);
+        return child;
+      });
+      child.close(0);
+      await p;
+      const e = seen[0].indexOf("-e");
+      // buildChildArgs validates against the real extensions root; sshbash
+      // is a real sibling in this package, so the -e pair must be present.
+      expect(e).toBeGreaterThanOrEqual(0);
+      expect(seen[0][e + 1]).toMatch(/extensions[\/]sshbash[\/]index\.ts$/);
+      expect(seen[0][seen[0].indexOf("--tools") + 1]).toBe("read,ssh_bash");
+    } finally {
+      if (saved === undefined) delete process.env.PI_SUBAGENT_EXTENSIONS;
+      else process.env.PI_SUBAGENT_EXTENSIONS = saved;
+    }
+  });
+
+  it("hints at the extension opt-in only when the child ran extensionless", async () => {
+    const bare = fakeChild();
+    const p1 = runChild(AGENT, "task", undefined, { timeoutMs: 5000 }, () => bare);
+    bare.stderrEmit('Error: Model "antigravity/gemini-3-pro" not found. Use --list-models to see available models.');
+    bare.close(1);
+    await expect(p1).rejects.toThrow(/PI_SUBAGENT_EXTENSIONS/);
+
+    // with extensions loaded the same miss has another cause — no misleading hint
+    const ext = fakeChild();
+    const agent: AgentDef = { ...AGENT, extensions: ["sshbash"] };
+    const p2 = runChild(agent, "task", undefined, { timeoutMs: 5000 }, () => ext);
+    ext.stderrEmit('Error: Model "antigravity/gemini-3-pro" not found. Use --list-models to see available models.');
+    ext.close(1);
+    const err = await p2.then(
+      () => undefined,
+      (e: Error) => e,
+    );
+    expect(err?.message).toMatch(/exited with code 1/);
+    expect(err?.message).not.toMatch(/PI_SUBAGENT_EXTENSIONS/);
+  });
+
+  it("degrades to isolation when a declared extension is missing, with its own hint", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const seen: string[][] = [];
+      const child = fakeChild();
+      const agent: AgentDef = { ...AGENT, extensions: ["does-not-exist"] };
+      const p = runChild(agent, "task", undefined, { timeoutMs: 5000 }, (_c, args) => {
+        seen.push(args);
+        return child;
+      });
+      child.stderrEmit('Error: Model "antigravity/gemini-3-pro" not found.');
+      child.close(1);
+      const err = await p.then(
+        () => undefined,
+        (e: Error) => e,
+      );
+      // one typo degrades the run to isolation, never kills it: no -e, tools intact
+      expect(seen[0].indexOf("-e")).toBe(-1);
+      expect(seen[0][seen[0].indexOf("--tools") + 1]).toBe("read,bash");
+      // and the hint names the real cause — not "declare extensions"
+      expect(err?.message).toMatch(/declared extension\(s\) failed to load/);
+      expect(err?.message).not.toMatch(/PI_SUBAGENT_EXTENSIONS/);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 

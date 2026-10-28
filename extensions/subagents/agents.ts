@@ -8,7 +8,14 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { type AgentDef, BUILTIN_TOOLS, THINKING_LEVELS, isValidThinkingLevel } from "./child";
+import {
+  type AgentDef,
+  BUILTIN_TOOLS,
+  EXTENSION_NAME_RE,
+  THINKING_LEVELS,
+  isValidThinkingLevel,
+  resolveChildExtensions,
+} from "./child";
 
 /** Frontmatter delimiter: `---` at column 0, tolerant of trailing whitespace. */
 const DELIMITER = /^---[ \t]*$/;
@@ -47,18 +54,34 @@ function isEnabled(raw: unknown): boolean {
   return !FALSY.has(String(raw).trim().toLowerCase());
 }
 
-function warnUnknownTools(kind: string, names: string[]): void {
-  const unknown = names.filter((n) => !BUILTIN_TOOLS.includes(n)).map((n) => `"${n}"`);
-  if (unknown.length > 0) {
-    console.warn(`tools: ignoring unknown ${kind} ${unknown.join(", ")} (known: ${BUILTIN_TOOLS.join(", ")})`);
+/** A tool name pi's --tools accepts as a plain entry. pi also allows
+ * modifier entries (`+name`, `-name`, patterns like `*`) that adjust the
+ * *default* selection instead of restricting it — forwarding one verbatim
+ * either makes the child exit(1) (mixed names and modifiers) or silently
+ * swaps the explicit allowlist for the settings default. Passthrough extras
+ * must therefore be plain names; anything else warns and drops. */
+const TOOL_NAME_RE = /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/;
+
+function warnUnknownTools(kind: string, names: string[], extensions: readonly string[]): void {
+  // With extensions declared, non-builtin names are extension tools (ssh_bash,
+  // …) loaded into the child via -e — pass them through. Without extensions
+  // they are typos: warn and drop, since the child would never see the tool.
+  const unknown = names.filter((n) => !BUILTIN_TOOLS.includes(n));
+  if (unknown.length > 0 && extensions.length === 0) {
+    console.warn(
+      `tools: ignoring unknown ${kind} ${unknown.map((n) => `"${n}"`).join(", ")} (known: ${BUILTIN_TOOLS.join(", ")}; list extension tools only alongside \`extensions:\`)`,
+    );
   }
 }
 
 /** Tools restriction accepts an allowlist string (`tools: read, bash`), an
  * allowlist array (`tools: [read, bash]`), or a per-tool enable map
  * (`tools: {write: false}`); anything else means all built-in tools.
- * A map entry with no value (`write:`) disables the tool — fail closed. */
-export function resolveTools(fm: Record<string, unknown>): string[] {
+ * A map entry with no value (`write:`) disables the tool — fail closed.
+ * When the agent declares extensions, allowlist entries beyond the builtins
+ * pass through unchanged so extension tools can be granted explicitly; the
+ * map form cannot grant them (it only restricts builtins) and says so. */
+export function resolveTools(fm: Record<string, unknown>, extensions: readonly string[] = []): string[] {
   const t = fm.tools;
   const names =
     typeof t === "string" && t.trim()
@@ -73,13 +96,33 @@ export function resolveTools(fm: Record<string, unknown>): string[] {
             .filter(Boolean)
         : null;
   if (names) {
-    warnUnknownTools("name(s) in", names);
+    warnUnknownTools("name(s) in", names, extensions);
     const allow = new Set(names);
-    return BUILTIN_TOOLS.filter((b) => allow.has(b));
+    const builtins = BUILTIN_TOOLS.filter((b) => allow.has(b));
+    let extra: string[] = [];
+    if (extensions.length > 0) {
+      const nonBuiltin = names.filter((n) => !BUILTIN_TOOLS.includes(n));
+      extra = nonBuiltin.filter((n) => TOOL_NAME_RE.test(n));
+      const rejected = nonBuiltin.filter((n) => !TOOL_NAME_RE.test(n));
+      if (rejected.length > 0) {
+        console.warn(
+          `tools: dropping ${rejected.map((n) => `"${n}"`).join(", ")} — not plain tool names (+name/-name/pattern entries would break or bypass the child's --tools allowlist)`,
+        );
+      }
+    }
+    return [...builtins, ...extra];
   }
   if (t && typeof t === "object") {
     const map = t as Record<string, unknown>;
-    warnUnknownTools("key(s) in", Object.keys(map));
+    warnUnknownTools("key(s) in", Object.keys(map), extensions);
+    if (extensions.length > 0) {
+      const ungrantable = Object.keys(map).filter((k) => !BUILTIN_TOOLS.includes(k));
+      if (ungrantable.length > 0) {
+        console.warn(
+          `tools: map form cannot grant extension tool(s) ${ungrantable.map((k) => `"${k}"`).join(", ")} — use the allowlist form (tools: [read, ${ungrantable[0]}])`,
+        );
+      }
+    }
     return BUILTIN_TOOLS.filter((b) => {
       const raw = map[b];
       if (raw === undefined) return true;
@@ -90,11 +133,41 @@ export function resolveTools(fm: Record<string, unknown>): string[] {
   return [...BUILTIN_TOOLS];
 }
 
+/** `extensions:` accepts a comma/space-separated string or an array of
+ * sibling-extension names the child loads via `-e`. Invalid-shaped names
+ * (paths, dots) warn and skip — they can never walk the filesystem. */
+export function parseExtensions(fm: Record<string, unknown>): string[] {
+  const raw = fm.extensions;
+  if (raw !== undefined && typeof raw !== "string" && !Array.isArray(raw)) {
+    // A wrong shape (a YAML map, a bare number) would otherwise silently
+    // degrade every run of this agent to an isolated child — the exact
+    // misleading "model not found" failure the run-time hint untangles.
+    console.warn(`extensions: ignoring ${typeof raw} value — use a list of extension directory names`);
+    return [];
+  }
+  const names = typeof raw === "string" && raw.trim() ? raw.split(/[,\s]+/) : Array.isArray(raw) ? raw.map(String) : [];
+  const valid: string[] = [];
+  for (const name of names) {
+    const n = name.trim();
+    if (!n) continue;
+    if (!EXTENSION_NAME_RE.test(n)) {
+      console.warn(`extensions: ignoring "${n}" — must be a plain extension directory name`);
+      continue;
+    }
+    if (!valid.includes(n)) valid.push(n);
+  }
+  return valid;
+}
+
 /**
  * Parse an agent markdown definition containing YAML frontmatter and markdown body instructions.
  * Validates thinking level if specified and falls back to fallbackName if frontmatter omits a name.
+ * `extensions:` is honored only for trusted sources (agent files under the
+ * agents dir, human-authored): inline agent_md is model-authored, and a
+ * prompt-supplied definition granting itself extension capabilities is
+ * escalation by prompt — stripped there with a warning, fail closed.
  */
-export function agentFromText(text: string, fallbackName: string): AgentDef {
+export function agentFromText(text: string, fallbackName: string, opts: { trusted?: boolean } = {}): AgentDef {
   const { fm, body } = splitFrontmatter(text);
   const name = typeof fm.name === "string" && fm.name ? fm.name : fallbackName;
   const thinking = typeof fm.thinking === "string" && fm.thinking ? fm.thinking : undefined;
@@ -104,14 +177,41 @@ export function agentFromText(text: string, fallbackName: string): AgentDef {
   if (thinking !== undefined && !isValidThinkingLevel(thinking)) {
     throw new Error(`agent ${name}: invalid thinking "${thinking}" — must be one of ${THINKING_LEVELS.join("|")}`);
   }
+  let extensions = parseExtensions(fm);
+  if (!opts.trusted && extensions.length > 0) {
+    console.warn(
+      `agent ${name}: ignoring "extensions:" in an inline definition — extension grants belong in an agent file`,
+    );
+    extensions = [];
+  }
   return {
     name,
     description: typeof fm.description === "string" ? fm.description : "",
     instructions: body,
-    tools: resolveTools(fm),
+    tools: resolveTools(fm, extensions),
+    toolsSpec: fm.tools,
     model: typeof fm.model === "string" && fm.model ? fm.model : undefined,
     thinking,
+    extensions,
+    trusted: opts.trusted === true || undefined,
   };
+}
+
+/** The agent as its children will run it: when the file declares no
+ * extensions of its own, PI_SUBAGENT_EXTENSIONS fills in (a human-set knob —
+ * it applies to ad-hoc inline agents too, by its own meaning of "every
+ * subagent"), and tools re-resolve from the raw spec so extension tools
+ * named in the allowlist survive — they were dropped at parse time as
+ * non-builtin names because the file declared no extensions. Untrusted
+ * (inline) definitions keep their parse-time tools: re-resolving would
+ * re-grant exactly the extension tools the trust strip removed, letting a
+ * model-authored definition grant itself capabilities. */
+export function effectiveAgent(agent: AgentDef, env: NodeJS.ProcessEnv = process.env): AgentDef {
+  if (agent.extensions?.length) return agent;
+  const extensions = resolveChildExtensions(agent, env);
+  if (extensions.length === 0) return agent;
+  if (!agent.trusted) return { ...agent, extensions };
+  return { ...agent, extensions, tools: resolveTools({ tools: agent.toolsSpec }, extensions) };
 }
 
 /** Generic agent used when a call names no agent and supplies no definition. */
@@ -186,7 +286,8 @@ export function loadAgents(dir: string): AgentDef[] {
     if (!file.endsWith(".md")) continue;
     try {
       const text = readFileSync(join(dir, file), "utf8");
-      agents.push(agentFromText(text, file.replace(/\.md$/, "")));
+      // Agent files are human-authored config — only they may grant extensions.
+      agents.push(agentFromText(text, file.replace(/\.md$/, ""), { trusted: true }));
     } catch (error) {
       console.warn(`subagents: skipping ${file}: ${error instanceof Error ? error.message : String(error)}`);
     }

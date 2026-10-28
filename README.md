@@ -17,7 +17,7 @@ Pi loads the TypeScript in this directory directly; there is no build step. The 
 
 | Extension                                        | Adds                                                                               | Useful for                                                                                                                                                                                                                                          |
 | ------------------------------------------------ | ---------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`subagents`](extensions/subagents/)             | `subagent`, `subagents`, background-task tools, `/tasks`, and named agent commands | Delegating work or running shell commands in parallel or background tasks. Blocking is default; wakes deliver results at turn boundaries. Replaces pi's `bash` tool with inline, auto, and background modes.                                        |
+| [`subagents`](extensions/subagents/)             | `subagent`, `subagents`, background-task tools, `/tasks`, and named agent commands | Delegating work or running shell commands in parallel or background tasks. Blocking is default; wakes deliver results at turn boundaries. Replaces pi's `bash` tool with inline, auto, and background modes. Children run isolated but can load extensions opt-in (`extensions:` frontmatter, `PI_SUBAGENT_EXTENSIONS`).                                        |
 | [`recall`](extensions/recall/)                   | `recall`                                                                           | Finding details from earlier in the session after compaction. Searches archived turns with BM25 lexical ranking and optional local semantic search; also manages context compaction and summaries.                                                  |
 | [`todo`](extensions/todo/)                       | `todo`, `/todos`                                                                   | Keeping a multi-step plan visible and recoverable across compaction, rewind, and resume. Replaces the complete list on each update; staleness reminders skip wake-driven agent starts.                                                              |
 | [`goal`](extensions/goal/)                       | `goal`, `/goal`                                                                    | Pursuing one high-level objective with per-criterion evidence and an optional verification command. Bounded by continuation and pivot limits; a settle judge manages measurement cadence, progress, and typed stops. Killable mid-run with `alt+x`. |
@@ -100,7 +100,7 @@ Use `recall` to find decisions, code snippets, or rationale that compaction remo
 
 ### Defining Subagents
 
-`subagents` reads agent definitions from `~/.pi/agent/agents/*.md`. Frontmatter configures tools, models, and thinking:
+`subagents` reads agent definitions from `~/.pi/agent/agents/*.md`. Frontmatter configures tools, models, thinking, and extensions:
 
 ```yaml
 ---
@@ -111,7 +111,27 @@ thinking: medium
 Review the requested change. Report actionable findings with file and line references.
 ```
 
-Each defined agent automatically registers a matching `/name` slash command. Child runs are isolated and headless.
+Each defined agent automatically registers a matching `/name` slash command. Child runs are isolated and headless: no extensions, skills, prompt templates, context files, or MCP servers by default.
+
+### Loading Extensions into Children
+
+By default a child sees only pi's built-in tools — loading the parent's extensions wholesale would bloat every child's tool surface, risk recursion (subagents spawning subagents), and make runs depend on whatever happens to be installed. But some capabilities only exist as extensions (`ssh_bash`, gateway providers, …), so an agent can opt in per name:
+
+```yaml
+---
+description: Investigate on remote machines
+extensions: [sshbash, openai-gateways]
+tools: [read, grep, ssh_bash]
+model: yeti/qwen3.8-27b
+---
+Investigate the remote host…
+```
+
+- Names are sibling directories of this package's `extensions/`; the child loads each via an explicit `-e <path>` flag — extension *discovery* stays off (`--no-extensions` and `--no-mcp` are always passed), so an opted-in child gets exactly the named extensions and nothing else.
+- Extension tools are granted by naming them in the `tools:` allowlist (as `ssh_bash` above). The child's tool set is always an explicit allowlist — never inherited from pi settings — and the `tools:` map form can only restrict builtins, not grant extension tools.
+- Only agent files under `~/.pi/agent/agents` may declare `extensions:` — inline `agent_md` is model-authored, and a definition granting itself extension capabilities would be escalation by prompt, so it is stripped there (with a warning).
+- `PI_SUBAGENT_EXTENSIONS=sshbash,openai-gateways` applies the same list to every agent that doesn't declare its own — including ad-hoc ones — one knob to give all subagents gateway providers, say. Extension tools named in an agent's `tools:` survive when the knob fills the gap.
+- The natural fix for "subagent exited with `Model "..." not found"": the model's provider is registered by an extension the child can't see (e.g. a gateway); when the child ran extensionless the run's error says exactly this, and `extensions:` (or the env knob) is the fix. The openai-gateways models.json mirror already covers gateway models for children that don't opt in.
 
 ### Execution and Thinking Levels
 
@@ -172,7 +192,7 @@ Configure local proxies and gateways (such as Ollama, vLLM, or LM Studio) in `~/
 }
 ```
 
-The extension queries `<baseUrl>/models` and mirrors discovered models into pi's `~/.pi/agent/models.json`, ensuring headless and subagent runs can resolve them.
+The extension queries `<baseUrl>/models` and mirrors discovered models into pi's `~/.pi/agent/models.json`, ensuring headless and subagent runs can resolve them. Subagents can also load the extension directly (`extensions: [openai-gateways]` in the agent file, or `PI_SUBAGENT_EXTENSIONS`) — the child then discovers the live catalog itself instead of relying on the mirror.
 
 ## Configuration
 
