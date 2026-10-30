@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -416,12 +416,20 @@ describe("extensions opt-in", () => {
     expect(parseExtensions({})).toEqual([]);
   });
 
-  it("parseExtensionsEnv parses the knob and drops invalid names", () => {
+  it("parseExtensionsEnv parses the knob, keeps path entries, drops junk", () => {
     expect(parseExtensionsEnv({ PI_SUBAGENT_EXTENSIONS: "sshbash, openai-gateways" })).toEqual([
       "sshbash",
       "openai-gateways",
     ]);
-    expect(parseExtensionsEnv({ PI_SUBAGENT_EXTENSIONS: "../evil ok" })).toEqual(["ok"]);
+    // absolute and ~ paths are third-party extension entries — kept verbatim
+    expect(
+      parseExtensionsEnv({
+        PI_SUBAGENT_EXTENSIONS: "~/.pi/agent/npm/node_modules/pi-antigravity/src/index.ts",
+      }),
+    ).toEqual(["~/.pi/agent/npm/node_modules/pi-antigravity/src/index.ts"]);
+    expect(parseExtensionsEnv({ PI_SUBAGENT_EXTENSIONS: "/opt/exts/review" })).toEqual(["/opt/exts/review"]);
+    // cwd-relative paths are not entries (cwd varies per session) nor names
+    expect(parseExtensionsEnv({ PI_SUBAGENT_EXTENSIONS: "../evil ./ok" })).toEqual([]);
     expect(parseExtensionsEnv({})).toEqual([]);
     expect(parseExtensionsEnv({ PI_SUBAGENT_EXTENSIONS: "   " })).toEqual([]);
   });
@@ -441,6 +449,28 @@ describe("extensions opt-in", () => {
       exists: (p) => p === "/pkg/extensions/sshbash/index.ts",
     });
     expect(args).toEqual(["-e", "/pkg/extensions/sshbash/index.ts"]);
+  });
+
+  it("resolveExtensionArgs resolves path entries: file as-is, dir by convention", () => {
+    const exists = (p: string) =>
+      p === "/npm/pi-antigravity/src/index.ts" ||
+      p === "/opt/exts/review/index.js" ||
+      p === join(homedir(), ".pi/x/index.ts");
+    // an entry file is used verbatim
+    expect(resolveExtensionArgs(["/npm/pi-antigravity/src/index.ts"], { exists })).toEqual([
+      "-e",
+      "/npm/pi-antigravity/src/index.ts",
+    ]);
+    // a directory picks its conventional entry (src/ layout for npm packages)
+    expect(resolveExtensionArgs(["/npm/pi-antigravity"], { exists })).toEqual([
+      "-e",
+      "/npm/pi-antigravity/src/index.ts",
+    ]);
+    expect(resolveExtensionArgs(["/opt/exts/review"], { exists })).toEqual(["-e", "/opt/exts/review/index.js"]);
+    // ~ expands to the home directory
+    expect(resolveExtensionArgs(["~/.pi/x"], { exists })).toEqual(["-e", join(homedir(), ".pi/x/index.ts")]);
+    // nothing found → skipped (warned), never fatal
+    expect(resolveExtensionArgs(["/opt/exts/missing"], { exists })).toEqual([]);
   });
 
   it("buildChildArgs loads declared extensions while keeping discovery off", () => {

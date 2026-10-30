@@ -5,6 +5,7 @@
 
 import { spawn as nodeSpawn } from "node:child_process";
 import { existsSync } from "node:fs";
+import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentToolResult } from "@earendil-works/pi-coding-agent";
@@ -224,10 +225,16 @@ export function resolveChildThinking(param: string | undefined, agentThinking: s
  * paths) is rejected so a frontmatter typo can never walk the filesystem. */
 export const EXTENSION_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 
-/** Parse PI_SUBAGENT_EXTENSIONS: comma/space-separated sibling-extension names
+/** Parse PI_SUBAGENT_EXTENSIONS: comma/space-separated extension entries
  * applied to agents that declare none of their own — one knob to give every
  * subagent a capability (e.g. gateway providers) without editing each agent
- * file. Invalid-shaped names are dropped, never thrown (knob convention). */
+ * file. Entries are either sibling-extension names (resolved against this
+ * package's extensions/ root, same as frontmatter) or absolute/`~`-relative
+ * paths to a third-party extension entry (file, or a directory holding
+ * index.ts / src/index.ts / …) — the knob is human-authored config, so
+ * pointing it at arbitrary code is the author's call; frontmatter stays
+ * name-only. Invalid-shaped entries are dropped, never thrown (knob
+ * convention). */
 export function parseExtensionsEnv(env: NodeJS.ProcessEnv): string[] {
   const raw = env.PI_SUBAGENT_EXTENSIONS;
   if (typeof raw !== "string" || !raw.trim()) return [];
@@ -236,9 +243,29 @@ export function parseExtensionsEnv(env: NodeJS.ProcessEnv): string[] {
       raw
         .split(/[,\s]+/)
         .map((s) => s.trim())
-        .filter((s) => EXTENSION_NAME_RE.test(s)),
+        .filter((s) => EXTENSION_NAME_RE.test(s) || isPathEntry(s)),
     ),
   ];
+}
+
+/** An entry is path-shaped when it is absolute or `~`-relative — resolved
+ * from the filesystem instead of the sibling root. Cwd-relative forms
+ * (./x, ../x) are deliberately not path entries: the parent's cwd varies
+ * per session, so they would resolve differently on every spawn. */
+function isPathEntry(entry: string): boolean {
+  return entry.startsWith("/") || entry.startsWith("~");
+}
+
+/** Resolve a path entry to an extension entry file: a file is used as-is;
+ * a directory picks its conventional entry (index.ts / index.js, then
+ * src/… — the pi npm-package layout, e.g. pi-antigravity). ~ expands to
+ * the home dir. Undefined when nothing exists. */
+function resolvePathEntry(entry: string, exists: (p: string) => boolean): string | undefined {
+  const base = entry.startsWith("~") ? join(homedir(), entry.slice(1)) : entry;
+  const candidates = /\.(ts|js|mjs|cjs)$/.test(base)
+    ? [base]
+    : [join(base, "index.ts"), join(base, "index.js"), join(base, "src", "index.ts"), join(base, "src", "index.js")];
+  return candidates.find(exists);
 }
 
 /** The extensions an agent's children load: the agent file's list wins, else
@@ -260,11 +287,13 @@ function defaultExtensionsRoot(): string {
   }
 }
 
-/** Build the `-e <path>` argv pairs for an agent's extensions. Names are
- * resolved against the package's extensions/ root and must exist as
- * `<name>/index.ts` (pi loads extension directories through their entry
- * file); invalid or missing names warn and skip so one typo can't kill the
- * child — the run degrades to isolation, not to a crash. */
+/** Build the `-e <path>` argv pairs for an agent's extensions. Plain names
+ * resolve against the package's extensions/ root and must exist as
+ * `<name>/index.ts`; path entries (absolute or `~`-relative) resolve to a
+ * file or a directory's conventional entry, so third-party extensions
+ * (npm packages under ~/.pi/agent/npm, e.g. pi-antigravity) load too.
+ * Invalid or missing entries warn and skip so one typo can't kill the child
+ * — the run degrades to isolation, not to a crash. */
 export function resolveExtensionArgs(
   names: readonly string[],
   opts: { root?: string; exists?: (path: string) => boolean } = {},
@@ -273,6 +302,15 @@ export function resolveExtensionArgs(
   const exists = opts.exists ?? ((p: string) => existsSync(p));
   const args: string[] = [];
   for (const name of [...new Set(names)]) {
+    if (isPathEntry(name)) {
+      const entry = resolvePathEntry(name, exists);
+      if (!entry) {
+        console.warn(`subagents: skipping extension "${name}": no entry file found`);
+        continue;
+      }
+      args.push("-e", entry);
+      continue;
+    }
     if (!EXTENSION_NAME_RE.test(name)) {
       console.warn(`subagents: skipping extension "${name}": not a plain extension directory name`);
       continue;
