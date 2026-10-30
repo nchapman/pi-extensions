@@ -4,7 +4,7 @@
  * bounded-concurrency driver for batch calls. */
 
 import { spawn as nodeSpawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -228,13 +228,13 @@ export const EXTENSION_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 /** Parse PI_SUBAGENT_EXTENSIONS: comma/space-separated extension entries
  * applied to agents that declare none of their own — one knob to give every
  * subagent a capability (e.g. gateway providers) without editing each agent
- * file. Entries are either sibling-extension names (resolved against this
- * package's extensions/ root, same as frontmatter) or absolute/`~`-relative
- * paths to a third-party extension entry (file, or a directory holding
- * index.ts / src/index.ts / …) — the knob is human-authored config, so
- * pointing it at arbitrary code is the author's call; frontmatter stays
- * name-only. Invalid-shaped entries are dropped, never thrown (knob
- * convention). */
+ * file. Entries are sibling-extension names (resolved against this
+ * package's extensions/ root, same as frontmatter), `npm:<package>`
+ * shorthands (pi's npm extension root, same spelling `pi list` shows), or
+ * absolute/`~`-relative paths to a third-party extension entry — paths are
+ * env-only (human-authored config, arbitrary code is the author's call);
+ * names and npm shorthands are validated shapes and allowed in frontmatter
+ * too. Invalid-shaped entries are dropped, never thrown (knob convention). */
 export function parseExtensionsEnv(env: NodeJS.ProcessEnv): string[] {
   const raw = env.PI_SUBAGENT_EXTENSIONS;
   if (typeof raw !== "string" || !raw.trim()) return [];
@@ -243,7 +243,7 @@ export function parseExtensionsEnv(env: NodeJS.ProcessEnv): string[] {
       raw
         .split(/[,\s]+/)
         .map((s) => s.trim())
-        .filter((s) => EXTENSION_NAME_RE.test(s) || isPathEntry(s)),
+        .filter((s) => EXTENSION_NAME_RE.test(s) || isNpmEntry(s) || isPathEntry(s)),
     ),
   ];
 }
@@ -256,22 +256,69 @@ function isPathEntry(entry: string): boolean {
   return entry.startsWith("/") || entry.startsWith("~");
 }
 
-/** Resolve a path entry to an extension entry file: a file is used as-is;
- * a directory picks its conventional entry (index.ts / index.js, then
- * src/… — the pi npm-package layout, e.g. pi-antigravity). ~ expands to
- * the home dir. Undefined when nothing exists. */
-function resolvePathEntry(entry: string, exists: (p: string) => boolean): string | undefined {
-  const base = entry.startsWith("~") ? join(homedir(), entry.slice(1)) : entry;
-  const candidates = /\.(ts|js|mjs|cjs)$/.test(base)
-    ? [base]
-    : [join(base, "index.ts"), join(base, "index.js"), join(base, "src", "index.ts"), join(base, "src", "index.js")];
+/** An `npm:<package>` entry uses the same shorthand `pi list` shows for
+ * npm-installed extensions: the package directory under
+ * ~/.pi/agent/npm/node_modules. The name part is regex-validated (optional
+ * @scope, no `..`/absolute shapes), so unlike path entries an npm entry can
+ * only ever reach the fixed npm root — safe for frontmatter too. */
+const NPM_ENTRY_RE = /^npm:@?[A-Za-z0-9][A-Za-z0-9._-]*(?:\/[A-Za-z0-9][A-Za-z0-9._-]*)?$/;
+
+export function isNpmEntry(entry: string): boolean {
+  return NPM_ENTRY_RE.test(entry);
+}
+
+/** Resolve a directory to its extension entry file: package.json `main`
+ * first (the package's own declaration), then the conventional layouts
+ * (index.ts / index.js, then src/… — pi npm packages like pi-antigravity
+ * ship TypeScript sources with `main: ./src/index.ts`). */
+function resolveDirEntry(
+  dir: string,
+  exists: (p: string) => boolean,
+  readFile: (p: string) => string | undefined,
+): string | undefined {
+  const candidates: string[] = [];
+  const pkg = readFile(join(dir, "package.json"));
+  if (pkg) {
+    try {
+      const main = (JSON.parse(pkg) as { main?: unknown }).main;
+      if (typeof main === "string" && main) candidates.push(join(dir, main));
+    } catch {
+      // unparseable package.json — fall through to the conventions
+    }
+  }
+  candidates.push(
+    join(dir, "index.ts"),
+    join(dir, "index.js"),
+    join(dir, "src", "index.ts"),
+    join(dir, "src", "index.js"),
+  );
   return candidates.find(exists);
+}
+
+/** Resolve a path entry to an extension entry file: a file is used as-is;
+ * a directory resolves via package.json main or convention (see
+ * resolveDirEntry). ~ expands to the home dir. Undefined when nothing
+ * exists. */
+function resolvePathEntry(
+  entry: string,
+  exists: (p: string) => boolean,
+  readFile: (p: string) => string | undefined,
+): string | undefined {
+  const base = entry.startsWith("~") ? join(homedir(), entry.slice(1)) : entry;
+  return /\.(ts|js|mjs|cjs)$/.test(base) ? (exists(base) ? base : undefined) : resolveDirEntry(base, exists, readFile);
 }
 
 /** The extensions an agent's children load: the agent file's list wins, else
  * the env default; empty means fully isolated (the default). */
 export function resolveChildExtensions(agent: Pick<AgentDef, "extensions">, env: NodeJS.ProcessEnv): string[] {
   return agent.extensions?.length ? agent.extensions : parseExtensionsEnv(env);
+}
+
+/** pi's npm extension root — where `pi install npm:<package>` materializes
+ * packages (the same paths `pi list` shows). Lazily derived from the home
+ * dir; overridable in resolveExtensionArgs for tests. */
+function defaultNpmRoot(): string {
+  return join(homedir(), ".pi/agent/npm/node_modules");
 }
 
 /** The package's `extensions/` directory (this module's parent), where
@@ -289,21 +336,46 @@ function defaultExtensionsRoot(): string {
 
 /** Build the `-e <path>` argv pairs for an agent's extensions. Plain names
  * resolve against the package's extensions/ root and must exist as
- * `<name>/index.ts`; path entries (absolute or `~`-relative) resolve to a
- * file or a directory's conventional entry, so third-party extensions
- * (npm packages under ~/.pi/agent/npm, e.g. pi-antigravity) load too.
- * Invalid or missing entries warn and skip so one typo can't kill the child
- * — the run degrades to isolation, not to a crash. */
+ * `<name>/index.ts`; `npm:<package>` entries resolve under
+ * ~/.pi/agent/npm/node_modules (package.json main or conventional entry);
+ * path entries (absolute or `~`-relative) resolve to a file or directory
+ * entry. Invalid or missing entries warn and skip so one typo can't kill
+ * the child — the run degrades to isolation, not to a crash. */
 export function resolveExtensionArgs(
   names: readonly string[],
-  opts: { root?: string; exists?: (path: string) => boolean } = {},
+  opts: {
+    root?: string;
+    npmRoot?: string;
+    exists?: (path: string) => boolean;
+    readFile?: (path: string) => string | undefined;
+  } = {},
 ): string[] {
   const root = opts.root ?? defaultExtensionsRoot();
+  const npmRoot = opts.npmRoot ?? defaultNpmRoot();
   const exists = opts.exists ?? ((p: string) => existsSync(p));
+  const readFile =
+    opts.readFile ??
+    ((p: string) => {
+      try {
+        return readFileSync(p, "utf8");
+      } catch {
+        return undefined;
+      }
+    });
   const args: string[] = [];
   for (const name of [...new Set(names)]) {
+    if (isNpmEntry(name)) {
+      const dir = join(npmRoot, name.slice("npm:".length));
+      const entry = resolveDirEntry(dir, exists, readFile);
+      if (!entry) {
+        console.warn(`subagents: skipping extension "${name}": no entry file under ${dir}`);
+        continue;
+      }
+      args.push("-e", entry);
+      continue;
+    }
     if (isPathEntry(name)) {
-      const entry = resolvePathEntry(name, exists);
+      const entry = resolvePathEntry(name, exists, readFile);
       if (!entry) {
         console.warn(`subagents: skipping extension "${name}": no entry file found`);
         continue;

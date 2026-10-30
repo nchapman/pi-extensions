@@ -13,6 +13,7 @@ import {
   BUILTIN_TOOLS,
   EXTENSION_NAME_RE,
   THINKING_LEVELS,
+  isNpmEntry,
   isValidThinkingLevel,
   resolveChildExtensions,
 } from "./child";
@@ -134,7 +135,11 @@ export function resolveTools(fm: Record<string, unknown>, extensions: readonly s
 }
 
 /** `extensions:` accepts a comma/space-separated string or an array of
- * sibling-extension names the child loads via `-e`. Invalid-shaped names
+ * extension entries the child loads via `-e`: sibling names (this
+ * package's extensions/ dirs) or `npm:<package>` shorthands (pi's npm
+ * extension root — same spelling `pi list` shows). Both are validated
+ * shapes that can only reach fixed roots, so human-authored agent files
+ * may use either; raw paths are env-knob-only. Invalid-shaped names
  * (paths, dots) warn and skip — they can never walk the filesystem. */
 export function parseExtensions(fm: Record<string, unknown>): string[] {
   const raw = fm.extensions;
@@ -150,8 +155,8 @@ export function parseExtensions(fm: Record<string, unknown>): string[] {
   for (const name of names) {
     const n = name.trim();
     if (!n) continue;
-    if (!EXTENSION_NAME_RE.test(n)) {
-      console.warn(`extensions: ignoring "${n}" — must be a plain extension directory name`);
+    if (!EXTENSION_NAME_RE.test(n) && !isNpmEntry(n)) {
+      console.warn(`extensions: ignoring "${n}" — must be a sibling extension name or npm:<package>`);
       continue;
     }
     if (!valid.includes(n)) valid.push(n);

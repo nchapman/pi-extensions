@@ -428,6 +428,14 @@ describe("extensions opt-in", () => {
       }),
     ).toEqual(["~/.pi/agent/npm/node_modules/pi-antigravity/src/index.ts"]);
     expect(parseExtensionsEnv({ PI_SUBAGENT_EXTENSIONS: "/opt/exts/review" })).toEqual(["/opt/exts/review"]);
+    // npm: shorthand — same spelling pi list shows — is kept verbatim
+    expect(parseExtensionsEnv({ PI_SUBAGENT_EXTENSIONS: "superedit, npm:pi-antigravity" })).toEqual([
+      "superedit",
+      "npm:pi-antigravity",
+    ]);
+    expect(parseExtensionsEnv({ PI_SUBAGENT_EXTENSIONS: "npm:@scope/pkg" })).toEqual(["npm:@scope/pkg"]);
+    // traversal or absolute shapes in the package slot are dropped
+    expect(parseExtensionsEnv({ PI_SUBAGENT_EXTENSIONS: "npm:../evil npm:/abs" })).toEqual([]);
     // cwd-relative paths are not entries (cwd varies per session) nor names
     expect(parseExtensionsEnv({ PI_SUBAGENT_EXTENSIONS: "../evil ./ok" })).toEqual([]);
     expect(parseExtensionsEnv({})).toEqual([]);
@@ -482,6 +490,28 @@ describe("extensions opt-in", () => {
     // --tools is always an explicit allowlist — never inherited from settings
     expect(args[args.indexOf("--tools") + 1]).toBe("read,ssh_bash");
     expect(buildChildArgs(AGENT, "t")).toContain("--tools");
+  });
+
+  it("resolveExtensionArgs resolves npm: entries via package main or convention", () => {
+    const files = new Map<string, string>([
+      ["/npm/pi-antigravity/package.json", '{"main":"./src/index.ts"}'],
+      ["/npm/pi-plain/package.json", "not json"],
+    ]);
+    const exists = (p: string) =>
+      p === "/npm/pi-antigravity/src/index.ts" || p === "/npm/pi-plain/index.js" || files.has(p);
+    const readFile = (p: string) => files.get(p);
+    const opts = { npmRoot: "/npm", exists, readFile };
+    // package.json main wins
+    expect(resolveExtensionArgs(["npm:pi-antigravity"], opts)).toEqual(["-e", "/npm/pi-antigravity/src/index.ts"]);
+    // unparseable package.json falls through to the conventional entries
+    expect(resolveExtensionArgs(["npm:pi-plain"], opts)).toEqual(["-e", "/npm/pi-plain/index.js"]);
+    // scoped packages resolve under the same root; missing packages skip
+    expect(resolveExtensionArgs(["npm:@scope/pkg", "npm:nope"], opts)).toEqual([]);
+  });
+
+  it("frontmatter accepts sibling names and npm: shorthands, never raw paths", () => {
+    expect(parseExtensions({ extensions: "sshbash, npm:pi-antigravity" })).toEqual(["sshbash", "npm:pi-antigravity"]);
+    expect(parseExtensions({ extensions: "~/.pi/elsewhere /abs/path" })).toEqual([]);
   });
 
   it("agentFromText carries extensions and toolsSpec only for trusted sources", () => {
