@@ -138,7 +138,8 @@ Investigate the remote host…
 
 - `subagent` runs a single delegated task; `subagents` runs a batch of tasks in parallel with bounded concurrency (`PI_SUBAGENT_CONCURRENCY`, default 4).
 - Thinking levels (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) can be specified per call, overriding the agent definition or the default (`low`).
-- Child runs use the agent definition's `model` or inherit the parent session's model.
+- Child runs use the agent definition's `model` or inherit the parent session's model. A model the child cannot resolve doesn't fail the run: the failure is instant and token-free (pi exits before any inference), so the child retries once on a fallback — a pinned model falls back to the session's, a session-inherited one to pi's default — and the result is prefixed with `[model fallback: …]` naming the model that actually ran. Failures past resolution (provider down mid-run, auth, quota) still surface as errors.
+- `/review`'s `--model` / `--verify-model` and agent-file pins get the same fallback.
 
 ### Idle Watchdog
 

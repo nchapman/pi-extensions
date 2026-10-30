@@ -137,6 +137,16 @@ export type SpawnFn = (command: string, args: string[], options: SpawnOptions) =
 export const defaultSpawn: SpawnFn = (command, args, options) =>
   nodeSpawn(command, args, options) as unknown as ChildLike;
 
+/** pi's model-resolution failure on stderr — the child exits before any
+ * inference, which is what makes runChild's fallback retry free. */
+const MODEL_NOT_FOUND_RE = /Model ".*" not found/;
+
+/** Escape regex metacharacters in a model id (ids contain `/` and dots) so
+ * the retry test can anchor to the exact requested model. */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 /** Options passed to runChild configuring deadlines, watchers, adoption, and event streaming. */
 export interface RunChildOptions {
   timeoutMs?: number;
@@ -165,6 +175,14 @@ export interface RunChildOptions {
    * Reviews of another directory run their finders in the reviewed repo so
    * relative paths in the diff resolve there. */
   cwd?: string;
+  /** Model to retry on when the child cannot resolve the effective model —
+   * the failure is instant and token-free (pi exits before any inference).
+   * Undefined retries on pi's default model (no --model flag). At most one
+   * retry, and only when the fallback differs from the failed model; the
+   * result text is prefixed with a note naming the model that actually ran.
+   * Failures past resolution (provider down mid-run, auth, quota) are not
+   * retried — they surface as errors. See childModelPlan. */
+  fallbackModel?: string;
 }
 
 /** What runChild hands to onAdopted when the soft threshold fires: the child's eventual outcome, plus a kill switch. Returns the task id embedded in the adoption marker. */
@@ -196,6 +214,21 @@ export function resolveChildModel(
   const provider = sessionModel?.provider;
   const id = sessionModel?.id;
   return typeof provider === "string" && typeof id === "string" ? `${provider}/${id}` : undefined;
+}
+
+/** The model plan for a child run: the effective model (agent pin, else the
+ * session's) and what to fall back to if it fails to resolve in the child.
+ * A pinned model falls back to the session's — the parent is running on it,
+ * so it resolves; a session-inherited model falls back to pi's default
+ * (fallbackModel undefined → runChild omits --model), because retrying the
+ * same string would fail identically. */
+export function childModelPlan(
+  agentModel: string | undefined,
+  sessionModel: { provider?: string; id?: string } | null | undefined,
+): { model: string | undefined; fallbackModel: string | undefined } {
+  const model = resolveChildModel(agentModel, sessionModel);
+  const session = resolveChildModel(undefined, sessionModel);
+  return { model, fallbackModel: model !== session ? session : undefined };
 }
 
 /** pi's closed set of thinking levels (pi --help). Exported so tests and
@@ -430,8 +463,10 @@ export function buildChildArgs(
     "--tools",
     agent.tools.join(","),
   ];
-  const effectiveModel = model ?? agent.model;
-  if (effectiveModel) args.push("--model", effectiveModel);
+  // The model is the caller's fully-resolved choice, passed through
+  // verbatim: undefined means pi's default (no flag) — the fallback retry
+  // depends on that meaning "omit", never "re-pin the agent's model".
+  if (model) args.push("--model", model);
   const effectiveThinking = thinking ?? agent.thinking;
   if (effectiveThinking) args.push("--thinking", effectiveThinking);
   args.push("--", task);
@@ -599,33 +634,15 @@ export function runChild(
 ): Promise<ChildOutcome> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const { onUpdate, signal } = options;
+  const firstModel = model ?? agent.model;
+  // -e pairs are resolved once so every attempt (and the exit-error hint)
+  // sees the same set; env folding happened earlier, in effectiveAgent —
+  // a definition concern, not a runner concern.
+  const extensionArgs = agent.extensions?.length ? resolveExtensionArgs(agent.extensions) : [];
   return new Promise((resolve, reject) => {
     const startedAt = Date.now();
-    // The heartbeat clock: every stdout chunk counts, whether or not it parses
-    // into an event. Initialized at spawn so a child that never emits anything
-    // is caught too.
-    let lastActivityAt = startedAt;
-    // Tool executions in flight, keyed by call id. Silence while a tool runs
-    // is the tool working (a long build or test emits nothing between start
-    // and end), not a dead LLM request — the watchdog stands down while any
-    // execution is open. Ids rather than a count so a lost or duplicated end
-    // line cannot corrupt the phase: an unmatched end is a no-op, and a
-    // missing one is healed at the next assistant message_start (the child
-    // only requests again after every tool of the turn has finished) or when
-    // the stdout cap discards data — both fail toward detection, never away.
-    const openToolRuns = new Set<string>();
-    // -e pairs are resolved once here so the exit-error hint can say whether
-    // the child truly ran extensionless (env folding happened earlier, in
-    // effectiveAgent — a definition concern, not a runner concern).
-    const extensionArgs = agent.extensions?.length ? resolveExtensionArgs(agent.extensions) : [];
-    const child = spawnFn(
-      resolveChildCommand(process.env, process.execPath),
-      buildChildArgs(agent, task, model, options.thinking, extensionArgs),
-      { stdio: ["ignore", "pipe", "pipe"], ...(options.cwd ? { cwd: options.cwd } : {}) },
-    );
-    let stdoutBuf = "";
-    let stderrBuf = "";
-    let lastText = "";
+    // Usage accumulates across attempts — a resolution failure reports none,
+    // but a retried run keeps its spend credited.
     let lastUsage: ChildUsage | undefined;
     let settled = false;
     // Adoption state: once the soft threshold fires, the outer promise has
@@ -634,6 +651,12 @@ export function runChild(
     let completionSettled = false;
     let completionResolve!: (run: ChildRun) => void;
     let completionReject!: (error: Error & { usage?: ChildUsage }) => void;
+    // The live child, so the abort listener and the adoption kill switch
+    // always address the current attempt's process.
+    let currentChild: ChildLike | undefined;
+    // Prefix set when the first attempt fails model resolution, so the
+    // eventual result says which model actually ran.
+    let fallbackNote = "";
 
     const settle = (fn: () => void) => {
       if (settled) return;
@@ -648,223 +671,289 @@ export function runChild(
       reject(err);
     };
 
-    const handleLine = (line: string) => {
-      const trimmed = line.trim();
-      if (!trimmed) return;
-      try {
-        const event = JSON.parse(trimmed) as {
-          type?: string;
-          toolCallId?: string;
-          message?: { role?: string; usage?: unknown; content?: unknown };
-        };
-        if (event.type === "tool_execution_start") {
-          openToolRuns.add(event.toolCallId ?? "");
-        } else if (event.type === "tool_execution_end") {
-          openToolRuns.delete(event.toolCallId ?? "");
-        } else if (event.type === "message_start" && event.message?.role === "assistant") {
-          // A new assistant message means the previous turn's tools all
-          // finished — heal any end line the stdout cap ate below.
-          openToolRuns.clear();
-        }
-        if (event.type === "message_end" && event.message?.role === "assistant") {
-          // Each assistant message carries its request's final usage; summing them
-          // mirrors pi's own session accounting (message_update resets per request).
-          if (looksLikeUsage(event.message.usage)) {
-            lastUsage = lastUsage ? addUsage(lastUsage, event.message.usage) : event.message.usage;
-          }
-          const text = extractAssistantText(event.message.content);
-          if (text) {
-            lastText = text;
-            // Partials have nowhere to go once the tool result returned (adoption).
-            if (!adopted) {
-              onUpdate?.({
-                content: [{ type: "text", text: lastText }],
-                details: { agent: agent.name, status: "running" },
-              });
-            }
-          }
-        }
-      } catch {
-        // ignore non-JSON lines
-      }
-    };
-
-    child.stdout.on("data", (chunk: Buffer) => {
-      lastActivityAt = Date.now();
-      stdoutBuf += chunk.toString();
-      if (stdoutBuf.length > STDOUT_BUF_MAX) {
-        // The discard can lose whole event lines — a >1MiB tool result makes
-        // its own tool_execution_end the culprit — so the tool-phase
-        // bookkeeping becomes unreliable: re-arm the watchdog.
-        openToolRuns.clear();
-        const nl = stdoutBuf.lastIndexOf("\n");
-        stdoutBuf = nl >= 0 ? stdoutBuf.slice(nl + 1) : "";
-      }
-      let nl: number;
-      while ((nl = stdoutBuf.indexOf("\n")) >= 0) {
-        const line = stdoutBuf.slice(0, nl);
-        stdoutBuf = stdoutBuf.slice(nl + 1);
-        handleLine(line);
-      }
-    });
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderrBuf += chunk.toString();
-      if (stderrBuf.length > STDERR_TAIL_MAX) stderrBuf = stderrBuf.slice(-STDERR_TAIL_MAX);
-    });
-
-    const timeout = setTimeout(() => {
-      child.kill("SIGKILL");
-      const error = new Error(`Subagent "${agent.name}" timed out after ${Math.round(timeoutMs / 1000)}s`);
-      // The hard timeout survives adoption: a backgrounded child still can't run forever.
-      if (adopted) {
-        if (completionSettled) return;
-        completionSettled = true;
-        if (lastUsage) Object.assign(error, { usage: lastUsage });
-        completionReject(error);
-      } else settle(() => rejectWith(error));
-    }, timeoutMs);
-    timeout.unref?.();
-
-    // Idle watchdog: kill a child that has waited on its LLM past the
-    // threshold without a single event, instead of burning the rest of the
-    // hard timeout on a request that will never return. The clock only judges
-    // LLM waits — a tool execution in progress stands it down (silence there
-    // is healthy work; `timeoutMs` is the backstop). Survives adoption like
-    // the hard timeout does; 0 opts out (the option is on by default).
-    const idleMs = resolveIdleTimeoutMs(options);
-    const stall = () => {
-      child.kill("SIGKILL");
-      const silentFor = Math.max(1, Math.round((Date.now() - lastActivityAt) / 1000));
-      const error = new Error(
-        `Subagent "${agent.name}" stalled: no output for ${silentFor}s (request likely dead)`,
-      ) as Error & { stalled: true };
-      error.stalled = true;
-      if (adopted) {
-        if (completionSettled) return;
-        completionSettled = true;
-        if (lastUsage) Object.assign(error, { usage: lastUsage });
-        completionReject(error);
-      } else settle(() => rejectWith(error));
-    };
-    // Check often enough to notice promptly, never more than 5s between ticks;
-    // unref'd so a forgotten watchdog can't hold the process open.
-    const watchdog =
-      idleMs > 0
-        ? setInterval(
-            () => {
-              if (settled && !adopted) return;
-              if (openToolRuns.size > 0) return; // a tool is executing — silence is expected
-              if (Date.now() - lastActivityAt >= idleMs) stall();
-            },
-            Math.max(100, Math.min(5_000, Math.floor(idleMs / 4))),
-          )
-        : undefined;
-    watchdog?.unref?.();
-
     const onAbort = () => {
-      child.kill("SIGKILL");
+      currentChild?.kill("SIGKILL");
       settle(() => rejectWith(signal?.reason ?? new Error(`Subagent "${agent.name}" aborted`)));
     };
+
+    const startAttempt = (attemptModel: string | undefined, allowRetry: boolean): void => {
+      // The heartbeat clock: every stdout chunk counts, whether or not it parses
+      // into an event. Initialized at spawn so a child that never emits anything
+      // is caught too.
+      let lastActivityAt = Date.now();
+      // Tool executions in flight, keyed by call id. Silence while a tool runs
+      // is the tool working (a long build or test emits nothing between start
+      // and end), not a dead LLM request — the watchdog stands down while any
+      // execution is open. Ids rather than a count so a lost or duplicated end
+      // line cannot corrupt the phase: an unmatched end is a no-op, and a
+      // missing one is healed at the next assistant message_start (the child
+      // only requests again after every tool of the turn has finished) or when
+      // the stdout cap discards data — both fail toward detection, never away.
+      const openToolRuns = new Set<string>();
+      // -e pairs are resolved once so every attempt (and the exit-error hint)
+      // sees the same set; env folding happened earlier, in effectiveAgent —
+      // a definition concern, not a runner concern.
+      const child = spawnFn(
+        resolveChildCommand(process.env, process.execPath),
+        buildChildArgs(agent, task, attemptModel, options.thinking, extensionArgs),
+        { stdio: ["ignore", "pipe", "pipe"], ...(options.cwd ? { cwd: options.cwd } : {}) },
+      );
+      currentChild = child;
+      let stdoutBuf = "";
+      let stderrBuf = "";
+      let lastText = "";
+
+      const handleLine = (line: string) => {
+        const trimmed = line.trim();
+        if (!trimmed) return;
+        try {
+          const event = JSON.parse(trimmed) as {
+            type?: string;
+            toolCallId?: string;
+            message?: { role?: string; usage?: unknown; content?: unknown };
+          };
+          if (event.type === "tool_execution_start") {
+            openToolRuns.add(event.toolCallId ?? "");
+          } else if (event.type === "tool_execution_end") {
+            openToolRuns.delete(event.toolCallId ?? "");
+          } else if (event.type === "message_start" && event.message?.role === "assistant") {
+            // A new assistant message means the previous turn's tools all
+            // finished — heal any end line the stdout cap ate below.
+            openToolRuns.clear();
+          }
+          if (event.type === "message_end" && event.message?.role === "assistant") {
+            // Each assistant message carries its request's final usage; summing them
+            // mirrors pi's own session accounting (message_update resets per request).
+            if (looksLikeUsage(event.message.usage)) {
+              lastUsage = lastUsage ? addUsage(lastUsage, event.message.usage) : event.message.usage;
+            }
+            const text = extractAssistantText(event.message.content);
+            if (text) {
+              lastText = text;
+              // Partials have nowhere to go once the tool result returned (adoption).
+              if (!adopted) {
+                onUpdate?.({
+                  content: [{ type: "text", text: lastText }],
+                  details: { agent: agent.name, status: "running" },
+                });
+              }
+            }
+          }
+        } catch {
+          // ignore non-JSON lines
+        }
+      };
+
+      child.stdout.on("data", (chunk: Buffer) => {
+        lastActivityAt = Date.now();
+        stdoutBuf += chunk.toString();
+        if (stdoutBuf.length > STDOUT_BUF_MAX) {
+          // The discard can lose whole event lines — a >1MiB tool result makes
+          // its own tool_execution_end the culprit — so the tool-phase
+          // bookkeeping becomes unreliable: re-arm the watchdog.
+          openToolRuns.clear();
+          const nl = stdoutBuf.lastIndexOf("\n");
+          stdoutBuf = nl >= 0 ? stdoutBuf.slice(nl + 1) : "";
+        }
+        let nl: number;
+        while ((nl = stdoutBuf.indexOf("\n")) >= 0) {
+          const line = stdoutBuf.slice(0, nl);
+          stdoutBuf = stdoutBuf.slice(nl + 1);
+          handleLine(line);
+        }
+      });
+      child.stderr.on("data", (chunk: Buffer) => {
+        stderrBuf += chunk.toString();
+        if (stderrBuf.length > STDERR_TAIL_MAX) stderrBuf = stderrBuf.slice(-STDERR_TAIL_MAX);
+      });
+
+      const timeout = setTimeout(() => {
+        child.kill("SIGKILL");
+        const error = new Error(`Subagent "${agent.name}" timed out after ${Math.round(timeoutMs / 1000)}s`);
+        // The hard timeout survives adoption: a backgrounded child still can't run forever.
+        if (adopted) {
+          if (completionSettled) return;
+          completionSettled = true;
+          if (lastUsage) Object.assign(error, { usage: lastUsage });
+          completionReject(error);
+        } else settle(() => rejectWith(error));
+      }, timeoutMs);
+      timeout.unref?.();
+
+      // Idle watchdog: kill a child that has waited on its LLM past the
+      // threshold without a single event, instead of burning the rest of the
+      // hard timeout on a request that will never return. The clock only judges
+      // LLM waits — a tool execution in progress stands it down (silence there
+      // is healthy work; `timeoutMs` is the backstop). Survives adoption like
+      // the hard timeout does; 0 opts out (the option is on by default).
+      const idleMs = resolveIdleTimeoutMs(options);
+      const stall = () => {
+        child.kill("SIGKILL");
+        const silentFor = Math.max(1, Math.round((Date.now() - lastActivityAt) / 1000));
+        const error = new Error(
+          `Subagent "${agent.name}" stalled: no output for ${silentFor}s (request likely dead)`,
+        ) as Error & { stalled: true };
+        error.stalled = true;
+        if (adopted) {
+          if (completionSettled) return;
+          completionSettled = true;
+          if (lastUsage) Object.assign(error, { usage: lastUsage });
+          completionReject(error);
+        } else settle(() => rejectWith(error));
+      };
+      // Check often enough to notice promptly, never more than 5s between ticks;
+      // unref'd so a forgotten watchdog can't hold the process open.
+      const watchdog =
+        idleMs > 0
+          ? setInterval(
+              () => {
+                if (settled && !adopted) return;
+                if (openToolRuns.size > 0) return; // a tool is executing — silence is expected
+                if (Date.now() - lastActivityAt >= idleMs) stall();
+              },
+              Math.max(100, Math.min(5_000, Math.floor(idleMs / 4))),
+            )
+          : undefined;
+      watchdog?.unref?.();
+
+      // Soft threshold: hand the still-running child to onAdopted and resolve
+      // immediately. The abort listener detaches — a backgrounded child survives
+      // turn aborts — while stdout parsing and the hard timeout continue. A
+      // throwing onAdopted falls back to the foreground failure contract.
+      // Re-armed per attempt (guarded by `adopted`) so a retried background
+      // child is still adoptable; onAdopted fires at most once.
+      const adoptAfterMs = options.adoptAfterMs ?? NEVER_ADOPT_MS;
+      // Infinity (the default) must never reach setTimeout — Node clamps it to
+      // 1ms, which would adopt instantly instead of blocking to completion.
+      const adoptTimer =
+        !adopted && options.onAdopted && Number.isFinite(adoptAfterMs)
+          ? setTimeout(() => {
+              if (settled || adopted) return;
+              signal?.removeEventListener("abort", onAbort);
+              const completion = new Promise<ChildRun>((resolveCompletion, rejectCompletion) => {
+                completionResolve = resolveCompletion;
+                completionReject = rejectCompletion;
+              });
+              let id: string;
+              try {
+                id = options.onAdopted!({ completion, kill: () => currentChild?.kill("SIGKILL"), startedAt });
+              } catch (error) {
+                // Fence later events out of the completion path, kill the child,
+                // and fail the call — adoption never happened.
+                completionSettled = true;
+                currentChild?.kill("SIGKILL");
+                settle(() => reject(error instanceof Error ? error : new Error(String(error))));
+                return;
+              }
+              adopted = true;
+              settle(() => resolve({ adopted: true, id }));
+            }, adoptAfterMs)
+          : undefined;
+      adoptTimer?.unref?.();
+
+      // Attempt-scoped cleanup: the abort listener deliberately outlives a
+      // retry (attempt 2 stays abortable) and detaches only on the final
+      // settle or on adoption (backgrounded children survive aborts).
+      const cleanup = () => {
+        clearTimeout(timeout);
+        clearInterval(watchdog);
+        clearTimeout(adoptTimer);
+      };
+
+      // Shared exit handling for the outer promise and an adopted child's
+      // completion promise: success carries the final text and usage; failure
+      // attaches the spend so callers can credit it.
+      const finishClose = (
+        code: number | null,
+        fulfill: (run: ChildRun) => void,
+        fail: (error: Error & { usage?: ChildUsage }) => void,
+      ) => {
+        if (code === 0) fulfill({ text: fallbackNote + (lastText || "(no output)"), usage: lastUsage });
+        else {
+          // A model the child cannot resolve is the extension-isolation trap —
+          // but only claim it when the child truly ran extensionless; with -e
+          // args present the miss has another cause (gateway down, typo'd id).
+          // Declared-but-skipped extensions (resolveExtensionArgs warned which
+          // at spawn) get their own wording: telling that user to "declare
+          // extensions:" points at a fix they already applied.
+          let hint = "";
+          if (extensionArgs.length === 0 && MODEL_NOT_FOUND_RE.test(stderrBuf)) {
+            hint = agent.extensions?.length
+              ? " — the declared extension(s) failed to load (see the warning at spawn), so the child ran extensionless; check the names exist under extensions/"
+              : " — the child runs without extensions, so providers registered by an extension are invisible to it; declare `extensions:` in the agent file (e.g. openai-gateways for gateway models) or set PI_SUBAGENT_EXTENSIONS";
+          }
+          const error = new Error(
+            `Subagent "${agent.name}" exited with code ${code}: ${stderrBuf.slice(-500) || "no stderr"}${hint}`,
+          );
+          if (lastUsage) Object.assign(error, { usage: lastUsage });
+          fail(error);
+        }
+      };
+
+      child.on("close", (code) => {
+        cleanup();
+        if (stdoutBuf.trim()) handleLine(stdoutBuf);
+        // Model-resolution failure: the child died before any inference —
+        // instant, zero tokens. Verified pre-inference three ways before the
+        // retry is allowed: stderr names EXACTLY the requested model
+        // (escaped, so a coincidental phrase — a nested pi quoting a
+        // different id — cannot trigger it), the attempt produced no
+        // assistant text and no usage (a child that did work may have had
+        // side effects; re-running it would duplicate them), and a model was
+        // actually requested (nothing to anchor against otherwise). Retrying
+        // on the fallback model is then the availability check done lazily:
+        // free in the happy path, one extra spawn only when the requested
+        // model is actually broken. One retry max, and only when the
+        // fallback differs (respawning the same unresolvable model would
+        // fail identically). Survives adoption: a backgrounded child's
+        // completion promise settles with the retry's outcome under the same
+        // task id.
+        const resolutionFailure =
+          code !== 0 &&
+          firstModel !== undefined &&
+          !lastText &&
+          !lastUsage &&
+          new RegExp(`Model "${escapeRegExp(firstModel)}" not found`).test(stderrBuf);
+        if (allowRetry && resolutionFailure && !signal?.aborted && options.fallbackModel !== firstModel) {
+          const next = options.fallbackModel;
+          fallbackNote = `[model fallback: "${firstModel ?? "the requested model"}" is unavailable in the child — ran on ${next ?? "pi's default model"}]\n`;
+          startAttempt(next, false);
+          return;
+        }
+        signal?.removeEventListener("abort", onAbort);
+        if (adopted) {
+          if (completionSettled) return;
+          completionSettled = true;
+          finishClose(code, completionResolve, completionReject);
+          return;
+        }
+        settle(() => {
+          if (signal?.aborted) rejectWith(signal.reason ?? new Error(`Subagent "${agent.name}" aborted`));
+          else finishClose(code, resolve, reject);
+        });
+      });
+      child.on("error", (error) => {
+        cleanup();
+        // The run leaves the retryable state here too — detach like the
+        // close path so a spawn failure can't leak the closure onto the
+        // caller's AbortSignal.
+        signal?.removeEventListener("abort", onAbort);
+        const wrapped = new Error(`Failed to spawn pi for subagent "${agent.name}": ${error.message}`);
+        if (adopted) {
+          if (completionSettled) return;
+          completionSettled = true;
+          completionReject(wrapped);
+          return;
+        }
+        settle(() => reject(wrapped));
+      });
+    };
+
+    startAttempt(firstModel, true);
     signal?.addEventListener("abort", onAbort, { once: true });
     // A signal aborted before registration never fires the listener — check
     // manually so an already-cancelled turn doesn't leave the child running.
     if (signal?.aborted) onAbort();
-
-    // Soft threshold: hand the still-running child to onAdopted and resolve
-    // immediately. The abort listener detaches — a backgrounded child survives
-    // turn aborts — while stdout parsing and the hard timeout continue. A
-    // throwing onAdopted falls back to the foreground failure contract.
-    const adoptAfterMs = options.adoptAfterMs ?? NEVER_ADOPT_MS;
-    // Infinity (the default) must never reach setTimeout — Node clamps it to
-    // 1ms, which would adopt instantly instead of blocking to completion.
-    const adoptTimer =
-      options.onAdopted && Number.isFinite(adoptAfterMs)
-        ? setTimeout(() => {
-            if (settled) return;
-            signal?.removeEventListener("abort", onAbort);
-            const completion = new Promise<ChildRun>((resolveCompletion, rejectCompletion) => {
-              completionResolve = resolveCompletion;
-              completionReject = rejectCompletion;
-            });
-            let id: string;
-            try {
-              id = options.onAdopted!({ completion, kill: () => child.kill("SIGKILL"), startedAt });
-            } catch (error) {
-              // Fence later events out of the completion path, kill the child,
-              // and fail the call — adoption never happened.
-              completionSettled = true;
-              child.kill("SIGKILL");
-              settle(() => reject(error instanceof Error ? error : new Error(String(error))));
-              return;
-            }
-            adopted = true;
-            settle(() => resolve({ adopted: true, id }));
-          }, adoptAfterMs)
-        : undefined;
-    adoptTimer?.unref?.();
-
-    const cleanup = () => {
-      clearTimeout(timeout);
-      clearInterval(watchdog);
-      clearTimeout(adoptTimer);
-      signal?.removeEventListener("abort", onAbort);
-    };
-
-    // Shared exit handling for the outer promise and an adopted child's
-    // completion promise: success carries the final text and usage; failure
-    // attaches the spend so callers can credit it.
-    const finishClose = (
-      code: number | null,
-      fulfill: (run: ChildRun) => void,
-      fail: (error: Error & { usage?: ChildUsage }) => void,
-    ) => {
-      if (code === 0) fulfill({ text: lastText || "(no output)", usage: lastUsage });
-      else {
-        // A model the child cannot resolve is the extension-isolation trap —
-        // but only claim it when the child truly ran extensionless; with -e
-        // args present the miss has another cause (gateway down, typo'd id).
-        // Declared-but-skipped extensions (resolveExtensionArgs warned which
-        // at spawn) get their own wording: telling that user to "declare
-        // extensions:" points at a fix they already applied.
-        let hint = "";
-        if (extensionArgs.length === 0 && /Model ".*" not found/.test(stderrBuf)) {
-          hint = agent.extensions?.length
-            ? " — the declared extension(s) failed to load (see the warning at spawn), so the child ran extensionless; check the names exist under extensions/"
-            : " — the child runs without extensions, so providers registered by an extension are invisible to it; declare `extensions:` in the agent file (e.g. openai-gateways for gateway models) or set PI_SUBAGENT_EXTENSIONS";
-        }
-        const error = new Error(
-          `Subagent "${agent.name}" exited with code ${code}: ${stderrBuf.slice(-500) || "no stderr"}${hint}`,
-        );
-        if (lastUsage) Object.assign(error, { usage: lastUsage });
-        fail(error);
-      }
-    };
-
-    child.on("close", (code) => {
-      cleanup();
-      if (stdoutBuf.trim()) handleLine(stdoutBuf);
-      if (adopted) {
-        if (completionSettled) return;
-        completionSettled = true;
-        finishClose(code, completionResolve, completionReject);
-        return;
-      }
-      settle(() => {
-        if (signal?.aborted) rejectWith(signal.reason ?? new Error(`Subagent "${agent.name}" aborted`));
-        else finishClose(code, resolve, reject);
-      });
-    });
-    child.on("error", (error) => {
-      cleanup();
-      const wrapped = new Error(`Failed to spawn pi for subagent "${agent.name}": ${error.message}`);
-      if (adopted) {
-        if (completionSettled) return;
-        completionSettled = true;
-        completionReject(wrapped);
-        return;
-      }
-      settle(() => reject(wrapped));
-    });
   });
 }
 

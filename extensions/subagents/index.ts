@@ -73,7 +73,7 @@ import {
   parseConcurrency,
   parseIdleTimeoutMs,
   parseTimeoutMs,
-  resolveChildModel,
+  childModelPlan,
   resolveChildThinking,
   runChild,
   runWithLimit,
@@ -198,12 +198,15 @@ By default the call blocks until the subagent finishes — waiting on a tool cal
         options.onAdopted = (handle: AdoptedHandle<ChildRun>) =>
           adoptSubagentTask(registry, agent.name, handle, ctx?.sessionManager?.getSessionDir());
       }
-      // Read per call so PI_SUBAGENT_EXTENSIONS changes apply live.
+      // Read per call so PI_SUBAGENT_EXTENSIONS changes apply live. A model
+      // the child can't resolve retries once on the fallback (pinned ->
+      // session -> pi default) instead of failing the run.
+      const plan = childModelPlan(agent.model, ctx?.model);
       const run = await runChild(
         effectiveAgent(agent),
         params.task,
-        resolveChildModel(agent.model, ctx?.model),
-        options,
+        plan.model,
+        { ...options, fallbackModel: plan.fallbackModel },
         spawnFn,
       );
       if ("adopted" in run) {
@@ -297,7 +300,14 @@ By default the call blocks until every subagent finishes — waiting on a tool c
             options.onAdopted = (handle: AdoptedHandle<ChildRun>) =>
               adoptSubagentTask(registry, agent.name, handle, sessionDir);
           }
-          return runChild(effectiveAgent(agent), t.task, resolveChildModel(agent.model, ctx?.model), options, spawnFn);
+          const plan = childModelPlan(agent.model, ctx?.model);
+          return runChild(
+            effectiveAgent(agent),
+            t.task,
+            plan.model,
+            { ...options, fallbackModel: plan.fallbackModel },
+            spawnFn,
+          );
         }),
         parseConcurrency(process.env),
       );

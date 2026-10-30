@@ -10,7 +10,7 @@ import {
   type ChildRun,
   type ChildUsage,
   isStalledError,
-  resolveChildModel,
+  childModelPlan,
   runChild,
   runWithLimit,
   type SpawnFn,
@@ -1004,14 +1004,24 @@ export async function runReview(opts: {
         chunkText(run.chunk),
       );
       const label = `finder ${run.lens}/${run.chunk}`;
+      // A pinned finder/verify model the child cannot resolve falls back to
+      // the session's (or pi's default) instead of failing the whole review
+      // — childModelPlan computes model and fallback in one place.
+      const plan = childModelPlan(config.model ?? agent.model, deps.sessionModel);
       return withStallRetry({ label, notify: deps.notify, signal }, () =>
         runChild(
           agent,
           task,
-          resolveChildModel(config.model ?? agent.model, deps.sessionModel),
+          plan.model,
           // Finders explore the reviewed repo: children run at its root (not
           // the session cwd) so diff paths — repo-root-relative — resolve.
-          { timeoutMs: config.timeoutMs, idleTimeoutMs: config.idleTimeoutMs, signal, cwd: repoRoot },
+          {
+            timeoutMs: config.timeoutMs,
+            idleTimeoutMs: config.idleTimeoutMs,
+            signal,
+            cwd: repoRoot,
+            fallbackModel: plan.fallbackModel,
+          },
           deps.spawnFn,
         ),
       ).then(
@@ -1072,12 +1082,19 @@ export async function runReview(opts: {
       files.map((f) => f.text).join("\n"),
     );
     try {
+      const vPlan = childModelPlan(config.verifyModel ?? config.model ?? vAgent.model, deps.sessionModel);
       const run = await withStallRetry({ label: "verifier", notify: deps.notify, signal }, () =>
         runChild(
           vAgent,
           vTask,
-          resolveChildModel(config.verifyModel ?? config.model ?? vAgent.model, deps.sessionModel),
-          { timeoutMs: config.timeoutMs, idleTimeoutMs: config.idleTimeoutMs, signal, cwd: repoRoot },
+          vPlan.model,
+          {
+            timeoutMs: config.timeoutMs,
+            idleTimeoutMs: config.idleTimeoutMs,
+            signal,
+            cwd: repoRoot,
+            fallbackModel: vPlan.fallbackModel,
+          },
           deps.spawnFn,
         ),
       );

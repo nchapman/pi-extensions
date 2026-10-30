@@ -18,6 +18,7 @@ import {
   buildCommandPrompt,
   BUILTIN_TOOLS,
   buildChildArgs,
+  childModelPlan,
   DEFAULT_AGENT_MD,
   effectiveAgent,
   extractAssistantText,
@@ -1109,6 +1110,188 @@ describe("runChild", () => {
     const promise = runChild(AGENT, "task", undefined, { timeoutMs: 5000 }, () => child);
     child.fail(new Error("ENOENT pi"));
     await expect(promise).rejects.toThrow(/Failed to spawn pi.*ENOENT/);
+  });
+
+  it("childModelPlan: pin falls back to session, inherited falls back to default", () => {
+    const session = { provider: "zai", id: "glm-5.3" };
+    expect(childModelPlan("antigravity/gemini-3", session)).toEqual({
+      model: "antigravity/gemini-3",
+      fallbackModel: "zai/glm-5.3",
+    });
+    expect(childModelPlan(undefined, session)).toEqual({ model: "zai/glm-5.3", fallbackModel: undefined });
+    expect(childModelPlan("antigravity/gemini-3", undefined)).toEqual({
+      model: "antigravity/gemini-3",
+      fallbackModel: undefined,
+    });
+    expect(childModelPlan(undefined, undefined)).toEqual({ model: undefined, fallbackModel: undefined });
+    expect(childModelPlan(undefined, { id: "glm-5.3" })).toEqual({ model: undefined, fallbackModel: undefined });
+  });
+
+  it("retries once on the fallback model when resolution fails, noting it", async () => {
+    const spawns: string[][] = [];
+    const failed = fakeChild();
+    const ok = fakeChild();
+    const kids = [failed, ok];
+    const promise = runChild(
+      { ...AGENT, model: "antigravity/gemini-3" },
+      "task",
+      "antigravity/gemini-3",
+      { timeoutMs: 5000, fallbackModel: "zai/glm-5.3" },
+      (_c, args) => {
+        spawns.push(args);
+        return kids[spawns.length - 1];
+      },
+    );
+    failed.stderrEmit('Error: Model "antigravity/gemini-3" not found. Use --list-models to see available models.');
+    failed.close(1);
+    ok.stdoutEmit(
+      JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "done" }] },
+      }) + "\n",
+    );
+    ok.close(0);
+    const r = await promise;
+    expect(spawns).toHaveLength(2);
+    expect(spawns[0][spawns[0].indexOf("--model") + 1]).toBe("antigravity/gemini-3");
+    expect(spawns[1][spawns[1].indexOf("--model") + 1]).toBe("zai/glm-5.3");
+    expect(r.text.startsWith('[model fallback: "antigravity/gemini-3" is unavailable')).toBe(true);
+    expect(r.text.endsWith("done")).toBe(true);
+  });
+
+  it("falls back to pi's default (no --model) when no fallbackModel is given", async () => {
+    const spawns: string[][] = [];
+    const failed = fakeChild();
+    const ok = fakeChild();
+    const kids = [failed, ok];
+    const promise = runChild(AGENT, "task", "ghost/model-x", { timeoutMs: 5000 }, (_c, args) => {
+      spawns.push(args);
+      return kids[spawns.length - 1];
+    });
+    failed.stderrEmit('Error: Model "ghost/model-x" not found.');
+    failed.close(1);
+    ok.close(0);
+    const r = await promise;
+    expect(spawns).toHaveLength(2);
+    expect(spawns[1]).not.toContain("--model");
+    expect(r.text).toContain("pi's default model");
+  });
+
+  it("never retries a child that already did work, whatever the stderr says", async () => {
+    // A child that produced assistant output may have had side effects —
+    // re-running would duplicate them.
+    let count = 0;
+    const child = fakeChild();
+    const promise = runChild(AGENT, "task", "ghost/model-x", { timeoutMs: 5000, fallbackModel: "y/z" }, () => {
+      count++;
+      return child;
+    });
+    child.stdoutEmit(
+      JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "partial work" }] },
+      }) + "\n",
+    );
+    child.stderrEmit('Error: Model "ghost/model-x" not found.');
+    child.close(1);
+    await expect(promise).rejects.toThrow(/exited with code 1/);
+    expect(count).toBe(1);
+  });
+
+  it("does not retry when stderr names a different model than the one requested", async () => {
+    let count = 0;
+    const child = fakeChild();
+    const promise = runChild(AGENT, "task", "a/b", { timeoutMs: 5000, fallbackModel: "c/d" }, () => {
+      count++;
+      return child;
+    });
+    // e.g. a nested pi invocation quoting its own missing model
+    child.stderrEmit('Error: Model "other/thing" not found.');
+    child.close(1);
+    await expect(promise).rejects.toThrow(/exited with code 1/);
+    expect(count).toBe(1);
+  });
+
+  it("does not retry when the fallback equals the failed model, and surfaces the second failure", async () => {
+    // fallback == effective: respawning the same model would fail identically
+    let count = 0;
+    const same = fakeChild();
+    const p1 = runChild(AGENT, "task", "zai/glm-5.3", { timeoutMs: 5000, fallbackModel: "zai/glm-5.3" }, () => {
+      count++;
+      return same;
+    });
+    same.stderrEmit('Error: Model "zai/glm-5.3" not found.');
+    same.close(1);
+    await expect(p1).rejects.toThrow(/exited with code 1/);
+    expect(count).toBe(1);
+
+    // both attempts unresolvable: the second failure is the reported one
+    const spawns = [fakeChild(), fakeChild()];
+    let i = 0;
+    const p2 = runChild(AGENT, "task", "a/b", { timeoutMs: 5000, fallbackModel: "c/d" }, () => spawns[i++]);
+    spawns[0].stderrEmit('Error: Model "a/b" not found.');
+    spawns[0].close(1);
+    spawns[1].stderrEmit('Error: Model "c/d" not found.');
+    spawns[1].close(1);
+    const err = await p2.then(
+      () => undefined,
+      (e: Error) => e,
+    );
+    expect(err?.message).toMatch(/Model "c\/d" not found/);
+  });
+
+  it("non-resolution failures never retry", async () => {
+    let count = 0;
+    const child = fakeChild();
+    const promise = runChild(AGENT, "task", "zai/glm-5.3", { timeoutMs: 5000, fallbackModel: "x/y" }, () => {
+      count++;
+      return child;
+    });
+    child.stderrEmit("boom");
+    child.close(2);
+    await expect(promise).rejects.toThrow(/exited with code 2: boom/);
+    expect(count).toBe(1);
+  });
+
+  it("a backgrounded child retries too and its completion carries the fallback note", async () => {
+    const spawns: string[][] = [];
+    const failed = fakeChild();
+    const ok = fakeChild();
+    const kids = [failed, ok];
+    let completion: Promise<ChildRun> | undefined;
+    const promise = runChild(
+      AGENT,
+      "task",
+      "ghost/model-x",
+      {
+        timeoutMs: 5000,
+        fallbackModel: "zai/glm-5.3",
+        adoptAfterMs: 0,
+        onAdopted: (handle) => {
+          completion = handle.completion;
+          return "t-fallback-bg";
+        },
+      },
+      (_c, args) => {
+        spawns.push(args);
+        return kids[spawns.length - 1];
+      },
+    );
+    const adopted = await promise;
+    expect("adopted" in adopted && adopted.id).toBe("t-fallback-bg");
+    failed.stderrEmit('Error: Model "ghost/model-x" not found.');
+    failed.close(1);
+    ok.stdoutEmit(
+      JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "bg done" }] },
+      }) + "\n",
+    );
+    ok.close(0);
+    const run = await completion;
+    expect(spawns).toHaveLength(2);
+    expect(run?.text.startsWith('[model fallback: "ghost/model-x" is unavailable')).toBe(true);
+    expect(run?.text.endsWith("bg done")).toBe(true);
   });
 });
 
