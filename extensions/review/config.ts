@@ -13,20 +13,18 @@ import path from "node:path";
 // Config
 // ---------------------------------------------------------------------------
 
-/** Default finder model. Thinking-off is load-bearing: deepseek at :off
- * measured the best recall of its candidates at ~1/4 the wall time of
- * default thinking (>6 min per finder child — the production hard cap is
- * 20m, so thinking-on means reviews measured in many minutes). pi's
- * `provider/id:thinking` suffix means PI_REVIEW_MODEL and --model still
- * override model and level together. Numbers (diffOnly protocol, 2026-11):
- * deepseek 80.6% at $0.047/PR and 326s/PR — the recall pick; muse-spark-1.3
- * :off ~69% (67.7/71.0) at $0.007/PR and ~29s/PR — the value pick, wrongly
- * written off on thinking-on wall numbers; openai/gpt-6-luna 45–58% (~52%
- * mean) at ~$0.006/PR, provider-default effort only (explicit :low/:medium
- * ~36%, :off 42–48%; ±13-point run variance). The 6.5% pre-disclosure luna
- * score was a harness artifact, not the model. Re-run npm run eval:review
- * whenever this changes. */
-export const DEFAULT_REVIEW_MODEL = "opencode-go/deepseek-v4.1-flash:off";
+/** Default finder model — the value pick, not the recall pick.
+ * muse-spark-1.3-contributor:off measured ~69% recall (67.7/71.0 across two
+ * 10-PR runs) at $0.007/PR and ~29s/PR; deepseek-v4.1-flash:off remains the
+ * recall pick at 80.6% but costs $0.047/PR and 326s/PR — override with
+ * PI_REVIEW_MODEL when recall matters more than cost/latency. The `:off`
+ * suffix is the measured arm for both — muse with thinking on was the slow
+ * tier this default used to be written off over. pi's `provider/id:thinking`
+ * suffix means PI_REVIEW_MODEL and --model still override model and level
+ * together. Numbers are diffOnly-protocol (2026-11); openai/gpt-6-luna
+ * measured ~52% (default effort only — explicit :low/:medium hurt it).
+ * Re-run npm run eval:review whenever this changes. */
+export const DEFAULT_REVIEW_MODEL = "opencode-go/muse-spark-1.3-contributor:off";
 
 export interface ReviewConfig {
   /** Characters of diff per finder chunk (file-boundary aligned). */
