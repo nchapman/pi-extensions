@@ -19,9 +19,11 @@ import path from "node:path";
  * 20m, so thinking-on means reviews measured in many minutes). pi's
  * `provider/id:thinking` suffix means PI_REVIEW_MODEL and --model still
  * override model and level together. Numbers (diffOnly protocol, 2026-11):
- * deepseek 80.6% at $0.047/PR; openai/gpt-6-luna 58.1% at $0.007/PR and 29s
- * per PR — a real recall gap, not the 6.5% artifact the pre-disclosure
- * prompt recorded for it. Re-run npm run eval:review whenever this changes. */
+ * deepseek 80.6% at $0.047/PR; openai/gpt-6-luna 45–58% across two runs
+ * (~52% mean) at ~$0.006/PR and ~29s per PR, provider-default effort —
+ * explicit :low/:medium measured ~35% (effort hurts luna) and ±13-point
+ * run variance is normal for it; the 6.5% pre-disclosure score was a harness
+ * artifact, not the model. Re-run npm run eval:review whenever this changes. */
 export const DEFAULT_REVIEW_MODEL = "opencode-go/deepseek-v4.1-flash:off";
 
 export interface ReviewConfig {
