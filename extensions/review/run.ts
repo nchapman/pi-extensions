@@ -988,7 +988,7 @@ export async function runReview(opts: {
   const findResults = await runWithLimit(
     runs.map((run) => () => {
       const lens = lenses.get(run.lens)!;
-      const agent = finderAgent(lens);
+      const agent = finderAgent(lens, { diffOnly: config.diffOnly });
       if (signal?.aborted) throw new Error("review aborted");
       const { task } = fitTask(
         (diff) =>
@@ -1000,6 +1000,7 @@ export async function runReview(opts: {
             guidelines,
             priorFindings,
             attachments: attachments[run.chunk] || undefined,
+            diffOnly: config.diffOnly,
           }),
         chunkText(run.chunk),
       );
@@ -1069,7 +1070,7 @@ export async function runReview(opts: {
   let bundle: VerifiedBundle = { findings: candidates, rejected: [], unverified: false };
   if (candidates.length > 0 && config.verify) {
     deps.notify(`Verifying ${candidates.length} candidate finding(s)…`, "info");
-    const vAgent = verifyAgent();
+    const vAgent = verifyAgent({ diffOnly: config.diffOnly });
     const { task: vTask } = fitTask(
       (diff) =>
         verifyTask({

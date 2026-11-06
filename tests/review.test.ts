@@ -100,6 +100,7 @@ const CONFIG = (over: Partial<ReviewConfig> = {}): ReviewConfig => ({
   priorChars: 8_000,
   persist: false,
   untrackedMaxBytes: 256 * 1024,
+  diffOnly: false,
   ...over,
 });
 
@@ -107,17 +108,21 @@ const CONFIG = (over: Partial<ReviewConfig> = {}): ReviewConfig => ({
 function fakeSpawn(
   respond: (task: string) => string,
   opts: { failVerify?: boolean } = {},
-): SpawnFn & { tasks: string[] } {
+): SpawnFn & { tasks: string[]; systems: string[] } {
   const tasks: string[] = [];
+  const systems: string[] = [];
   const fn = ((_command: string, args: string[], _options: unknown) => {
     const dash = args.lastIndexOf("--");
     const task = dash >= 0 ? String(args[dash + 1]) : "";
     tasks.push(task);
+    const sp = args.indexOf("--system-prompt");
+    if (sp >= 0) systems.push(String(args[sp + 1]));
     const isVerify = task.startsWith("# Verify code-review findings");
     const text = isVerify && opts.failVerify ? "verifier says no" : respond(task);
     return childWithMessage(text, isVerify && opts.failVerify ? 1 : 0);
-  }) as SpawnFn & { tasks: string[] };
+  }) as SpawnFn & { tasks: string[]; systems: string[] };
   fn.tasks = tasks;
+  fn.systems = systems;
   return fn;
 }
 
@@ -567,6 +572,7 @@ describe("parseReviewConfig", () => {
   it("defaults without env (verification on, the measured config)", () => {
     const c = parseReviewConfig({});
     expect(c.verify).toBe(true);
+    expect(c.diffOnly).toBe(false); // production default: a real tree exists
     expect(c.chunkChars).toBe(96_000);
     expect(c.attachChars).toBe(64_000);
     expect(c.maxChildren).toBe(8);
@@ -589,8 +595,10 @@ describe("parseReviewConfig", () => {
       PI_REVIEW_MODEL: "ollama/qwen3 ",
       PI_REVIEW_CHECK_CMD: "npm run check",
       PI_REVIEW_STATE: "0",
+      PI_REVIEW_DIFF_ONLY: "1",
     });
     expect(c.verify).toBe(true);
+    expect(c.diffOnly).toBe(true);
     expect(c.chunkChars).toBe(8_000); // clamped to min
     expect(c.attachChars).toBe(262_144); // clamped to max
     expect(parseReviewConfig({ PI_REVIEW_ATTACH_CHARS: "0" }).attachChars).toBe(0); // numeric zero disables
@@ -612,6 +620,11 @@ describe("parseReviewConfig", () => {
       expect(parseReviewConfig({ PI_REVIEW_VERIFY: off }).verify).toBe(false);
     }
     expect(parseReviewConfig({ PI_REVIEW_VERIFY: "1" }).verify).toBe(true);
+    // diffOnly is opt-in: garbage and blank stay off, truthy words opt in
+    expect(parseReviewConfig({ PI_REVIEW_DIFF_ONLY: "banana" }).diffOnly).toBe(false);
+    for (const on of ["1", "true", "on", " TRUE "]) {
+      expect(parseReviewConfig({ PI_REVIEW_DIFF_ONLY: on }).diffOnly).toBe(true);
+    }
   });
 
   it("treats blank env values as unset, not zero", () => {
@@ -1334,6 +1347,45 @@ describe("prompts", () => {
     // The verifier, conversely, is told to verdict its numbered candidates.
     expect(task).toContain("Verdict every candidate: one JSON array of {id, verdict, reason}");
     expect(verifyAgent().name).toBe("review-verify");
+  });
+
+  it("diffOnly prompts disclose the missing tree instead of asserting one", () => {
+    // Base prompts describe production: a real tree to explore.
+    expect(finderAgent(FINDER_LENSES[0]).instructions).toContain(
+      "You are reviewing one diff against the working tree of the repository.",
+    );
+    expect(
+      finderTask({
+        lens: FINDER_LENSES[0],
+        chunkIndex: 0,
+        chunkCount: 1,
+        diffText: "D",
+        guidelines: "",
+        priorFindings: "",
+      }),
+    ).toContain("Explore the working tree only to answer questions this diff raises.");
+    expect(verifyAgent().instructions).toContain("The working tree of the repository is available to you.");
+    // The lie silences substantiation-obedient models (luna: [] on 7/10 PRs
+    // while grepping for exactly the right guards) — diffOnly tells the truth.
+    const f = finderAgent(FINDER_LENSES[0], { diffOnly: true });
+    expect(f.instructions).toContain("no repository working tree");
+    expect(f.instructions).not.toContain("against the working tree of the repository");
+    const t = finderTask({
+      lens: FINDER_LENSES[0],
+      chunkIndex: 0,
+      chunkCount: 1,
+      diffText: "D",
+      guidelines: "",
+      priorFindings: "",
+      diffOnly: true,
+    });
+    expect(t).toContain("substantiate findings from the diff alone");
+    expect(t).not.toContain("Explore the working tree");
+    const v = verifyAgent({ diffOnly: true });
+    expect(v.instructions).toContain("No repository working tree is available in this environment");
+    expect(v.instructions).toContain("re-trace the claim yourself against the diff");
+    expect(v.instructions).not.toContain("The working tree of the repository is available to you.");
+    expect(v.instructions).not.toContain("open the code, follow the callers and guards");
   });
 });
 
@@ -2609,6 +2661,39 @@ describe("runReview", () => {
     expect(finderTaskText).toContain("+++ b/new.ts");
     expect(result.findingCount).toBe(0);
     expect(result.report).toContain("**No actionable findings.**");
+  });
+
+  it("diffOnly config discloses the missing tree in finder and verifier prompts", async () => {
+    const spawn = fakeSpawn((task) =>
+      task.startsWith("# Code review")
+        ? '```json\n[{"file":"src/a.ts","line":2,"severity":"important","title":"T","detail":"D"}]\n```'
+        : "```json\n[]\n```",
+    );
+    const git = gitFor([
+      { match: (a) => a[0] === "rev-parse", result: { code: 0, stdout: "/repo\n", stderr: "" } },
+      {
+        match: (a) => a[0] === "diff" && a[a.length - 1] === "HEAD",
+        result: { code: 0, stdout: SAMPLE_DIFF, stderr: "" },
+      },
+    ]);
+    await runReview({
+      cwd: "/repo",
+      config: CONFIG({ diffOnly: true }),
+      target: { kind: "default" },
+      deps: emptyDeps({ git, spawnFn: spawn }) as never,
+    });
+    const finderTasks = spawn.tasks.filter((t) => t.startsWith("# Code review"));
+    expect(finderTasks.length).toBeGreaterThan(0);
+    // Every finder task tells the truth about the world instead of sending
+    // children grepping a void that cannot answer.
+    for (const t of finderTasks) {
+      expect(t).toContain("substantiate findings from the diff alone");
+      expect(t).not.toContain("Explore the working tree");
+    }
+    // Both finder and verifier system prompts disclose the empty world.
+    expect(spawn.systems.some((s) => s.includes("no repository working tree"))).toBe(true);
+    expect(spawn.systems.some((s) => s.includes("re-trace the claim yourself against the diff"))).toBe(true);
+    expect(spawn.systems.some((s) => s.includes("against the working tree of the repository"))).toBe(false);
   });
 
   it("fails open when the verifier dies (verify opted in)", async () => {

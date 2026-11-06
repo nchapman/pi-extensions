@@ -14,15 +14,14 @@ import path from "node:path";
 // ---------------------------------------------------------------------------
 
 /** Default finder model. Thinking-off is load-bearing: deepseek at :off
- * measured 100% recall (31/31 on code-review-bench) at ~1/4 the wall time of
+ * measured the best recall of its candidates at ~1/4 the wall time of
  * default thinking (>6 min per finder child — the production hard cap is
  * 20m, so thinking-on means reviews measured in many minutes). pi's
  * `provider/id:thinking` suffix means PI_REVIEW_MODEL and --model still
- * override model and level together. muse-spark-1.3 was tried as a
- * successor — 67.7% recall at :off, ~61% ceiling with default thinking, at
- * 2× tokens and 4× wall — a finder-capability gap, not a thinking-budget one,
- * so deepseek stays (see README for the numbers). Re-run npm run eval:review
- * whenever this changes. */
+ * override model and level together. Numbers (diffOnly protocol, 2026-11):
+ * deepseek 80.6% at $0.047/PR; openai/gpt-6-luna 58.1% at $0.007/PR and 29s
+ * per PR — a real recall gap, not the 6.5% artifact the pre-disclosure
+ * prompt recorded for it. Re-run npm run eval:review whenever this changes. */
 export const DEFAULT_REVIEW_MODEL = "opencode-go/deepseek-v4.1-flash:off";
 
 export interface ReviewConfig {
@@ -60,6 +59,11 @@ export interface ReviewConfig {
   persist: boolean;
   /** Byte cap for untracked file content synthesized into the diff. */
   untrackedMaxBytes: number;
+  /** Review with no repository tree (the eval's fixture world, or a bare
+   * patch): prompts disclose the absence instead of asserting a working
+   * tree the children cannot open — see finderAgent for why that lie
+   * silences substantiation-obedient models. */
+  diffOnly: boolean;
 }
 
 function clampInt(raw: unknown, fallback: number, min: number, max: number): number {
@@ -105,6 +109,11 @@ export function parseReviewConfig(env: NodeJS.ProcessEnv): ReviewConfig {
     priorChars: clampInt(env.PI_REVIEW_PRIOR_CHARS, 8_000, 0, 32_000),
     persist: String(env.PI_REVIEW_STATE ?? "1") !== "0",
     untrackedMaxBytes: clampInt(env.PI_REVIEW_UNTRACKED_MAX_BYTES, 256 * 1024, 0, 4 * 1024 * 1024),
+    diffOnly: ["1", "true", "on"].includes(
+      String(env.PI_REVIEW_DIFF_ONLY ?? "")
+        .trim()
+        .toLowerCase(),
+    ),
   };
 }
 

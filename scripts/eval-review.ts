@@ -28,6 +28,12 @@
  *                     resolution as /review.
  *
  * Spawns real pi children (finders, verifier, judge) — never part of npm test.
+ * The eval world is diff-only (no repo tree): PI_REVIEW_DIFF_ONLY=1 is forced
+ * below so finder/verifier prompts disclose that instead of asserting a tree
+ * the children cannot open — the tree-asserting prompt silenced
+ * substantiation-obedient models (gpt-6-luna: [] on 7/10 PRs while grepping
+ * for exactly the right guards). Runs before that fix recorded
+ * meta.diffOnly=false/absent and are not comparable to runs after it.
  * Results flush incrementally to scripts/eval/results/run-<ts>.jsonl (one line
  * per PR, gitignored) so a timeout or Ctrl-C keeps what was spent; the summary
  * and full JSON are written when the run completes. Judge usage and wall time
@@ -213,7 +219,7 @@ describe("eval: review pipeline on code-review-bench", () => {
     "reviews the sampled PRs and scores against golden issues",
     { timeout: 24 * 60 * 60_000 },
     async () => {
-      const config: ReviewConfig = parseReviewConfig({ ...env, PI_REVIEW_STATE: "0" });
+      const config: ReviewConfig = parseReviewConfig({ ...env, PI_REVIEW_STATE: "0", PI_REVIEW_DIFF_ONLY: "1" });
       const all = loadBench(DATA_DIR);
       // EVAL_ONLY bypasses sampling entirely (retests don't care about seeds).
       let fixtures = ONLY.length ? all.filter((f) => ONLY.includes(f.key)) : sampleFixtures(all, PRS, SEED);
@@ -359,6 +365,9 @@ describe("eval: review pipeline on code-review-bench", () => {
               // Attribution: a PI_REVIEW_VERIFY=1 run must be distinguishable
               // from a verify-off one in the results file.
               verify: config.verify,
+              // Attribution: the no-tree disclosure is part of the protocol —
+              // pre-fix runs (no field) asserted a tree that did not exist.
+              diffOnly: config.diffOnly,
               judgeModel: judgeModel ?? "(pi global default)",
               date: new Date().toISOString(),
             },
@@ -456,20 +465,20 @@ describe("eval: review pipeline on code-review-bench", () => {
       // replaying over them re-confirms nearly everything and reads as
       // "verification buys nothing" — the exact inverse of the truth.
       let judgeModel = JUDGE_MODEL;
-      let meta: { verify?: boolean; judgeModel?: string } | undefined;
+      let meta: { verify?: boolean; diffOnly?: boolean; judgeModel?: string } | undefined;
       try {
         meta = JSON.parse(readFileSync(VERIFY_REPLAY.replace(/\.jsonl$/, ".json"), "utf8")).meta;
       } catch {
         // no sibling meta — fall back to the finders' model below
       }
-      const gate = verifyBaselineGate(meta);
+      const config = parseReviewConfig({ ...env, PI_REVIEW_STATE: "0", PI_REVIEW_DIFF_ONLY: "1" });
+      const gate = verifyBaselineGate(meta, config.diffOnly);
       if (gate.fatal) throw new Error(`verify replay: ${gate.fatal}`);
       if (gate.warn) console.log(`verify replay: ${gate.warn}`);
       if (!judgeModel) {
         judgeModel = meta?.judgeModel && meta.judgeModel !== "(pi global default)" ? meta.judgeModel : undefined;
       }
-      const config = parseReviewConfig({ ...env, PI_REVIEW_STATE: "0" });
-      const vAgent = verifyAgent();
+      const vAgent = verifyAgent({ diffOnly: config.diffOnly });
       // Same model resolution as runReview's verify stage.
       const verifyModel = resolveChildModel(config.verifyModel ?? config.model ?? vAgent.model, null);
       console.log(

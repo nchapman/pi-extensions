@@ -71,15 +71,26 @@ const FINDER_RULES = `## Deciding what to report
 - Scope: the diff is the review. Report issues this change introduces or aggravates; skip pre-existing problems it merely passes by.
 - Suggestions must identify concrete low-impact problems, not style preferences, speculative hardening, or optional polish. Do not invent work to fill a severity bucket.`;
 
-/** Construct the AgentDef configuration for a finder child specialized to the given lens. */
-export function finderAgent(lens: Lens): AgentDef {
+/** Construct the AgentDef configuration for a finder child specialized to
+ * the given lens. `diffOnly` describes a world with no repository tree (the
+ * eval's fixture world, or reviewing a bare patch): the base prompt asserts
+ * a working tree, and a prompt that claims a tree the child cannot open is
+ * not merely wasted tokens — substantiation-obedient models believe it, grep
+ * for exactly the right guards, fail, and honor "do not report what you
+ * cannot substantiate" with silence. Measured: gpt-6-luna returned [] on
+ * 7/10 eval PRs under the tree-asserting prompt and reviewed from the diff
+ * (hitting the golden Critical) the moment the prompt disclosed the world. */
+export function finderAgent(lens: Lens, opts: { diffOnly?: boolean } = {}): AgentDef {
+  const world = opts.diffOnly
+    ? "You are reviewing one diff in an environment with no repository working tree — the diff itself is all the evidence you will have."
+    : "You are reviewing one diff against the working tree of the repository.";
   return {
     name: `review-${lens.id}`,
     description: `${lens.name} finder`,
     tools: ["read", "grep", "find", "ls"],
     instructions: `Find real problems this diff introduces, seen through one lens, and report each as evidence-backed JSON. Precision over volume: an empty result is a valid outcome — report only what you substantiate.
 
-You are reviewing one diff against the working tree of the repository. Your lens: **${lens.name}** — ${lens.focus}. Report only through this lens; other reviewers cover the rest.
+${world} Your lens: **${lens.name}** — ${lens.focus}. Report only through this lens; other reviewers cover the rest.
 
 ${EVIDENCE_RULES}
 
@@ -97,15 +108,23 @@ Severity: critical = credible severe security exposure, data loss, or broad brea
   };
 }
 
-/** Construct the AgentDef configuration for the adversarial verifier subagent. */
-export function verifyAgent(): AgentDef {
+/** Construct the AgentDef configuration for the adversarial verifier subagent.
+ * `diffOnly` matches the finder's world disclosure — the verifier's re-trace
+ * instructions otherwise tell it to open code it cannot open. */
+export function verifyAgent(opts: { diffOnly?: boolean } = {}): AgentDef {
+  const retrace = opts.diffOnly
+    ? "For each candidate, re-trace the claim yourself against the diff: follow the changed code, callers, and guards it shows, and decide whether the stated triggering conditions actually produce the stated consequence. Behavior claims need evidence in the diff you have seen — not inference from naming."
+    : "For each candidate, re-trace the claim yourself: open the code, follow the callers and guards, and decide whether the stated triggering conditions actually produce the stated consequence. Behavior claims need file:line evidence you have seen — not inference from naming.";
+  const world = opts.diffOnly
+    ? "No repository working tree is available in this environment — the diff, the guidelines, and these candidates are all the evidence you have."
+    : "The working tree of the repository is available to you.";
   return {
     name: "review-verify",
     description: "Adversarial finding verifier",
     tools: ["read", "grep", "find", "ls"],
-    instructions: `You are auditing code-review findings for false positives. You get an annotated diff, repo review guidelines, and a numbered list of candidate findings other reviewers produced. The working tree of the repository is available to you.
+    instructions: `You are auditing code-review findings for false positives. You get an annotated diff, repo review guidelines, and a numbered list of candidate findings other reviewers produced. ${world}
 
-For each candidate, re-trace the claim yourself: open the code, follow the callers and guards, and decide whether the stated triggering conditions actually produce the stated consequence. Behavior claims need file:line evidence you have seen — not inference from naming.
+${retrace}
 
 - confirmed: you traced a concrete path where it goes wrong (or it is a clear guideline violation with a concrete consequence).
 - rejected: only a mechanism refutation — you traced the code and the claim itself fails. The premise is factually wrong, a guard prevents the stated consequence, the trigger cannot arise from this code, the pattern matches the repo's own convention, or the finding is not a defect at all (test-coverage request, style preference, fabrication).
@@ -133,13 +152,20 @@ export function finderTask(opts: {
   priorFindings: string;
   /** Rendered attachment section (current contents of changed files). */
   attachments?: string;
+  /** No repository tree exists (eval fixtures, bare patches): the task says
+   * so, so obedient models review the diff instead of grepping a void. */
+  diffOnly?: boolean;
 }): string {
   const parts: string[] = [];
   parts.push(
     `# Code review: ${opts.lens.name}${opts.chunkCount > 1 ? ` (chunk ${opts.chunkIndex + 1}/${opts.chunkCount})` : ""}`,
   );
   parts.push(
-    `## Your job\nWork the ${opts.lens.name} lens — ${opts.lens.focus} — over the diff below and nothing else. Explore the working tree only to answer questions this diff raises.`,
+    `## Your job\nWork the ${opts.lens.name} lens — ${opts.lens.focus} — over the diff below and nothing else. ${
+      opts.diffOnly
+        ? "No repository working tree is available in this environment — the diff itself is all the evidence there is; substantiate findings from the diff alone."
+        : "Explore the working tree only to answer questions this diff raises."
+    }`,
   );
   if (opts.guidelines) parts.push(`## Repo review guidelines\n${opts.guidelines}`);
   if (opts.priorFindings) {

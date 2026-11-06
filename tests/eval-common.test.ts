@@ -367,6 +367,16 @@ describe("verify replay helpers", () => {
     expect(verifyBaselineGate(undefined).fatal).toContain("verify state unknown");
     // runs recorded before the verify meta field existed (verify-off era)
     expect(verifyBaselineGate({}).warn).toContain("assuming verify-off");
-    expect(verifyBaselineGate({ verify: false })).toEqual({});
+    // pre-fix baselines (no diffOnly field) under a diff-only replay: the
+    // frozen verify stage asserted a tree that did not exist — disclose it.
+    expect(verifyBaselineGate({ verify: false }).warn).toContain("verify wording differs");
+    // the same absent field under a tree-mode replay: both sides assert the
+    // tree (the pre-fix protocol) — consistent wording, no disclosure needed.
+    expect(verifyBaselineGate({ verify: false }, false)).toEqual({});
+    expect(verifyBaselineGate({ verify: false, diffOnly: true })).toEqual({});
+    // pre-disclosure baselines: the frozen verify stage ran under a prompt
+    // that asserted a tree which did not exist — verdicts may differ for
+    // wording, not mechanism, so the replay proceeds with a disclosure.
+    expect(verifyBaselineGate({ verify: false, diffOnly: false }).warn).toContain("verify wording differs");
   });
 });

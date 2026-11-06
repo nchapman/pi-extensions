@@ -13,9 +13,11 @@
  * The runner spawns real pi children through the production runReview()
  * (provided-diff seam: no git, empty working tree) — so scores exercise the
  * exact prompts, chunking, verify, and merge the user gets from /review.
- * The one deviation (no repo tree to explore) is deliberate and disclosed:
- * it lower-bounds the finders, which normally confirm findings against the
- * working tree.
+ * The one deviation (no repo tree to explore) is deliberate, disclosed, and
+ * since the diffOnly fix prompt-honest: finder/verifier prompts say no tree
+ * exists rather than sending children grepping into a void. It still
+ * lower-bounds the finders, which in production also get changed-file
+ * attachments and a real tree.
  */
 
 import { readdirSync, readFileSync } from "node:fs";
@@ -518,8 +520,14 @@ export function aggregateVerify(rows: VerifyReplayRow[]): VerifyAggregate {
  * replayed — the A/B would silently invert (already-verified findings
  * re-confirm and read as "verification buys nothing"). Fatal means refuse to
  * run; warn means proceed with a disclosure; empty is a clean verify-off
- * baseline. Pure so the triage is pinned by tests. */
-export function verifyBaselineGate(meta: { verify?: boolean } | undefined): {
+ * baseline. The diffOnly check flags a protocol seam: frozen findings scored
+ * under a prompt that asserted a missing tree, while the replay's verifier
+ * is told the truth — verdicts may differ for wording, not mechanism. Pure
+ * so the triage is pinned by tests. */
+export function verifyBaselineGate(
+  meta: { verify?: boolean; diffOnly?: boolean } | undefined,
+  replayDiffOnly = true,
+): {
   fatal?: string;
   warn?: string;
 } {
@@ -534,6 +542,14 @@ export function verifyBaselineGate(meta: { verify?: boolean } | undefined): {
   }
   if (meta.verify === undefined) {
     return { warn: "baseline predates the verify meta field — assuming verify-off (the old default)" };
+  }
+  // An absent diffOnly field means the pre-fix protocol (a prompt asserting a
+  // tree that did not exist): it matches a tree-mode replay and warns under a
+  // diff-only one — the seam the disclosure exists for.
+  if ((meta.diffOnly ?? false) !== replayDiffOnly) {
+    return {
+      warn: `baseline diffOnly=${String(meta.diffOnly)} but the replay runs diffOnly=${replayDiffOnly} — verify wording differs (pre-disclosure runs asserted a tree that did not exist)`,
+    };
   }
   return {};
 }
