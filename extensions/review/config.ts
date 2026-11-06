@@ -21,8 +21,9 @@ import path from "node:path";
  * override model and level together. Numbers (diffOnly protocol, 2026-11):
  * deepseek 80.6% at $0.047/PR; openai/gpt-6-luna 45–58% across two runs
  * (~52% mean) at ~$0.006/PR and ~29s per PR, provider-default effort —
- * explicit :low/:medium measured ~35% (effort hurts luna) and ±13-point
- * run variance is normal for it; the 6.5% pre-disclosure score was a harness
+ * explicit :low/:medium measured ~36%, :off 42–48%, so explicit reasoning
+ * effort hurts luna and default-vs-off is within run noise; ±13-point run
+ * variance is normal for it. The 6.5% pre-disclosure score was a harness
  * artifact, not the model. Re-run npm run eval:review whenever this changes. */
 export const DEFAULT_REVIEW_MODEL = "opencode-go/deepseek-v4.1-flash:off";
 
