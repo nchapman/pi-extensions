@@ -234,7 +234,7 @@ export interface TaskRegistry {
 export const NEVER_ADOPT_MS = Number.POSITIVE_INFINITY;
 
 /** Millis bash (wait: auto) blocks before promoting to the background. */
-export const DEFAULT_BASH_BG_AFTER_MS = 120_000;
+export const DEFAULT_BASH_BG_AFTER_MS = 300_000;
 
 /** Shared PI_*_BG_AFTER_MS parsing: trim first (Number("") is 0, which would
  * background instantly); "off"/"never" opts out entirely (never promote —
@@ -1094,7 +1094,7 @@ export function createBashTool(
   const now = opts.now ?? Date.now;
   // The description states the auto-promote window; report the value in effect
   // at registration — PI_BASH_BG_AFTER_MS is a session-level knob, so a tuned
-  // window shouldn't be described as the 2m default. "off" (Infinity) means
+  // window shouldn't be described as the 5m default. "off" (Infinity) means
   // auto never promotes: describe that instead of a garbage "Infinitys".
   const descWindowMs = typeof opts.waitMs === "function" ? opts.waitMs() : (opts.waitMs ?? DEFAULT_BASH_BG_AFTER_MS);
   const windowFinite = Number.isFinite(descWindowMs);
