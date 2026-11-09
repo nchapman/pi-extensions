@@ -807,6 +807,35 @@ describe("registerSshBashExtension", () => {
     expect(wake).toContain("epoch 1 done");
   });
 
+  it("promotes a default (auto) call after PI_BASH_BG_AFTER_MS and wakes on exit", async () => {
+    const { sendUserMessage, registry } = registryDeps();
+    publishSharedTaskRegistry(registry);
+    const { pi, tools } = makePi();
+    const f = fakeSpawn();
+    registerSshBashExtension(pi, { ...OPS, spawnFn: f.spawnFn } as never);
+    const tool = tools.get(SSH_TOOL_NAME)!;
+    // No wait param → auto (the default); the env knob sets a 20ms window the
+    // undriven fake child outlasts, so the call must promote.
+    process.env.PI_BASH_BG_AFTER_MS = "20";
+    try {
+      const result = (await tool.execute(
+        "1",
+        { command: "train.py --epochs 40", target: "root@1.2.3.4", port: 13839 },
+        undefined,
+        undefined,
+        CTX,
+      )) as { content: Array<{ type: string; text: string }> };
+      expect(result.content[0].text).toContain("Backgrounded");
+      expect(result.content[0].text).toContain("[ssh-1]");
+      f.children[0].emitStdout("epoch 1 done\n");
+      f.children[0].close(0);
+      await vi.waitFor(() => expect(sendUserMessage).toHaveBeenCalledTimes(1));
+      expect(sendUserMessage.mock.calls[0][0] as string).toContain("epoch 1 done");
+    } finally {
+      delete process.env.PI_BASH_BG_AFTER_MS;
+    }
+  });
+
   it("closes the session's control masters on session_shutdown", () => {
     const { pi, tools, events } = makePi();
     const f = fakeSpawn();

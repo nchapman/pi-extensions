@@ -432,9 +432,12 @@ export function registerSubagentsExtension(
     }
   });
   registerSubagentTools(pi, agentsDir, opts.spawnFn ?? defaultSpawn, agents, registry);
-  // The unified bash tool replaces the built-in by name: wait: inline delegates
-  // to pi's own bash tool; auto/background promote to this registry like subagents.
-  // The wait window is read per call so PI_BASH_BG_AFTER_MS changes apply live.
+  // The unified bash tool replaces the built-in by name: wait defaults to
+  // auto — quick commands return inline, and one still running after the
+  // window promotes to this registry like a backgrounded subagent. Explicit
+  // wait: inline delegates to pi's own bash tool (the deliberate unbounded
+  // block); background adopts immediately. The wait window is read per call
+  // so PI_BASH_BG_AFTER_MS changes apply live.
   pi.registerTool(
     createBashTool(registry, {
       // bgOperations is a test harness faking pi's own LOCAL bash operations —

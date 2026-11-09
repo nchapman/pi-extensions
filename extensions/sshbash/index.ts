@@ -57,7 +57,14 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { Type } from "typebox";
 import type { BashOperations, ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createBashTool, getSharedTaskRegistry, piAgentDir, type BashToolCallParams } from "../../lib/superbash";
+import {
+  createBashTool,
+  formatDuration,
+  getSharedTaskRegistry,
+  parseBashBgAfterMs,
+  piAgentDir,
+  type BashToolCallParams,
+} from "../../lib/superbash";
 
 /** Tool name registered for remote command execution over SSH. */
 export const SSH_TOOL_NAME = "ssh_bash";
@@ -619,12 +626,21 @@ export function registerSshBashExtension(
       strictHostKeyChecking: parseStrictHostKey(process.env),
     });
 
+  // Description states the auto window in effect at registration; the window
+  // itself is read per call (PI_BASH_BG_AFTER_MS, "off" honored) so env
+  // changes apply live, exactly like the local bash tool.
+  const descWindowMs = parseBashBgAfterMs(process.env);
+  const windowTxt = Number.isFinite(descWindowMs) ? `~${formatDuration(descWindowMs)}` : undefined;
+  const sshWaitClause = windowTxt
+    ? `wait defaults to "auto": a command that finishes within ${windowTxt} blocks and returns inline; one still running after ${windowTxt} moves to the background and returns a task id, with the result arriving automatically as your next message.`
+    : `wait defaults to "auto" with promotion disabled (PI_BASH_BG_AFTER_MS=off): commands block until they finish.`;
   const tool = createBashTool(() => getSharedTaskRegistry(), {
     name: SSH_TOOL_NAME,
     label: "SSH bash",
+    waitMs: () => parseBashBgAfterMs(process.env),
     description: `Execute a shell command on a remote machine over SSH and get stdout/stderr. The connection is reused across calls (OpenSSH multiplexing): the first call to a destination pays the full handshake; later calls connect in milliseconds without re-authenticating. The command runs through the remote shell in the login directory — cd yourself as needed. Prefer this over bash with a raw ssh command for any remote machine.
 target: user@host, host, an ~/.ssh/config alias, ssh://user@host:port, or a connection id (ssh-N) named in an earlier result; port and key refine it. Auth must be non-interactive (identity file, ssh-agent, or ssh config) — there are no password prompts; a destination that cannot authenticate fails fast with ssh's error.
-wait: "inline" (default) blocks until completion; "auto" blocks ~2m then backgrounds; "background" returns a task id immediately and the result arrives automatically as your next message.
+${sshWaitClause} "inline" blocks until completion, however long; "background" returns a task id immediately.
 Run commands in the foreground — do not use nohup, trailing &, disown, screen, or tmux; pass wait: "background" instead. Backgrounding inside the shell exits immediately with code 0, breaking task tracking, log streaming, completion wakes, and task_kill (which cleanly SIGKILLs the remote session group).
 Never sleep or poll remote commands in a loop — output streams automatically (peek with task <id>).`,
     promptSnippet: "Execute commands on a remote machine over SSH",

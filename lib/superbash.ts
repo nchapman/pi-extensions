@@ -11,12 +11,21 @@
  *   background). The one exception is persistent bash tasks (below), which
  *   shutdown spares because their state lives on disk
  * - one tool for every CLI task, named `bash` so it replaces the built-in by
- *   name: wait: "inline" (default) delegates to pi's own bash tool (identical
- *   streaming, truncation, temp-file stashing, structured output); wait: "auto"
- *   blocks for up to a ~2m window and then promotes to the
- *   background exactly like subagents do; wait: "background" returns the task
- *   id immediately. No default timeout — the agent decides; 0 or omitted
- *   means no timeout
+ *   name: wait defaults to "auto" — quick commands block and return inline
+ *   (built-in-style results through the registry's pipe leg), and one still
+ *   running after the window promotes to the background exactly like
+ *   subagents do; wait: "inline" is the deliberate unbounded block (pi's own
+ *   bash tool, identical streaming, truncation, temp-file stashing, structured
+ *   output, no task registered); wait: "background" returns the task id
+ *   immediately. The auto default reverses the 2026-10-03 cut (blocking
+ *   everywhere): the churn that killed auto then — sleep-poll starvation and
+ *   check-in escalation — is now impossible by mechanism (steering wakes
+ *   deliver mid-run at turn boundaries; reminders are content-bearing and say
+ *   elapsed time alone is not a reason to kill), so a long foreground command
+ *   hands the session back instead of parking it. A command that settles
+ *   inside the window leaves no log behind unless the result points at it as
+ *   the truncation stash — with auto as the default, per-command logs would be
+ *   pure litter for every quick command
  * - a backgrounded task keeps running while the parent turn moves on; when it
  *   settles, one wake message steers in with the result — delivered as the
  *   parent's next message at a turn boundary, even mid-run, so a sleep-polling
@@ -42,7 +51,9 @@
  *   the 128+signal exit-code convention. The full command output is streamed
  *   to <sessionDir>/tasks/<id>.log (or a temp file with no session dir) from
  *   byte zero — `task <id>` peeks at it while the command runs and it
- *   survives resume; the log is removed on kill
+ *   survives resume; the log is removed on kill, and by an auto command that
+ *   settles inside its window unless the result points at it (truncation
+ *   stash) — with auto as the default, quick commands must not litter
  * - wait: "background" + persist: true opts a bash task into surviving pi
  *   itself (lib/persistent-bash holds the design: detached group leader, a
  *   wrapper that records the exit status, metadata under the session dir).
@@ -216,9 +227,9 @@ export interface TaskRegistry {
 
 /**
  * Subagents block to completion by default — adoption never fires unless
- * background: true or PI_SUBAGENT_BG_AFTER_MS opts in. Node clamps Infinity
- * setTimeout delays to 1ms (an instant adopt), so callers must guard with
- * Number.isFinite before scheduling.
+ * background: true or PI_SUBAGENT_BG_AFTER_MS opts in ("off"/"never" spells
+ * the same never). Node clamps Infinity setTimeout delays to 1ms (an instant
+ * adopt), so callers must guard with Number.isFinite before scheduling.
  */
 export const NEVER_ADOPT_MS = Number.POSITIVE_INFINITY;
 
@@ -226,20 +237,25 @@ export const NEVER_ADOPT_MS = Number.POSITIVE_INFINITY;
 export const DEFAULT_BASH_BG_AFTER_MS = 120_000;
 
 /** Shared PI_*_BG_AFTER_MS parsing: trim first (Number("") is 0, which would
- * background instantly); negative or invalid values fall back to the default. */
+ * background instantly); "off"/"never" opts out entirely (never promote —
+ * restores the 2026-10 blocking default); other negative or invalid values
+ * fall back to the default. */
 function parseAfterMs(env: Record<string, string | undefined>, key: string, fallback: number): number {
   const raw = env[key]?.trim();
-  return raw && Number.isFinite(Number(raw)) && Number(raw) >= 0 ? Number(raw) : fallback;
+  if (!raw) return fallback;
+  if (/^(off|never)$/i.test(raw)) return Number.POSITIVE_INFINITY;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
 }
 
-/** Parse PI_SUBAGENT_BG_AFTER_MS: threshold in ms after which a blocking child is backgrounded. */
+/** Parse PI_SUBAGENT_BG_AFTER_MS: threshold in ms after which a blocking child is backgrounded ("off" = never, the default). */
 export function parseBgAfterMs(env: Record<string, string | undefined>): number {
   // Default: never adopt — blocking is the norm; the env knob opts into the
-  // old auto-adoption window.
+  // auto-adoption window.
   return parseAfterMs(env, "PI_SUBAGENT_BG_AFTER_MS", NEVER_ADOPT_MS);
 }
 
-/** Parse PI_BASH_BG_AFTER_MS: default auto-wait window in ms before promoting bash commands. */
+/** Parse PI_BASH_BG_AFTER_MS: default auto-wait window in ms before promoting bash commands ("off" = never). */
 export function parseBashBgAfterMs(env: Record<string, string | undefined>): number {
   return parseAfterMs(env, "PI_BASH_BG_AFTER_MS", DEFAULT_BASH_BG_AFTER_MS);
 }
@@ -1028,16 +1044,18 @@ const UPDATE_THROTTLE_MS = 100;
 /**
  * The unified bash tool — replaces the built-in by name and covers the whole
  * range of "run a CLI task":
- * - wait: "inline" (default) — delegates to pi's own bash tool (same streaming,
- *   truncation, temp-file stashing, structured output); no task is registered
- * - wait: "auto" — blocks up to the window, streaming live output to
- *   the TUI; a command that finishes in time returns a built-in-style result
- *   inline, one that doesn't is promoted to the background and the tool
- *   returns its task id, with the wake delivering the result later
+ * - wait defaults to "auto" — blocks up to the window, streaming live output
+ *   to the TUI; a command that finishes in time returns a built-in-style
+ *   result inline, one that doesn't is promoted to the background and the
+ *   tool returns its task id, with the wake delivering the result later
+ * - wait: "inline" — the deliberate unbounded block: delegates to pi's own
+ *   bash tool (same streaming, truncation, temp-file stashing, structured
+ *   output); no task is registered
  * - wait: "background" — returns the task id immediately
  * Auto and background run through pi's local bash operations with a full
  * output log, so `task <id>` can peek at any point and the output survives
- * resume.
+ * resume. A command that settles inside the auto window leaves no log behind
+ * unless the result points at it as the truncation stash.
  */
 export function createBashTool(
   registry: TaskRegistry | (() => TaskRegistry | undefined),
@@ -1076,8 +1094,14 @@ export function createBashTool(
   const now = opts.now ?? Date.now;
   // The description states the auto-promote window; report the value in effect
   // at registration — PI_BASH_BG_AFTER_MS is a session-level knob, so a tuned
-  // window shouldn't be described as the 2m default.
+  // window shouldn't be described as the 2m default. "off" (Infinity) means
+  // auto never promotes: describe that instead of a garbage "Infinitys".
   const descWindowMs = typeof opts.waitMs === "function" ? opts.waitMs() : (opts.waitMs ?? DEFAULT_BASH_BG_AFTER_MS);
+  const windowFinite = Number.isFinite(descWindowMs);
+  const windowTxt = windowFinite ? `~${formatDuration(descWindowMs)}` : undefined;
+  const autoClause = windowFinite
+    ? `wait defaults to "auto": a command that finishes within ${windowTxt} blocks and returns its output inline — waiting on a tool call costs nothing — while one still running after ${windowTxt} moves to the background and returns a task id (t-xxxxx). "inline" blocks until the command finishes, however long: the deliberate wait-in-turn choice for when you'd rather not be re-engaged. "background" returns a task id immediately — for known-long work you'll do other things while it runs.`
+    : `wait defaults to "auto" with promotion disabled (PI_BASH_BG_AFTER_MS=off): commands block until they finish and return their output — waiting on a tool call costs nothing; pass a timeout to bound a command you're unsure about. "inline" is the same unbounded block through pi's own bash tool. "background" returns a task id immediately.`;
   // The definition (not the wrapped tool): its execute takes the tool ctx,
   // which the inline path needs for cwd, session env, and streaming.
   const piBashDef = opts.inline ? undefined : createBashToolDefinition(process.cwd());
@@ -1112,12 +1136,14 @@ export function createBashTool(
     description:
       opts.description ??
       `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first); when truncated, the full output is saved to a file whose path the result includes.
-wait: "inline" (default) blocks until the command finishes and returns its output — waiting on a tool call costs nothing, so this is the normal choice; pass a timeout to bound a command you're unsure about. wait: "auto" blocks up to ~${formatDuration(descWindowMs)} — a command that finishes in time returns its output inline, one that exceeds it moves to the background and returns a task id (t-xxxxx). "background" returns a task id immediately — for work you'll do other things while it runs. A backgrounded command's result (exit status, duration, output tail) is delivered to you automatically as your next message, even mid-run — if you have nothing else to do, end your turn and the wake re-engages you; never sleep or poll to wait. Peek at a running task with task <id> only when its new output would change what you do; stop it with task_kill.
+${autoClause} A backgrounded command's result (exit status, duration, output tail) is delivered to you automatically as your next message, even mid-run — if you have nothing else to do, end your turn and the wake re-engages you; never sleep or poll to wait. Peek at a running task with task <id> only when its new output would change what you do; stop it with task_kill.
 persist: true (wait: "background" only) detaches the command from pi entirely: it keeps running across pi exits and restarts, logs to the session's tasks directory, and its outcome is reported when the session resumes. The default is non-persistent; PI_BG_BASH_PERSIST=1 flips the default for background mode.
 Timeout is in seconds, optional, no default — a command without a timeout runs until it finishes or is killed (0 also means no timeout).`,
     promptSnippet: opts.promptSnippet ?? "Execute bash commands (ls, grep, find, etc.)",
     promptGuidelines: opts.promptGuidelines ?? [
-      "Default to plain blocking (inline): waiting on a tool call costs nothing. Use wait: background for long-running work (builds, test suites, migrations) you have other work to do alongside; wait: auto only when you want a bounded block before backgrounding.",
+      windowFinite
+        ? `Quick commands need no wait param: they block and return inline, and waiting on a tool call costs nothing. A command still running after ${windowTxt} moves to the background on its own — use wait: "background" up front for known-long work (builds, test suites, migrations) you have other work to do alongside, and wait: "inline" only when you deliberately want to wait in-turn past the window.`
+        : "Default to plain blocking: waiting on a tool call costs nothing. Use wait: background for long-running work you have other work to do alongside.",
       "Background results are delivered to you automatically as your next message, even mid-run — if you have nothing else to do, end your turn; the wake re-engages you. Never sleep or poll to wait.",
       "Peek at a running task with task <id> only when new output would change what you do; otherwise end your turn and let the completion wake re-engage you. Stop a task with task_kill.",
       "You can inspect PI_* environment variables for current model and session details.",
@@ -1131,7 +1157,9 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
       ),
       wait: Type.Optional(
         Type.Union([Type.Literal("inline"), Type.Literal("auto"), Type.Literal("background")], {
-          description: `inline (default): block and return output. auto: block up to ~${formatDuration(descWindowMs)}, then move to the background. background: return a task id immediately.`,
+          description: windowFinite
+            ? `auto (default): block and return inline; if still running after ${windowTxt}, move to the background. inline: block until the command finishes, however long. background: return a task id immediately.`
+            : `auto (default): block until the command finishes (promotion disabled). inline: the same unbounded block. background: return a task id immediately.`,
         }),
       ),
       persist: Type.Optional(
@@ -1148,7 +1176,7 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
       onUpdate: BashOnUpdate | undefined,
       ctx: ToolCtx | undefined,
     ): Promise<BashToolResult> {
-      const mode: BashWaitMode = params.wait ?? "inline";
+      const mode: BashWaitMode = params.wait ?? "auto";
       const error = (text: string): BashToolResult => ({
         content: [{ type: "text", text }],
         details: { kind: "bash", mode },
@@ -1182,8 +1210,17 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
       const prep = opts.prepare?.(params) ?? { operations, inline: runInline };
       const inlineExec = prep.inline ?? (opts.prepare ? inlineFromOps(prep.operations) : runInline);
       const taskHead = prep.head ?? bashCommandHead(command);
+      // Registry resolution happens before the inline leg because the default
+      // mode (auto) needs the answer: without a registry (a vendored ssh_bash
+      // without subagents, say) auto degrades to a plain inline run — the
+      // command still executes and returns inline, only promotion is lost, so
+      // a standalone tool stays usable (fail-open, documented here). Explicit
+      // background stays a loud error: it cannot honor its contract (a task id
+      // now, a wake later) at all.
+      const reg = typeof registry === "function" ? registry() : registry;
+      const degradedAuto = mode === "auto" && !reg;
       // Inline is the built-in, byte for byte: no task, no wake, no log.
-      if (mode === "inline") {
+      if (mode === "inline" || degradedAuto) {
         try {
           const result = await inlineExec(toolCallId, { command, timeout: timeoutSecs }, signal, onUpdate, ctx);
           return {
@@ -1194,10 +1231,6 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
           return error(e instanceof Error ? e.message : String(e));
         }
       }
-      // A lazy registry (sibling tools read the session's shared registry per
-      // call) may be absent; inline already ran above, so only the background
-      // legs need it, and the error says exactly which mode still works.
-      const reg = typeof registry === "function" ? registry() : registry;
       if (!reg) {
         return error(`${name}: background execution unavailable (no task registry); use wait: "inline"`);
       }
@@ -1580,6 +1613,15 @@ The command keeps running in its own process group, detached from pi — it surv
         });
       } catch (err) {
         settle(`failed: ${err instanceof Error ? err.message : String(err)}`, false);
+        // The command never ran; drop the eagerly-created (empty) log so a
+        // failed start leaves nothing behind.
+        if (logPath) {
+          try {
+            unlinkSync(logPath);
+          } catch {
+            // best effort
+          }
+        }
         return error(`Failed to start command: ${err instanceof Error ? err.message : String(err)}`);
       }
       const backgrounded = (): BashToolResult => ({
@@ -1605,10 +1647,12 @@ The command keeps running in the background. When it exits, the exit status, dur
       }
       // Auto: block up to the window, then promote. The window is read per
       // call so PI_BASH_BG_AFTER_MS changes apply without a reload; 0 behaves
-      // like background.
+      // like background. "off" (Infinity) must never reach setTimeout — Node
+      // clamps out-of-range delays to 1ms, which would promote instantly
+      // instead of never; with no promote arm the race is the exec alone.
       const windowMs = typeof opts.waitMs === "function" ? opts.waitMs() : (opts.waitMs ?? DEFAULT_BASH_BG_AFTER_MS);
       let windowTimer: ReturnType<typeof setTimeout> | undefined;
-      const race = await Promise.race([
+      const racers: Array<Promise<{ ok: boolean; exitCode: number | null; error?: string } | "promote">> = [
         execPromise.then(
           (r) => {
             const status = r.exitCode === null ? "terminated without an exit code" : `exited ${r.exitCode}`;
@@ -1625,10 +1669,15 @@ The command keeps running in the background. When it exits, the exit status, dur
             };
           },
         ),
-        new Promise<"promote">((resolve) => {
-          windowTimer = setTimeout(() => resolve("promote"), Math.max(0, windowMs - (now() - startedAt)));
-        }),
-      ]);
+      ];
+      if (Number.isFinite(windowMs)) {
+        racers.push(
+          new Promise<"promote">((resolve) => {
+            windowTimer = setTimeout(() => resolve("promote"), Math.max(0, windowMs - (now() - startedAt)));
+          }),
+        );
+      }
+      const race = await Promise.race(racers);
       if (windowTimer) clearTimeout(windowTimer);
       if (race === "promote") {
         promoted = true;
@@ -1678,6 +1727,17 @@ The command keeps running in the background. When it exits, the exit status, dur
       let text = display.content || "(no output)";
       if (display.truncated && logPath) {
         text += `\n\n[Output truncated — full output: ${logPath}]`;
+      }
+      // Auto-default hygiene: a command that settled inside the window leaves
+      // no log unless the result points at it as the truncation stash — with
+      // auto as the default, one log file per quick command would be pure
+      // litter (the log was already read back for the result above).
+      if (logPath && !display.truncated) {
+        try {
+          unlinkSync(logPath);
+        } catch {
+          // best effort — a leftover log is harmless
+        }
       }
       const exitCode = settled.exitCode;
       if (!settled.ok) {
@@ -1837,9 +1897,12 @@ Task ids come from bash (wait: background or auto), backgrounded subagents, or b
         } else if (task.kind === "bash") {
           const sessionDir = ctx?.sessionManager?.getSessionDir?.();
           const logPath = sessionDir ? outputLogPath(sessionDir, task.id) : tempOutputLogPath(task.id);
+          // A quick-settled auto task delivered inline (no wake) and left no
+          // log unless truncated; a promoted/backgrounded task woke with the
+          // tail and keeps its log. Both wordings must hold for either path.
           text += existsSync(logPath)
-            ? `\nFull output: ${logPath} (the completion wake carried the tail).`
-            : " — the completion wake carried its output.";
+            ? `\nFull output: ${logPath} (the tail already came back — inline result or completion wake).`
+            : " — its output already came back (inline result or completion wake).";
         } else {
           text += " — the completion wake carried its reply.";
         }
