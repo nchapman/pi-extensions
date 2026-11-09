@@ -651,11 +651,13 @@ function makePi() {
     }
   >();
   const events = new Map<string, (event?: unknown, ctx?: unknown) => unknown>();
+  const rendererResolvers: Array<(toolName: string, next: () => unknown) => unknown> = [];
   const pi = {
     registerTool: (t: never) => tools.set((t as { name: string }).name, t as never),
+    registerToolRenderer: (resolver: never) => rendererResolvers.push(resolver),
     on: (event: string, handler: (event?: unknown, ctx?: unknown) => unknown) => events.set(event, handler),
   } as unknown as ExtensionAPI;
-  return { pi, tools, events };
+  return { pi, tools, events, rendererResolvers };
 }
 
 const registryDeps = () => {
@@ -834,6 +836,24 @@ describe("registerSshBashExtension", () => {
     } finally {
       delete process.env.PI_BASH_BG_AFTER_MS;
     }
+  });
+
+  it("resolves pi's shell renderers for ssh_bash so its rows show the elapsed timer like bash", () => {
+    const { pi, rendererResolvers } = makePi();
+    registerSshBashExtension(pi, OPS as never);
+    expect(rendererResolvers).toHaveLength(1);
+    const resolve = rendererResolvers[0];
+    // ssh_bash gets the shell renderers (renderCall starts the row's clock;
+    // renderResult draws "Elapsed 34.0s" while partial / "Took" at the end —
+    // pi grafts these onto the builtin-named bash by name; ssh_bash has no
+    // namesake, so the resolver is what carries them).
+    const forSsh = resolve(SSH_TOOL_NAME, () => undefined) as { renderCall?: unknown; renderResult?: unknown };
+    expect(typeof forSsh.renderCall).toBe("function");
+    expect(typeof forSsh.renderResult).toBe("function");
+    // Every other tool delegates to the remaining resolvers unchanged.
+    const next = vi.fn(() => "fallback" as const);
+    expect(resolve("bash", next)).toBe("fallback");
+    expect(next).toHaveBeenCalledTimes(1);
   });
 
   it("closes the session's control masters on session_shutdown", () => {

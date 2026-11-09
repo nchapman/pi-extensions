@@ -62,7 +62,7 @@ Configuration: set both `PI_PUSHOVER_TOKEN` and `PI_PUSHOVER_USER` (from your Pu
 - **Non-interactive auth.** Runs with `BatchMode=yes` (key/agent/config only). If authentication cannot proceed non-interactively, it fails fast with SSH stderr instead of hanging waiting for user input.
 - **Session-scoped connection handles.** Each distinct destination (`user@host:port`) receives a handle (`ssh-1`, `ssh-2`, …). Subsequent calls can pass this handle as `target` instead of repeating the destination address.
 - **Remote process-group cancellation.** Commands run as `sh -s` scripts fed on stdin (never exposed in argv). A per-call nonce marker makes each execution's remote process group addressable, allowing `task_kill` and timeouts to group-SIGKILL the remote process tree cleanly.
-- **Full superbash parity.** Supports the same wait modes (`auto` default, `inline`, `background`), wake notifications, logging, and task inspection tools as local `bash`. A remote command still running after the auto window is moved to the background like a local one.
+- **Full superbash parity.** Supports the same wait modes (`auto` default, `inline`, `background`), wake notifications, logging, and task inspection tools as local `bash`. A remote command still running after the auto window is moved to the background like a local one. The TUI row matches too — pi's shell renderers (live `Elapsed` timer, capped output preview) are resolved for `ssh_bash` the way pi grafts them onto the builtin-named `bash`.
 
 ## Plans, goals, and memory
 

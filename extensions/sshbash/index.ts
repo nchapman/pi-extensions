@@ -56,7 +56,8 @@ import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Type } from "typebox";
-import type { BashOperations, ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { BashOperations, ExtensionAPI, ToolRenderers } from "@earendil-works/pi-coding-agent";
+import { createBashToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
   createBashTool,
   formatDuration,
@@ -698,7 +699,7 @@ Run the command in the foreground (remove nohup, disown, and trailing &) and pas
 ssh_bash tracks the process group, streams output to task <id>, and wakes you on completion.`,
           },
         ],
-        details: { kind: "bash", mode: params.wait ?? "inline" },
+        details: { kind: "bash", mode: params.wait ?? "auto" },
         isError: true,
       };
     }
@@ -706,7 +707,7 @@ ssh_bash tracks the process group, streams output to task <id>, and wakes you on
     if (resolved.error || !resolved.conn) {
       return {
         content: [{ type: "text", text: `Error: ${resolved.error ?? "invalid target"}` }],
-        details: { kind: "bash", mode: params.wait ?? "inline" },
+        details: { kind: "bash", mode: params.wait ?? "auto" },
         isError: true,
       };
     }
@@ -726,6 +727,18 @@ ssh_bash tracks the process group, streams output to task <id>, and wakes you on
   };
 
   pi.registerTool(tool);
+
+  // The TUI row must match local bash. pi grafts its shell renderers onto
+  // tools named after a built-in (withBuiltInRenderers), which is why the
+  // replaced `bash` shows the live "Elapsed 34.0s" timer and the capped
+  // output preview — ssh_bash has no namesake, so resolve pi's own bash
+  // renderers for it here. The definition is the only public surface that
+  // carries them (createShellRenderers is not root-exported).
+  // The renderer functions read args?.command/args?.timeout defensively, so
+  // widening their bash-typed signature to ToolRenderers' `unknown` args is
+  // safe (the cast is only for strictFunctionTypes contravariance).
+  const shellRenderers = createBashToolDefinition(process.cwd()) as unknown as ToolRenderers;
+  pi.registerToolRenderer((toolName, next) => (toolName === SSH_TOOL_NAME ? shellRenderers : next()));
 
   pi.on("session_shutdown", () => {
     // Best-effort, fire-and-forget: close the masters this session created.
