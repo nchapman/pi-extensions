@@ -4,6 +4,7 @@
  * and the security redaction/validation helpers. Network boundaries are never
  * touched — discovery fixtures are hand-shaped fetchAvailableModels payloads.
  */
+import { existsSync, readFileSync } from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   createAssistantMessageEventStream,
@@ -13,7 +14,12 @@ import {
 } from "@earendil-works/pi-ai";
 import { convertMessages, friendlyAntigravityError, streamResponse } from "../extensions/antigravity/stream/stream";
 import { getApiKey } from "../extensions/antigravity/auth/oauth";
-import { defaultProjectId, parseApiKey } from "../extensions/antigravity/client/client";
+import {
+  defaultProjectId,
+  fetchAvailableModelsCatalog,
+  isUsableCatalogData,
+  parseApiKey,
+} from "../extensions/antigravity/client/client";
 import {
   DEFAULT_CATALOG_REFRESH_INTERVAL_MS,
   getCatalogRefreshIntervalMs,
@@ -30,6 +36,8 @@ import {
   clearModelEnumCache,
   getAntigravityRequestModelId,
   getCurrentAntigravityCatalog,
+  ANTIGRAVITY_MODELS,
+  ANTIGRAVITY_ROUTING,
   getFallbackRuntimeModel,
   getModelEnum,
   getMaxOutputTokens,
@@ -670,5 +678,171 @@ describe("antigravity built-in conformance (SME audit fixes)", () => {
     await expect(
       streamResponse(new Response(body), createAssistantMessageEventStream(), baseOutput(), model),
     ).rejects.toThrow(/429/);
+  });
+});
+
+describe("antigravity xhigh grouping (live agy 1.5.7 payload shape)", () => {
+  it("merges plain -xhigh runtime ids into their family instead of a separate group", () => {
+    const info = (displayName: string) => ({
+      displayName,
+      supportsImages: true,
+      supportsThinking: true,
+      recommended: true,
+      maxTokens: 1048576,
+      maxOutputTokens: 262144,
+    });
+    const raw = {
+      models: {
+        "gemini-4-hydrogen-low": info("Gemini 4 Hydrogen (Low)"),
+        "gemini-4-hydrogen-medium": info("Gemini 4 Hydrogen (Medium)"),
+        "gemini-4-hydrogen-high": info("Gemini 4 Hydrogen (High)"),
+        "gemini-4-hydrogen-xhigh": info("Gemini 4 Hydrogen (XHigh)"),
+      },
+      agentModelSorts: [
+        {
+          displayName: "Recommended",
+          groups: [
+            {
+              modelIds: [
+                "gemini-4-hydrogen-low",
+                "gemini-4-hydrogen-medium",
+                "gemini-4-hydrogen-high",
+                "gemini-4-hydrogen-xhigh",
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const catalog = buildAntigravityCatalog(
+      raw.models,
+      { models: ANTIGRAVITY_MODELS, routing: { ...ANTIGRAVITY_ROUTING } },
+      raw.agentModelSorts,
+    );
+    expect(catalog.models.map((m) => m.id)).toEqual(["gemini-4-hydrogen"]);
+    expect(catalog.routing["gemini-4-hydrogen"]?.routing).toMatchObject({
+      low: "gemini-4-hydrogen-low",
+      medium: "gemini-4-hydrogen-medium",
+      high: "gemini-4-hydrogen-high",
+      xhigh: "gemini-4-hydrogen-xhigh",
+    });
+  });
+
+  const liveDump = "/tmp/agy-catalog.json";
+  it.skipIf(!existsSync(liveDump))(
+    "groups the recorded live 1.5.7 catalog like the agy CLI (regression snapshot)",
+    () => {
+      const raw = JSON.parse(readFileSync(liveDump, "utf8"));
+      const catalog = buildAntigravityCatalog(
+        raw.models,
+        { models: ANTIGRAVITY_MODELS, routing: { ...ANTIGRAVITY_ROUTING } },
+        raw.agentModelSorts,
+      );
+      expect(catalog.models.map((m) => m.id)).toEqual([
+        "gemini-3.8-flash",
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "gemini-4-argon",
+        "gemini-4-carbon",
+        "gemini-4-hydrogen",
+        "gpt-oss-120b",
+      ]);
+    },
+  );
+});
+
+describe("antigravity catalog source of truth (agy parity)", () => {
+  // Google's hosts serve different rollout snapshots (2026-11-12: cloudcode-pa
+  // lacked the Gemini-4 carbon/hydrogen families that daily-cloudcode-pa served).
+  // The catalog now comes from the FIRST valid endpoint only — never a mix —
+  // so a lagging host cannot filter fresh models out of the picker.
+  const info = (displayName: string) => ({
+    displayName,
+    supportsImages: true,
+    supportsThinking: true,
+    recommended: true,
+    maxTokens: 1048576,
+    maxOutputTokens: 262144,
+  });
+  const hydrogenModels = {
+    "gemini-4-hydrogen-low": info("Gemini 4 Hydrogen (Low)"),
+    "gemini-4-hydrogen-xhigh": info("Gemini 4 Hydrogen (XHigh)"),
+  };
+  const sorts = (ids: string[]) => [{ displayName: "Recommended", groups: [{ modelIds: ids }] }];
+  const dailyPayload = {
+    models: { ...hydrogenModels },
+    agentModelSorts: sorts(Object.keys(hydrogenModels)),
+    defaultAgentModelId: "gemini-4-hydrogen-low",
+  };
+  const laggingPayload = {
+    models: { "gemini-3.8-flash-low": info("Gemini 3.8 Flash (Low)") },
+    agentModelSorts: sorts(["gemini-3.8-flash-low"]),
+  };
+  const fakeFetch =
+    (responders: Record<string, () => Response | Error>) =>
+    (url: string | URL): Promise<Response> => {
+      for (const [needle, respond] of Object.entries(responders)) {
+        if (String(url).includes(needle)) {
+          const out = respond();
+          if (out instanceof Error) return Promise.reject(out);
+          return Promise.resolve(out);
+        }
+      }
+      return Promise.reject(new Error(`unexpected fetch: ${url}`));
+    };
+
+  it("takes the first valid endpoint's catalog whole — no mixing with lagging hosts", async () => {
+    const fetched: string[] = [];
+    const fetchFn = fakeFetch({
+      "daily-cloudcode-pa.googleapis.com": () => {
+        fetched.push("daily");
+        return new Response(JSON.stringify(dailyPayload), { status: 200 });
+      },
+      "cloudcode-pa.googleapis.com": () => {
+        fetched.push("cloudcode");
+        return new Response(JSON.stringify(laggingPayload), { status: 200 });
+      },
+    });
+    expect(isUsableCatalogData(dailyPayload)).toBe(true);
+    expect(isUsableCatalogData({ models: {} })).toBe(false);
+    const got = await fetchAvailableModelsCatalog("token", "project", undefined, fetchFn);
+    expect(got.endpoint).toBe("https://daily-cloudcode-pa.googleapis.com");
+    expect(Object.keys(got.data.models ?? {})).toEqual(Object.keys(hydrogenModels));
+    expect(got.data.defaultAgentModelId).toBe("gemini-4-hydrogen-low");
+    expect(fetched).toEqual(["daily"]); // lagging host never consulted
+  });
+
+  it("falls back to the next endpoint when the first fails", async () => {
+    const fetchFn = fakeFetch({
+      "daily-cloudcode-pa.googleapis.com": () => new Response("upstream error", { status: 503 }),
+      "sandbox.googleapis.com": () => new Error("connection reset"),
+      "cloudcode-pa.googleapis.com": () => new Response(JSON.stringify(laggingPayload), { status: 200 }),
+    });
+    const got = await fetchAvailableModelsCatalog("token", "project", undefined, fetchFn);
+    expect(got.endpoint).toBe("https://cloudcode-pa.googleapis.com");
+    expect(Object.keys(got.data.models ?? {})).toEqual(["gemini-3.8-flash-low"]);
+  });
+
+  it("fails with a diagnostic when every endpoint fails", async () => {
+    const fetchFn = fakeFetch({
+      googleapis: () => new Response("upstream error", { status: 503 }),
+    });
+    await expect(fetchAvailableModelsCatalog("token", "project", undefined, fetchFn)).rejects.toThrow(
+      /failed on all endpoints/,
+    );
+  });
+
+  it("groups the first endpoint's payload into one hydrogen family with an xhigh variant", async () => {
+    const fetchFn = fakeFetch({
+      "daily-cloudcode-pa.googleapis.com": () => new Response(JSON.stringify(dailyPayload), { status: 200 }),
+    });
+    const got = await fetchAvailableModelsCatalog("token", "project", undefined, fetchFn);
+    const catalog = buildAntigravityCatalog(
+      got.data.models!,
+      { models: ANTIGRAVITY_MODELS, routing: { ...ANTIGRAVITY_ROUTING } },
+      got.data.agentModelSorts,
+    );
+    expect(catalog.models.map((m) => m.id)).toEqual(["gemini-4-hydrogen"]);
+    expect(catalog.routing["gemini-4-hydrogen"]?.routing).toMatchObject({ xhigh: "gemini-4-hydrogen-xhigh" });
   });
 });

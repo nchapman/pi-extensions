@@ -362,9 +362,10 @@ async function fetchAvailableModelsFromEndpoint(
   token: string,
   projectId: string,
   signal?: AbortSignal,
+  fetchFn: typeof antigravityFetch = antigravityFetch,
 ): Promise<{ endpoint: string; status: number; data: unknown } | undefined> {
   try {
-    const res = await antigravityFetch(`${endpoint}/v1internal:fetchAvailableModels`, {
+    const res = await fetchFn(`${endpoint}/v1internal:fetchAvailableModels`, {
       method: "POST",
       headers: antigravityHeaders(token),
       body: JSON.stringify({ project: projectId }),
@@ -396,74 +397,43 @@ function catalogSignal(signal?: AbortSignal): AbortSignal {
 }
 
 /** Merge catalog payloads from one or more fetchAvailableModels responses. */
-export function mergeAvailableModelsResults(
-  results: Array<{ endpoint: string; status: number; data: unknown } | undefined>,
-): { endpoint: string; status: number; data: AvailableModelsRaw } {
-  const mergedModels: Record<string, unknown> = {};
-  let defaultAgentModelId: string | undefined;
-  let defaultAgentModel: string | undefined;
-  let agentModelSorts: AvailableModelsRaw["agentModelSorts"];
-  let lastEndpoint = "";
-  let lastStatus = 0;
-
-  for (const result of results) {
-    if (
-      !result ||
-      !isRecord(result.data) ||
-      !isRecord(result.data.models) ||
-      Object.keys(result.data.models).length === 0 ||
-      !Object.values(result.data.models).every(isRecord)
-    )
-      continue;
-    setLastEndpoint(result.endpoint);
-    setLastStatus(result.status);
-    lastEndpoint = result.endpoint;
-    lastStatus = result.status;
-    const data = result.data;
-    if (isRecord(data) && isRecord(data.models)) {
-      Object.assign(mergedModels, data.models);
-      registerDiscoveredModelEnums(data.models as Record<string, { model?: unknown }>);
-    }
-    if (isRecord(data) && typeof data.defaultAgentModelId === "string") {
-      defaultAgentModelId = data.defaultAgentModelId;
-    }
-    if (isRecord(data) && typeof data.defaultAgentModel === "string") {
-      defaultAgentModel = data.defaultAgentModel;
-    }
-    if (isRecord(data) && Array.isArray(data.agentModelSorts)) {
-      agentModelSorts = data.agentModelSorts as AvailableModelsRaw["agentModelSorts"];
-    }
-  }
-
-  if (!lastEndpoint) {
-    throw new Error(`/v1internal:fetchAvailableModels failed: no endpoint returned a valid non-empty catalog`);
-  }
-
-  return {
-    endpoint: lastEndpoint,
-    status: lastStatus,
-    data: {
-      models: mergedModels as AvailableModelsRaw["models"],
-      defaultAgentModelId,
-      defaultAgentModel,
-      agentModelSorts,
-    },
-  };
+/** Validate one endpoint's fetchAvailableModels response as a usable catalog. */
+export function isUsableCatalogData(data: unknown): data is AvailableModelsRaw {
+  return (
+    isRecord(data) &&
+    isRecord(data.models) &&
+    Object.keys(data.models).length > 0 &&
+    Object.values(data.models).every(isRecord)
+  );
 }
 
-/**
- * Merge fetchAvailableModels across endpoint candidates so daily/sandbox-only
- * models appear alongside production catalog entries.
- */
 export async function fetchAvailableModelsCatalog(
   token: string,
   projectId: string,
   signal?: AbortSignal,
+  fetchFn: typeof antigravityFetch = antigravityFetch,
 ): Promise<{ endpoint: string; status: number; data: AvailableModelsRaw }> {
-  const results = await Promise.all(
-    endpointCandidates().map((endpoint) => fetchAvailableModelsFromEndpoint(endpoint, token, projectId, signal)),
+  // One source of truth, like the agy CLI: take the first endpoint that returns a
+  // valid catalog, in candidate order. Google's hosts serve different rollout
+  // snapshots (cloudcode-pa lagged daily by a Gemini-4 family on 2026-11-12), and
+  // merging across them produces a view no single host ever served — the stale
+  // agentModelSorts from the lagging host then filtered the fresh models out of
+  // every refresh. Failover stays, mixing sources does not.
+  let lastError;
+  for (const endpoint of endpointCandidates()) {
+    try {
+      const result = await fetchAvailableModelsFromEndpoint(endpoint, token, projectId, signal, fetchFn);
+      if (result && isUsableCatalogData(result.data)) {
+        return { endpoint: result.endpoint, status: result.status, data: result.data };
+      }
+      if (result) lastError = new Error(`catalog from ${endpoint} was empty or unrecognized`);
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+    }
+  }
+  throw new Error(
+    `/v1internal:fetchAvailableModels failed on all endpoints: ${lastError ? safeError(lastError) : "no endpoint returned a valid non-empty catalog"}`,
   );
-  return mergeAvailableModelsResults(results);
 }
 
 async function loadCodeAssistUncached(token: string): Promise<string | undefined> {

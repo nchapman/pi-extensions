@@ -32,6 +32,8 @@ type RuntimeGroup = {
 const THINKING_SUFFIXES: Array<{ suffix: string; level: ThinkingLevel }> = [
   { suffix: "extra-low", level: ThinkingEffort.Low },
   { suffix: "extra-high", level: ThinkingEffort.Xhigh },
+  // "xhigh" must precede "high" — hydrogen ships a plain -xhigh runtime id.
+  { suffix: "xhigh", level: ThinkingEffort.Xhigh },
   { suffix: "thinking", level: ThinkingEffort.High },
   { suffix: "minimal", level: ThinkingEffort.Minimal },
   { suffix: "medium", level: ThinkingEffort.Medium },
@@ -42,6 +44,8 @@ const THINKING_SUFFIXES: Array<{ suffix: string; level: ThinkingLevel }> = [
 const DISPLAY_LEVELS: Array<{ pattern: RegExp; level: ThinkingLevel }> = [
   { pattern: /\(\s*extra\s*low\s*\)/i, level: ThinkingEffort.Low },
   { pattern: /\(\s*extra\s*high\s*\)/i, level: ThinkingEffort.Xhigh },
+  // "(XHigh)" must precede "(High)" — the display name contains "High".
+  { pattern: /\(\s*x\s*high\s*\)/i, level: ThinkingEffort.Xhigh },
   { pattern: /\(\s*thinking\s*\)/i, level: ThinkingEffort.High },
   { pattern: /\(\s*minimal\s*\)/i, level: ThinkingEffort.Minimal },
   { pattern: /\(\s*medium\s*\)/i, level: ThinkingEffort.Medium },
@@ -252,7 +256,7 @@ function modelDisplayName(info: ModelInfoRaw | undefined): string | undefined {
 function displayFamily(displayName: string | undefined): string | undefined {
   if (!displayName) return undefined;
   return displayName
-    .replace(/\s*\((?:extra\s*low|extra\s*high|low|medium|high|minimal|thinking)\)\s*$/i, "")
+    .replace(/\s*\((?:extra\s*low|extra\s*high|x\s*high|low|medium|high|minimal|thinking)\)\s*$/i, "")
     .trim()
     .toLowerCase();
 }
