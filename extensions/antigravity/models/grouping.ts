@@ -367,42 +367,14 @@ function familyTemplate(
   return undefined;
 }
 
+/**
+ * Model display name — deliberately the public id itself. pi's model picker only
+ * shows the name in parens when it adds information beyond the id
+ * (getDistinctModelName), so a humanized variant ("Gemini 3.8 Flash
+ * (Antigravity)") just pollutes every row; id-as-name keeps the list clean.
+ */
 function publicModelName(group: RuntimeGroup): string {
-  const family = group.displayNames.map((name) => displayFamily(name)).find(Boolean);
-  if (family) {
-    return `${titleCase(family)} (Antigravity)`;
-  }
-  return `${humanizePublicId(group.publicId)} (Antigravity)`;
-}
-
-function titleCase(value: string): string {
-  return value.replace(/\b([a-z])/g, (char) => char.toUpperCase());
-}
-
-export function humanizePublicId(id: string): string {
-  const tokens = id.split("-");
-  const words: string[] = [];
-  for (let i = 0; i < tokens.length; i++) {
-    const token = tokens[i];
-    if (!token) continue;
-    const next = tokens[i + 1];
-    if (token === "gpt" && next === "oss") {
-      words.push("GPT-OSS");
-      i++;
-      continue;
-    }
-    if (/^\d+$/.test(token) && next && /^\d+$/.test(next)) {
-      words.push(`${token}.${next}`);
-      i++;
-      continue;
-    }
-    if (/^\d/.test(token)) {
-      words.push(token.toUpperCase());
-      continue;
-    }
-    words.push(token.charAt(0).toUpperCase() + token.slice(1));
-  }
-  return words.join(" ");
+  return group.publicId;
 }
 
 function parseGeminiVersion(id: string): number {

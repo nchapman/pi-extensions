@@ -16,7 +16,6 @@ import {
 import {
   buildAntigravityCatalog,
   extractRecommendedModelIds,
-  humanizePublicId,
   isSelectableRuntimeModelId,
   resolvedCatalog,
 } from "../extensions/antigravity/models/grouping";
@@ -146,7 +145,9 @@ describe("antigravity catalog grouping", () => {
     const catalog = buildAntigravityCatalog(rawModels, getCurrentAntigravityCatalog());
     const flash = catalog.models.find((m) => m.id === "gemini-3.9-flash");
     expect(flash).toBeDefined();
-    expect(flash?.name).toBe("Gemini 3.9 Flash (Antigravity)");
+    // Grouped catalog: name is the public id (pi's picker hides names that add
+    // nothing beyond the id, so rows render clean).
+    expect(flash?.name).toBe("gemini-3.9-flash");
     expect(flash?.thinkingLevelMap).toMatchObject({
       low: "low",
       medium: "medium",
@@ -186,11 +187,6 @@ describe("antigravity catalog grouping", () => {
     expect(isSelectableRuntimeModelId("has image inside")).toBe(false);
     expect(isSelectableRuntimeModelId("fine", { isInternal: true })).toBe(false);
   });
-
-  it("humanizes public ids for display", () => {
-    expect(humanizePublicId("gemini-3.9-flash")).toBe("Gemini 3.9 Flash");
-    expect(humanizePublicId("gpt-oss-120b")).toBe("GPT-OSS 120B");
-  });
 });
 
 describe("antigravity catalog hydration", () => {
@@ -225,6 +221,34 @@ describe("antigravity catalog hydration", () => {
     expect(hydrateAntigravityCatalog(persisted)).toBe(123456);
     expect(getCurrentAntigravityCatalog().models.map((m) => m.id)).toEqual(["gemini-9-flash"]);
     expect(getAntigravityRequestModelId("gemini-9-flash", "high")).toBe("gemini-9-flash");
+  });
+
+  it("normalizes persisted display names to ids on hydrate", () => {
+    // A pre-fork store carried humanized names; hydration must not resurrect them.
+    const persisted = {
+      "pi-antigravity": {
+        catalog: {
+          models: [
+            {
+              id: "gemini-3.8-flash",
+              name: "Gemini 3.8 Flash (Antigravity)",
+              reasoning: true,
+              input: ["text"],
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+              contextWindow: 1048576,
+              maxTokens: 65536,
+            },
+          ],
+          routing: {},
+        },
+        checkedAt: 999,
+        modelEnums: {},
+        schemaVersion: 2,
+        credentialKey: "k",
+      },
+    };
+    expect(hydrateAntigravityCatalog(persisted)).toBe(999);
+    expect(getCurrentAntigravityCatalog().models[0]?.name).toBe("gemini-3.8-flash");
   });
 
   it("returns 0 for missing or malformed stores", () => {

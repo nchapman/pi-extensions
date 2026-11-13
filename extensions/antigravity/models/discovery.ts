@@ -49,7 +49,15 @@ export function hydrateAntigravityCatalog(stored: unknown): number {
   if (!isRecord(persisted)) return 0;
 
   if (isStringMap(persisted.modelEnums)) restoreDynamicModelEnums(persisted.modelEnums);
-  if (isCatalog(persisted.catalog)) applyAntigravityCatalog(persisted.catalog);
+  if (isCatalog(persisted.catalog)) {
+    // Normalize names to ids: catalogs persisted before this fork displayed
+    // humanized "… (Antigravity)" names, and hydration restores them verbatim —
+    // renormalize so stale stores cannot resurrect the polluted picker rows.
+    applyAntigravityCatalog({
+      models: persisted.catalog.models.map((model) => ({ ...model, name: model.id })),
+      routing: persisted.catalog.routing,
+    });
+  }
   return typeof persisted.checkedAt === "number" && persisted.checkedAt > 0 ? persisted.checkedAt : 0;
 }
 

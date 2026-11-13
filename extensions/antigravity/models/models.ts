@@ -218,7 +218,7 @@ const thinkingLevelMaps = {
 export const ANTIGRAVITY_MODELS: AntigravityModelConfig[] = [
   {
     id: "gemini-3.8-flash",
-    name: "Gemini 3.8 Flash (Antigravity)",
+    name: "gemini-3.8-flash",
     reasoning: true,
     thinkingLevelMap: thinkingLevelMaps.lowMediumHigh,
     input: ["text", "image"],
@@ -228,7 +228,7 @@ export const ANTIGRAVITY_MODELS: AntigravityModelConfig[] = [
   },
   {
     id: "gemini-3.7-flash",
-    name: "Gemini 3.7 Flash (Antigravity)",
+    name: "gemini-3.7-flash",
     reasoning: true,
     thinkingLevelMap: thinkingLevelMaps.lowMediumHigh,
     input: ["text", "image"],
@@ -238,7 +238,7 @@ export const ANTIGRAVITY_MODELS: AntigravityModelConfig[] = [
   },
   {
     id: "gemini-3.6-flash",
-    name: "Gemini 3.6 Flash (Antigravity)",
+    name: "gemini-3.6-flash",
     reasoning: true,
     thinkingLevelMap: thinkingLevelMaps.lowMediumHigh,
     input: ["text", "image"],
@@ -248,7 +248,7 @@ export const ANTIGRAVITY_MODELS: AntigravityModelConfig[] = [
   },
   {
     id: "claude-opus-4-6",
-    name: "Claude Opus 4.6 (Antigravity)",
+    name: "claude-opus-4-6",
     reasoning: true,
     thinkingLevelMap: thinkingLevelMaps.thinking,
     input: ["text", "image"],
@@ -258,7 +258,7 @@ export const ANTIGRAVITY_MODELS: AntigravityModelConfig[] = [
   },
   {
     id: "claude-sonnet-4-6",
-    name: "Claude Sonnet 4.6 (Antigravity)",
+    name: "claude-sonnet-4-6",
     reasoning: true,
     thinkingLevelMap: thinkingLevelMaps.thinking,
     input: ["text", "image"],
@@ -268,7 +268,7 @@ export const ANTIGRAVITY_MODELS: AntigravityModelConfig[] = [
   },
   {
     id: "gemini-3.1-pro",
-    name: "Gemini 3.1 Pro (Antigravity)",
+    name: "gemini-3.1-pro",
     reasoning: true,
     thinkingLevelMap: thinkingLevelMaps.lowHigh,
     input: ["text", "image"],
@@ -278,7 +278,7 @@ export const ANTIGRAVITY_MODELS: AntigravityModelConfig[] = [
   },
   {
     id: "gemini-3.5-flash",
-    name: "Gemini 3.5 Flash (Antigravity)",
+    name: "gemini-3.5-flash",
     reasoning: true,
     thinkingLevelMap: thinkingLevelMaps.lowMediumHigh,
     input: ["text", "image"],
@@ -288,7 +288,7 @@ export const ANTIGRAVITY_MODELS: AntigravityModelConfig[] = [
   },
   {
     id: "gpt-oss-120b",
-    name: "GPT-OSS 120B (Antigravity)",
+    name: "gpt-oss-120b",
     reasoning: true,
     thinkingLevelMap: thinkingLevelMaps.medium,
     input: ["text"],
