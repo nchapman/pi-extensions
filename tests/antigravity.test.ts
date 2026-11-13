@@ -5,8 +5,13 @@
  * touched — discovery fixtures are hand-shaped fetchAvailableModels payloads.
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { isRetryableAssistantError, type Api, type Model } from "@earendil-works/pi-ai";
-import { friendlyAntigravityError } from "../extensions/antigravity/stream/stream";
+import {
+  createAssistantMessageEventStream,
+  isRetryableAssistantError,
+  type Api,
+  type Model,
+} from "@earendil-works/pi-ai";
+import { convertMessages, friendlyAntigravityError, streamResponse } from "../extensions/antigravity/stream/stream";
 import { getApiKey } from "../extensions/antigravity/auth/oauth";
 import { defaultProjectId, parseApiKey } from "../extensions/antigravity/client/client";
 import {
@@ -509,5 +514,161 @@ describe("antigravity retry-classifier parity", () => {
     expect(classify("Quota reached. Please wait 5 hours. Next: switch models.")).toBe(false);
     expect(classify("context_length_exceeded: Antigravity API error (request-failed): input too long")).toBe(false);
     expect(classify(wrapped(400, "Unknown name: badField"))).toBe(false);
+  });
+});
+
+describe("antigravity built-in conformance (SME audit fixes)", () => {
+  // Base64, length % 4 === 0.
+  const SIG = "c2lnbmF0dXJlLXZhbGlkLWJhc2U2NC0wMQ==";
+  const baseOutput = () => ({
+    role: "assistant" as const,
+    content: [],
+    api: "antigravity-api",
+    provider: "antigravity",
+    model: "gemini-3.8-flash",
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "stop" as const,
+    timestamp: Date.now(),
+  });
+
+  it("drops cross-model thoughtSignatures on toolCall parts but keeps same-model ones", () => {
+    const model = { id: "gemini-3.8-flash", input: ["text", "image"] } as unknown as Model<Api>;
+    const assistant = (modelId: string) =>
+      ({
+        role: "assistant",
+        provider: "antigravity",
+        model: modelId,
+        stopReason: "stop",
+        timestamp: Date.now(),
+        content: [{ type: "toolCall", id: "call-1", name: "bash", arguments: { cmd: "ls" }, thoughtSignature: SIG }],
+      }) as never;
+    const toolResult = {
+      role: "toolResult",
+      toolCallId: "call-1",
+      toolName: "bash",
+      content: [{ type: "text", text: "ok" }],
+    } as never;
+    const cross = convertMessages(
+      model,
+      { messages: [{ role: "user", content: "hi" } as never, assistant("claude-sonnet-4.6"), toolResult] },
+      "claude-sonnet-4.6",
+    );
+    const crossCall = cross.flatMap((c) => c.parts).find((p) => "functionCall" in p) as Record<string, unknown>;
+    expect(crossCall).toBeDefined();
+    expect(crossCall).not.toHaveProperty("thoughtSignature");
+
+    const same = convertMessages(
+      model,
+      { messages: [{ role: "user", content: "hi" } as never, assistant("gemini-3.8-flash"), toolResult] },
+      "gemini-3.8-flash",
+    );
+    const sameCall = same.flatMap((c) => c.parts).find((p) => "functionCall" in p) as Record<string, unknown>;
+    expect(sameCall).toHaveProperty("thoughtSignature", SIG);
+  });
+
+  it("synthesizes tool results for orphaned tool calls (mid-history and final turn)", () => {
+    const model = { id: "gemini-3.8-flash", input: ["text", "image"] } as unknown as Model<Api>;
+    const callTurn = {
+      role: "assistant",
+      provider: "antigravity",
+      model: "gemini-3.8-flash",
+      stopReason: "stop",
+      timestamp: Date.now(),
+      content: [{ type: "toolCall", id: "call-1", name: "bash", arguments: {}, thoughtSignature: SIG }],
+    } as never;
+    const user = (text: string) => ({ role: "user", content: text, timestamp: Date.now() }) as never;
+
+    const mid = convertMessages(model, { messages: [user("hi"), callTurn, user("continue")] }, "claude-sonnet-4.6");
+    const synthetics = mid
+      .flatMap((c) => c.parts)
+      .filter((p) => "functionResponse" in p && JSON.stringify(p).includes("No result provided"));
+    expect(synthetics).toHaveLength(1);
+
+    // Final-turn orphan no longer throws; it degrades to a synthetic result.
+    const final = convertMessages(model, { messages: [user("hi"), callTurn] }, "claude-sonnet-4.6");
+    expect(JSON.stringify(final)).toContain("No result provided");
+
+    // Answered calls get no synthetic result.
+    const answered = convertMessages(
+      model,
+      {
+        messages: [
+          user("hi"),
+          callTurn,
+          {
+            role: "toolResult",
+            toolCallId: "call-1",
+            toolName: "bash",
+            content: [{ type: "text", text: "ok" }],
+          } as never,
+        ],
+      },
+      "claude-sonnet-4.6",
+    );
+    expect(JSON.stringify(answered)).not.toContain("No result provided");
+  });
+
+  it("only escalates to toolUse on a clean STOP finish", async () => {
+    const model = { id: "gemini-3.8-flash", input: ["text", "image"] } as unknown as Model<Api>;
+    const run = async (finishReason: string) => {
+      const output = baseOutput();
+      const event = {
+        candidates: [{ content: { parts: [{ functionCall: { name: "bash", args: {} } }] }, finishReason }],
+      };
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
+          controller.close();
+        },
+      });
+      await streamResponse(new Response(body), createAssistantMessageEventStream(), output, model);
+      return output.stopReason;
+    };
+    expect(await run("MAX_TOKENS")).toBe("length");
+    expect(await run("STOP")).toBe("toolUse");
+  });
+
+  it("replaces images with placeholders for text-only models", () => {
+    const model = { id: "gpt-oss-120b", input: ["text"] } as unknown as Model<Api>;
+    const contents = convertMessages(
+      model,
+      {
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "look at this" },
+              { type: "image", mimeType: "image/png", data: "aGlzdGVjaQ==" },
+            ],
+            timestamp: Date.now(),
+          } as never,
+        ],
+      },
+      "gpt-oss-120b-medium",
+    );
+    const json = JSON.stringify(contents);
+    expect(json).toContain("(image omitted: model does not support images)");
+    expect(json).not.toContain("inlineData");
+  });
+
+  it("recovers a stray error payload after a stray non-error JSON line", async () => {
+    const model = { id: "gemini-3.8-flash", input: ["text", "image"] } as unknown as Model<Api>;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"healthy":"metadata"}\n'));
+        controller.enqueue(new TextEncoder().encode('{"error":{"code":429,"message":"too many requests"}}\n\n'));
+        controller.close();
+      },
+    });
+    await expect(
+      streamResponse(new Response(body), createAssistantMessageEventStream(), baseOutput(), model),
+    ).rejects.toThrow(/429/);
   });
 });

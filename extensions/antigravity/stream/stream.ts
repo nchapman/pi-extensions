@@ -253,6 +253,28 @@ function withoutSkillBlocks(text: string): string {
   return text.replace(SKILL_BLOCK_PATTERN, "");
 }
 
+// Built-in-provider wording for images a text-only model cannot accept; consecutive
+// unsupported images collapse into one placeholder (see pi-ai transform-messages).
+const NON_VISION_USER_IMAGE_PLACEHOLDER = "(image omitted: model does not support images)";
+const NON_VISION_TOOL_IMAGE_PLACEHOLDER = "(tool image omitted: model does not support images)";
+
+function replaceImagesWithPlaceholder(content: unknown, placeholder: string): unknown {
+  if (!Array.isArray(content)) return content;
+  const result: ContentBlock[] = [];
+  let previousWasPlaceholder = false;
+  for (const item of content) {
+    if (isRecord(item) && (item as ContentBlock).type === "image") {
+      if (!previousWasPlaceholder) result.push({ type: "text", text: placeholder });
+      previousWasPlaceholder = true;
+      continue;
+    }
+    const block = (isRecord(item) ? item : { type: "text", text: "" }) as ContentBlock;
+    result.push(block);
+    previousWasPlaceholder = block.type === "text" && block.text === placeholder;
+  }
+  return result;
+}
+
 function asTextParts(content: unknown): Array<GeminiTextPart | GeminiInlineDataPart> {
   const textPart = (text: string): GeminiTextPart[] => {
     const userText = withoutSkillBlocks(text);
@@ -305,13 +327,40 @@ function appendTurn(contents: GeminiContent[], role: GeminiRole, parts: GeminiPa
 export function convertMessages(model: Model<Api>, context: Context, runtimeModel: string): GeminiContent[] {
   const contents: GeminiContent[] = [];
   const requiresSig = geminiRequiresThoughtSignature(runtimeModel);
+  const supportsImages = model.input.includes("image");
   const droppedToolCallIds = new Map<string, string>();
+  // Orphaned tool calls (edited/resumed/compacted sessions) get synthetic results so
+  // the backend never sees a functionCall without a matching functionResponse —
+  // the same graceful degradation as pi-ai's transform-messages closePendingToolCalls.
+  let pendingCalls: Array<{ id: string; name: string }> = [];
+  let answeredIds = new Set<string>();
+  const closePendingToolCalls = () => {
+    if (!pendingCalls.length) return;
+    for (const call of pendingCalls) {
+      if (answeredIds.has(call.id)) continue;
+      appendTurn(contents, GeminiRole.User, [
+        {
+          functionResponse: {
+            name: call.name,
+            response: { error: "No result provided" },
+            ...(toolCallIdNeeded(model.id, runtimeModel) ? { id: sanitizeToolCallId(call.id, call.name) } : {}),
+          },
+        },
+      ]);
+    }
+    pendingCalls = [];
+    answeredIds = new Set();
+  };
   for (const msg of context.messages) {
     if ((msg.role as string) === "system") continue;
     if (msg.role === "user") {
-      const parts = asTextParts(msg.content);
+      closePendingToolCalls();
+      const parts = asTextParts(
+        supportsImages ? msg.content : replaceImagesWithPlaceholder(msg.content, NON_VISION_USER_IMAGE_PLACEHOLDER),
+      );
       appendTurn(contents, GeminiRole.User, parts);
     } else if (msg.role === "assistant") {
+      closePendingToolCalls();
       if (msg.stopReason === "error" || msg.stopReason === "aborted") {
         continue;
       }
@@ -324,6 +373,7 @@ export function convertMessages(model: Model<Api>, context: Context, runtimeMode
       );
       const groupIsSigned = isSameModel && firstCallHasSig && allSigsValid;
 
+      const emittedCalls: Array<{ id: string; name: string }> = [];
       for (const block of msg.content) {
         if (block.type === "text") {
           const textSig = isSameModel && isValidThoughtSignature(block.textSignature) ? block.textSignature : undefined;
@@ -366,19 +416,32 @@ export function convertMessages(model: Model<Api>, context: Context, runtimeMode
                   ? { id: sanitizeToolCallId(block.id || "", block.name) }
                   : {}),
               },
-              ...(block.thoughtSignature ? { thoughtSignature: block.thoughtSignature } : {}),
+              // Foreign-model signatures must not cross the bridge (Claude/GPT routes
+              // reject them); gated exactly like the text branch above.
+              ...(isSameModel && isValidThoughtSignature(block.thoughtSignature)
+                ? { thoughtSignature: block.thoughtSignature }
+                : {}),
             });
+            emittedCalls.push({ id: block.id || "", name: block.name });
           }
         }
       }
       appendTurn(contents, GeminiRole.Model, parts);
+      if (emittedCalls.length > 0) {
+        pendingCalls = emittedCalls;
+        answeredIds = new Set();
+      }
     } else if (msg.role === "toolResult") {
-      const text = msg.content
+      answeredIds.add(msg.toolCallId);
+      const toolResultContent = (
+        supportsImages ? msg.content : replaceImagesWithPlaceholder(msg.content, NON_VISION_TOOL_IMAGE_PLACEHOLDER)
+      ) as typeof msg.content;
+      const text = toolResultContent
         .filter((c): c is TextContent => c.type === "text")
         .map((c) => sanitizeText(c.text))
         .join("\n");
       const responseText = text || (msg.isError ? "Tool failed" : "");
-      const imageParts = asImageParts(msg.content);
+      const imageParts = supportsImages ? asImageParts(toolResultContent) : [];
       const rawId = msg.toolCallId || "";
       const sanitizedId = toolCallIdNeeded(model.id, runtimeModel) ? sanitizeToolCallId(rawId, msg.toolName) : rawId;
       const droppedArgs = requiresSig
@@ -441,13 +504,13 @@ export function convertMessages(model: Model<Api>, context: Context, runtimeMode
     else contents.unshift({ role: GeminiRole.User, parts: [bridge] });
   }
 
+  // Close any still-unanswered calls (conversation ends on an assistant tool-call
+  // turn): synthesize results instead of failing the request, matching pi-ai's
+  // end-of-transcript closePendingToolCalls.
+  closePendingToolCalls();
+
   const lastTurn = contents.at(-1);
   if (lastTurn?.role === GeminiRole.Model) {
-    if (lastTurn.parts.some((part) => "functionCall" in part)) {
-      throw new Error(
-        "Antigravity request is missing tool result(s) for the final assistant tool call. Provide the corresponding tool result before continuing.",
-      );
-    }
     appendTurn(contents, GeminiRole.User, [{ text: CONTINUATION_TEXT }]);
   }
 
@@ -1247,7 +1310,12 @@ export async function streamResponse(
     } catch {
       return;
     }
-    if (!parsed || typeof parsed !== "object" || !("error" in parsed)) return;
+    if (!parsed || typeof parsed !== "object" || !("error" in parsed)) {
+      // Complete non-error JSON line: drop it so a later stray error payload is
+      // still detected instead of re-parsing from this line's opening brace.
+      stray = "";
+      return;
+    }
     const record = parsed as { error?: { code?: unknown; message?: unknown } };
     const status = typeof record.error?.code === "number" ? record.error.code : undefined;
     if (status !== undefined) setLastStatus(status);
@@ -1363,9 +1431,12 @@ export async function streamResponse(
     if (candidate?.finishReason) {
       sawFinishReason = true;
       output.rawStopReason = candidate.finishReason;
-      output.stopReason = blocks.some((b) => b.type === "toolCall")
-        ? StopReason.ToolUse
-        : mapStopReason(candidate.finishReason);
+      // Only a clean STOP escalates to toolUse — a MAX_TOKENS/SAFETY stop after a
+      // partial functionCall must surface as length/error, not execute the call
+      // (same gating as the built-in Gemini adapter).
+      const mapped = mapStopReason(candidate.finishReason);
+      output.stopReason =
+        mapped === StopReason.Stop && blocks.some((b) => b.type === "toolCall") ? StopReason.ToolUse : mapped;
     }
 
     if (responseData.usageMetadata) {
@@ -1536,7 +1607,19 @@ export function streamAntigravity(
         if (opts.signal?.aborted) throw new Error("Request was aborted");
         if (emptyAttempt > 0) {
           const delay = 500 * 2 ** (emptyAttempt - 1);
-          await new Promise((res) => setTimeout(res, delay));
+          // Abort-interruptible backoff sleep (built-ins use abortableSleep):
+          // a user abort during backoff must not wait out the delay.
+          await new Promise<void>((resolve, reject) => {
+            const timer = setTimeout(() => resolve(), delay);
+            opts.signal?.addEventListener(
+              "abort",
+              () => {
+                clearTimeout(timer);
+                reject(new Error("Request was aborted"));
+              },
+              { once: true },
+            );
+          });
         }
 
         for (let candIdx = 0; candIdx < runtimeCandidates.length; candIdx++) {
