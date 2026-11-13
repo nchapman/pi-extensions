@@ -37,6 +37,7 @@
  * - render.ts  what the user sees: tool-call and result rows
  */
 
+import { bindActivity } from "../../lib/activity";
 import { Type } from "typebox";
 import type { BashOperations, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
@@ -380,7 +381,9 @@ export function registerSubagentsExtension(
       // a synchronous failure (session gone) must not surface on the wake path
     }
   };
+  const activity = bindActivity(pi, "background-tasks");
   const registry = createTaskRegistry({
+    holdBusy: activity.hold,
     sendUserMessage: steer,
     notify: (message, level) => ui?.notify(message, level),
     setStatus: (key, text) => ui?.setStatus(key, text),

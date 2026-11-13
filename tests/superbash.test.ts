@@ -56,6 +56,81 @@ const textOf = (r: { content: readonly unknown[] }): string => (r.content[0] as 
 /** Task id from a result that adopted a task (always set once the command has started). */
 const idOf = (r: { details: unknown }): string => (r.details as { id: string }).id;
 
+describe("task activity", () => {
+  it("tracks overlapping jobs, kill/revive, persistent detach, and idempotent re-adoption", () => {
+    let held = 0;
+    const registry = createTaskRegistry({
+      holdBusy: () => {
+        held++;
+        return () => {
+          held--;
+        };
+      },
+    });
+    const a = registry.adopt({ name: "local", kind: "bash", kill() {} });
+    const b = registry.adopt({ name: "child", kind: "subagent", kill() {} });
+    const persistent = { name: "remote", kind: "bash" as const, persistent: true, kill() {}, detach() {} };
+    registry.adopt(persistent, "t-123");
+    registry.adopt(persistent, "t-123");
+    expect(held).toBe(3);
+    registry.remind(a, 1000);
+    registry.cancelReminder(a);
+    expect(held).toBe(3);
+    registry.kill(a);
+    registry.kill(a);
+    expect(held).toBe(2);
+    registry.revive(a);
+    registry.revive(a);
+    expect(held).toBe(3);
+    registry.complete(b, { ok: false, text: "failed", wake: false });
+    expect(held).toBe(2);
+    registry.killAll({ sparePersistent: true });
+    expect(held).toBe(0);
+  });
+
+  it("releases even when a wake throws or is disabled", () => {
+    for (const wakeEnabled of [true, false]) {
+      let held = 0;
+      const send = vi.fn(() => {
+        throw new Error("session gone");
+      });
+      const registry = createTaskRegistry({
+        wakeEnabled,
+        sendUserMessage: send,
+        holdBusy: () => {
+          held++;
+          return () => {
+            held--;
+          };
+        },
+      });
+      const id = registry.adopt({ name: "job", kind: "bash", kill() {} });
+      registry.complete(id, { ok: true, text: "done" });
+      expect(held).toBe(0);
+      expect(send).toHaveBeenCalledTimes(wakeEnabled ? 1 : 0);
+    }
+  });
+
+  it("keeps background work busy until completion, including wake delivery", () => {
+    let held = 0;
+    const registry = createTaskRegistry({
+      holdBusy: () => {
+        held++;
+        return () => {
+          held--;
+        };
+      },
+      sendUserMessage: () => expect(held).toBe(1),
+    });
+    const id = registry.adopt({ name: "test", kind: "bash", kill() {} });
+    expect(held).toBe(1);
+    registry.complete(id, { ok: true, text: "done" });
+    expect(held).toBe(0);
+    registry.complete(id, { ok: true, text: "duplicate" });
+    expect(held).toBe(0);
+  });
+});
+
 describe("env parsing", () => {
   it("defaults to never adopting and rejects invalid values", () => {
     // Blocking is the norm: adoption only happens when the env knob opts in.

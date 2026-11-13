@@ -64,6 +64,9 @@
  *   tasks instead of killing them; resumePersistedTasks re-adopts live ones
  *   under their on-disk id and settles the rest — disk state, not memory, owns
  *   the outcome, so exactly one runtime ever wakes for a given task
+ * - registered jobs hold generic extension activity until completion/kill/detach.
+ *   The wake is initiated before releasing activity so status consumers can bridge
+ *   the handoff to Pi; reminders share their running task's hold, never add one
  * - PI_BG_WAKE=0 disables wake messages (completions and reminders); the
  *   terminal notification still fires
  */
@@ -145,6 +148,8 @@ export interface AdoptedHandle<T = { text: string; usage?: unknown }> {
 
 /** Injected external capabilities and messaging channels for the task registry. */
 export interface TaskDeps {
+  /** Generic activity API; the session owner supplies bindActivity(pi, owner).hold. */
+  holdBusy?: () => () => void;
   /** Wake channel — receives the steered user message text. */
   sendUserMessage?: (text: string) => void;
   /** Terminal notification channel (ctx.ui.notify); optional for headless modes. */
@@ -357,7 +362,19 @@ export function createTaskRegistry(deps: TaskDeps = {}): TaskRegistry {
   // meaning two different tasks. Same-millisecond adopts advance the clock by 1ms.
   let lastTs = 0;
 
+  const activity = new Map<string, () => void>();
   const refreshStatus = () => {
+    for (const [id, task] of tasks) {
+      if (task.state === "running" && !activity.has(id) && deps.holdBusy) {
+        activity.set(id, deps.holdBusy());
+      }
+    }
+    for (const [id, release] of activity) {
+      if (tasks.get(id)?.state !== "running") {
+        activity.delete(id);
+        release();
+      }
+    }
     const n = [...tasks.values()].filter((t) => t.state === "running").length;
     deps.setStatus?.("bg", n > 0 ? `${n} running` : undefined);
   };
@@ -443,9 +460,11 @@ export function createTaskRegistry(deps: TaskDeps = {}): TaskRegistry {
       task.state = ok ? "done" : "failed";
       task.endedAt = now();
       if (status) task.status = status;
-      refreshStatus();
       cancelReminder(id);
+      // Start the wake while the old work is still held. Pi's public send API
+      // is void; the terminal adapter gives the handoff a bounded grace window.
       if (wake) deliver(text, ok);
+      refreshStatus();
     },
     running() {
       return [...tasks.values()]

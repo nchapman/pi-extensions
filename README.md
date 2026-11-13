@@ -27,7 +27,44 @@ Pi loads the TypeScript in this directory directly; there is no build step. The 
 | [`sshbash`](extensions/sshbash/)                 | `ssh_bash`                                                                         | Running commands on remote machines over multiplexed OpenSSH connections, sharing the same wait modes, wakes, and task tools as `bash`. Fast connection reuse (`ssh-1`), non-interactive auth, and remote group-SIGKILL. See [sshbash](#sshbash).                                                                                                                                                                 |
 | [`superedit`](extensions/superedit/)             | replaces `edit`                                                                    | Forgiving-matcher edit tool: a three-tier ladder (exact bytes → Unicode/whitespace normalization → uniform indent shift), sequential chained edits, occurrence disambiguation, and line-numbered diff diagnostics. See [superedit](#superedit).                                                                                                                                                                   |
 | [`pushover`](extensions/pushover/)               | nothing (event listener)                                                           | Phone notifications when a goal completes, via [Pushover](https://pushover.net). Subscribes to typed completion events with zero model surface; fails open. See [pushover](#pushover).                                                                                                                                                                                                                            |
+| [`activity`](extensions/activity/) | nothing (status adapter) | Keeps OSC 7501 terminal status working while extensions hold background activity; shared opt-in API in `lib/activity.ts`. |
 | [`antigravity`](extensions/antigravity/)         | `antigravity` provider                                                             | A slim in-repo fork of pi-antigravity: Gemini/Claude/GPT-OSS via Google Cloud Code Assist with our own auth and live model catalog — models, nothing else. See [antigravity](#antigravity).                                                                                                                                                                                                                       |
+
+## Extension activity and terminal status
+
+The `activity` extension keeps Pi's terminal status **working** while extensions have unfinished background work, even after the agent run settles. This fixes premature completion in the **Herdr app / herdr-core (`hc`)** and other terminals supporting Pi's native OSC 7501 program-status protocol. It requires no Herdr installation hook or socket configuration. The separate Herdr terminal multiplexer and its `pane.report_agent` integration are not targeted by this adapter.
+
+### Opt in from any extension
+
+```ts
+import { bindActivity } from "../../lib/activity";
+
+export default function (pi) {
+  const activity = bindActivity(pi, "my-extension");
+  // Inside a tool, command, or session event, after session_start:
+  async function doWork() {
+    const release = activity.hold();
+    try {
+      await backgroundWork();
+    } finally {
+      release();
+    }
+  }
+}
+```
+
+- Holds are counted across extensions in the same session. Release functions are idempotent. Each binding releases its own holds and detaches its observers on shutdown; late callbacks cannot release a replacement session's work. Calls before startup or after shutdown are inert.
+- `activity.count` and `activity.subscribe(count => ...)` expose the aggregate to other consumers. Subscriptions replay current state once connected; the returned function unsubscribes. Observer errors fail open. No model messages, tokens, or extra tools are involved.
+- Local `bash`, `ssh_bash`, and background subagents consume this API through their shared task registry. Completion, failure, kill, revive, persistent-task detach, and resume adoption all update holds. Reminders reuse the running job's hold. Persistent jobs reacquire holds when re-adopted, not while Pi is absent.
+- A running server or watcher counts as unfinished work too, even with `PI_BG_WAKE=0`. There is no attempt to infer whether a job is relevant from command text. For custom extensions, acquire a hold only for work whose completion the session is waiting for—not perpetual maintenance timers.
+
+### Reporting and limitations
+
+Pi does not yet expose a busy-hold/status middleware API. A small compatibility adapter decorates the public TUI terminal's `setProgramStatus` method, reached through a zero-row widget factory. It changes only native **idle/done → working** while holds exist, before the report reaches the terminal; emitting a correction afterward would already let `hc wait` return. Native **working, blocked, error, and clear** retain their meaning, and the latest unmodified native state is restored after the last hold releases. Pi still controls encoding, capability negotiation, compaction, dialogs, and `PI_PROGRAM_STATUS`. The adapter is TUI-only: headless children cannot report against their parent's terminal.
+
+A fixed **100 ms last-release grace** bridges ordinary wake scheduling. Pi's `sendUserMessage` API returns no acceptance acknowledgment: rejected/consumed wakes must not leave the session busy forever, and input hooks taking longer than the grace can still create a completion gap. Attention states (blocked/error) and clear are never delayed. This is a reporting compatibility shim, **not** a change to `ctx.isIdle()`, Pi scheduling, or shutdown rules. It does not hide errors or user questions merely because jobs remain running.
+
+On reload, the adapter retains the last native report it observed and removes its wrapper/subscriptions/timers on teardown. If first installed by reload into an already idle session, the setter-only API cannot recover an earlier error/dialog report; until Pi reports again, the initial baseline comes from `ctx.isIdle()`. Set `PI_ACTIVITY_STATUS=0` to disable the terminal adapter without disabling the generic API. Terminals that do not confirm OSC 7501 support receive no reports, just as with stock Pi. The shim is tested against Pi **1.5.2** and should be revisited when Pi gains a native activity API.
 
 ## Design docs
 
