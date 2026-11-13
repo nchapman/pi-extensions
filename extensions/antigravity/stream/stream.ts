@@ -961,6 +961,23 @@ export function mapStopReason(reason: string | undefined): StopReason {
   return reason ? StopReason.Error : StopReason.Stop;
 }
 
+/**
+ * Error detail for a stream that ended on an error stop reason. Deliberate
+ * divergence from the built-in Gemini adapters for one finish reason:
+ * MALFORMED_FUNCTION_CALL is a transient model flake (the model emitted an
+ * unparseable tool call; resending the request usually succeeds), so its
+ * wording carries pi's "provider returned an error" retryable marker and pi's
+ * central auto-retry re-issues the turn instead of dead-ending it. Every other
+ * finish reason (SAFETY, RECITATION, …) keeps the built-in wording verbatim,
+ * which pi's classifier leaves non-retryable — resending would fail again.
+ */
+export function stopReasonErrorDetail(rawStopReason: string | undefined): string {
+  if (rawStopReason === "MALFORMED_FUNCTION_CALL") {
+    return "Provider returned an error (MALFORMED_FUNCTION_CALL): the model emitted an unparseable function call; retrying the request usually succeeds";
+  }
+  return rawStopReason ? `Provider stopped with: ${rawStopReason}` : "An unknown error occurred";
+}
+
 /** Account quota walls. These must stay non-retryable and may fail over to another login. */
 function isAccountQuota429(text: string): boolean {
   return (
@@ -1760,10 +1777,7 @@ export function streamAntigravity(
       if (!received) throw new Error("Antigravity API returned an empty response");
       setLastLatencyMs(Date.now() - startTime);
       if (output.stopReason === "error" || output.stopReason === "aborted") {
-        const errorDetail = output.rawStopReason
-          ? `Provider stopped with: ${output.rawStopReason}`
-          : "An unknown error occurred";
-        output.errorMessage = output.errorMessage || errorDetail;
+        output.errorMessage = output.errorMessage || stopReasonErrorDetail(output.rawStopReason);
         setLastError(output.errorMessage);
         stream.push({ type: "error", reason: output.stopReason, error: output });
       } else if (output.stopReason === "pending") {

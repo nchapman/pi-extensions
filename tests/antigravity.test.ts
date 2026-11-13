@@ -12,7 +12,12 @@ import {
   type Api,
   type Model,
 } from "@earendil-works/pi-ai";
-import { convertMessages, friendlyAntigravityError, streamResponse } from "../extensions/antigravity/stream/stream";
+import {
+  convertMessages,
+  friendlyAntigravityError,
+  stopReasonErrorDetail,
+  streamResponse,
+} from "../extensions/antigravity/stream/stream";
 import { getApiKey } from "../extensions/antigravity/auth/oauth";
 import {
   defaultProjectId,
@@ -522,6 +527,20 @@ describe("antigravity retry-classifier parity", () => {
     expect(classify("Quota reached. Please wait 5 hours. Next: switch models.")).toBe(false);
     expect(classify("context_length_exceeded: Antigravity API error (request-failed): input too long")).toBe(false);
     expect(classify(wrapped(400, "Unknown name: badField"))).toBe(false);
+  });
+
+  it("auto-retries a MALFORMED_FUNCTION_CALL finish reason instead of dead-ending the turn", () => {
+    // The model emitted an unparseable tool call — a transient flake. The
+    // wording must land on pi's retryable list so the turn re-issues.
+    expect(classify(stopReasonErrorDetail("MALFORMED_FUNCTION_CALL"))).toBe(true);
+  });
+
+  it("keeps deterministic finish reasons non-retryable with built-in wording", () => {
+    expect(stopReasonErrorDetail("SAFETY")).toBe("Provider stopped with: SAFETY");
+    expect(classify(stopReasonErrorDetail("SAFETY"))).toBe(false);
+    expect(stopReasonErrorDetail("RECITATION")).toBe("Provider stopped with: RECITATION");
+    expect(classify(stopReasonErrorDetail("RECITATION"))).toBe(false);
+    expect(stopReasonErrorDetail(undefined)).toBe("An unknown error occurred");
   });
 });
 
