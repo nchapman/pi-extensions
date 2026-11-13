@@ -5,7 +5,8 @@
  * touched — discovery fixtures are hand-shaped fetchAvailableModels payloads.
  */
 import { afterEach, describe, expect, it } from "vitest";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import { isRetryableAssistantError, type Api, type Model } from "@earendil-works/pi-ai";
+import { friendlyAntigravityError } from "../extensions/antigravity/stream/stream";
 import { getApiKey } from "../extensions/antigravity/auth/oauth";
 import { defaultProjectId, parseApiKey } from "../extensions/antigravity/client/client";
 import {
@@ -471,5 +472,42 @@ describe("antigravity stream hooks", () => {
     expect(observed).toEqual([event]);
     expect(output.stopReason).toBe("stop");
     expect(output.usage.totalTokens).toBe(5);
+  });
+});
+
+describe("antigravity retry-classifier parity", () => {
+  // pi retries assistant errors by pattern-matching errorMessage
+  // (isRetryableAssistantError). These tests run our real messages through
+  // pi's real classifier so transient failures auto-retry and permanent ones
+  // fail fast, exactly like the built-in providers.
+  const classify = (errorMessage: string) =>
+    isRetryableAssistantError({
+      stopReason: "error",
+      errorMessage,
+    } as Parameters<typeof isRetryableAssistantError>[0]);
+
+  const wrapped = (status: number | undefined, body: string) =>
+    `Antigravity API error (request-failed, endpoint=x, project=p, runtimeModel=m): ${friendlyAntigravityError(status, body)}`;
+
+  it("classifies transient failures as retryable", () => {
+    expect(classify(wrapped(500, "internal error"))).toBe(true);
+    expect(classify(wrapped(502, "bad gateway"))).toBe(true);
+    expect(classify(wrapped(503, "unavailable"))).toBe(true);
+    expect(classify(wrapped(503, "No capacity available"))).toBe(true);
+    expect(classify(wrapped(504, "upstream timeout"))).toBe(true);
+    expect(classify(wrapped(408, "request timeout"))).toBe(true);
+    expect(classify("Rate limited by Antigravity (429 ResourceExhausted). Next: retrying automatically.")).toBe(true);
+    expect(classify("Antigravity stream ended without a finish reason; terminated early.")).toBe(true);
+    expect(classify("Antigravity stream ended without a stop reason")).toBe(true);
+    expect(classify("fetch failed")).toBe(true);
+  });
+
+  it("classifies permanent failures as non-retryable", () => {
+    expect(classify(wrapped(401, "invalid token"))).toBe(false);
+    expect(classify(wrapped(403, "permission denied"))).toBe(false);
+    expect(classify(wrapped(404, "Requested entity was not found"))).toBe(false);
+    expect(classify("Quota reached. Please wait 5 hours. Next: switch models.")).toBe(false);
+    expect(classify("context_length_exceeded: Antigravity API error (request-failed): input too long")).toBe(false);
+    expect(classify(wrapped(400, "Unknown name: badField"))).toBe(false);
   });
 });

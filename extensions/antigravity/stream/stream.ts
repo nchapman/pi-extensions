@@ -945,6 +945,7 @@ function recordStaticRouteDiagnostics(runtimeModel: string): void {
 }
 
 /** Exported for unit tests. */
+/** Exported for unit tests: message wording is paired with pi's retry classifier. */
 export function friendlyAntigravityError(status: number | undefined, text: string): string {
   const msg = redactSecrets(jsonOrTextError(text)).slice(0, 500);
   if (status === 400) {
@@ -1016,12 +1017,16 @@ export function friendlyAntigravityError(status: number | undefined, text: strin
   if (status === 500) {
     return "Antigravity had an internal server error. Next: retry in a moment or switch models.";
   }
-  if (status === 502) return "Antigravity returned a bad gateway error. Next: retry in a moment.";
+  // 502/503 wording must stay on pi's retryable-error pattern list (the
+  // request wrapper strips the numeric status unless the message says it is
+  // retrying automatically, so "bad gateway"/"temporarily unavailable" alone
+  // would classify as a permanent failure and never auto-retry).
+  if (status === 502) return "Antigravity returned a bad gateway error (502 server error). Next: retry in a moment.";
   if (status === 503) {
     if (/No capacity available/i.test(msg)) {
-      return "This model has no capacity right now. Next: retry later or switch to another model.";
+      return "This model is at capacity right now (503 service unavailable). Next: retry later or switch to another model.";
     }
-    return "Antigravity is temporarily unavailable. Next: retry in a moment or switch models.";
+    return "Antigravity is temporarily unavailable (503 service unavailable). Next: retry in a moment or switch models.";
   }
   if (status === 504) return "Antigravity timed out upstream. Next: retry in a moment.";
   return msg;
@@ -1587,7 +1592,9 @@ export function streamAntigravity(
             if (response.status === 429 && isAccountQuota429(lastText)) break;
             // Generic resource exhaustion is a dead model, not a reason to walk every endpoint.
             if (response.status === 429 && !isRetryableRateLimit(lastText)) break;
-            if (![403, 404, 429, 500, 502, 503, 504].includes(response.status)) break;
+            // 408 joins the endpoint walk: it is a transient server-side timeout in
+            // pi's built-in SDK retry policy (408/409/429/5xx retry there too).
+            if (![403, 404, 408, 429, 500, 502, 503, 504].includes(response.status)) break;
           }
 
           // Every endpoint threw before sending headers: rethrow the original
@@ -1677,7 +1684,9 @@ export function streamAntigravity(
         setLastError(output.errorMessage);
         stream.push({ type: "error", reason: output.stopReason, error: output });
       } else if (output.stopReason === "pending") {
-        throw new Error("Antigravity API returned no stop reason");
+        // "ended without" keeps this safety-net failure on pi's retryable list,
+        // matching the built-in Gemini adapter's truncation error.
+        throw new Error("Antigravity stream ended without a stop reason");
       } else {
         stream.push({ type: "done", reason: output.stopReason, message: output });
       }
