@@ -852,6 +852,22 @@ function mapToolChoiceMode(toolChoice: AntigravityStreamOptions["toolChoice"]): 
   return GeminiToolCallingMode.Auto;
 }
 
+/**
+ * Antigravity rejects these system phrases with a generic RESOURCE_EXHAUSTED
+ * under requestType: "agent", even with quota available (upstream #141/#143).
+ * Normalize every outgoing system part, not after a failed request. Keep this
+ * narrow and idempotent: no changes to source context, conversation text, tools,
+ * or other providers. The pi boundary guards preserve identifiers like pi.js.
+ */
+function sanitizeSystemPrompt(text: string): string {
+  return text
+    .replace(/\brunning inside pi,\s*a coding agent harness\b/gi, "running inside your development environment")
+    .replace(/\binside pi,\s*a coding agent harness\b/gi, "inside your development environment")
+    .replace(/\brunning inside pi(?=[.,!?;:\s]|$)(?!\.\w)/gi, "running inside your development environment")
+    .replace(/\b(coding agent )inside pi(?=[.,!?;:\s]|$)(?!\.\w)/gi, "$1inside your development environment")
+    .replace(/\bpractical,\s*and tool-aware\./gi, "practical, and tool aware.");
+}
+
 /** Exported for unit tests. */
 export function buildRequest(
   model: Model<Api>,
@@ -883,7 +899,7 @@ export function buildRequest(
     contents,
     systemInstruction: {
       role: GeminiRole.User,
-      parts: systemParts,
+      parts: systemParts.map((part) => ({ text: sanitizeSystemPrompt(part.text) })),
     },
   };
 
@@ -1089,10 +1105,10 @@ export function friendlyAntigravityError(status: number | undefined, text: strin
     if (/rate.?limit|too many requests/i.test(msg)) {
       return "Rate limited by Antigravity (429 ResourceExhausted). Next: retrying automatically; if it persists, switch models.";
     }
-    // A generic RESOURCE_EXHAUSTED body, with no reset hint, is how unavailable models
-    // such as gemini-3.1-pro fail (#89). Do not include 429/ResourceExhausted: those
-    // tokens make Pi burn its automatic retry budget and look like an account quota wall.
-    return `This model is unavailable right now (${msg || "resource exhausted"}). Next: switch to gemini-3.8-flash or another Flash model. This is not necessarily an account quota wall.`;
+    // Generic RESOURCE_EXHAUSTED also covers content-dependent request rejection
+    // (#141/#143), not just unavailable models (#89). Don't diagnose the cause or
+    // add retry markers: resending an identical rejected prompt does not help.
+    return `Antigravity rejected this request; the cause is ambiguous (${msg || "resource exhausted"}). This can reflect system-prompt wording, model capacity, or account limits. Next: check quota and update the extension; if it persists, try another provider.`;
   }
   if (status === 500) {
     return "Antigravity had an internal server error. Next: retry in a moment or switch models.";

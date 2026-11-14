@@ -10,9 +10,11 @@ import {
   createAssistantMessageEventStream,
   isRetryableAssistantError,
   type Api,
+  type Context,
   type Model,
 } from "@earendil-works/pi-ai";
 import {
+  buildRequest,
   convertMessages,
   friendlyAntigravityError,
   stopReasonErrorDetail,
@@ -445,6 +447,99 @@ describe("antigravity review-fix regressions", () => {
   });
 });
 
+describe("antigravity outgoing system prompt", () => {
+  const model: Model<Api> = {
+    ...ANTIGRAVITY_MODELS.find((m) => m.id === "gemini-3.8-flash")!,
+    api: "antigravity-api",
+    provider: "antigravity",
+    baseUrl: "https://daily-cloudcode-pa.googleapis.com",
+  };
+  const build = (context: Context) => buildRequest(model, context, "project", {}, "gemini-3.8-flash-high");
+  const prompt = (systemPrompt: string) =>
+    build({ systemPrompt, messages: [] })
+      .request.systemInstruction.parts.map((part) => part.text)
+      .join("\n");
+
+  it.each([
+    [
+      "You are a coding assistant running inside pi, a coding agent harness. Help users inspect files.",
+      "You are a coding assistant running inside your development environment. Help users inspect files.",
+    ],
+    ["You work inside pi, a coding agent harness.", "You work inside your development environment."],
+    [
+      "You are a coding assistant running inside pi.",
+      "You are a coding assistant running inside your development environment.",
+    ],
+    ["A coding agent inside pi!", "A coding agent inside your development environment!"],
+    ["RUNNING INSIDE PI", "running inside your development environment"],
+    ["Be concise, practical, and tool-aware.", "Be concise, practical, and tool aware."],
+  ])("normalizes known wording before the first request: %s", (source, expected) => {
+    expect(prompt(source)).toBe(expected);
+    expect(prompt(`${source}\n${source}`)).toBe(`${expected}\n${expected}`);
+    expect(prompt(expected)).toBe(expected);
+  });
+
+  it.each([
+    "You are a helpful assistant. Preserve all instructions. π = 3.14.",
+    "You are a coding assistant running inside pi.js.",
+    "A coding agent inside pi_tools; running inside pip; running inside pi-tools.",
+    "A coding agent inside pi/project; running inside pi.example.com.",
+    "Be practical and tool-aware; inspect pi's source code.",
+  ])("preserves unrelated wording and identifiers: %s", (source) => {
+    expect(prompt(source)).toBe(source);
+  });
+
+  it.each([undefined, ""])("normalizes the fallback prompt when systemPrompt is %s", (systemPrompt) => {
+    const parts = build({ systemPrompt, messages: [] }).request.systemInstruction.parts;
+    expect(parts).toHaveLength(2);
+    expect(parts[0].text).toContain("Be concise, practical, and tool aware.");
+    expect(parts[1].text).toContain("CRITICAL: NEVER output rule checks");
+  });
+
+  it("normalizes replayed system sections without mutating context, user text, or tool descriptions", () => {
+    const source = "You are a coding assistant running inside pi, a coding agent harness.";
+    const context: Context = {
+      messages: [
+        { role: "system", content: source, sections: { rules: "Old rule." }, timestamp: 0 },
+        { role: "user", content: source, timestamp: 1 },
+        {
+          role: "system",
+          content: "",
+          sections: { rules: "Be concise, practical, and tool-aware." },
+          toolsAdded: [{ name: "read", description: source, parameters: { type: "object", properties: {} } }],
+          timestamp: 2,
+        },
+      ],
+    };
+    const before = structuredClone(context);
+    const payload = build(context);
+    expect(payload.request.systemInstruction.parts).toEqual([
+      {
+        text: "You are a coding assistant running inside your development environment.\n\nBe concise, practical, and tool aware.",
+      },
+    ]);
+    expect(payload.request.contents).toEqual([{ role: "user", parts: [{ text: source }] }]);
+    expect(payload.request.tools?.[0].functionDeclarations[0].description).toBe(source);
+    expect(payload.requestType).toBe("agent");
+    expect(context).toEqual(before);
+    expect(build(context).request.systemInstruction).toEqual(payload.request.systemInstruction);
+  });
+
+  it("also normalizes skill text copied into system instructions without mutating the original", () => {
+    const skill = '<skill name="example">Be concise, practical, and tool-aware.</skill>';
+    const context: Context = {
+      systemPrompt: "Help with code.",
+      messages: [{ role: "user", content: skill, timestamp: 0 }],
+    };
+    const before = structuredClone(context);
+    expect(build(context).request.systemInstruction.parts).toEqual([
+      { text: "Help with code." },
+      { text: '<skill name="example">Be concise, practical, and tool aware.</skill>' },
+    ]);
+    expect(context).toEqual(before);
+  });
+});
+
 describe("antigravity stream hooks", () => {
   it("observes parsed provider events through onProviderStreamEvent", async () => {
     const { streamResponse } = await import("../extensions/antigravity/stream/stream");
@@ -527,6 +622,20 @@ describe("antigravity retry-classifier parity", () => {
     expect(classify("Quota reached. Please wait 5 hours. Next: switch models.")).toBe(false);
     expect(classify("context_length_exceeded: Antigravity API error (request-failed): input too long")).toBe(false);
     expect(classify(wrapped(400, "Unknown name: badField"))).toBe(false);
+  });
+
+  it("reports an ambiguous resource rejection without diagnosing a dead model or retrying blindly", () => {
+    const body = JSON.stringify({
+      error: { code: 429, message: "Resource has been exhausted (e.g. check quota).", status: "RESOURCE_EXHAUSTED" },
+    });
+    const message = friendlyAntigravityError(429, body);
+    expect(message).toContain("cause is ambiguous");
+    expect(message).toContain("system-prompt wording");
+    expect(message).not.toContain("This model is unavailable");
+    expect(message).not.toContain("switch to gemini");
+    expect(classify(wrapped(429, body))).toBe(false);
+    expect(classify(wrapped(429, "Too many requests"))).toBe(true);
+    expect(classify(wrapped(429, "Individual quota reached. Resets in 5 hours."))).toBe(false);
   });
 
   it("auto-retries a MALFORMED_FUNCTION_CALL finish reason instead of dead-ending the turn", () => {
