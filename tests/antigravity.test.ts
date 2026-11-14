@@ -624,18 +624,20 @@ describe("antigravity retry-classifier parity", () => {
     expect(classify(wrapped(400, "Unknown name: badField"))).toBe(false);
   });
 
-  it("reports an ambiguous resource rejection without diagnosing a dead model or retrying blindly", () => {
+  it("auto-retries generic resource exhaustion but not hard quota walls", () => {
     const body = JSON.stringify({
       error: { code: 429, message: "Resource has been exhausted (e.g. check quota).", status: "RESOURCE_EXHAUSTED" },
     });
     const message = friendlyAntigravityError(429, body);
-    expect(message).toContain("cause is ambiguous");
-    expect(message).toContain("system-prompt wording");
+    // Transient capacity throttling wears the same generic body as content
+    // rejection and dead models: pi's bounded auto-retry heals the first, and
+    // fails fast enough on the others. Real quota walls stay non-retryable.
+    expect(message).toContain("retrying automatically");
     expect(message).not.toContain("This model is unavailable");
-    expect(message).not.toContain("switch to gemini");
-    expect(classify(wrapped(429, body))).toBe(false);
+    expect(classify(wrapped(429, body))).toBe(true);
     expect(classify(wrapped(429, "Too many requests"))).toBe(true);
     expect(classify(wrapped(429, "Individual quota reached. Resets in 5 hours."))).toBe(false);
+    expect(classify(wrapped(429, "You have exceeded your quota. Please retry later."))).toBe(false);
   });
 
   it("auto-retries a MALFORMED_FUNCTION_CALL finish reason instead of dead-ending the turn", () => {

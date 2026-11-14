@@ -1105,10 +1105,12 @@ export function friendlyAntigravityError(status: number | undefined, text: strin
     if (/rate.?limit|too many requests/i.test(msg)) {
       return "Rate limited by Antigravity (429 ResourceExhausted). Next: retrying automatically; if it persists, switch models.";
     }
-    // Generic RESOURCE_EXHAUSTED also covers content-dependent request rejection
-    // (#141/#143), not just unavailable models (#89). Don't diagnose the cause or
-    // add retry markers: resending an identical rejected prompt does not help.
-    return `Antigravity rejected this request; the cause is ambiguous (${msg || "resource exhausted"}). This can reflect system-prompt wording, model capacity, or account limits. Next: check quota and update the extension; if it persists, try another provider.`;
+    // Generic RESOURCE_EXHAUSTED covers transient capacity throttling (observed:
+    // intermittent gemini-4-hydrogen 429s that clear within seconds), content-
+    // dependent rejection (#141/#143), and dead models (#89). Retry: throttling
+    // heals on pi's bounded backoff, and the other causes fail fast enough after
+    // it. Real quota walls keep their dedicated wording above.
+    return `Resource exhausted at Antigravity (429 ResourceExhausted, usually transient capacity throttling). Next: retrying automatically; if it persists, update the extension, check quota, or switch models.`;
   }
   if (status === 500) {
     return "Antigravity had an internal server error. Next: retry in a moment or switch models.";
@@ -1706,7 +1708,9 @@ export function streamAntigravity(
             if (response.ok) break;
             lastText = await response.text();
             if (response.status === 429 && isAccountQuota429(lastText)) break;
-            // Generic resource exhaustion is a dead model, not a reason to walk every endpoint.
+            // Generic resource exhaustion is usually account-wide throttling, not a
+            // per-endpoint outage: walking the fallbacks multiplies load. pi's central
+            // retry re-issues the turn instead (see friendlyAntigravityError).
             if (response.status === 429 && !isRetryableRateLimit(lastText)) break;
             // 408 joins the endpoint walk: it is a transient server-side timeout in
             // pi's built-in SDK retry policy (408/409/429/5xx retry there too).
