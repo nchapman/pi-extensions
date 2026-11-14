@@ -16,6 +16,7 @@ import {
 import {
   buildRequest,
   convertMessages,
+  ANTIGRAVITY_PREAMBLE_REPLACEMENT,
   friendlyAntigravityError,
   stopReasonErrorDetail,
   streamResponse,
@@ -462,6 +463,14 @@ describe("antigravity outgoing system prompt", () => {
 
   it.each([
     [
+      "You are a coding assistant running inside pi, a coding agent harness. Help users inspect files, run commands, and modify code.",
+      ANTIGRAVITY_PREAMBLE_REPLACEMENT,
+    ],
+    [
+      "You are a coding assistant running inside your development environment. Help users inspect files, run commands, and modify code.",
+      ANTIGRAVITY_PREAMBLE_REPLACEMENT,
+    ],
+    [
       "You are a coding assistant running inside pi, a coding agent harness. Help users inspect files.",
       "You are a coding assistant running inside your development environment. Help users inspect files.",
     ],
@@ -515,6 +524,8 @@ describe("antigravity outgoing system prompt", () => {
     const payload = build(context);
     expect(payload.request.systemInstruction.parts).toEqual([
       {
+        // First-sentence-only fragments keep the piecemeal rewrite; only the full
+        // two-sentence preamble (raw or sanitized) takes the identity replacement.
         text: "You are a coding assistant running inside your development environment.\n\nBe concise, practical, and tool aware.",
       },
     ]);

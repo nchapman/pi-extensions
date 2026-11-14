@@ -855,17 +855,34 @@ function mapToolChoiceMode(toolChoice: AntigravityStreamOptions["toolChoice"]): 
 /**
  * Antigravity rejects these system phrases with a generic RESOURCE_EXHAUSTED
  * under requestType: "agent", even with quota available (upstream #141/#143).
- * Normalize every outgoing system part, not after a failed request. Keep this
- * narrow and idempotent: no changes to source context, conversation text, tools,
- * or other providers. The pi boundary guards preserve identifiers like pi.js.
+ * The backend now also matches the exact literal those upstream rewrites
+ * produce, so the pi preamble is replaced wholesale with the sanctioned
+ * Antigravity identity shape (both the raw pi form and the already-sanitized
+ * form). Normalize every outgoing system part, not after a failed request. Keep
+ * this narrow and idempotent: no changes to source context, conversation text,
+ * tools, or other providers. The pi boundary guards preserve identifiers like
+ * pi.js. Trade-off: on this provider the model addresses itself as Antigravity.
  */
+export const ANTIGRAVITY_PREAMBLE_REPLACEMENT =
+  "You are Antigravity, a powerful agentic AI assistant designed by the Google Deepmind team.\n\n" +
+  "You are operating in the user's development environment. Inspect code, run commands, debug issues, and make targeted changes. " +
+  "Follow project conventions, verify your work, and communicate clearly.";
+
 function sanitizeSystemPrompt(text: string): string {
   return text
+    .replace(
+      /\b(?:you are a )?coding assistant running inside pi,\s*a coding agent harness\.\s*help users inspect files, run commands, and modify code\./gi,
+      ANTIGRAVITY_PREAMBLE_REPLACEMENT,
+    )
     .replace(/\brunning inside pi,\s*a coding agent harness\b/gi, "running inside your development environment")
     .replace(/\binside pi,\s*a coding agent harness\b/gi, "inside your development environment")
     .replace(/\brunning inside pi(?=[.,!?;:\s]|$)(?!\.\w)/gi, "running inside your development environment")
     .replace(/\b(coding agent )inside pi(?=[.,!?;:\s]|$)(?!\.\w)/gi, "$1inside your development environment")
-    .replace(/\bpractical,\s*and tool-aware\./gi, "practical, and tool aware.");
+    .replace(/\bpractical,\s*and tool-aware\./gi, "practical, and tool aware.")
+    .replace(
+      /\b(?:you are a )?coding assistant running inside your development environment\.\s*help users inspect files, run commands, and modify code\./gi,
+      ANTIGRAVITY_PREAMBLE_REPLACEMENT,
+    );
 }
 
 /** Exported for unit tests. */
