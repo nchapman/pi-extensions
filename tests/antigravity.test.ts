@@ -498,6 +498,18 @@ describe("antigravity outgoing system prompt", () => {
     expect(prompt(source)).toBe(source);
   });
 
+  it("rewrites the pi docs topic-mapping line that the backend fingerprints at full length", () => {
+    const line =
+      "- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md, skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), packages (docs/packages.md), environment variables (docs/environment-variables.md), MCP servers (docs/mcp.md), codemode scripts and non-LLM models such as classifiers and image models (docs/codemode.md)";
+    const out = prompt(`Pi documentation:\n${line}`);
+    expect(out).toContain("When asked about a harness topic");
+    expect(out).toContain("Additional docs directory above");
+    expect(out).not.toContain("docs/extensions.md, examples/extensions/");
+    expect(prompt("- When asked about: whatever the user brings up")).toBe(
+      "- When asked about: whatever the user brings up",
+    );
+  });
+
   it.each([undefined, ""])("normalizes the fallback prompt when systemPrompt is %s", (systemPrompt) => {
     const parts = build({ systemPrompt, messages: [] }).request.systemInstruction.parts;
     expect(parts).toHaveLength(2);

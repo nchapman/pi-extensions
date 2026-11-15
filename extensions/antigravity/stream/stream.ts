@@ -868,21 +868,33 @@ export const ANTIGRAVITY_PREAMBLE_REPLACEMENT =
   "You are operating in the user's development environment. Inspect code, run commands, debug issues, and make targeted changes. " +
   "Follow project conventions, verify your work, and communicate clearly.";
 
+/** Replacement for pi's docs topic-mapping line — a long distinctive literal the
+ * backend fingerprints at full length (no sub-slice is matched, only the whole
+ * ~546-char line). Keeps the topic list and the pointer to the docs directory. */
+const ANTIGRAVITY_DOCS_TOPIC_LINE =
+  "- When asked about a harness topic — extensions, themes, skills, prompt templates, TUI components, keybindings, " +
+  "SDK integrations, custom providers, models, packages, environment variables, MCP servers, or codemode scripts — " +
+  "a dedicated doc file for it lives under the Additional docs directory above (filenames follow the topic name).";
+
 function sanitizeSystemPrompt(text: string): string {
-  return text
-    .replace(
-      /\b(?:you are a )?coding assistant running inside pi,\s*a coding agent harness\.\s*help users inspect files, run commands, and modify code\./gi,
-      ANTIGRAVITY_PREAMBLE_REPLACEMENT,
-    )
-    .replace(/\brunning inside pi,\s*a coding agent harness\b/gi, "running inside your development environment")
-    .replace(/\binside pi,\s*a coding agent harness\b/gi, "inside your development environment")
-    .replace(/\brunning inside pi(?=[.,!?;:\s]|$)(?!\.\w)/gi, "running inside your development environment")
-    .replace(/\b(coding agent )inside pi(?=[.,!?;:\s]|$)(?!\.\w)/gi, "$1inside your development environment")
-    .replace(/\bpractical,\s*and tool-aware\./gi, "practical, and tool aware.")
-    .replace(
-      /\b(?:you are a )?coding assistant running inside your development environment\.\s*help users inspect files, run commands, and modify code\./gi,
-      ANTIGRAVITY_PREAMBLE_REPLACEMENT,
-    );
+  return (
+    text
+      .replace(
+        /\b(?:you are a )?coding assistant running inside pi,\s*a coding agent harness\.\s*help users inspect files, run commands, and modify code\./gi,
+        ANTIGRAVITY_PREAMBLE_REPLACEMENT,
+      )
+      .replace(/\brunning inside pi,\s*a coding agent harness\b/gi, "running inside your development environment")
+      .replace(/\binside pi,\s*a coding agent harness\b/gi, "inside your development environment")
+      .replace(/\brunning inside pi(?=[.,!?;:\s]|$)(?!\.\w)/gi, "running inside your development environment")
+      .replace(/\b(coding agent )inside pi(?=[.,!?;:\s]|$)(?!\.\w)/gi, "$1inside your development environment")
+      .replace(/\bpractical,\s*and tool-aware\./gi, "practical, and tool aware.")
+      .replace(
+        /\b(?:you are a )?coding assistant running inside your development environment\.\s*help users inspect files, run commands, and modify code\./gi,
+        ANTIGRAVITY_PREAMBLE_REPLACEMENT,
+      )
+      // pi's docs topic-mapping line: rewritten only when it carries the docs/*.md path list.
+      .replace(/^(- )When asked about:(?=[^\n]*docs\/[a-z-]+\.md)[^\n]*$/gm, ANTIGRAVITY_DOCS_TOPIC_LINE)
+  );
 }
 
 /** Exported for unit tests. */
