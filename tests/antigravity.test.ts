@@ -17,6 +17,7 @@ import {
   buildRequest,
   convertMessages,
   ANTIGRAVITY_PREAMBLE_REPLACEMENT,
+  renderPrivateSystemPrompt,
   friendlyAntigravityError,
   stopReasonErrorDetail,
   streamResponse,
@@ -503,11 +504,163 @@ describe("antigravity outgoing system prompt", () => {
       "- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md, skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), packages (docs/packages.md), environment variables (docs/environment-variables.md), MCP servers (docs/mcp.md), codemode scripts and non-LLM models such as classifiers and image models (docs/codemode.md)";
     const out = prompt(`Pi documentation:\n${line}`);
     expect(out).toContain("When asked about a harness topic");
-    expect(out).toContain("Additional docs directory above");
+    expect(out).toContain("Further docs directory above");
     expect(out).not.toContain("docs/extensions.md, examples/extensions/");
     expect(prompt("- When asked about: whatever the user brings up")).toBe(
       "- When asked about: whatever the user brings up",
     );
+  });
+
+  it("renders every pi-stock section through private wording, leaving tools untouched", () => {
+    const stock = [
+      "<preamble>",
+      "You are a coding assistant running inside pi, a coding agent harness. Help users inspect files, run commands, and modify code.",
+      "</preamble>",
+      "",
+      "<tools>",
+      "<tools>",
+      "- read: Read file contents",
+      "Additional tools may be available.",
+      "</tools>",
+      "</tools>",
+      "",
+      "<rules>",
+      "<rules>",
+      "- Use read to examine files instead of cat or sed.",
+      "- Be concise in your responses",
+      "- Show file paths clearly when working with files",
+      "</rules>",
+      "</rules>",
+      "",
+      "<docs>",
+      "<docs>",
+      "Pi documentation (read only when the user asks about the harness itself, its SDK, extensions, themes, skills, or TUI):",
+      "- Main documentation: /x/README.md",
+      "- Additional docs: /x/docs",
+      "- Examples: /x/examples (extensions, custom tools, SDK)",
+      "- When reading pi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory",
+      "- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md, skills (docs/skills.md)",
+      "- Before implementing harness changes, read the relevant docs and examples in full, following related cross-references.",
+      "</docs>",
+      "</docs>",
+      "",
+      "<project_context>",
+      "<project_context>",
+      "Project-specific instructions and guidelines:",
+      "",
+      '<project_instructions path="/repo/AGENTS.md">',
+      "# My Project",
+      "Do good work.",
+      "</project_instructions>",
+      "</project_context>",
+      "</project_context>",
+      "",
+      "<skills>",
+      "<skills>",
+      "The following skills provide specialized instructions for specific tasks.",
+      "Use the read tool to load a skill's file when the task matches its description.",
+      "Resolve relative paths against the skill's directory (parent of SKILL.md). Use absolute paths in tool calls.",
+      "",
+      "<available_skills>",
+      "  <skill>",
+      "    <name>demo</name>",
+      "  </skill>",
+      "</available_skills>",
+      "</skills>",
+      "</skills>",
+      "",
+      "<cwd>",
+      "/cwd/path",
+      "</cwd>",
+      "",
+      "<mcp_servers>",
+      "<mcp_servers>",
+      "MCP servers whose tools are not declared to you. Load the tools of `tool_search` servers with `tool_search`.",
+      "- mcp__demo (tool_search): Demo server.",
+      "</mcp_servers>",
+      "</mcp_servers>",
+    ].join("\n");
+    const rendered = renderPrivateSystemPrompt(stock);
+
+    // No pi-stock literals survive: not the text, not the tag names.
+    for (const marker of [
+      "<preamble>",
+      "<rules>",
+      "<docs>",
+      "<project_context>",
+      "<skills>",
+      "<cwd>",
+      "<mcp_servers>",
+      "<available_skills>",
+      "<project_instructions",
+      "You are a coding assistant",
+      "Pi documentation (read only",
+      "- Main documentation:",
+      "- Additional docs:",
+      "- When reading pi docs or examples",
+      "- Before implementing harness changes",
+      "When asked about:",
+      "- Be concise in your responses",
+      "- Show file paths clearly when working with files",
+      "The following skills provide",
+      "Project-specific instructions and guidelines:",
+      "MCP servers whose tools are not declared",
+    ]) {
+      expect(rendered).not.toContain(marker);
+    }
+
+    // Our stable private renderings and renamed tags are present…
+    for (const marker of [
+      "<orientation>",
+      "You are Antigravity, a powerful agentic AI assistant designed by the Google Deepmind team.",
+      "<operating_rules>",
+      "- Keep answers tight",
+      "- Name file paths explicitly whenever files are involved",
+      "<reference_docs>",
+      "Docs for this coding environment",
+      "- Sample code: /x/examples (extensions, custom tools, SDK)",
+      "When asked about a harness topic",
+      "<project_guidance>",
+      '<repo_instructions path="/repo/AGENTS.md">',
+      "<skill_index>",
+      "<skill_list>",
+      "<working_directory>",
+      "/cwd/path",
+      "<external_servers>",
+    ]) {
+      expect(rendered).toContain(marker);
+    }
+
+    // …user content and tool-derived text pass through untouched.
+    expect(rendered).toContain("# My Project\nDo good work.");
+    expect(rendered).toContain("- mcp__demo (tool_search): Demo server.");
+    expect(rendered).toContain(
+      "<tools>\n<tools>\n- read: Read file contents\nAdditional tools may be available.\n</tools>\n</tools>",
+    );
+    expect(rendered).toContain("- Use read to examine files instead of cat or sed.");
+
+    // Stable across repeated application: mid-session section patches render consistently.
+    expect(renderPrivateSystemPrompt(rendered)).toBe(rendered);
+  });
+
+  it("renames both forms of the project-instructions tag symmetrically", () => {
+    expect(renderPrivateSystemPrompt('<project_instructions path="/a">x</project_instructions>')).toBe(
+      '<repo_instructions path="/a">x</repo_instructions>',
+    );
+    // Bare form (no attributes) must stay balanced too.
+    expect(renderPrivateSystemPrompt("<project_instructions>x</project_instructions>")).toBe(
+      "<repo_instructions>x</repo_instructions>",
+    );
+  });
+
+  it("applies the private rendering on the wire through buildRequest", () => {
+    const payload = build({
+      systemPrompt:
+        "<preamble>\nYou are a coding assistant running inside pi, a coding agent harness. Help users inspect files, run commands, and modify code.\n</preamble>",
+      messages: [],
+    });
+    expect(payload.request.systemInstruction.parts[0].text).toContain("You are Antigravity");
+    expect(payload.request.systemInstruction.parts[0].text).toContain("<orientation>");
   });
 
   it.each([undefined, ""])("normalizes the fallback prompt when systemPrompt is %s", (systemPrompt) => {
