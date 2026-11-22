@@ -51,6 +51,7 @@ import {
   createTaskTool,
   parseBashBgAfterMs,
   parseBgAfterMs,
+  parseBgCheckInMs,
   parseWakeEnabled,
   publishSharedTaskRegistry,
   resumePersistedTasks,
@@ -388,6 +389,9 @@ export function registerSubagentsExtension(
     notify: (message, level) => ui?.notify(message, level),
     setStatus: (key, text) => ui?.setStatus(key, text),
     wakeEnabled: parseWakeEnabled(process.env),
+    // Read per arm, like the bash tool's window: PI_BG_CHECK_IN_MS changes
+    // apply without a reload.
+    checkInIdleMs: () => parseBgCheckInMs(process.env),
   });
   // Cross-extension visibility (goal's settle check defers while tasks run):
   // publish after creation so readers never see a half-built registry. A
@@ -440,7 +444,9 @@ export function registerSubagentsExtension(
   // window promotes to this registry like a backgrounded subagent. Explicit
   // wait: inline delegates to pi's own bash tool (the deliberate unbounded
   // block); background adopts immediately. The wait window is read per call
-  // so PI_BASH_BG_AFTER_MS changes apply live.
+  // so PI_BASH_BG_AFTER_MS changes apply live. daemon: true registers a
+  // process that is not expected to exit as such — no activity hold, no
+  // check-ins, woken only on exit.
   pi.registerTool(
     createBashTool(registry, {
       // bgOperations is a test harness faking pi's own LOCAL bash operations —
@@ -448,6 +454,8 @@ export function registerSubagentsExtension(
       operations: opts.bgOperations?.(),
       persistent: opts.bgOperations ? { localOperations: true } : undefined,
       waitMs: () => parseBashBgAfterMs(process.env),
+      // For the description: the registry's interval, read the same way.
+      checkInIdleMs: () => parseBgCheckInMs(process.env),
     }),
   );
   // Task management: peek (pull-based check-in), kill, and scheduled check-ins.

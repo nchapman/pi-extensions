@@ -643,11 +643,12 @@ export function registerSshBashExtension(
 target: user@host, host, an ~/.ssh/config alias, ssh://user@host:port, or a connection id (ssh-N) named in an earlier result; port and key refine it. Auth must be non-interactive (identity file, ssh-agent, or ssh config) — there are no password prompts; a destination that cannot authenticate fails fast with ssh's error.
 ${sshWaitClause} "inline" blocks until completion, however long; "background" returns a task id immediately.
 Run commands in the foreground — do not use nohup, trailing &, disown, screen, or tmux; pass wait: "background" instead. Backgrounding inside the shell exits immediately with code 0, breaking task tracking, log streaming, completion wakes, and task_kill (which cleanly SIGKILLs the remote session group).
+daemon: true marks a remote process that is not expected to exit (a dev server, a training job's tensorboard): it is not work the session is waiting on and gets no automatic check-ins — you are woken only if it exits, which for a daemon is news.
 Never sleep or poll remote commands in a loop — output streams automatically (peek with task <id>).`,
     promptSnippet: "Execute commands on a remote machine over SSH",
     promptGuidelines: [
       "Use ssh_bash (not bash + raw ssh) for remote machines: connections are multiplexed so repeated calls are cheap. Later calls can pass target: the connection id (ssh-1) an earlier result named.",
-      "For long remote jobs (training runs, dev servers), use wait: 'background' with a foreground command. Do not use nohup, trailing &, disown, screen, or tmux — backgrounding in the remote shell exits immediately with code 0, breaking task tracking and task_kill.",
+      "For long remote jobs (training runs), use wait: 'background' with a foreground command; for a remote dev server add daemon: true (not expected to exit: no automatic check-ins, you hear of it only if it exits). Do not use nohup, trailing &, disown, screen, or tmux — backgrounding in the remote shell exits immediately with code 0, breaking task tracking and task_kill.",
       "Never sleep or poll remote commands in a loop. Output streams automatically (peek with task <id>), and completion wakes you automatically when the command finishes.",
     ],
     extraParams: {

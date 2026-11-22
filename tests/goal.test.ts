@@ -3325,6 +3325,33 @@ describe("registerGoalTool", () => {
     }
   });
 
+  it("a daemon is not in flight: a running dev server never holds the check (the default seam reads waiting())", async () => {
+    const { pi, tools, events, sentCustom } = makePi();
+    const ctx = { ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
+    publishSharedTaskRegistry(createTaskRegistry());
+    try {
+      registerGoalTool(pi, { maxContinuations: 10, verifyRunner: async () => failVerify });
+      await tools.get(GOAL_TOOL_NAME)!.execute("1", { action: "set", objective: "ship it", verify: "npm test" });
+
+      // The agent started a dev server the right way — daemon: true. It will
+      // never finish; before the flag it parked the check until the user
+      // killed it (the observed production failure).
+      getSharedTaskRegistry()!.adopt({ name: "npm run dev", kind: "bash", kill: () => {}, daemon: true });
+      expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true }); // the check runs
+      expect(sentCustom).toHaveLength(1);
+
+      // In-flight work next to it still defers, exactly as before.
+      const build = getSharedTaskRegistry()!.adopt({ name: "vitest", kind: "bash", kill: () => {} });
+      expect(await fire(events, "agent_before_settle", ctx)).toBeUndefined();
+      expect(sentCustom).toHaveLength(1);
+      getSharedTaskRegistry()!.complete(build, { ok: true, text: "exited 0", wake: false });
+      expect(await fire(events, "agent_before_settle", ctx)).toEqual({ continue: true });
+      expect(sentCustom).toHaveLength(2);
+    } finally {
+      publishSharedTaskRegistry(createTaskRegistry());
+    }
+  });
+
   it("resolves (does not reject) when the runner throws at set or complete", async () => {
     const { pi, tools } = makePi();
     registerGoalTool(pi, {

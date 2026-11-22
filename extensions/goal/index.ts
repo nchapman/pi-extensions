@@ -266,11 +266,13 @@ export interface RegisterGoalOptions {
    *  the registration-path wiring (model inheritance, signal, timeout) is
    *  assertable without spawning pi. */
   judgeRunChildFn?: JudgeChildRunner;
-  /** Live background tasks at settle time; while any run, the settle
+  /** Live background tasks in flight at settle time; while any run, the settle
    *  judge decides hold-vs-proceed — without one in the loop, the check
-   *  defers unconditionally. Defaults to the shared superbash registry — absent registry means no background work
-   *  (fail-open: the loop must not stall on a missing writer). Inject a fake
-   *  in tests. */
+   *  defers unconditionally. Defaults to the shared superbash registry's
+   *  waiting() set — every running task but daemons (daemon: true), which
+   *  never finish and so must never hold the check; an absent registry means no
+   *  background work (fail-open: the loop must not stall on a missing writer).
+   *  Inject a fake in tests. */
   runningTasks?: () => BgTask[];
   /** Timeout (ms) for a verify run. Defaults to PI_GOAL_VERIFY_TIMEOUT_MS, then VERIFY_TIMEOUT_MS_DEFAULT. */
   verifyTimeoutMs?: number;
@@ -324,7 +326,7 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
   // Read per event, not captured at registration: a /reload rebuilds the
   // superbash registry, and a registration-time capture would keep deferring
   // on a dead registry (or miss the fresh one) after every reload.
-  const runningTasks: () => BgTask[] = options.runningTasks ?? (() => getSharedTaskRegistry()?.running() ?? []);
+  const runningTasks: () => BgTask[] = options.runningTasks ?? (() => getSharedTaskRegistry()?.waiting() ?? []);
   // Verify outputs observed during the current budget window (oldest first) —
   // the trajectory the settle judge's projection diffs (first-vs-last).
   // Cleared with the budget.
@@ -721,7 +723,8 @@ export function registerGoalTool(pi: ExtensionAPI, options: RegisterGoalOptions 
     // (PI_GOAL_JUDGE=0), and a judge that errors or returns no opinion
     // while tasks run, keep the unconditional deferral; a milestone judge
     // failure still fails open to the continuation (its established
-    // contract). No registry wired (goal registered standalone) reads as
+    // contract). A process the agent marked daemon: true never reaches this
+    // list. No registry wired (goal registered standalone) reads as
     // zero tasks — fail-open.
     const running = runningTasks();
     const holding = running.length > 0;

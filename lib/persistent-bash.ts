@@ -29,6 +29,10 @@
  *   that every scan ignores — documented, not machined around
  * - no log rotation: the child holds the fd (O_APPEND — leader and
  *   grandchildren share one open-file description); rotation would break that
+ * - daemon rides the metadata as an optional field: older runtimes ignore it
+ *   and older files simply lack it, so no version bump; a re-adopted daemon
+ *   must read as one again (no activity hold, no check-ins) after the restart
+ *   it was persisted to survive
  */
 
 import { execFile, spawn } from "node:child_process";
@@ -116,6 +120,8 @@ export interface PersistentTaskMeta {
   startedAt: number;
   timeoutSecs?: number;
   cwd: string;
+  /** The command was started daemon: true (not expected to exit). */
+  daemon?: boolean;
 }
 
 /** Task ids are t-<base36 time>: a safe single path component. Metadata is
@@ -138,7 +144,8 @@ function isTaskMeta(v: unknown): v is PersistentTaskMeta {
     Number.isFinite(m.startedAt) &&
     typeof m.cwd === "string" &&
     (m.timeoutSecs === undefined ||
-      (typeof m.timeoutSecs === "number" && Number.isFinite(m.timeoutSecs) && m.timeoutSecs > 0))
+      (typeof m.timeoutSecs === "number" && Number.isFinite(m.timeoutSecs) && m.timeoutSecs > 0)) &&
+    (m.daemon === undefined || typeof m.daemon === "boolean")
   );
 }
 

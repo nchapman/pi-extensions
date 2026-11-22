@@ -33,13 +33,25 @@
  *   again after compaction). Fire-once: a killed task never wakes, a completed
  *   task wakes exactly once; a task that settles inside the auto window
  *   completes wake-less, because the tool result already carried the output
- * - checking in is pull-based and model-scheduled, never a fixed heartbeat:
+ * - checking in is model-scheduled first, with an idle floor underneath:
  *   `task <id>` reads new output from the task's log since the last check (an
  *   in-memory byte offset; the first check shows the tail), and `task_remind`
  *   arms at most one one-shot timer per task (re-arm replaces; omitting
  *   in_secs cancels) whose fire is dropped when the task already settled — the
  *   completion wake already delivered the result, so a heartbeat could only
- *   burn turns on silence
+ *   burn turns on silence. The old "never a fixed heartbeat" cut stands for
+ *   everything the model schedules itself, but a task nobody looks at was the
+ *   opposite failure — forgotten for hours — so every running task also
+ *   carries an automatic check-in PI_BG_CHECK_IN_MS (15m) after its last
+ *   check (a `task <id>` peek, a check-in firing, or auto promotion handing
+ *   it over), re-armed until it settles. It is content-bearing like any
+ *   reminder and never repeats what a peek showed; an explicit task_remind
+ *   owns the cadence until it fires or is cancelled, and cancelling
+ *   restarts the idle clock rather than silencing it — only a daemon opts out
+ * - daemon: true marks a process that is not expected to exit (a dev server,
+ *   a watcher): its exit is news, not an awaited result, so it holds no
+ *   activity, stays out of the in-flight set (waiting()), and gets no
+ *   automatic check-ins — an explicit task_remind still works on it
  * - full replies over the wake cap are stashed beside the session at
  *   <sessionDir>/tasks/<id>.txt with a pointer in the wake (stash-and-pointer, recoverable after compaction);
  *   with no session dir the text is hard-capped and says so
@@ -64,9 +76,10 @@
  *   tasks instead of killing them; resumePersistedTasks re-adopts live ones
  *   under their on-disk id and settles the rest — disk state, not memory, owns
  *   the outcome, so exactly one runtime ever wakes for a given task
- * - registered jobs hold generic extension activity until completion/kill/detach.
- *   The wake is initiated before releasing activity so status consumers can bridge
- *   the handoff to Pi; reminders share their running task's hold, never add one
+ * - registered jobs hold generic extension activity until completion/kill/detach
+ *   (daemons excepted). The wake is initiated before releasing activity so status
+ *   consumers can bridge the handoff to Pi; reminders share their running task's
+ *   hold, never add one
  * - PI_BG_WAKE=0 disables wake messages (completions and reminders); the
  *   terminal notification still fires
  */
@@ -132,6 +145,10 @@ export interface BgTask {
   status?: string;
   /** True for tasks that outlive pi: spared by killAll({sparePersistent}), shown with a marker. */
   persistent?: boolean;
+  /** True for a process that is not expected to exit (daemon: true — a dev
+   *  server, a watcher): it holds no activity, is left out of waiting(), and
+   *  gets no automatic check-ins. Its exit still wakes. */
+  daemon?: boolean;
   /** Live progress line for check-in wakes; undefined when the kind has nothing to report.
    *  Consuming: calling it advances the reminder channel's read offset — the
    *  delta it reports is one-shot, so call it exactly once per wake. */
@@ -160,50 +177,66 @@ export interface TaskDeps {
   wakeEnabled?: boolean;
   /** Injectable clock for tests. */
   now?: () => number;
-  /** Injectable timer for task_remind (tests); defaults to setTimeout. */
+  /** Injectable timer for check-ins (tests); defaults to setTimeout. */
   schedule?: (fn: () => void, ms: number) => unknown;
   unschedule?: (handle: unknown) => void;
+  /** Automatic check-in interval: a running task nobody has checked on for
+   *  this long gets a check-in wake. A function is read per arm, so an env
+   *  knob applies without a reload. Infinity (or a non-positive value) means
+   *  none; default DEFAULT_CHECK_IN_IDLE_MS. */
+  checkInIdleMs?: number | (() => number);
+}
+
+/** A task as `adopt` registers it. */
+export interface AdoptRecord {
+  name: string;
+  kind: "subagent" | "bash";
+  kill: () => void;
+  progress?: () => string | undefined;
+  persistent?: boolean;
+  detach?: () => void;
+  /** daemon: true — not expected to exit: no activity hold, no automatic check-ins. */
+  daemon?: boolean;
+  /** True start time for re-adopted durable tasks, so elapsed times and
+   *  ordering report since the spawn, not since the restart. */
+  startedAt?: number;
+}
+
+/** One pending check-in as the registry reports it. */
+export interface CheckIn {
+  /** The delay the check-in was armed with. */
+  ms: number;
+  note?: string;
+  /** True for the registry's own idle check-in (nobody armed it). */
+  automatic?: boolean;
+  /** Epoch ms the check-in fires; with a clock, listings show the time left. */
+  dueAt?: number;
+}
+
+/** A pending check-in together with the task it belongs to. */
+export interface CheckInListing extends CheckIn {
+  id: string;
 }
 
 /** The session-scoped background task registry interface. */
 export interface TaskRegistry {
   /** Register a running task; returns its id (t-<base36 time>, e.g. t-1134z8v). */
-  adopt(
-    record: {
-      name: string;
-      kind: "subagent" | "bash";
-      kill: () => void;
-      progress?: () => string | undefined;
-      persistent?: boolean;
-      detach?: () => void;
-      /** True start time for re-adopted durable tasks, so elapsed times and
-       *  ordering report since the spawn, not since the restart. */
-      startedAt?: number;
-    },
-    preferredId?: string,
-  ): string;
+  adopt(record: AdoptRecord, preferredId?: string): string;
   /** Re-adopt a durable task under its on-disk id (persistent tasks resuming
    *  after a restart); idempotent when that id is already registered. */
-  adopt(
-    record: {
-      name: string;
-      kind: "subagent" | "bash";
-      kill: () => void;
-      progress?: () => string | undefined;
-      persistent?: boolean;
-      detach?: () => void;
-      startedAt?: number;
-    },
-    preferredId: string,
-  ): string;
+  adopt(record: AdoptRecord, preferredId: string): string;
   /**
    * Record the outcome and deliver the wake exactly once; a no-op for unknown
    * or non-running tasks. wake: false records without messaging — the tool
    * result already carried the output (auto mode settling inside its window).
    */
   complete(id: string, outcome: { ok: boolean; text: string; status?: string; wake?: boolean }): void;
-  /** Tasks still running, oldest first. */
+  /** Tasks still running, oldest first — daemons included. */
   running(): BgTask[];
+  /** Running tasks in flight: the ones whose completion the session is
+   *  waiting for. Every running task but daemons — the set that holds activity
+   *  and defers a goal's settle check. */
+  waiting(): BgTask[];
   /** Whether the task exists and has not settled or been killed. */
   isRunning(id: string): boolean;
   /** Full record for any known task, running or settled. */
@@ -220,14 +253,27 @@ export interface TaskRegistry {
    *  state (no kill signal, no wake, dropped from the registry) so they keep
    *  running across the restart. */
   killAll(opts?: { sparePersistent?: boolean }): number;
-  /** Arm (or re-arm) a one-shot check-in on a running task; false when the task is unknown or settled. */
+  /** Arm (or re-arm) a one-shot check-in on a running task; false when the task is unknown or settled.
+   *  Re-arming replaces the pending check-in, the automatic one included; the
+   *  idle cadence resumes once this check-in fires. */
   remind(id: string, ms: number, note?: string): boolean;
-  /** Cancel the task's pending check-in; true when one was pending. */
+  /** Cancel the task's pending check-in; true when one was pending. Cancelling
+   *  is not silencing: a running task's automatic check-in restarts from now
+   *  (only a daemon, or a disabled interval, leaves it with none). */
   cancelReminder(id: string): boolean;
   /** The task's pending check-in, if any. */
-  reminderFor(id: string): { ms: number; note?: string } | undefined;
-  /** All pending check-ins, oldest task first. */
-  reminders(): { id: string; ms: number; note?: string }[];
+  reminderFor(id: string): CheckIn | undefined;
+  /** All pending check-ins, in the order they were armed. */
+  reminders(): CheckInListing[];
+  /** A check on a running task just happened — the agent looked at it by hand
+   *  (`task <id>`), or auto promotion just handed it over. The idle check-in
+   *  clock restarts from now; an explicitly armed check-in keeps its time.
+   *  `seen: true` marks that the look covered the task's output up to now, so
+   *  the check-in channel skips it and the next check-in reports only what
+   *  appeared after the look. */
+  checkIn(id: string, opts?: { seen?: boolean }): void;
+  /** The automatic check-in interval in effect (ms); Infinity when none are armed. */
+  checkInIdleMs(): number;
 }
 
 /**
@@ -263,6 +309,29 @@ export function parseBgAfterMs(env: Record<string, string | undefined>): number 
 /** Parse PI_BASH_BG_AFTER_MS: default auto-wait window in ms before promoting bash commands ("off" = never). */
 export function parseBashBgAfterMs(env: Record<string, string | undefined>): number {
   return parseAfterMs(env, "PI_BASH_BG_AFTER_MS", DEFAULT_BASH_BG_AFTER_MS);
+}
+
+/** How long a running task goes unchecked before the registry checks on it
+ *  itself: after this long with no `task <id>` peek and no check-in fired, an
+ *  automatic check-in wakes the agent with the task's new output. */
+export const DEFAULT_CHECK_IN_IDLE_MS = 15 * 60_000;
+
+/** Floor for PI_BG_CHECK_IN_MS: every check-in costs the agent a turn, and a
+ *  sub-second cadence is never what a setting that small meant. */
+export const MIN_CHECK_IN_IDLE_MS = 1_000;
+
+/** Parse PI_BG_CHECK_IN_MS, the automatic check-in interval: missing or
+ *  invalid keeps the 15m default; "off"/"never" and any numerically-zero
+ *  spelling disable it (the sibling-knob convention); anything else is
+ *  range-clamped, never thrown. */
+export function parseBgCheckInMs(env: Record<string, string | undefined>): number {
+  const raw = env.PI_BG_CHECK_IN_MS?.trim();
+  if (!raw) return DEFAULT_CHECK_IN_IDLE_MS;
+  if (/^(off|never)$/i.test(raw)) return Number.POSITIVE_INFINITY;
+  const n = Number(raw);
+  if (n === 0) return Number.POSITIVE_INFINITY;
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_CHECK_IN_IDLE_MS;
+  return Math.min(Math.max(Math.floor(n), MIN_CHECK_IN_IDLE_MS), MAX_TIMEOUT_MS);
 }
 
 const WAKE_OFF = new Set(["0", "false", "no", "off"]);
@@ -323,9 +392,22 @@ export function formatSubagentWake(
   return `${header}${body}`;
 }
 
-/** The wake message for a scheduled check-in on a task that is still running. */
-export function formatReminderWake(task: BgTask, elapsedMs: number, note?: string): string {
-  const notePart = note ? ` — ${note}` : "";
+/** The wake message for a check-in on a task that is still running. An
+ *  automatic one (idleIntervalMs) names its trigger and says when the next
+ *  follows, so the model never arms a tighter check-in just to wait. */
+export function formatReminderWake(
+  task: BgTask,
+  elapsedMs: number,
+  note?: string,
+  opts: { idleIntervalMs?: number } = {},
+): string {
+  const idle = opts.idleIntervalMs;
+  const notePart =
+    idle !== undefined
+      ? ` — automatic check-in: ${formatDuration(idle)} passed with no check`
+      : note
+        ? ` — ${note}`
+        : "";
   // The wake must be content-bearing: a bare elapsed time is the only salient
   // number otherwise, and it reads as pressure — the observed 3m→1m check-in
   // escalation ended in killing a healthy run ~90s early.
@@ -333,14 +415,25 @@ export function formatReminderWake(task: BgTask, elapsedMs: number, note?: strin
     task.progress?.() ??
     (task.kind === "subagent" ? "subagents stream no output, so elapsed time is the only signal" : undefined);
   const progressPart = progress ? `\n${progress}` : "";
-  return `[reminder] ${task.id} (${task.kind}, ${formatDuration(elapsedMs)}) still running${notePart}${progressPart}\nNothing here needs action: end your turn unless you'd act differently at a later check-in. A long elapsed time alone is not a reason to kill or restart — the completion wake is automatic; kill only if the result is no longer wanted.`;
+  const again =
+    idle !== undefined
+      ? ` The next automatic check-in follows in ${formatDuration(idle)} unless you peek with task ${task.id} first.`
+      : "";
+  return `[reminder] ${task.id} (${task.kind}, ${formatDuration(elapsedMs)}) still running${notePart}${progressPart}\nNothing here needs action: end your turn unless you'd act differently at a later check-in. A long elapsed time alone is not a reason to kill or restart — the completion wake is automatic; kill only if the result is no longer wanted.${again}`;
 }
 
-/** The "Check-ins:" block appended to task listings (task tool and /tasks). */
-export function describeReminders(reminders: { id: string; ms: number; note?: string }[]): string {
+/** The "Check-ins:" block appended to task listings (task tool and /tasks).
+ *  With a clock, each line shows the time left (dueAt - now) rather than the
+ *  delay originally armed: a standing automatic check-in would otherwise read
+ *  "in 15m" at minute 14. */
+export function describeReminders(reminders: CheckInListing[], nowMs?: number): string {
   if (reminders.length === 0) return "";
   return `\nCheck-ins:\n${reminders
-    .map((r) => `  ${r.id} in ${formatDuration(r.ms)}${r.note ? ` — ${r.note}` : ""}`)
+    .map((r) => {
+      const left = r.dueAt !== undefined && nowMs !== undefined ? Math.max(0, r.dueAt - nowMs) : r.ms;
+      const why = r.automatic ? "automatic idle check-in" : (r.note ?? "");
+      return `  ${r.id} in ${formatDuration(left)}${why ? ` — ${why}` : ""}`;
+    })
     .join("\n")}`;
 }
 
@@ -349,13 +442,27 @@ function isPromiseLike(v: unknown): v is { catch: (onRejected: (reason: unknown)
   return typeof v === "object" && v !== null && typeof (v as { catch?: unknown }).catch === "function";
 }
 
+/** A task as the registry stores it: the public record plus its live handles. */
+type RegisteredTask = BgTask & { kill: () => void; detach?: () => void };
+
 /** Create a session-scoped registry. Pure over its injected channels. */
 export function createTaskRegistry(deps: TaskDeps = {}): TaskRegistry {
   const now = deps.now ?? Date.now;
-  const schedule = deps.schedule ?? ((fn: () => void, ms: number) => setTimeout(fn, ms));
+  // A pending check-in never keeps the loop alive (the persistent monitors'
+  // rule): a process that is otherwise done exits, timer or no timer.
+  const schedule: NonNullable<TaskDeps["schedule"]> =
+    deps.schedule ??
+    ((fn, ms) => {
+      const handle = setTimeout(fn, ms);
+      handle.unref?.();
+      return handle;
+    });
   const unschedule = deps.unschedule ?? ((handle: unknown) => clearTimeout(handle as ReturnType<typeof setTimeout>));
-  const tasks = new Map<string, BgTask & { kill: () => void; detach?: () => void }>();
-  const reminders = new Map<string, { handle: unknown; ms: number; note?: string }>();
+  const tasks = new Map<string, RegisteredTask>();
+  const reminders = new Map<
+    string,
+    { handle: unknown; ms: number; note?: string; automatic?: boolean; dueAt: number }
+  >();
   // Ids are "t-" + base36 millisecond timestamp, monotonic within the session.
   // Time-based so ids are unique across resumes and parallel sessions: a long
   // context can hold task ids from earlier sessions without "t-same" ever
@@ -365,7 +472,9 @@ export function createTaskRegistry(deps: TaskDeps = {}): TaskRegistry {
   const activity = new Map<string, () => void>();
   const refreshStatus = () => {
     for (const [id, task] of tasks) {
-      if (task.state === "running" && !activity.has(id) && deps.holdBusy) {
+      // Only in-flight work holds activity: a daemon's exit is news, not a
+      // result the session is waiting for, so it never reads as "working".
+      if (task.state === "running" && !task.daemon && !activity.has(id) && deps.holdBusy) {
         activity.set(id, deps.holdBusy());
       }
     }
@@ -375,8 +484,14 @@ export function createTaskRegistry(deps: TaskDeps = {}): TaskRegistry {
         release();
       }
     }
-    const n = [...tasks.values()].filter((t) => t.state === "running").length;
-    deps.setStatus?.("bg", n > 0 ? `${n} running` : undefined);
+    const running = [...tasks.values()].filter((t) => t.state === "running");
+    const daemons = running.filter((t) => t.daemon).length;
+    const awaited = running.length - daemons;
+    const parts = [
+      awaited > 0 ? `${awaited} running` : "",
+      daemons > 0 ? `${daemons} daemon${daemons === 1 ? "" : "s"}` : "",
+    ].filter(Boolean);
+    deps.setStatus?.("bg", parts.length > 0 ? parts.join(", ") : undefined);
   };
 
   // Channels are external and can throw (a wake landing during session
@@ -399,7 +514,8 @@ export function createTaskRegistry(deps: TaskDeps = {}): TaskRegistry {
     }
   };
 
-  const cancelReminder = (id: string): boolean => {
+  /** Withdraw the pending check-in, with no replacement. */
+  const withdraw = (id: string): boolean => {
     const r = reminders.get(id);
     if (!r) return false;
     reminders.delete(id);
@@ -411,13 +527,71 @@ export function createTaskRegistry(deps: TaskDeps = {}): TaskRegistry {
     return true;
   };
 
+  /** The automatic check-in interval in effect right now (a function dep is
+   *  read per arm, so an env knob applies without a reload). */
+  const idleCheckInMs = (): number => {
+    const value = typeof deps.checkInIdleMs === "function" ? deps.checkInIdleMs() : deps.checkInIdleMs;
+    return value ?? DEFAULT_CHECK_IN_IDLE_MS;
+  };
+
+  /** Arm one check-in: the registry's own (automatic) or the model's. */
+  const scheduleCheckIn = (task: RegisteredTask, ms: number, note: string | undefined, automatic: boolean): void => {
+    const { id } = task;
+    const entry: { handle: unknown; ms: number; note?: string; automatic?: boolean; dueAt: number } = {
+      handle: undefined,
+      ms,
+      note,
+      ...(automatic ? { automatic: true } : {}),
+      dueAt: now() + ms,
+    };
+    entry.handle = schedule(() => {
+      // Identity, not mere presence: a timer that was replaced must not fire
+      // its successor's check-in if it runs anyway.
+      if (reminders.get(id) !== entry) return;
+      reminders.delete(id);
+      const current = tasks.get(id);
+      // Settled tasks are dropped: the completion wake already delivered the
+      // result, so the check-in would only burn a turn on stale news.
+      if (!current || current.state !== "running") return;
+      deliver(
+        formatReminderWake(current, now() - current.startedAt, note, automatic ? { idleIntervalMs: ms } : {}),
+        true,
+      );
+      // The check just happened, so the idle clock starts over (a no-op for
+      // daemons, with wakes off, or with the interval disabled).
+      armIdleCheckIn(current);
+    }, ms);
+    reminders.set(id, entry);
+  };
+
+  /** Arm the automatic check-in one idle interval out — only for a running
+   *  task the session waits on, and only when a wake can actually reach the
+   *  agent: with wakes off (or no channel) there is nothing to deliver, and a
+   *  recurring terminal notification would be noise, not a check-in. */
+  const armIdleCheckIn = (task: RegisteredTask): boolean => {
+    if (task.state !== "running" || task.daemon || deps.wakeEnabled === false || !deps.sendUserMessage) return false;
+    const interval = idleCheckInMs();
+    if (!Number.isFinite(interval) || interval <= 0) return false;
+    scheduleCheckIn(task, interval, undefined, true);
+    return true;
+  };
+
+  /** The public view of a task: its record without the kill/detach handles. */
+  const view = ({ kill: _kill, detach: _detach, ...rest }: RegisteredTask): BgTask => rest;
+  /** Running tasks as the public sees them, oldest first. */
+  const runningViews = (): BgTask[] =>
+    [...tasks.values()]
+      .filter((t) => t.state === "running")
+      .map(view)
+      .sort((a, b) => a.startedAt - b.startedAt);
+
   // Mark killed before killing: the child's close event must find a
   // non-running task, and a failed kill surfaces through the process exit.
-  const killTask = (task: (BgTask & { kill: () => void }) | undefined): boolean => {
+  const killTask = (task: RegisteredTask | undefined): boolean => {
     if (!task || task.state !== "running") return false;
     task.state = "killed";
     task.endedAt = now();
-    cancelReminder(task.id);
+    withdraw(task.id);
     try {
       task.kill();
     } catch {
@@ -440,7 +614,7 @@ export function createTaskRegistry(deps: TaskDeps = {}): TaskRegistry {
         if (tasks.has(preferredId)) return preferredId; // idempotent re-adopt
         id = preferredId;
       }
-      tasks.set(id, {
+      const task: RegisteredTask = {
         id,
         name: record.name,
         kind: record.kind,
@@ -450,7 +624,10 @@ export function createTaskRegistry(deps: TaskDeps = {}): TaskRegistry {
         progress: record.progress,
         persistent: record.persistent,
         detach: record.detach,
-      });
+        daemon: record.daemon,
+      };
+      tasks.set(id, task);
+      armIdleCheckIn(task); // the idle clock starts at adoption
       refreshStatus();
       return id;
     },
@@ -460,26 +637,24 @@ export function createTaskRegistry(deps: TaskDeps = {}): TaskRegistry {
       task.state = ok ? "done" : "failed";
       task.endedAt = now();
       if (status) task.status = status;
-      cancelReminder(id);
+      withdraw(id);
       // Start the wake while the old work is still held. Pi's public send API
       // is void; the terminal adapter gives the handoff a bounded grace window.
       if (wake) deliver(text, ok);
       refreshStatus();
     },
     running() {
-      return [...tasks.values()]
-        .filter((t) => t.state === "running")
-        .map(({ kill: _kill, detach: _detach, ...rest }) => rest)
-        .sort((a, b) => a.startedAt - b.startedAt);
+      return runningViews();
+    },
+    waiting() {
+      return runningViews().filter((t) => !t.daemon);
     },
     isRunning(id) {
       return tasks.get(id)?.state === "running";
     },
     get(id) {
       const task = tasks.get(id);
-      if (!task) return undefined;
-      const { kill: _kill, detach: _detach, ...rest } = task;
-      return rest;
+      return task ? view(task) : undefined;
     },
     kill(id) {
       return killTask(tasks.get(id));
@@ -490,6 +665,7 @@ export function createTaskRegistry(deps: TaskDeps = {}): TaskRegistry {
       task.state = "running";
       task.endedAt = undefined;
       refreshStatus();
+      armIdleCheckIn(task); // running again: the idle clock starts over
       return true;
     },
     killAll(opts = {}) {
@@ -500,7 +676,7 @@ export function createTaskRegistry(deps: TaskDeps = {}): TaskRegistry {
           // monitor its goodbye (listeners off, settle guard up), then drop the
           // task entirely — as if never adopted. No kill signal, no wake; the
           // on-disk metadata is the single owner of its outcome now.
-          cancelReminder(id);
+          withdraw(id);
           try {
             task.detach?.();
           } catch {
@@ -517,26 +693,50 @@ export function createTaskRegistry(deps: TaskDeps = {}): TaskRegistry {
     remind(id, ms, note) {
       const task = tasks.get(id);
       if (!task || task.state !== "running") return false;
-      cancelReminder(id); // re-arm replaces the pending check-in
-      const handle = schedule(() => {
-        if (!reminders.delete(id)) return; // cancelled or replaced in the meantime
-        const current = tasks.get(id);
-        // Settled tasks are dropped: the completion wake already delivered the
-        // result, so the check-in would only burn a turn on stale news.
-        if (!current || current.state !== "running") return;
-        deliver(formatReminderWake(current, now() - current.startedAt, note), true);
-      }, ms);
-      reminders.set(id, { handle, ms, note });
+      withdraw(id); // re-arm replaces the pending check-in, the automatic one included
+      scheduleCheckIn(task, ms, note, false);
       return true;
     },
-    cancelReminder,
+    cancelReminder(id) {
+      if (!withdraw(id)) return false;
+      // Cancelling is not silencing: the agent withdrew one check-in, so the
+      // idle clock restarts from now (a no-op where none applies).
+      const task = tasks.get(id);
+      if (task) armIdleCheckIn(task);
+      return true;
+    },
     reminderFor(id) {
       const r = reminders.get(id);
-      return r ? { ms: r.ms, note: r.note } : undefined;
+      return r ? { ms: r.ms, note: r.note, ...(r.automatic ? { automatic: true } : {}), dueAt: r.dueAt } : undefined;
     },
     reminders() {
-      return [...reminders.entries()].map(([id, r]) => ({ id, ms: r.ms, note: r.note }));
+      return [...reminders.entries()].map(([id, r]) => ({
+        id,
+        ms: r.ms,
+        note: r.note,
+        ...(r.automatic ? { automatic: true } : {}),
+        dueAt: r.dueAt,
+      }));
     },
+    checkIn(id, opts) {
+      const task = tasks.get(id);
+      if (!task || task.state !== "running") return;
+      // Only the registry's own check-in moves: one the agent armed keeps its time.
+      if (reminders.get(id)?.automatic) {
+        withdraw(id);
+        armIdleCheckIn(task);
+      }
+      if (opts?.seen) {
+        // The look covered the output so far: advance the check-in channel
+        // past it, so a later check-in reports only what appeared since.
+        try {
+          task.progress?.();
+        } catch {
+          // progress is advisory text; a reader that throws must not escape the peek
+        }
+      }
+    },
+    checkInIdleMs: idleCheckInMs,
   };
 }
 
@@ -634,6 +834,7 @@ function adoptPersistedMonitor(
           : display.truncated
             ? `[… truncated — full output: ${logPath} …]`
             : undefined,
+        daemon: meta.daemon,
       }),
     });
   };
@@ -650,6 +851,7 @@ function adoptPersistedMonitor(
       name: head,
       kind: "bash",
       persistent: true,
+      daemon: meta.daemon,
       // The durable record owns the true start time — /tasks and reminders
       // report since the spawn, not since this restart.
       startedAt: meta.startedAt,
@@ -774,6 +976,7 @@ export async function resumePersistedTasks(
             name: head,
             kind: "bash",
             persistent: true,
+            daemon: meta.daemon,
             kill: () => undefined,
             detach: () => undefined,
             startedAt: meta.startedAt,
@@ -791,6 +994,7 @@ export async function resumePersistedTasks(
             durationMs: now() - meta.startedAt,
             output: tail.output,
             outputNote: tail.note,
+            daemon: meta.daemon,
           }),
         });
       };
@@ -823,6 +1027,7 @@ export async function resumePersistedTasks(
               name: head,
               kind: "bash",
               persistent: true,
+              daemon: meta.daemon,
               kill: () => undefined,
               detach: () => undefined,
               startedAt: meta.startedAt,
@@ -846,6 +1051,7 @@ export async function resumePersistedTasks(
               // Only point at the log when it still exists (kept on a decline,
               // removed on a kill or a recycled pid).
               outputNote: outcome.killed || outcome.reason === "mismatched" ? undefined : tail.note,
+              daemon: meta.daemon,
             }),
           });
           break;
@@ -861,7 +1067,11 @@ export async function resumePersistedTasks(
         case "adopt":
           adoptPersistedMonitor(registry, sessionDir, meta, deps, now);
           deps.wake?.(
-            `Background task still running (${meta.id}): ${head} — it survived the restart and was re-adopted; its outcome will be delivered when it exits. Peek: task ${meta.id}`,
+            `Background task still running (${meta.id}): ${head} — it survived the restart and was re-adopted${
+              meta.daemon
+                ? " as a daemon (not expected to exit: no automatic check-ins, you hear of it only if it exits)"
+                : ""
+            }; its outcome will be delivered when it exits. Peek: task ${meta.id}`,
           );
           break;
         case "discard":
@@ -982,6 +1192,8 @@ export function formatBashWake(opts: {
   output: string;
   /** Pointer/warning appended after the output (full-output path, or a stash failure). */
   outputNote?: string;
+  /** The command was marked daemon: its exit is unexpected, and the header says so. */
+  daemon?: boolean;
 }): string {
   const body =
     opts.output.trim() || opts.outputNote
@@ -989,7 +1201,7 @@ export function formatBashWake(opts: {
       : ""; // quiet commands stay quiet
   return `[background] bash (${opts.id}, ${formatDuration(opts.durationMs)}) ${opts.status} — ${bashCommandHead(
     opts.command,
-  )}${body}`;
+  )}${opts.daemon ? " (daemon, not expected to exit)" : ""}${body}`;
 }
 
 /** The fixed prefixes of this package's three machine-written wake messages. */
@@ -1041,7 +1253,34 @@ export type BashToolCallParams = {
   wait?: BashWaitMode;
   /** Opt the background command into surviving pi restarts (background mode only). */
   persist?: boolean;
+  /** Mark a process that is not expected to exit (a dev server, a watcher):
+   *  it backgrounds immediately, holds no activity, gets no automatic check-ins, and
+   *  wakes only when it exits. */
+  daemon?: boolean;
 } & Record<string, unknown>;
+
+/** The tool result text when a command moves to the background: what keeps
+ *  running, how its result arrives — and, for a daemon, why nothing will. */
+export function formatBackgroundedNotice(opts: {
+  id: string;
+  head: string;
+  persistent?: boolean;
+  daemon?: boolean;
+}): string {
+  const marks = [opts.persistent ? "persistent" : "", opts.daemon ? "daemon" : ""].filter(Boolean);
+  const header = `Backgrounded (${opts.id}${marks.length ? `, ${marks.join(", ")}` : ""}): ${opts.head}`;
+  const timeoutClause = " Any timeout you passed still applies.";
+  if (opts.daemon) {
+    const lifetime = opts.persistent
+      ? "The command keeps running in its own process group, detached from pi — it survives pi exiting and restarting — and is not expected to exit: it is not work the session is waiting on and gets no automatic check-ins, so you are woken only if it exits, which for a daemon is news (a crash or an external stop); after a restart, the next session reports that exit."
+      : "The command keeps running in the background and is not expected to exit: it is not work the session is waiting on and gets no automatic check-ins — you are woken only if it exits, which for a daemon is news (a crash or an external stop).";
+    return `${header}\n${lifetime} Peek at it with task ${opts.id} when you need its output, for example to confirm it came up; stop it with task_kill ${opts.id} when it is no longer needed.${timeoutClause}`;
+  }
+  const lifetime = opts.persistent
+    ? "The command keeps running in its own process group, detached from pi — it survives pi exiting and restarting, and its outcome is reported when the session resumes. In this session the exit status, duration, and output tail are delivered to you automatically as your next message when it exits — even mid-run."
+    : "The command keeps running in the background. When it exits, the exit status, duration, and output tail are delivered to you automatically as your next message — even mid-run.";
+  return `${header}\n${lifetime} If you have nothing else to do, end your turn: the wake re-engages you. Never sleep or poll to wait, and don't arm a check-in just to wait — the result arrives on its own. Peek at it with task ${opts.id}; stop it with task_kill ${opts.id}.${timeoutClause}`;
+}
 
 /** Per-call provisioning from a `prepare` hook: the operations this call runs
  * through, an optional inline executor over them, and the one-line task name
@@ -1071,6 +1310,10 @@ const UPDATE_THROTTLE_MS = 100;
  *   bash tool (same streaming, truncation, temp-file stashing, structured
  *   output); no task is registered
  * - wait: "background" — returns the task id immediately
+ * - daemon: true — a process that is not expected to exit (a dev server, a
+ *   watcher): backgrounded whatever the wait mode says (inline, the one mode
+ *   that would never return, is refused), registered so it holds no activity
+ *   and gets no automatic check-ins, and woken only when it exits
  * Auto and background run through pi's local bash operations with a full
  * output log, so `task <id>` can peek at any point and the output survives
  * resume. A command that settles inside the auto window leaves no log behind
@@ -1084,6 +1327,9 @@ export function createBashTool(
     inline?: BashInlineExecutor;
     /** Auto-promote window in ms; a function is called per invocation so env changes apply without a reload. */
     waitMs?: number | (() => number);
+    /** The registry's automatic check-in interval, for the description only
+     *  (the registry itself owns the timers); defaults to PI_BG_CHECK_IN_MS. */
+    checkInIdleMs?: number | (() => number);
     now?: () => number;
     /** Tool identity overrides for sibling tools built on the same core
      * (ssh_bash); the default is the built-in-replacing `bash`. */
@@ -1121,6 +1367,13 @@ export function createBashTool(
   const autoClause = windowFinite
     ? `wait defaults to "auto": a command that finishes within ${windowTxt} blocks and returns its output inline — waiting on a tool call costs nothing — while one still running after ${windowTxt} moves to the background and returns a task id (t-xxxxx). "inline" blocks until the command finishes, however long: the deliberate wait-in-turn choice for when you'd rather not be re-engaged. "background" returns a task id immediately — for known-long work you'll do other things while it runs.`
     : `wait defaults to "auto" with promotion disabled (PI_BASH_BG_AFTER_MS=off): commands block until they finish and return their output — waiting on a tool call costs nothing; pass a timeout to bound a command you're unsure about. "inline" is the same unbounded block through pi's own bash tool. "background" returns a task id immediately.`;
+  // The description states the automatic check-in interval in effect at
+  // registration, like the window: PI_BG_CHECK_IN_MS is a session-level knob.
+  // "off" (Infinity) means none — then the description promises none.
+  const descCheckInMs =
+    (typeof opts.checkInIdleMs === "function" ? opts.checkInIdleMs() : opts.checkInIdleMs) ??
+    parseBgCheckInMs(process.env);
+  const checkInTxt = Number.isFinite(descCheckInMs) && descCheckInMs > 0 ? formatDuration(descCheckInMs) : undefined;
   // The definition (not the wrapped tool): its execute takes the tool ctx,
   // which the inline path needs for cwd, session env, and streaming.
   const piBashDef = opts.inline ? undefined : createBashToolDefinition(process.cwd());
@@ -1155,8 +1408,13 @@ export function createBashTool(
     description:
       opts.description ??
       `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first); when truncated, the full output is saved to a file whose path the result includes.
-${autoClause} A backgrounded command's result (exit status, duration, output tail) is delivered to you automatically as your next message, even mid-run — if you have nothing else to do, end your turn and the wake re-engages you; never sleep or poll to wait. Peek at a running task with task <id> only when its new output would change what you do; stop it with task_kill.
+${autoClause} A backgrounded command's result (exit status, duration, output tail) is delivered to you automatically as your next message, even mid-run — if you have nothing else to do, end your turn and the wake re-engages you; never sleep or poll to wait.${
+        checkInTxt
+          ? ` A task nobody has checked on for ${checkInTxt} gets an automatic check-in with its new output, so a forgotten task always comes back.`
+          : ""
+      } Peek at a running task with task <id> only when its new output would change what you do; stop it with task_kill.
 persist: true (wait: "background" only) detaches the command from pi entirely: it keeps running across pi exits and restarts, logs to the session's tasks directory, and its outcome is reported when the session resumes. The default is non-persistent; PI_BG_BASH_PERSIST=1 flips the default for background mode.
+daemon: true marks a process that is not expected to exit (a dev server, a watcher): it runs in the background whatever the wait mode, is not work the session is waiting on, and is never checked on automatically — you are woken only if it exits, which for a daemon is news (a crash or an external stop).
 Timeout is in seconds, optional, no default — a command without a timeout runs until it finishes or is killed (0 also means no timeout).`,
     promptSnippet: opts.promptSnippet ?? "Execute bash commands (ls, grep, find, etc.)",
     promptGuidelines: opts.promptGuidelines ?? [
@@ -1164,7 +1422,10 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
         ? `Quick commands need no wait param: they block and return inline, and waiting on a tool call costs nothing. A command still running after ${windowTxt} moves to the background on its own — use wait: "background" up front for known-long work (builds, test suites, migrations) you have other work to do alongside, and wait: "inline" only when you deliberately want to wait in-turn past the window.`
         : "Default to plain blocking: waiting on a tool call costs nothing. Use wait: background for long-running work you have other work to do alongside.",
       "Background results are delivered to you automatically as your next message, even mid-run — if you have nothing else to do, end your turn; the wake re-engages you. Never sleep or poll to wait.",
-      "Peek at a running task with task <id> only when new output would change what you do; otherwise end your turn and let the completion wake re-engage you. Stop a task with task_kill.",
+      checkInTxt
+        ? `Peek at a running task with task <id> only when new output would change what you do; otherwise end your turn and let the completion wake re-engage you — after ${checkInTxt} without a look, an automatic check-in brings you the task's new output, so never arm one just to wait. Stop a task with task_kill.`
+        : "Peek at a running task with task <id> only when new output would change what you do; otherwise end your turn and let the completion wake re-engage you. Stop a task with task_kill.",
+      "Start servers and watchers with daemon: true: they are not supposed to exit, so they must not read as work the session waits on. Confirm one came up with a peek (task <id>), and expect to hear of it again only if it exits.",
       "You can inspect PI_* environment variables for current model and session details.",
     ],
     parameters: Type.Object({
@@ -1186,6 +1447,12 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
           description: `With wait: "background" only: keep the command running across pi restarts (outcome reported on session resume).`,
         }),
       ),
+      daemon: Type.Optional(
+        Type.Boolean({
+          description:
+            "True for a process that is not expected to exit (dev server, watcher): backgrounds immediately, is not work the session waits on, gets no automatic check-ins; you are woken only if it exits.",
+        }),
+      ),
       ...(opts.extraParams ?? {}),
     }),
     async execute(
@@ -1195,12 +1462,28 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
       onUpdate: BashOnUpdate | undefined,
       ctx: ToolCtx | undefined,
     ): Promise<BashToolResult> {
-      const mode: BashWaitMode = params.wait ?? "auto";
+      const daemon = params.daemon === true;
+      // A daemon is not expected to exit, so blocking on it — even for the auto
+      // window — can only park the session: it backgrounds whatever the wait
+      // mode says, except the one mode that would never return.
+      const mode: BashWaitMode = daemon ? "background" : (params.wait ?? "auto");
       const error = (text: string): BashToolResult => ({
         content: [{ type: "text", text }],
         details: { kind: "bash", mode },
         isError: true,
       });
+      if (daemon && params.wait === "inline") {
+        return {
+          content: [
+            {
+              type: "text",
+              text: 'daemon: true cannot use wait: "inline" — a daemon is not expected to exit, so the call would never return. Omit wait (a daemon backgrounds immediately).',
+            },
+          ],
+          details: { kind: "bash", mode: "inline" },
+          isError: true,
+        };
+      }
       const command = params.command?.trim();
       if (!command) return error("bash: command is required");
       // Timeout in seconds (like the built-in): omitted or 0 means no timeout;
@@ -1325,6 +1608,7 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
           name: taskHead,
           kind: "bash",
           persistent: true,
+          daemon,
           progress: logProgressFor(() => logPath),
           kill: () => {
             // Registry kill (task_kill, /tasks kill). We hold the child handle,
@@ -1375,6 +1659,9 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
           startedAt,
           ...(timeoutSecs !== undefined ? { timeoutSecs } : {}),
           cwd,
+          // The mark rides the durable record: a daemon must read as one again
+          // after the restart it was persisted to survive.
+          ...(daemon ? { daemon: true } : {}),
         };
         try {
           writeTaskMeta(dir, meta); // after spawn — the pid must exist by now
@@ -1410,6 +1697,7 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
               durationMs: now() - startedAt,
               output: display.content,
               outputNote: display.truncated ? `[… truncated — full output: ${logPath} …]` : undefined,
+              daemon,
             }),
           });
         };
@@ -1451,12 +1739,11 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
           content: [
             {
               type: "text",
-              text: `Backgrounded (${id}, persistent): ${taskHead}
-The command keeps running in its own process group, detached from pi — it survives pi exiting and restarting, and its outcome is reported when the session resumes. In this session the exit status, duration, and output tail are delivered to you automatically as your next message when it exits — even mid-run. If you have nothing else to do, end your turn: the wake re-engages you. Never sleep or poll to wait, and don't arm a check-in just to wait — the result arrives on its own. Peek at it with task ${id}; stop it with task_kill ${id}. Any timeout you passed still applies.`,
+              text: formatBackgroundedNotice({ id, head: taskHead, persistent: true, daemon }),
             },
           ],
           details: { kind: "bash", mode, id },
-          structuredContent: { backgrounded: true, task_id: id, persistent: true },
+          structuredContent: { backgrounded: true, task_id: id, persistent: true, ...(daemon ? { daemon: true } : {}) },
         };
       };
       if (persistWanted && persistGatesPass) return runPersistent();
@@ -1543,6 +1830,7 @@ The command keeps running in its own process group, detached from pi — it surv
       const id = reg.adopt({
         name: taskHead,
         kind: "bash",
+        daemon,
         // Check-in wakes read the log from their own offset, so each wake
         // carries the output that appeared since the last look — the wake is
         // content-bearing, never just an elapsed-time nag.
@@ -1605,6 +1893,7 @@ The command keeps running in its own process group, detached from pi — it surv
               durationMs: now() - startedAt,
               output: display.content,
               outputNote: note,
+              daemon,
             }),
           });
         } else {
@@ -1644,15 +1933,9 @@ The command keeps running in its own process group, detached from pi — it surv
         return error(`Failed to start command: ${err instanceof Error ? err.message : String(err)}`);
       }
       const backgrounded = (): BashToolResult => ({
-        content: [
-          {
-            type: "text",
-            text: `Backgrounded (${id}): ${taskHead}
-The command keeps running in the background. When it exits, the exit status, duration, and output tail are delivered to you automatically as your next message — even mid-run. If you have nothing else to do, end your turn: the wake re-engages you. Never sleep or poll to wait, and don't arm a check-in just to wait — the result arrives on its own. Peek at it with task ${id}; stop it with task_kill ${id}. Any timeout you passed still applies.`,
-          },
-        ],
+        content: [{ type: "text", text: formatBackgroundedNotice({ id, head: taskHead, daemon }) }],
         details: { kind: "bash", mode, id },
-        structuredContent: { backgrounded: true, task_id: id },
+        structuredContent: { backgrounded: true, task_id: id, ...(daemon ? { daemon: true } : {}) },
       });
       if (promoted) {
         void execPromise.then(
@@ -1705,6 +1988,11 @@ The command keeps running in the background. When it exits, the exit status, dur
           updateTimer = undefined;
         }
         emitOutputUpdate();
+        // The agent learns of the task only now (the tool result names it), so
+        // the idle check-in clock starts here rather than at adoption — with a
+        // window longer than the idle interval, a check-in would otherwise
+        // land right behind this result.
+        reg.checkIn(id);
         void execPromise.then(
           ({ exitCode }) =>
             settle(exitCode === null ? "terminated without an exit code" : `exited ${exitCode}`, exitCode === 0),
@@ -1825,10 +2113,10 @@ function logProgressFor(getPath: () => string | undefined): () => string | undef
 export function describeRunningTasks(tasks: BgTask[], nowMs: number = Date.now()): string {
   if (tasks.length === 0) return "No background tasks running.";
   return tasks
-    .map(
-      (t) =>
-        `${t.id} (${t.kind}${t.persistent ? ", persistent" : ""}, ${formatDuration(nowMs - t.startedAt)}) ${t.name}`,
-    )
+    .map((t) => {
+      const marks = [t.persistent ? "persistent" : "", t.daemon ? "daemon" : ""].filter(Boolean);
+      return `${t.id} (${t.kind}${marks.length ? `, ${marks.join(", ")}` : ""}, ${formatDuration(nowMs - t.startedAt)}) ${t.name}`;
+    })
     .join("\n");
 }
 
@@ -1867,11 +2155,19 @@ function readLogChunk(
 export function createTaskTool(registry: TaskRegistry, opts: { now?: () => number } = {}) {
   const now = opts.now ?? Date.now;
   const peekOffsets = new Map<string, number>();
+  // The description states the automatic check-in interval in effect at
+  // registration, like the bash tool's.
+  const idleMs = registry.checkInIdleMs();
+  const idleTxt = Number.isFinite(idleMs) && idleMs > 0 ? formatDuration(idleMs) : undefined;
   return {
     name: "task",
     label: "Task status",
     description: `Check on a background task (t-xxxxx) without waiting: state, elapsed time, and — for bash tasks — new output since your last check (the first check shows the last 4KB). Call with no id to list running tasks and pending check-ins.
-Task ids come from bash (wait: background or auto), backgrounded subagents, or background wake messages.`,
+Task ids come from bash (wait: background or auto), backgrounded subagents, or background wake messages.${
+      idleTxt
+        ? ` A running task nobody looks at for ${idleTxt} gets an automatic check-in — the listing shows when it is due, and a peek restarts that clock. Daemons (daemon: true) get none.`
+        : ""
+    }`,
     promptSnippet: "Check on a background task",
     promptGuidelines: [
       "Use task <id> to peek at a running task only when its new output would change what you do; otherwise end your turn and let the completion wake re-engage you — it returns only the output since your last check.",
@@ -1892,7 +2188,7 @@ Task ids come from bash (wait: background or auto), backgrounded subagents, or b
     }> {
       const taskId = params.id?.trim();
       if (!taskId) {
-        const text = `${describeRunningTasks(registry.running(), now())}${describeReminders(registry.reminders())}`;
+        const text = `${describeRunningTasks(registry.running(), now())}${describeReminders(registry.reminders(), now())}`;
         return { content: [{ type: "text", text }], details: { kind: "task" } };
       }
       const task = registry.get(taskId);
@@ -1910,7 +2206,7 @@ Task ids come from bash (wait: background or auto), backgrounded subagents, or b
       const elapsed = formatDuration((task.endedAt ?? now()) - task.startedAt);
       if (task.state !== "running") {
         const statusLine = task.status ? `, ${task.status}` : "";
-        let text = `${task.id} (${task.kind}, ${task.state}${statusLine}, ${elapsed}) ${task.name}`;
+        let text = `${task.id} (${task.kind}${task.daemon ? ", daemon" : ""}, ${task.state}${statusLine}, ${elapsed}) ${task.name}`;
         if (task.state === "killed") {
           text += " — killed; its output was discarded.";
         } else if (task.kind === "bash") {
@@ -1927,7 +2223,15 @@ Task ids come from bash (wait: background or auto), backgrounded subagents, or b
         }
         return { content: [{ type: "text", text }], details: { kind: "task", id: task.id } };
       }
+      // A look is a check: the idle check-in clock restarts (and a peek that
+      // showed output advances the check-in channel past it, so the next
+      // check-in reports only what appeared after this look).
+      // A daemon is watched only by its exit; the trailers say so.
+      const whatNext = task.daemon
+        ? "a daemon gets no automatic check-ins — you're woken only if it exits"
+        : "the completion wake re-engages you";
       if (task.kind === "subagent") {
+        registry.checkIn(task.id);
         return {
           content: [
             {
@@ -1943,12 +2247,13 @@ Task ids come from bash (wait: background or auto), backgrounded subagents, or b
       const sessionDir = ctx?.sessionManager?.getSessionDir?.();
       const logPath = sessionDir ? outputLogPath(sessionDir, task.id) : tempOutputLogPath(task.id);
       const chunk = readLogChunk(logPath, peekOffsets.get(task.id), WAKE_TEXT_CAP);
+      registry.checkIn(task.id, { seen: chunk !== undefined && chunk.bytes > 0 });
       if (chunk === undefined) {
         return {
           content: [
             {
               type: "text",
-              text: `${task.id} (bash, running, ${elapsed}) ${task.name} — (no output yet) If there's nothing to act on, end your turn — the completion wake re-engages you.`,
+              text: `${task.id} (bash${task.daemon ? ", daemon" : ""}, running, ${elapsed}) ${task.name} — (no output yet) If there's nothing to act on, end your turn — ${whatNext}.`,
             },
           ],
           details: { kind: "task", id: task.id },
@@ -1960,7 +2265,7 @@ Task ids come from bash (wait: background or auto), backgrounded subagents, or b
         content: [
           {
             type: "text",
-            text: `${task.id} (bash, running, ${elapsed}) ${task.name}${body}\nIf the new output doesn't change what you do, end your turn — the completion wake re-engages you.`,
+            text: `${task.id} (bash${task.daemon ? ", daemon" : ""}, running, ${elapsed}) ${task.name}${body}\nIf the new output doesn't change what you do, end your turn — ${whatNext}.`,
           },
         ],
         details: { kind: "task", id: task.id },
@@ -2025,15 +2330,34 @@ The task stops immediately and its result never arrives. Ids come from bash (wai
  * The check-in lever: at most one one-shot timer per running task (re-arm
  * replaces, omitting in_secs cancels). The fire is dropped when the task has
  * settled — the completion wake already delivered the result, so a reminder
- * could only burn a turn on stale news.
+ * could only burn a turn on stale news. The registry's automatic check-in is
+ * the floor under this: an armed check-in replaces it until it fires or is
+ * cancelled, and cancelling restarts the idle clock rather than silencing it.
  */
 export function createTaskRemindTool(registry: TaskRegistry, opts: { now?: () => number } = {}) {
   const now = opts.now ?? Date.now;
+  // The description states the automatic check-in interval in effect at
+  // registration, like the bash tool's.
+  const idleMs = registry.checkInIdleMs();
+  const idleTxt = Number.isFinite(idleMs) && idleMs > 0 ? formatDuration(idleMs) : undefined;
+  /** Time left on a pending check-in, from its due time when the registry gives one. */
+  const left = (c: CheckIn): string => formatDuration(c.dueAt !== undefined ? Math.max(0, c.dueAt - now()) : c.ms);
+  /** The clause that tells the agent what became of the check-in it replaced. */
+  const replaced = (prev: CheckIn | undefined): string =>
+    prev
+      ? prev.automatic
+        ? ` (replacing the automatic check-in, due in ${left(prev)})`
+        : ` (replacing the earlier check-in, was in ${left(prev)})`
+      : "";
   return {
     name: "task_remind",
     label: "Schedule task check-in",
     description: `Schedule a one-shot check-in on a running background task (t-xxxxx): after in_secs, a wake message reports that it is still running, with elapsed time and your note. If the task settles first, the check-in is dropped — the completion wake already carries the result. Re-arming replaces the pending check-in for that task; omit in_secs to cancel it.
-Use this only for long, uncertain runs where a status ping would change what you do — never to wait for a result you'll receive anyway (for that, end your turn; the completion wake is automatic). The fit is work with a go/no-go point: watchers, dev servers, migrations past a deadline you'd abandon.`,
+Use this only for long, uncertain runs where a status ping would change what you do — never to wait for a result you'll receive anyway (for that, end your turn; the completion wake is automatic). The fit is work with a go/no-go point: watchers, dev servers, migrations past a deadline you'd abandon.${
+      idleTxt
+        ? ` Every running task already gets an automatic check-in after ${idleTxt} without a look, so arm one only for a specific moment you'd act on: it replaces the automatic check-in until it fires or is cancelled, and cancelling restarts the automatic clock. Daemon tasks (daemon: true) get none — an armed check-in is the only way to be pinged about one.`
+        : ""
+    }`,
     promptSnippet: "Schedule a check-in on a background task",
     promptGuidelines: [
       "Use task_remind only when a status ping would change what you do on a long, uncertain run — not as a way to wait; for that, end your turn and let the completion wake re-engage you.",
@@ -2072,16 +2396,21 @@ Use this only for long, uncertain runs where a status ping would change what you
         };
       }
       if (params.in_secs === undefined) {
-        const cancelled = registry.cancelReminder(id);
-        if (!cancelled) {
+        if (!registry.cancelReminder(id)) {
           return {
             content: [{ type: "text", text: `No pending check-in for ${id}.` }],
             details: { kind: "task_remind", id: id ?? "" },
             isError: true,
           };
         }
+        // Cancelling is not silencing: the registry restarted the automatic
+        // check-in (unless none applies), and the result says when it is due.
+        const next = registry.reminderFor(id);
+        const restart = next?.automatic
+          ? ` The automatic check-in restarts from now: next in ${left(next)} unless you peek with task ${id} first.`
+          : "";
         return {
-          content: [{ type: "text", text: `Cancelled the pending check-in for ${id}.` }],
+          content: [{ type: "text", text: `Cancelled the pending check-in for ${id}.${restart}` }],
           details: { kind: "task_remind", id: id ?? "" },
         };
       }
@@ -2122,7 +2451,7 @@ Use this only for long, uncertain runs where a status ping would change what you
         content: [
           {
             type: "text",
-            text: `Check-in set for ${id} in ${formatDuration(ms)}${prev ? ` (replacing the earlier check-in, was in ${formatDuration(prev.ms)})` : ""}${note ? ` — ${note}` : ""}; you'll be woken with its status if it is still running. This is not a way to wait: if you have nothing else to do, end your turn — the completion or check-in wake re-engages you either way.`,
+            text: `Check-in set for ${id} in ${formatDuration(ms)}${replaced(prev)}${note ? ` — ${note}` : ""}; you'll be woken with its status if it is still running. This is not a way to wait: if you have nothing else to do, end your turn — the completion or check-in wake re-engages you either way.`,
           },
         ],
         details: { kind: "task_remind", id: id ?? "", in_secs: params.in_secs },
@@ -2134,7 +2463,8 @@ Use this only for long, uncertain runs where a status ping would change what you
 /** The user-side lever: /tasks lists running tasks and check-ins; /tasks kill <id|all> stops one or all. */
 export function createTasksCommand(registry: TaskRegistry, opts: { now?: () => number } = {}) {
   const now = opts.now ?? Date.now;
-  const listing = () => `${describeRunningTasks(registry.running(), now())}${describeReminders(registry.reminders())}`;
+  const listing = () =>
+    `${describeRunningTasks(registry.running(), now())}${describeReminders(registry.reminders(), now())}`;
   const usage = () => `Usage: /tasks — list running tasks; /tasks kill <t-xxxxx | all>\n\n${listing()}`;
   return {
     description: "List background tasks and check-ins, or kill: /tasks kill <id | all>",

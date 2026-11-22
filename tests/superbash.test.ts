@@ -18,19 +18,23 @@ import {
   createTaskTool,
   createTasksCommand,
   DEFAULT_BASH_BG_AFTER_MS,
+  DEFAULT_CHECK_IN_IDLE_MS,
   NEVER_ADOPT_MS,
   describeReminders,
   describeRunningTasks,
   type BgTask,
+  formatBackgroundedNotice,
   formatDuration,
   formatReminderWake,
   formatSubagentWake,
   formatBashWake,
   isWakeMessage,
   MAX_TIMEOUT_MS,
+  MIN_CHECK_IN_IDLE_MS,
   outputLogPath,
   parseBashBgAfterMs,
   parseBgAfterMs,
+  parseBgCheckInMs,
   parseWakeEnabled,
   piAgentDir,
   resumePersistedTasks,
@@ -129,6 +133,37 @@ describe("task activity", () => {
     registry.complete(id, { ok: true, text: "duplicate" });
     expect(held).toBe(0);
   });
+
+  it("daemons hold no activity, count separately in the footer, and stay out of waiting()", () => {
+    let held = 0;
+    const setStatus = vi.fn();
+    const registry = createTaskRegistry({
+      holdBusy: () => {
+        held++;
+        return () => {
+          held--;
+        };
+      },
+      setStatus,
+      now: () => 1_000,
+    });
+    const dev = registry.adopt({ name: "npm run dev", kind: "bash", kill() {}, daemon: true });
+    expect(held).toBe(0); // not work the session is waiting for
+    expect(registry.running().map((t) => t.id)).toEqual([dev]); // still a running task
+    expect(registry.waiting()).toEqual([]);
+    expect(setStatus).toHaveBeenLastCalledWith("bg", "1 daemon");
+    const build = registry.adopt({ name: "vitest", kind: "bash", kill() {} });
+    expect(held).toBe(1);
+    expect(registry.waiting().map((t) => t.id)).toEqual([build]);
+    expect(setStatus).toHaveBeenLastCalledWith("bg", "1 running, 1 daemon");
+    registry.complete(build, { ok: true, text: "", wake: false });
+    expect(held).toBe(0);
+    expect(setStatus).toHaveBeenLastCalledWith("bg", "1 daemon");
+    // A daemon's exit still settles and wakes: its exit is news.
+    registry.complete(dev, { ok: false, text: "dev server died" });
+    expect(registry.get(dev)).toMatchObject({ state: "failed", daemon: true });
+    expect(setStatus).toHaveBeenLastCalledWith("bg", undefined);
+  });
 });
 
 describe("env parsing", () => {
@@ -171,6 +206,26 @@ describe("env parsing", () => {
     expect(parseWakeEnabled({})).toBe(true);
     expect(parseWakeEnabled({ PI_BG_WAKE: "1" })).toBe(true);
     expect(parseWakeEnabled({ PI_BG_WAKE: "yes" })).toBe(true);
+  });
+
+  it("parseBgCheckInMs: 15m by default; off/never and any zero spelling disable it", () => {
+    expect(DEFAULT_CHECK_IN_IDLE_MS).toBe(15 * 60_000);
+    expect(parseBgCheckInMs({})).toBe(DEFAULT_CHECK_IN_IDLE_MS);
+    expect(parseBgCheckInMs({ PI_BG_CHECK_IN_MS: "  " })).toBe(DEFAULT_CHECK_IN_IDLE_MS);
+    for (const off of ["0", "0.0", "00", "off", "never", " OFF "]) {
+      expect(parseBgCheckInMs({ PI_BG_CHECK_IN_MS: off }), off).toBe(Number.POSITIVE_INFINITY);
+    }
+  });
+
+  it("parseBgCheckInMs: keeps valid intervals, clamps into schedulable range, garbage falls back", () => {
+    expect(parseBgCheckInMs({ PI_BG_CHECK_IN_MS: "600000" })).toBe(600_000);
+    expect(parseBgCheckInMs({ PI_BG_CHECK_IN_MS: "9.5e5" })).toBe(950_000);
+    // Floored: every check-in costs the agent a turn.
+    expect(parseBgCheckInMs({ PI_BG_CHECK_IN_MS: "500" })).toBe(MIN_CHECK_IN_IDLE_MS);
+    expect(parseBgCheckInMs({ PI_BG_CHECK_IN_MS: String(MAX_TIMEOUT_MS + 5) })).toBe(MAX_TIMEOUT_MS);
+    for (const bad of ["abc", "-5", "Infinity", "NaN"]) {
+      expect(parseBgCheckInMs({ PI_BG_CHECK_IN_MS: bad }), bad).toBe(DEFAULT_CHECK_IN_IDLE_MS);
+    }
   });
 });
 
@@ -318,6 +373,15 @@ describe("formatReminderWake", () => {
       "subagents stream no output, so elapsed time is the only signal",
     );
   });
+
+  it("names the trigger and the next check-in for an automatic one", () => {
+    const chatty = { ...task, progress: () => "new output since the last look (10B):\nhi" };
+    expect(formatReminderWake(chatty, 900_000, undefined, { idleIntervalMs: 900_000 })).toBe(
+      "[reminder] t-1134z8v (bash, 15m) still running — automatic check-in: 15m passed with no check" +
+        "\nnew output since the last look (10B):\nhi" +
+        "\nNothing here needs action: end your turn unless you'd act differently at a later check-in. A long elapsed time alone is not a reason to kill or restart — the completion wake is automatic; kill only if the result is no longer wanted. The next automatic check-in follows in 15m unless you peek with task t-1134z8v first.",
+    );
+  });
 });
 
 describe("isWakeMessage", () => {
@@ -336,6 +400,29 @@ describe("isWakeMessage", () => {
     expect(
       isWakeMessage(
         formatReminderWake({ id: "t-1134z8v", name: "npm test", kind: "bash", state: "running", startedAt: 0 }, 1),
+      ),
+    ).toBe(true);
+    // The automatic check-in and the daemon exit ride the same prefixes.
+    expect(
+      isWakeMessage(
+        formatReminderWake(
+          { id: "t-1134z8v", name: "npm test", kind: "bash", state: "running", startedAt: 0 },
+          1,
+          undefined,
+          { idleIntervalMs: 900_000 },
+        ),
+      ),
+    ).toBe(true);
+    expect(
+      isWakeMessage(
+        formatBashWake({
+          command: "npm run dev",
+          id: "t-1134z8v",
+          status: "exited 1",
+          durationMs: 1,
+          output: "",
+          daemon: true,
+        }),
       ),
     ).toBe(true);
   });
@@ -360,10 +447,22 @@ describe("describeReminders", () => {
     );
     expect(describeReminders([{ id: "t-1134z9w", ms: 60_000 }])).toBe("\nCheck-ins:\n  t-1134z9w in 1m");
   });
+
+  it("shows the time left when a clock is given, and labels the registry's own check-in", () => {
+    const listing = [
+      { id: "t-a", ms: 900_000, automatic: true, dueAt: 901_000 },
+      { id: "t-b", ms: 300_000, note: "check the build", dueAt: 301_000 },
+    ];
+    expect(describeReminders(listing, 11_000)).toBe(
+      "\nCheck-ins:\n  t-a in 14m50s — automatic idle check-in\n  t-b in 4m50s — check the build",
+    );
+    // A check-in past due reads as due now, never negative.
+    expect(describeReminders([{ id: "t-c", ms: 1000, dueAt: 500 }], 5_000)).toBe("\nCheck-ins:\n  t-c in 0s");
+  });
 });
 
 describe("describeRunningTasks", () => {
-  it("lists nothing when idle, and marks persistent tasks", () => {
+  it("lists nothing when idle, and marks persistent and daemon tasks", () => {
     expect(describeRunningTasks([])).toBe("No background tasks running.");
     const p: BgTask = {
       id: "t-a",
@@ -375,6 +474,49 @@ describe("describeRunningTasks", () => {
     };
     const f: BgTask = { id: "t-b", name: "vitest", kind: "bash", state: "running", startedAt: 1_000 };
     expect(describeRunningTasks([p, f], 4_000)).toBe("t-a (bash, persistent, 3s) npm run build\nt-b (bash, 3s) vitest");
+    const dev: BgTask = {
+      id: "t-c",
+      name: "npm run dev",
+      kind: "bash",
+      state: "running",
+      startedAt: 1_000,
+      daemon: true,
+      persistent: true,
+    };
+    expect(describeRunningTasks([dev], 4_000)).toBe("t-c (bash, persistent, daemon, 3s) npm run dev");
+  });
+});
+
+describe("formatBackgroundedNotice", () => {
+  it("keeps the regular contracts intact and explains a daemon instead", () => {
+    expect(formatBackgroundedNotice({ id: "t-1", head: "vitest" })).toMatch(
+      /^Backgrounded \(t-1\): vitest\nThe command keeps running in the background\. /,
+    );
+    expect(formatBackgroundedNotice({ id: "t-1", head: "vitest" })).toContain(
+      "don't arm a check-in just to wait — the result arrives on its own. Peek at it with task t-1; stop it with task_kill t-1. Any timeout you passed still applies.",
+    );
+    expect(formatBackgroundedNotice({ id: "t-1", head: "vitest", persistent: true })).toMatch(
+      /^Backgrounded \(t-1, persistent\): vitest\nThe command keeps running in its own process group/,
+    );
+
+    const daemon = formatBackgroundedNotice({ id: "t-1", head: "npm run dev", daemon: true });
+    expect(daemon).toMatch(
+      /^Backgrounded \(t-1, daemon\): npm run dev\nThe command keeps running in the background and is not expected to exit: /,
+    );
+    expect(daemon).toContain("is not work the session is waiting on and gets no automatic check-ins");
+    expect(daemon).toContain("you are woken only if it exits, which for a daemon is news");
+    expect(daemon).toContain("Peek at it with task t-1 when you need its output");
+    expect(daemon).toContain(
+      "stop it with task_kill t-1 when it is no longer needed. Any timeout you passed still applies.",
+    );
+    expect(daemon).not.toContain("completion wake"); // nothing is awaited
+    expect(daemon).not.toContain("task_remind");
+
+    const durable = formatBackgroundedNotice({ id: "t-1", head: "npm run dev", daemon: true, persistent: true });
+    expect(durable).toMatch(
+      /^Backgrounded \(t-1, persistent, daemon\): npm run dev\nThe command keeps running in its own process group/,
+    );
+    expect(durable).toContain("after a restart, the next session reports that exit");
   });
 });
 
@@ -571,14 +713,14 @@ describe("createTaskRegistry", () => {
     expect(kills).toEqual(["p"]);
   });
 
-  it("spare cancels the task's pending check-in before detaching", () => {
-    const timers: Array<{ fn: () => void; cancelled: boolean }> = [];
+  it("spare cancels every pending check-in before detaching", () => {
+    const timers: Array<{ fn: () => void; ms: number; cancelled: boolean }> = [];
     const registry = createTaskRegistry({
       sendUserMessage: vi.fn(),
       notify: vi.fn(),
       now: () => 1000,
-      schedule: (fn, _ms) => {
-        const t = { fn, cancelled: false };
+      schedule: (fn, ms) => {
+        const t = { fn, ms, cancelled: false };
         timers.push(t);
         return t;
       },
@@ -594,8 +736,10 @@ describe("createTaskRegistry", () => {
       detach: () => undefined,
     });
     registry.remind(id, 5_000);
+    expect(timers).toHaveLength(2); // the idle check-in armed at adopt, then the explicit one
     registry.killAll({ sparePersistent: true });
-    expect(timers[0]?.cancelled).toBe(true);
+    expect(timers.map((t) => t.cancelled)).toEqual([true, true]);
+    expect(registry.reminders()).toEqual([]);
   });
 
   it("maintains the footer status across transitions", () => {
@@ -610,6 +754,9 @@ describe("createTaskRegistry", () => {
   });
 
   describe("check-ins (remind)", () => {
+    // Explicit check-ins in isolation: the registry's automatic idle check-in
+    // is off, so timer indices and shapes stay unambiguous. The interplay
+    // with the automatic one has its own suite below.
     function remindDeps() {
       const timers: Array<{ fn: () => void; ms: number; cancelled: boolean }> = [];
       const sendUserMessage = vi.fn();
@@ -618,6 +765,7 @@ describe("createTaskRegistry", () => {
         sendUserMessage,
         notify,
         now: () => 1000,
+        checkInIdleMs: 0,
         schedule: (fn, ms) => {
           const t = { fn, ms, cancelled: false };
           timers.push(t);
@@ -634,9 +782,9 @@ describe("createTaskRegistry", () => {
       const d = remindDeps();
       const id = d.registry.adopt({ name: "a", kind: "bash", kill: () => undefined });
       expect(d.registry.remind(id, 300_000, "first")).toBe(true);
-      expect(d.registry.reminderFor(id)).toEqual({ ms: 300_000, note: "first" });
+      expect(d.registry.reminderFor(id)).toEqual({ ms: 300_000, note: "first", dueAt: 301_000 });
       expect(d.registry.remind(id, 600_000, "second")).toBe(true); // re-arm replaces
-      expect(d.registry.reminderFor(id)).toEqual({ ms: 600_000, note: "second" });
+      expect(d.registry.reminderFor(id)).toEqual({ ms: 600_000, note: "second", dueAt: 601_000 });
       expect(d.timers[0].cancelled).toBe(true); // the first timer was withdrawn
       expect(d.registry.cancelReminder(id)).toBe(true);
       expect(d.registry.reminderFor(id)).toBeUndefined();
@@ -683,6 +831,200 @@ describe("createTaskRegistry", () => {
       expect(d.registry.reminderFor(id)).toBeUndefined();
       d.timers[0].fn();
       expect(d.sendUserMessage).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("automatic check-ins (the idle floor)", () => {
+    /** Fake timers and a hand-set clock: nothing fires or advances on its own. */
+    function idleDeps(extra: { checkInIdleMs?: number | (() => number); wakeEnabled?: boolean } = {}) {
+      const timers: Array<{ fn: () => void; ms: number; cancelled: boolean }> = [];
+      const sendUserMessage = vi.fn();
+      const clock = { tick: 1_000 };
+      const registry = createTaskRegistry({
+        sendUserMessage,
+        notify: vi.fn(),
+        now: () => clock.tick,
+        schedule: (fn, ms) => {
+          const t = { fn, ms, cancelled: false };
+          timers.push(t);
+          return t;
+        },
+        unschedule: (h) => {
+          (h as { cancelled: boolean }).cancelled = true;
+        },
+        ...extra,
+      });
+      return { registry, sendUserMessage, timers, clock };
+    }
+
+    const NOTHING_TO_DO =
+      "\nNothing here needs action: end your turn unless you'd act differently at a later check-in. A long elapsed time alone is not a reason to kill or restart — the completion wake is automatic; kill only if the result is no longer wanted.";
+
+    it("arms one at adopt, fires it with the new output, re-arms, and withdraws it on settle", () => {
+      const d = idleDeps();
+      let looks = 0;
+      const id = d.registry.adopt({
+        name: "build",
+        kind: "bash",
+        kill() {},
+        progress: () => `new output, look ${++looks}`,
+      });
+      expect(d.timers).toHaveLength(1);
+      expect(d.timers[0].ms).toBe(DEFAULT_CHECK_IN_IDLE_MS);
+      expect(d.registry.reminderFor(id)).toEqual({ ms: 900_000, automatic: true, dueAt: 901_000 });
+
+      d.clock.tick += 900_000; // 15m with no check
+      d.timers[0].fn();
+      expect(d.sendUserMessage).toHaveBeenCalledTimes(1);
+      expect(d.sendUserMessage).toHaveBeenCalledWith(
+        `[reminder] ${id} (bash, 15m) still running — automatic check-in: 15m passed with no check\nnew output, look 1` +
+          `${NOTHING_TO_DO} The next automatic check-in follows in 15m unless you peek with task ${id} first.`,
+      );
+      // Re-armed from the fire: a task left alone is checked again, and again.
+      expect(d.timers).toHaveLength(2);
+      expect(d.timers[1].ms).toBe(DEFAULT_CHECK_IN_IDLE_MS);
+      expect(d.registry.reminderFor(id)).toEqual({ ms: 900_000, automatic: true, dueAt: 1_801_000 });
+
+      d.registry.complete(id, { ok: true, text: "done" });
+      expect(d.sendUserMessage).toHaveBeenCalledTimes(2); // the check-in, then the completion wake
+      expect(d.timers[1].cancelled).toBe(true);
+      expect(d.registry.reminderFor(id)).toBeUndefined();
+      d.timers[1].fn(); // a stray fire after settlement must be silent
+      expect(d.sendUserMessage).toHaveBeenCalledTimes(2);
+    });
+
+    it("covers subagent tasks too, with their no-output signal", () => {
+      const d = idleDeps();
+      const id = d.registry.adopt({ name: "reviewer", kind: "subagent", kill() {} });
+      d.clock.tick += 900_000;
+      d.timers[0].fn();
+      expect(d.sendUserMessage).toHaveBeenCalledWith(
+        `[reminder] ${id} (subagent, 15m) still running — automatic check-in: 15m passed with no check` +
+          `\nsubagents stream no output, so elapsed time is the only signal${NOTHING_TO_DO} The next automatic check-in follows in 15m unless you peek with task ${id} first.`,
+      );
+    });
+
+    it("an explicit check-in replaces the idle one and owns the cadence until it fires; the idle cadence resumes after", () => {
+      const d = idleDeps();
+      const id = d.registry.adopt({ name: "a", kind: "bash", kill() {} });
+      d.registry.remind(id, 60_000, "check the build");
+      expect(d.timers[0].cancelled).toBe(true); // the idle one stood down
+      expect(d.registry.reminderFor(id)).toMatchObject({ ms: 60_000, note: "check the build" });
+      expect(d.registry.reminderFor(id)?.automatic).toBeUndefined();
+
+      // Half an hour later the explicit timer fires (late, as far as its own
+      // delay goes): no idle fire preceded it — the agent chose this moment.
+      d.clock.tick += 1_800_000;
+      d.timers[1].fn();
+      expect(d.sendUserMessage).toHaveBeenCalledTimes(1);
+      expect(d.sendUserMessage).toHaveBeenCalledWith(
+        `[reminder] ${id} (bash, 30m) still running — check the build${NOTHING_TO_DO}`,
+      );
+      // That fire was a check: the idle floor is back underneath.
+      expect(d.timers).toHaveLength(3);
+      expect(d.registry.reminderFor(id)).toMatchObject({ ms: 900_000, automatic: true });
+    });
+
+    it("a peek restarts the idle clock, and `seen` advances the check-in channel past what it showed", () => {
+      const d = idleDeps();
+      const progress = vi.fn().mockReturnValueOnce("new output: a\n").mockReturnValueOnce("new output: b\n");
+      const id = d.registry.adopt({ name: "a", kind: "bash", kill() {}, progress });
+
+      d.clock.tick += 600_000; // the agent looks at minute 10
+      d.registry.checkIn(id, { seen: true });
+      expect(progress).toHaveBeenCalledTimes(1); // the look consumed the channel's delta
+      expect(d.timers[0].cancelled).toBe(true);
+      expect(d.registry.reminderFor(id)).toEqual({ ms: 900_000, automatic: true, dueAt: 1_501_000 });
+
+      d.clock.tick += 900_000; // 15m after the look, not after adoption
+      d.timers[1].fn();
+      expect(d.sendUserMessage).toHaveBeenCalledWith(
+        `[reminder] ${id} (bash, 25m) still running — automatic check-in: 15m passed with no check\nnew output: b\n\nNothing here needs action: end your turn unless you'd act differently at a later check-in. A long elapsed time alone is not a reason to kill or restart — the completion wake is automatic; kill only if the result is no longer wanted. The next automatic check-in follows in 15m unless you peek with task ${id} first.`,
+      );
+    });
+
+    it("a peek leaves an explicitly armed check-in alone", () => {
+      const d = idleDeps();
+      const id = d.registry.adopt({ name: "a", kind: "bash", kill() {} });
+      d.registry.remind(id, 5_000, "mine");
+      d.registry.checkIn(id);
+      expect(d.timers).toHaveLength(2); // nothing re-armed
+      expect(d.timers[1].cancelled).toBe(false);
+      expect(d.registry.reminderFor(id)).toMatchObject({ ms: 5_000, note: "mine" });
+    });
+
+    it("cancelling restarts the idle check-in from now — it is not a way to silence a task", () => {
+      const d = idleDeps();
+      const id = d.registry.adopt({ name: "a", kind: "bash", kill() {} });
+      d.registry.remind(id, 5_000, "mine");
+      d.clock.tick = 100_000;
+      expect(d.registry.cancelReminder(id)).toBe(true);
+      expect(d.registry.reminderFor(id)).toEqual({ ms: 900_000, automatic: true, dueAt: 1_000_000 });
+    });
+
+    it("daemons get none, and an armed check-in on one is not followed by another", () => {
+      const d = idleDeps();
+      const id = d.registry.adopt({ name: "npm run dev", kind: "bash", kill() {}, daemon: true });
+      expect(d.timers).toHaveLength(0);
+      expect(d.registry.reminderFor(id)).toBeUndefined();
+      expect(d.registry.cancelReminder(id)).toBe(false); // nothing to cancel, nothing to restart
+      expect(d.registry.remind(id, 5_000, "did it print 'ready'?")).toBe(true);
+      d.timers[0].fn();
+      expect(d.sendUserMessage).toHaveBeenCalledWith(
+        `[reminder] ${id} (bash, 0s) still running — did it print 'ready'?${NOTHING_TO_DO}`,
+      );
+      expect(d.timers).toHaveLength(1); // no idle check-in follows
+      expect(d.registry.reminderFor(id)).toBeUndefined();
+    });
+
+    it("stays off with wakes disabled, without a wake channel, or with the interval disabled", () => {
+      for (const extra of [
+        { wakeEnabled: false },
+        { checkInIdleMs: 0 },
+        { checkInIdleMs: Number.POSITIVE_INFINITY },
+      ] as const) {
+        const d = idleDeps(extra);
+        d.registry.adopt({ name: "a", kind: "bash", kill() {} });
+        expect(d.timers, JSON.stringify(extra)).toHaveLength(0);
+      }
+      const noChannel = createTaskRegistry({ now: () => 1000 }); // no sendUserMessage: nothing could be delivered
+      noChannel.adopt({ name: "a", kind: "bash", kill() {} });
+      expect(noChannel.reminders()).toEqual([]);
+    });
+
+    it("reads a function interval per arm, and reports the interval in effect", () => {
+      let interval = 60_000;
+      const d = idleDeps({ checkInIdleMs: () => interval });
+      expect(d.registry.checkInIdleMs()).toBe(60_000);
+      d.registry.adopt({ name: "a", kind: "bash", kill() {} });
+      expect(d.timers[0].ms).toBe(60_000);
+      interval = 120_000; // an env knob changed: the next arm picks it up
+      d.clock.tick += 60_000;
+      d.timers[0].fn();
+      expect(d.timers[1].ms).toBe(120_000);
+      expect(d.sendUserMessage).toHaveBeenCalledWith(
+        expect.stringContaining("automatic check-in: 1m passed with no check"),
+      );
+    });
+
+    it("revive re-arms the idle check-in: a revived task is watched again", () => {
+      const d = idleDeps();
+      const id = d.registry.adopt({ name: "a", kind: "bash", kill() {} });
+      d.registry.kill(id);
+      expect(d.timers[0].cancelled).toBe(true);
+      d.clock.tick += 5_000;
+      d.registry.revive(id);
+      expect(d.timers).toHaveLength(2);
+      expect(d.registry.reminderFor(id)).toMatchObject({ ms: 900_000, automatic: true, dueAt: 906_000 });
+    });
+
+    it("a replaced timer that fires anyway is silent — identity, not mere presence", () => {
+      const d = idleDeps();
+      const id = d.registry.adopt({ name: "a", kind: "bash", kill() {} });
+      d.registry.remind(id, 60_000, "explicit"); // timers[0] (idle) withdrawn, timers[1] armed
+      d.timers[0].fn(); // the withdrawn one runs late
+      expect(d.sendUserMessage).not.toHaveBeenCalled();
+      expect(d.registry.reminderFor(id)).toMatchObject({ note: "explicit" }); // and did not consume its successor
     });
   });
 });
@@ -770,6 +1112,23 @@ describe("createBashTool", () => {
     expect(tool.description).toContain("no default");
     expect(tool.promptGuidelines.join("\n")).toMatch(/never sleep or poll/i);
     expect(tool.promptGuidelines.join("\n")).toContain("end your turn");
+    // The idle floor and the daemon flag are part of the contract the tool teaches.
+    expect(tool.description).toContain("automatic check-in");
+    expect(tool.description).toContain("for 15m");
+    expect(tool.description).toContain("daemon: true");
+    expect(tool.promptGuidelines.join("\n")).toContain("daemon: true");
+    expect(tool.promptGuidelines.join("\n")).toContain("never arm one just to wait");
+    expect(tool.parameters.properties).toHaveProperty("daemon");
+  });
+
+  it("promises no automatic check-in when the interval is off", () => {
+    const d = toolDeps();
+    const tool = createBashTool(d.registry, {
+      operations: fakeBashOps(),
+      checkInIdleMs: Number.POSITIVE_INFINITY,
+    });
+    expect(tool.description).not.toContain("automatic check-in");
+    expect(tool.promptGuidelines.join("\n")).not.toContain("automatic check-in");
   });
 
   it("describes a disabled promote window instead of a bogus duration", () => {
@@ -799,6 +1158,65 @@ describe("createBashTool", () => {
     // The notice must not suggest arming a check-in — task_remind scoped to its own tool only.
     expect(textOf(result)).not.toContain("task_remind");
     expect(result.structuredContent).toEqual({ backgrounded: true, task_id: id });
+  });
+
+  it("daemon: true backgrounds immediately whatever the wait mode, registers a daemon, and still wakes on its exit", async () => {
+    const d = toolDeps();
+    const ops = fakeBashOps();
+    const tool = createBashTool(d.registry, { operations: ops });
+    // No wait param (auto by default): a daemon must not park the session for the window.
+    const result = await tool.execute("1", { command: "npm run dev", daemon: true }, undefined, undefined, CTX);
+    const id = idOf(result);
+    expect(result.details).toMatchObject({ kind: "bash", mode: "background", id });
+    expect(result.structuredContent).toEqual({ backgrounded: true, task_id: id, daemon: true });
+    expect(d.registry.get(id)).toMatchObject({ id, daemon: true, state: "running" });
+    expect(d.registry.waiting()).toEqual([]); // not in flight
+    expect(textOf(result)).toContain(`Backgrounded (${id}, daemon): npm run dev`);
+    expect(textOf(result)).toContain("not expected to exit");
+    expect(textOf(result)).toContain("woken only if it exits");
+    expect(textOf(result)).toContain(`Peek at it with task ${id}`);
+    expect(textOf(result)).not.toContain("task_remind");
+
+    // An explicit wait: "auto" means the same thing for a daemon.
+    const d2 = toolDeps();
+    const tool2 = createBashTool(d2.registry, { operations: fakeBashOps() });
+    const r2 = await tool2.execute(
+      "2",
+      { command: "npm run dev", wait: "auto", daemon: true },
+      undefined,
+      undefined,
+      CTX,
+    );
+    expect(r2.details).toMatchObject({ mode: "background" });
+    d2.registry.killAll();
+
+    // Its exit is news: the wake carries the daemon marker and the output.
+    ops.emit("Error: listen EADDRINUSE\n");
+    await ops.exit(1);
+    expect(d.sendUserMessage).toHaveBeenCalledTimes(1);
+    const wake = d.sendUserMessage.mock.calls[0][0] as string;
+    expect(wake).toContain(`[background] bash (${id}, 0s) exited 1 — npm run dev (daemon, not expected to exit)`);
+    expect(wake).toContain("EADDRINUSE");
+    expect(d.registry.running()).toHaveLength(0);
+  });
+
+  it('daemon: true refuses wait: "inline" — a daemon would never return', async () => {
+    const d = toolDeps();
+    const ops = fakeBashOps();
+    const inline = vi.fn();
+    const tool = createBashTool(d.registry, { operations: ops, inline });
+    const result = await tool.execute(
+      "1",
+      { command: "npm run dev", wait: "inline", daemon: true },
+      undefined,
+      undefined,
+      CTX,
+    );
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain('daemon: true cannot use wait: "inline"');
+    expect(inline).not.toHaveBeenCalled();
+    expect(ops.last).toBeUndefined();
+    expect(d.registry.running()).toHaveLength(0);
   });
 
   it("wakes with exit status and the output tail on a clean exit", async () => {
@@ -1320,6 +1738,43 @@ describe("createBashTool", () => {
       expect(wake).toContain("out");
     });
 
+    it("promotion restarts the idle check-in clock from the moment the agent learns of the task", async () => {
+      // Fake timers in the registry, a hand-set clock, a real (short) window.
+      const timers: Array<{ fn: () => void; ms: number; cancelled: boolean }> = [];
+      let tick = 5_000;
+      const registry = createTaskRegistry({
+        sendUserMessage: vi.fn(),
+        notify: vi.fn(),
+        now: () => tick,
+        schedule: (fn, ms) => {
+          const t = { fn, ms, cancelled: false };
+          timers.push(t);
+          return t;
+        },
+        unschedule: (h) => {
+          (h as { cancelled: boolean }).cancelled = true;
+        },
+      });
+      const ops = fakeBashOps();
+      const exec = ops.exec.bind(ops);
+      // Time passes between adoption and promotion: the command starts, then
+      // the window runs out some wall-clock later.
+      ops.exec = (command, cwd, opts) => {
+        tick += 240_000;
+        return exec(command, cwd, opts);
+      };
+      const tool = createBashTool(registry, { operations: ops, waitMs: 20, now: () => tick });
+      const result = await tool.execute("1", { command: "sleep 30" }, undefined, undefined, CTX);
+      const id = idOf(result);
+      // Armed at adoption (due 5s + 15m), re-armed at promotion (due 245s + 15m):
+      // with a window longer than the idle interval a check-in would otherwise
+      // land right behind the "Backgrounded" result.
+      expect(timers).toHaveLength(2);
+      expect(timers[0].cancelled).toBe(true);
+      expect(registry.reminderFor(id)).toMatchObject({ ms: 900_000, automatic: true, dueAt: 1_145_000 });
+      registry.killAll();
+    });
+
     it("reports a nonzero exit inline with the built-in wording", async () => {
       const dir = mkdtempSync(join(tmpdir(), "bash-auto-err-"));
       const d = toolDeps();
@@ -1593,21 +2048,25 @@ describe("createTaskTool", () => {
   function setup() {
     const dir = mkdtempSync(join(tmpdir(), "task-peek-"));
     const ctx = { sessionManager: { getSessionDir: () => dir } } as never;
-    const registry = createTaskRegistry({ now: () => 5_000 });
+    const registry = createTaskRegistry({ now: () => 5_000, sendUserMessage: vi.fn() }); // a wake channel: the idle check-in is armed
     const id = registry.adopt({ name: "long build", kind: "bash", kill: () => undefined });
     const log = outputLogPath(dir, id);
     const tool = createTaskTool(registry, { now: () => 7_000 });
     return { ctx, registry, id, log, tool };
   }
 
-  it("lists running tasks and pending check-ins", async () => {
+  it("lists running tasks and pending check-ins, with time left and the registry's own check-in labelled", async () => {
     const d = setup();
-    d.registry.remind(d.id, 300_000, "check the build");
-    const result = await d.tool.execute("1", {}, undefined, undefined, d.ctx);
-    const text = textOf(result);
+    // Adopted at t=5s; listed at t=7s: the idle check-in is due 15m after adoption.
+    let text = textOf(await d.tool.execute("1", {}, undefined, undefined, d.ctx));
     expect(text).toContain(`${d.id} (bash, 2s) long build`); // 7s now - 5s start
+    expect(text).toContain(`${d.id} in 14m58s — automatic idle check-in`);
+
+    d.registry.remind(d.id, 300_000, "check the build");
+    text = textOf(await d.tool.execute("2", {}, undefined, undefined, d.ctx));
     expect(text).toContain("Check-ins:");
-    expect(text).toContain(`${d.id} in 5m — check the build`);
+    expect(text).toContain(`${d.id} in 4m58s — check the build`);
+    expect(text).not.toContain("automatic idle check-in"); // replaced
   });
 
   it("lists an empty registry as such", async () => {
@@ -1701,22 +2160,14 @@ describe("createTaskTool", () => {
     expect(textOf(result)).toContain("output was discarded");
   });
 
-  /** <sessionDir> for a log path produced by outputLogPath. */
-  function dirOf(log: string): string {
-    // outputLogPath is <sessionDir>/tasks/<id>.log — drop the last two segments.
-    const i = log.lastIndexOf("/tasks/");
-    return log.slice(0, i);
-  }
-});
-
-describe("createTaskRemindTool", () => {
-  function remindDeps() {
+  it("a peek is a check: it restarts the idle check-in clock and the next check-in skips what the peek showed", async () => {
     const timers: Array<{ fn: () => void; ms: number; cancelled: boolean }> = [];
     const sendUserMessage = vi.fn();
+    let tick = 5_000;
     const registry = createTaskRegistry({
       sendUserMessage,
       notify: vi.fn(),
-      now: () => 1000,
+      now: () => tick,
       schedule: (fn, ms) => {
         const t = { fn, ms, cancelled: false };
         timers.push(t);
@@ -1726,7 +2177,92 @@ describe("createTaskRemindTool", () => {
         (h as { cancelled: boolean }).cancelled = true;
       },
     });
-    const tool = createTaskRemindTool(registry);
+    const dir = mkdtempSync(join(tmpdir(), "task-peek-"));
+    const ctx = { sessionManager: { getSessionDir: () => dir } } as never;
+    // A stand-in for the bash tool's check-in channel: each call reports the
+    // log delta since the previous call.
+    let logPath = "";
+    let offset = 0;
+    const progress = () => {
+      const whole = readFileSync(logPath, "utf8");
+      const delta = whole.slice(offset);
+      offset = whole.length;
+      return delta
+        ? `new output since the last look (${delta.length}B):\n${delta}`
+        : "no new output since the last look";
+    };
+    const id = registry.adopt({ name: "long build", kind: "bash", kill: () => undefined, progress });
+    // The task tool peeks <sessionDir>/tasks/<id>.log; the channel reads the same file.
+    logPath = outputLogPath(dir, id);
+    mkdirSync(join(dir, "tasks"), { recursive: true });
+    writeFileSync(logPath, "SHOWN\n");
+    const tool = createTaskTool(registry, { now: () => tick });
+
+    tick = 605_000; // the agent looks ten minutes in
+    const peeked = await tool.execute("1", { id }, undefined, undefined, ctx);
+    expect(textOf(peeked)).toContain("SHOWN");
+    expect(textOf(peeked)).toContain("the completion wake re-engages you");
+    expect(timers[0].cancelled).toBe(true);
+    expect(registry.reminderFor(id)).toMatchObject({ automatic: true, dueAt: 1_505_000 }); // 15m after the look
+
+    appendFileSync(logPath, "LATER\n");
+    tick = 1_505_000;
+    timers[1].fn(); // the idle check-in fires
+    expect(sendUserMessage).toHaveBeenCalledTimes(1);
+    const wake = sendUserMessage.mock.calls[0][0] as string;
+    expect(wake).toContain("automatic check-in: 15m passed with no check");
+    expect(wake).toContain("LATER");
+    expect(wake).not.toContain("SHOWN"); // the peek already showed it
+  });
+
+  it("a daemon peek says there are no check-ins and that only its exit wakes", async () => {
+    const registry = createTaskRegistry({ now: () => 5_000 });
+    const id = registry.adopt({ name: "npm run dev", kind: "bash", kill: () => undefined, daemon: true });
+    const dir = mkdtempSync(join(tmpdir(), "task-peek-"));
+    const ctx = { sessionManager: { getSessionDir: () => dir } } as never;
+    const tool = createTaskTool(registry, { now: () => 7_000 });
+    const empty = textOf(await tool.execute("1", { id }, undefined, undefined, ctx));
+    expect(empty).toContain(`${id} (bash, daemon, running, 2s) npm run dev`);
+    expect(empty).toContain("a daemon gets no automatic check-ins — you're woken only if it exits");
+    mkdirSync(join(dir, "tasks"), { recursive: true });
+    writeFileSync(outputLogPath(dir, id), "ready on :3000\n");
+    const shown = textOf(await tool.execute("2", { id }, undefined, undefined, ctx));
+    expect(shown).toContain("ready on :3000");
+    expect(shown).not.toContain("completion wake re-engages you");
+    registry.complete(id, { ok: false, text: "died", status: "exited 1", wake: false });
+    const settled = textOf(await tool.execute("3", { id }, undefined, undefined, ctx));
+    expect(settled).toContain(`${id} (bash, daemon, failed, exited 1, 0s) npm run dev`);
+  });
+
+  /** <sessionDir> for a log path produced by outputLogPath. */
+  function dirOf(log: string): string {
+    // outputLogPath is <sessionDir>/tasks/<id>.log — drop the last two segments.
+    const i = log.lastIndexOf("/tasks/");
+    return log.slice(0, i);
+  }
+});
+
+describe("createTaskRemindTool", () => {
+  // Explicit check-ins in isolation (the registry's automatic idle check-in
+  // is off); the interplay with it has its own suite below.
+  function remindDeps() {
+    const timers: Array<{ fn: () => void; ms: number; cancelled: boolean }> = [];
+    const sendUserMessage = vi.fn();
+    const registry = createTaskRegistry({
+      sendUserMessage,
+      notify: vi.fn(),
+      now: () => 1000,
+      checkInIdleMs: 0,
+      schedule: (fn, ms) => {
+        const t = { fn, ms, cancelled: false };
+        timers.push(t);
+        return t;
+      },
+      unschedule: (h) => {
+        (h as { cancelled: boolean }).cancelled = true;
+      },
+    });
+    const tool = createTaskRemindTool(registry, { now: () => 1000 });
     return { registry, sendUserMessage, timers, tool };
   }
 
@@ -1743,7 +2279,7 @@ describe("createTaskRemindTool", () => {
     expect(textOf(result)).toContain(`Check-in set for ${id} in 5m — check the build`);
     expect(textOf(result)).toContain("not a way to wait");
     expect(result.details).toMatchObject({ kind: "task_remind", in_secs: 300 });
-    expect(d.registry.reminderFor(id)).toEqual({ ms: 300_000, note: "check the build" });
+    expect(d.registry.reminderFor(id)).toEqual({ ms: 300_000, note: "check the build", dueAt: 301_000 });
   });
 
   it("re-arming replaces the pending check-in and says so", async () => {
@@ -1754,7 +2290,7 @@ describe("createTaskRemindTool", () => {
     const second = await d.tool.execute("2", { id, in_secs: 2 }, undefined, undefined, undefined);
     expect(textOf(second)).toContain("replacing the earlier check-in, was in 1s");
     expect(d.timers[0].cancelled).toBe(true);
-    expect(d.registry.reminderFor(id)).toEqual({ ms: 2000, note: undefined });
+    expect(d.registry.reminderFor(id)).toEqual({ ms: 2000, note: undefined, dueAt: 3000 });
   });
 
   it("cancels the pending check-in when in_secs is omitted", async () => {
@@ -1773,6 +2309,29 @@ describe("createTaskRemindTool", () => {
     const result = await d.tool.execute("1", { id }, undefined, undefined, undefined);
     expect(result.isError).toBe(true);
     expect(textOf(result)).toContain(`No pending check-in for ${id}`);
+  });
+
+  it("has nothing to cancel for a daemon either — it never gets an automatic check-in", async () => {
+    const timers: Array<{ fn: () => void; ms: number; cancelled: boolean }> = [];
+    const registry = createTaskRegistry({
+      sendUserMessage: vi.fn(),
+      notify: vi.fn(),
+      now: () => 1000,
+      schedule: (fn, ms) => {
+        const t = { fn, ms, cancelled: false };
+        timers.push(t);
+        return t;
+      },
+      unschedule: (h) => {
+        (h as { cancelled: boolean }).cancelled = true;
+      },
+    });
+    const tool = createTaskRemindTool(registry, { now: () => 1000 });
+    const id = registry.adopt({ name: "npm run dev", kind: "bash", kill: () => undefined, daemon: true });
+    const result = await tool.execute("1", { id }, undefined, undefined, undefined);
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain(`No pending check-in for ${id}`);
+    expect(tool.description).toContain("Daemon tasks (daemon: true) get none");
   });
 
   it("refuses unknown ids with the running list", async () => {
@@ -1824,6 +2383,70 @@ describe("createTaskRemindTool", () => {
     d.registry.complete(id, { ok: true, text: "done", wake: false });
     d.timers[0].fn(); // stray fire after settlement
     expect(d.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  describe("with the automatic idle check-in underneath", () => {
+    function idleRemindDeps() {
+      const timers: Array<{ fn: () => void; ms: number; cancelled: boolean }> = [];
+      const sendUserMessage = vi.fn();
+      const clock = { tick: 1_000 };
+      const registry = createTaskRegistry({
+        sendUserMessage,
+        notify: vi.fn(),
+        now: () => clock.tick,
+        schedule: (fn, ms) => {
+          const t = { fn, ms, cancelled: false };
+          timers.push(t);
+          return t;
+        },
+        unschedule: (h) => {
+          (h as { cancelled: boolean }).cancelled = true;
+        },
+      });
+      const tool = createTaskRemindTool(registry, { now: () => clock.tick });
+      return { registry, sendUserMessage, timers, clock, tool };
+    }
+
+    it("arming says it replaced the automatic one, with the time it had left", async () => {
+      const d = idleRemindDeps();
+      const id = d.registry.adopt({ name: "a", kind: "bash", kill: () => undefined });
+      d.clock.tick += 180_000; // 3m in: 12m left on the automatic check-in
+      const result = await d.tool.execute(
+        "1",
+        { id, in_secs: 120, note: "check the build" },
+        undefined,
+        undefined,
+        undefined,
+      );
+      expect(textOf(result)).toContain(
+        `Check-in set for ${id} in 2m (replacing the automatic check-in, due in 12m) — check the build`,
+      );
+      expect(d.timers[0].cancelled).toBe(true);
+      expect(d.registry.reminderFor(id)).toMatchObject({ ms: 120_000, note: "check the build" });
+
+      // Re-arming an explicit one reports that one, by the time it had left.
+      d.clock.tick += 60_000;
+      const again = await d.tool.execute("2", { id, in_secs: 30 }, undefined, undefined, undefined);
+      expect(textOf(again)).toContain("(replacing the earlier check-in, was in 1m)");
+    });
+
+    it("cancelling restarts the automatic check-in and says when it is due", async () => {
+      const d = idleRemindDeps();
+      const id = d.registry.adopt({ name: "a", kind: "bash", kill: () => undefined });
+      await d.tool.execute("1", { id, in_secs: 600 }, undefined, undefined, undefined);
+      d.clock.tick += 100_000;
+      const result = await d.tool.execute("2", { id }, undefined, undefined, undefined);
+      expect(textOf(result)).toBe(
+        `Cancelled the pending check-in for ${id}. The automatic check-in restarts from now: next in 15m unless you peek with task ${id} first.`,
+      );
+      expect(d.registry.reminderFor(id)).toMatchObject({ automatic: true, dueAt: 1_001_000 });
+    });
+
+    it("teaches the automatic floor in its description", () => {
+      const d = idleRemindDeps();
+      expect(d.tool.description).toContain("automatic check-in after 15m");
+      expect(d.tool.description).toContain("cancelling restarts the automatic clock");
+    });
   });
 });
 
@@ -1923,7 +2546,10 @@ describe("kill and control surfaces", () => {
     notify.mockClear();
     cmd.handler("", ctx);
     expect(notify).toHaveBeenCalledWith(expect.stringContaining("Check-ins:"), "info");
-    expect(notify).toHaveBeenCalledWith(expect.stringContaining(`${idA} in 5m — check the build`), "info");
+    // Time left, not the armed delay (the registry's clock is at 1s, the command's at 4s);
+    // t-B's own idle check-in stands underneath.
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining(`${idA} in 4m57s — check the build`), "info");
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining(`${idB} in 14m57s — automatic idle check-in`), "info");
 
     // Bare id — the old form — now teaches the grammar instead of killing.
     cmd.handler(idA, ctx);
@@ -2243,6 +2869,54 @@ describe("bash tool persistent background (real)", () => {
     expect(d.registry.running()).toHaveLength(0);
   }, 15_000);
 
+  it("daemon composes with persist: the mark rides the metadata, nothing is held, and the exit wake says daemon", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pb-tooldaemon-"));
+    let held = 0;
+    const sendUserMessage = vi.fn();
+    const registry = createTaskRegistry({
+      sendUserMessage,
+      notify: vi.fn(),
+      setStatus: vi.fn(),
+      holdBusy: () => {
+        held++;
+        return () => {
+          held--;
+        };
+      },
+    });
+    const tool = createBashTool(registry, {});
+    const ctx = { sessionManager: { getSessionDir: () => dir } } as never;
+    const result = await tool.execute(
+      "1",
+      { command: "sleep 30", daemon: true, persist: true },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = idOf(result);
+    expect(textOf(result)).toContain(`Backgrounded (${id}, persistent, daemon)`);
+    expect(result.structuredContent).toEqual({ backgrounded: true, task_id: id, persistent: true, daemon: true });
+    expect(readTaskMeta(dir, id)).toMatchObject({ id, daemon: true });
+    expect(registry.get(id)).toMatchObject({ persistent: true, daemon: true });
+    expect(registry.waiting()).toEqual([]);
+    expect(held).toBe(0); // a daemon is not work the session waits on
+    expect(registry.reminderFor(id)).toBeUndefined(); // and gets no check-ins
+    expect(registry.kill(id)).toBe(true); // test cleanup; killed tasks never wake
+    // A daemon that exits on its own is news: the wake carries the marker.
+    const exited = await tool.execute(
+      "2",
+      { command: "echo dev-up", daemon: true, persist: true },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const quick = idOf(exited);
+    await vi.waitFor(() => expect(sendUserMessage).toHaveBeenCalledTimes(1), { timeout: 10_000 });
+    expect(sendUserMessage.mock.calls[0][0]).toContain(
+      `[background] bash (${quick}, 0s) exited 0 — echo dev-up (daemon, not expected to exit)`,
+    );
+  }, 15_000);
+
   it("a killed persistent task loses its group and every artifact, and never wakes", async () => {
     const dir = mkdtempSync(join(tmpdir(), "pb-toolkill-"));
     const d = realPersistentTool(dir);
@@ -2524,6 +3198,68 @@ describe("resumePersistedTasks (real)", () => {
     expect(again).toBe("t-durable");
     expect(registry.running()).toHaveLength(1);
   });
+
+  it("a daemon that finished while away wakes with the daemon marker: its exit was not expected", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pb-resume-daemon-"));
+    const rt = newRuntime();
+    writeTask(
+      dir,
+      metaOf({
+        id: "twiredaemon",
+        pid: 4_194_304, // beyond pid_max: dead
+        daemon: true,
+        command: "npm run dev",
+        startedAt: Date.now() - 7_200_000,
+      }),
+      { status: "1", log: "Error: listen EADDRINUSE\n" },
+    );
+    await resumePersistedTasks(rt.registry, dir, {});
+    expect(wakes(rt.sendUserMessage)).toContain(
+      "[background] bash (twiredaemon, 2h) exited 1 (finished while pi was away) — npm run dev (daemon, not expected to exit)",
+    );
+    expect(wakes(rt.sendUserMessage)).toContain("EADDRINUSE");
+    expect(rt.registry.get("twiredaemon")).toMatchObject({ state: "failed", daemon: true, persistent: true });
+    expect(rt.registry.waiting()).toEqual([]);
+  });
+
+  it("a live daemon re-adopts as one: not in flight, no check-in, and the notice says so", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pb-resume-daemonlive-"));
+    const oldRt = newRuntime();
+    const oldTool = createBashTool(oldRt.registry, {});
+    const oldCtx = { sessionManager: { getSessionDir: () => dir } } as never;
+    let pid: number | undefined;
+    try {
+      const result = await oldTool.execute(
+        "1",
+        { command: "sleep 30", daemon: true, persist: true },
+        undefined,
+        undefined,
+        oldCtx,
+      );
+      const id = idOf(result);
+      pid = readTaskMeta(dir, id)!.pid;
+      oldRt.registry.killAll({ sparePersistent: true }); // shutdown detach
+
+      const rt = newRuntime();
+      const adoptedWake = vi.fn();
+      const outcomes = await resumePersistedTasks(rt.registry, dir, { wake: adoptedWake, pollMs: 25 });
+      expect(outcomes[0].decision.action).toBe("adopt");
+      expect(rt.registry.get(id)).toMatchObject({ persistent: true, daemon: true });
+      expect(rt.registry.waiting()).toEqual([]); // a dev server must never hold a goal check
+      expect(rt.registry.reminderFor(id)).toBeUndefined(); // nor collect check-ins
+      expect(adoptedWake).toHaveBeenCalledWith(
+        expect.stringContaining(
+          `re-adopted as a daemon (not expected to exit: no automatic check-ins, you hear of it only if it exits); its outcome will be delivered when it exits. Peek: task ${id}`,
+        ),
+      );
+    } finally {
+      try {
+        if (pid !== undefined && isProcessAlive(pid)) process.kill(-pid, "SIGKILL");
+      } catch {
+        // already gone
+      }
+    }
+  }, 15_000);
 
   // The declined-kill semantics: no real process — the scan deps fake a live
   // verified task, the kill seam declines, and everything else (files, poll,

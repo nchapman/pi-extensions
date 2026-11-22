@@ -93,10 +93,13 @@ describe("wrapper script and env", () => {
 });
 
 describe("task metadata", () => {
-  it("round-trips through write and read", () => {
+  it("round-trips through write and read, the daemon mark included", () => {
     const dir = mkdtempSync(join(tmpdir(), "pb-meta-"));
     writeTaskMeta(dir, meta());
     expect(readTaskMeta(dir, "t-test")).toEqual(meta());
+    const daemon = meta({ daemon: true });
+    writeTaskMeta(dir, daemon);
+    expect(readTaskMeta(dir, "t-test")).toEqual(daemon);
   });
 
   it("reads undefined for missing, corrupt, or foreign metadata", () => {
@@ -111,6 +114,8 @@ describe("task metadata", () => {
     expect(readTaskMeta(dir, "t-nopid")).toBeUndefined();
     writeFileSync(taskMetaPath(dir, "t-badto"), JSON.stringify({ ...meta(), timeoutSecs: 0 }));
     expect(readTaskMeta(dir, "t-badto")).toBeUndefined();
+    writeFileSync(taskMetaPath(dir, "t-baddaemon"), JSON.stringify({ ...meta(), daemon: "yes" }));
+    expect(readTaskMeta(dir, "t-baddaemon")).toBeUndefined(); // the mark is a boolean or absent
     // Disk-derived ids are path components — traversal payloads read as corrupt
     // rather than steering artifact paths outside the tasks dir.
     writeFileSync(taskMetaPath(dir, "t-trav"), JSON.stringify({ ...meta(), id: "../../evil" }));

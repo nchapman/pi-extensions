@@ -678,11 +678,13 @@ describe("registerSshBashExtension", () => {
     registerSshBashExtension(pi, { spawnFn: fakeSpawn().spawnFn });
     const tool = tools.get(SSH_TOOL_NAME)!;
     expect(Object.keys(tool.parameters.properties)).toEqual(
-      expect.arrayContaining(["command", "timeout", "wait", "target", "port", "key"]),
+      expect.arrayContaining(["command", "timeout", "wait", "persist", "daemon", "target", "port", "key"]),
     );
     expect(tool.description).toContain("multiplex");
     expect(tool.description).toContain("non-interactive");
     expect(tool.description).toContain("foreground");
+    expect(tool.description).toContain("daemon: true");
+    expect(tool.promptGuidelines?.join("\n")).toContain("daemon: true");
     expect(tool.promptGuidelines?.join("\n")).toContain("ssh-1");
     expect(tool.promptGuidelines?.join("\n")).toContain("nohup");
     expect(tool.promptGuidelines?.join("\n")).toContain("trailing &");
@@ -974,6 +976,27 @@ describe("registerSshBashExtension", () => {
     expect(registry.running()[0]).toMatchObject({ kind: "bash", name: "[ssh-1] train.py" });
     const result = await exec;
     expect(result.content[0].text).toContain("Backgrounded");
+  });
+
+  it("daemon: true backgrounds a remote server as a daemon: not in flight, no check-ins, notice says so", async () => {
+    const { registry } = registryDeps();
+    const { pi, tools } = makePi();
+    const f = fakeSpawn();
+    registerSshBashExtension(pi, { ...OPS, spawnFn: f.spawnFn } as never);
+    publishSharedTaskRegistry(registry);
+    const result = (await tools
+      .get(SSH_TOOL_NAME)!
+      .execute("1", { command: "npm run dev", target: "root@box", daemon: true }, undefined, undefined, CTX)) as {
+      content: Array<{ text: string }>;
+      details: { id: string };
+    };
+    const id = result.details.id;
+    expect(registry.get(id)).toMatchObject({ daemon: true, kind: "bash", name: "[ssh-1] npm run dev" });
+    expect(registry.waiting()).toEqual([]); // a remote dev server holds nothing
+    expect(registry.reminderFor(id)).toBeUndefined(); // and collects no check-ins
+    expect(result.content[0].text).toContain(`Backgrounded (${id}, daemon): [ssh-1] npm run dev`);
+    expect(result.content[0].text).toContain("[ssh-1] root@box"); // the connection line still lands
+    registry.killAll();
   });
 
   it("fails background modes with an explicit error when no shared registry exists", async () => {

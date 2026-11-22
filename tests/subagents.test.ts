@@ -1946,6 +1946,42 @@ describe("registerSubagentsExtension (full wiring)", () => {
     expect(published!.isRunning(id)).toBe(true); // the old registry still answers for its own tasks
   });
 
+  it("wires daemon: true and PI_BG_CHECK_IN_MS end to end: no hold, no check-in, and the idle floor from the env knob", async () => {
+    vi.stubEnv("PI_BG_CHECK_IN_MS", "60000"); // read at registration (description) and per arm (registry)
+    try {
+      const wired = wireUp();
+      const published = getSharedTaskRegistry()!;
+      expect(published.checkInIdleMs()).toBe(60_000);
+      const ctx = { sessionManager: { getSessionDir: () => undefined } };
+      const dev = (await wired.tools
+        .get("bash")!
+        .execute("1", { command: "npm run dev", daemon: true }, undefined, undefined, ctx)) as {
+        details: { id: string };
+      };
+      expect(published.get(dev.details.id)).toMatchObject({ daemon: true, state: "running" });
+      expect(published.waiting()).toEqual([]); // not in flight
+      expect(published.reminderFor(dev.details.id)).toBeUndefined(); // no check-ins
+      expect(wired.setStatus).toHaveBeenLastCalledWith("bg", "1 daemon");
+
+      // A regular background command alongside it is watched: the idle check-in
+      // comes from the knob, and the tool's description states it.
+      const plain = (await wired.tools
+        .get("bash")!
+        .execute("2", { command: "sleep 30", wait: "background" }, undefined, undefined, ctx)) as {
+        details: { id: string };
+      };
+      expect(published.reminderFor(plain.details.id)).toMatchObject({ ms: 60_000, automatic: true });
+      expect(published.waiting().map((t) => t.id)).toEqual([plain.details.id]);
+      expect(wired.setStatus).toHaveBeenLastCalledWith("bg", "1 running, 1 daemon");
+      expect((wired.tools.get("bash") as unknown as { description: string }).description).toContain("for 1m");
+
+      wired.handlers.get("session_shutdown")!({ reason: "quit" }); // test cleanup: kills both, withdraws the timer
+      expect(published.reminders()).toEqual([]);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("delivers wakes as steering so a busy or sleep-polling model receives them", async () => {
     const wired = wireUp();
     await runBackgroundedTask(wired.tools, wired.children);

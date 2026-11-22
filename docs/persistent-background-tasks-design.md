@@ -96,7 +96,13 @@ stash (no collisions — different suffixes):
 | --- | --- | --- |
 | `<id>.log` | the child (stdout+stderr redirected to it, `O_APPEND`) | full output from byte zero |
 | `<id>.status` | the wrapper, after the command exits | the exit code, one truncate-write |
-| `<id>.task.json` | pi, **after** a successful spawn | `{version: 1, id, command, pid, startedAt, timeoutSecs?, cwd}` |
+| `<id>.task.json` | pi, **after** a successful spawn | `{version: 1, id, command, pid, startedAt, timeoutSecs?, daemon?, cwd}` |
+
+`daemon` (added later, optional, boolean) is the on-disk half of `bash`'s
+`daemon: true`: a resumed live task re-adopts as a daemon (no activity hold, no
+check-ins) and a daemon that finished while pi was away wakes with the
+daemon marker, so the next session knows the exit was not expected. Missing
+means `false`; any non-boolean value reads as corrupt metadata.
 
 Invariant: **metadata files exist ⇔ the outcome is not yet reported.** On any
 settle (completion, death, kill, timeout) the owning monitor deletes
