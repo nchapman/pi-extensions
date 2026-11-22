@@ -51,7 +51,10 @@
  * - daemon: true marks a process that is not expected to exit (a dev server,
  *   a watcher): its exit is news, not an awaited result, so it holds no
  *   activity, stays out of the in-flight set (waiting()), and gets no
- *   automatic check-ins — an explicit task_remind still works on it
+ *   automatic check-ins — an explicit task_remind still works on it. It is
+ *   persistent by default, so "not expected to exit" also covers /reload
+ *   (whose shutdown kills every pipe-mode task) and restarts; persist: false
+ *   opts back into an attached task, and the notice says it is not durable
  * - full replies over the wake cap are stashed beside the session at
  *   <sessionDir>/tasks/<id>.txt with a pointer in the wake (stash-and-pointer, recoverable after compaction);
  *   with no session dir the text is hard-capped and says so
@@ -72,8 +75,10 @@
  *   Explicit persist that cannot be honored (non-background wait, tools built
  *   on a prepare seam, no session dir) is a loud error; PI_BG_BASH_PERSIST=1
  *   defaults background mode to persistent wherever those gates already pass,
- *   and persist: false overrides it. Shutdown detaches (spares) persistent
- *   tasks instead of killing them; resumePersistedTasks re-adopts live ones
+ *   and persist: false overrides it; daemon: true defaults to persistent on
+ *   the same gates, silently keeping the pipe path where they fail. Shutdown
+ *   detaches (spares) persistent tasks instead of killing them;
+ *   resumePersistedTasks re-adopts live ones
  *   under their on-disk id and settles the rest — disk state, not memory, owns
  *   the outcome, so exactly one runtime ever wakes for a given task
  * - registered jobs hold generic extension activity until completion/kill/detach
@@ -1254,8 +1259,9 @@ export type BashToolCallParams = {
   /** Opt the background command into surviving pi restarts (background mode only). */
   persist?: boolean;
   /** Mark a process that is not expected to exit (a dev server, a watcher):
-   *  it backgrounds immediately, holds no activity, gets no automatic check-ins, and
-   *  wakes only when it exits. */
+   *  it backgrounds immediately, holds no activity, gets no automatic check-ins,
+   *  wakes only when it exits, and is persistent by default (survives /reload
+   *  and restarts) wherever the persistence gates pass. */
   daemon?: boolean;
 } & Record<string, unknown>;
 
@@ -1272,12 +1278,12 @@ export function formatBackgroundedNotice(opts: {
   const timeoutClause = " Any timeout you passed still applies.";
   if (opts.daemon) {
     const lifetime = opts.persistent
-      ? "The command keeps running in its own process group, detached from pi — it survives pi exiting and restarting — and is not expected to exit: it is not work the session is waiting on and gets no automatic check-ins, so you are woken only if it exits, which for a daemon is news (a crash or an external stop); after a restart, the next session reports that exit."
-      : "The command keeps running in the background and is not expected to exit: it is not work the session is waiting on and gets no automatic check-ins — you are woken only if it exits, which for a daemon is news (a crash or an external stop).";
+      ? "The command keeps running in its own process group, detached from pi — it survives /reload, pi exiting, and restarting — and is not expected to exit: it is not work the session is waiting on and gets no automatic check-ins, so you are woken only if it exits, which for a daemon is news (a crash or an external stop); after a reload or restart, the session reports that exit."
+      : "The command keeps running in the background and is not expected to exit: it is not work the session is waiting on and gets no automatic check-ins — you are woken only if it exits, which for a daemon is news (a crash or an external stop). It is not durable: after /reload or a restart nothing tracks it, so start it again if you still need it.";
     return `${header}\n${lifetime} Peek at it with task ${opts.id} when you need its output, for example to confirm it came up; stop it with task_kill ${opts.id} when it is no longer needed.${timeoutClause}`;
   }
   const lifetime = opts.persistent
-    ? "The command keeps running in its own process group, detached from pi — it survives pi exiting and restarting, and its outcome is reported when the session resumes. In this session the exit status, duration, and output tail are delivered to you automatically as your next message when it exits — even mid-run."
+    ? "The command keeps running in its own process group, detached from pi — it survives /reload, pi exiting, and restarting, and its outcome is reported when the session resumes. In this session the exit status, duration, and output tail are delivered to you automatically as your next message when it exits — even mid-run."
     : "The command keeps running in the background. When it exits, the exit status, duration, and output tail are delivered to you automatically as your next message — even mid-run.";
   return `${header}\n${lifetime} If you have nothing else to do, end your turn: the wake re-engages you. Never sleep or poll to wait, and don't arm a check-in just to wait — the result arrives on its own. Peek at it with task ${opts.id}; stop it with task_kill ${opts.id}.${timeoutClause}`;
 }
@@ -1414,7 +1420,7 @@ ${autoClause} A backgrounded command's result (exit status, duration, output tai
           : ""
       } Peek at a running task with task <id> only when its new output would change what you do; stop it with task_kill.
 persist: true (wait: "background" only) detaches the command from pi entirely: it keeps running across pi exits and restarts, logs to the session's tasks directory, and its outcome is reported when the session resumes. The default is non-persistent; PI_BG_BASH_PERSIST=1 flips the default for background mode.
-daemon: true marks a process that is not expected to exit (a dev server, a watcher): it runs in the background whatever the wait mode, is not work the session is waiting on, and is never checked on automatically — you are woken only if it exits, which for a daemon is news (a crash or an external stop).
+daemon: true marks a process that is not expected to exit (a dev server, a watcher): it runs in the background whatever the wait mode, is not work the session is waiting on, and is never checked on automatically — you are woken only if it exits, which for a daemon is news (a crash or an external stop). Durable by default: it survives /reload and restarts and is reported again by the next session (persist: false keeps it attached instead).
 Timeout is in seconds, optional, no default — a command without a timeout runs until it finishes or is killed (0 also means no timeout).`,
     promptSnippet: opts.promptSnippet ?? "Execute bash commands (ls, grep, find, etc.)",
     promptGuidelines: opts.promptGuidelines ?? [
@@ -1450,7 +1456,7 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
       daemon: Type.Optional(
         Type.Boolean({
           description:
-            "True for a process that is not expected to exit (dev server, watcher): backgrounds immediately, is not work the session waits on, gets no automatic check-ins; you are woken only if it exits.",
+            "True for a process that is not expected to exit (dev server, watcher): backgrounds immediately, is not work the session waits on, gets no automatic check-ins, and is persistent by default; you are woken only if it exits.",
         }),
       ),
       ...(opts.extraParams ?? {}),
@@ -1566,7 +1572,13 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
       const localBackend =
         !opts.prepare && !opts.inline && (!opts.operations || opts.persistent?.localOperations === true);
       const persistGatesPass = localBackend && process.platform !== "win32" && !!sessionDir && mode === "background";
-      const persistWanted = params.persist ?? (mode === "background" && parseBashPersist(process.env));
+      // A daemon is durable by default: "not expected to exit" has to cover
+      // /reload too, whose shutdown kills every pipe-mode task — a dev server
+      // must not die because the extensions were reloaded. The env default
+      // stays background-only; an explicit persist: false opts a daemon back
+      // into pipe mode. Where the gates fail (ssh_bash, no session dir) the
+      // daemon silently keeps the pipe path, like the env default.
+      const persistWanted = params.persist ?? (daemon || (mode === "background" && parseBashPersist(process.env)));
       if (params.persist === true && !persistGatesPass) {
         if (!localBackend)
           return error(

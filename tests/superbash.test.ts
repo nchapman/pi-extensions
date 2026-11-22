@@ -510,6 +510,9 @@ describe("formatBackgroundedNotice", () => {
     expect(daemon).toContain(
       "stop it with task_kill t-1 when it is no longer needed. Any timeout you passed still applies.",
     );
+    expect(daemon).toContain(
+      "It is not durable: after /reload or a restart nothing tracks it, so start it again if you still need it.",
+    );
     expect(daemon).not.toContain("completion wake"); // nothing is awaited
     expect(daemon).not.toContain("task_remind");
 
@@ -517,7 +520,9 @@ describe("formatBackgroundedNotice", () => {
     expect(durable).toMatch(
       /^Backgrounded \(t-1, persistent, daemon\): npm run dev\nThe command keeps running in its own process group/,
     );
-    expect(durable).toContain("after a restart, the next session reports that exit");
+    expect(durable).toContain("it survives /reload, pi exiting, and restarting");
+    expect(durable).toContain("after a reload or restart, the session reports that exit");
+    expect(durable).not.toContain("not durable");
   });
 });
 
@@ -1177,6 +1182,13 @@ describe("createBashTool", () => {
     expect(textOf(result)).toContain("woken only if it exits");
     expect(textOf(result)).toContain(`Peek at it with task ${id}`);
     expect(textOf(result)).not.toContain("task_remind");
+    // No session dir and injected operations: the persistence gates fail, so the
+    // daemon keeps the pipe path and the notice says it is not durable.
+    expect(result.structuredContent).not.toHaveProperty("persistent");
+    expect(textOf(result)).toContain(
+      "It is not durable: after /reload or a restart nothing tracks it, so start it again if you still need it.",
+    );
+    expect(tool.description).toContain("Durable by default: it survives /reload and restarts");
 
     // An explicit wait: "auto" means the same thing for a daemon.
     const d2 = toolDeps();
@@ -2894,7 +2906,7 @@ describe("bash tool persistent background (real)", () => {
     const result = await runPersist(d, "echo persist-hi; exit 3");
     const id = idOf(result);
     expect(textOf(result)).toContain(`Backgrounded (${id}, persistent)`);
-    expect(textOf(result)).toContain("survives pi exiting and restarting");
+    expect(textOf(result)).toContain("survives /reload, pi exiting, and restarting");
     expect(result.structuredContent).toEqual({ backgrounded: true, task_id: id, persistent: true });
     expect(d.registry.running()[0]).toMatchObject({ id, kind: "bash", persistent: true });
     const meta = readTaskMeta(dir, id);
@@ -2957,6 +2969,53 @@ describe("bash tool persistent background (real)", () => {
     expect(sendUserMessage.mock.calls[0][0]).toContain(
       `[background] bash (${quick}, 0s) exited 0 — echo dev-up (daemon, not expected to exit)`,
     );
+  }, 15_000);
+
+  it("daemon: true is durable by default: /reload's shutdown spares it and the next runtime re-adopts it as a daemon", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pb-tooldurable-"));
+    const oldRt = realPersistentTool(dir);
+    const result = await oldRt.tool.execute(
+      "1",
+      { command: "sleep 30", daemon: true },
+      undefined,
+      undefined,
+      oldRt.ctx,
+    );
+    const id = idOf(result);
+    expect(textOf(result)).toContain(`Backgrounded (${id}, persistent, daemon)`);
+    expect(result.structuredContent).toEqual({ backgrounded: true, task_id: id, persistent: true, daemon: true });
+    expect(readTaskMeta(dir, id)).toMatchObject({ id, daemon: true });
+    // What /reload does: the old runtime's shutdown spares persistent tasks.
+    oldRt.registry.killAll({ sparePersistent: true });
+    expect(oldRt.registry.get(id)).toBeUndefined();
+    expect(readTaskMeta(dir, id)).toBeDefined();
+    // The replacement runtime's session_start scan re-adopts it with the mark.
+    const next = realPersistentTool(dir);
+    const outcomes = await resumePersistedTasks(next.registry, dir, { wake: vi.fn(), pollMs: 25 });
+    expect(outcomes[0].decision.action).toBe("adopt");
+    expect(next.registry.get(id)).toMatchObject({ persistent: true, daemon: true, state: "running" });
+    expect(next.registry.waiting()).toEqual([]);
+    expect(next.registry.kill(id)).toBe(true); // test cleanup, through the resumed task's own kill
+    await vi.waitFor(() => expect(readTaskMeta(dir, id)).toBeUndefined(), { timeout: 5_000 });
+  }, 15_000);
+
+  it("daemon: true with persist: false stays attached: pipe mode, nothing on disk, and the notice says it is not durable", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pb-tooldaemonpipe-"));
+    const d = realPersistentTool(dir);
+    const result = await d.tool.execute(
+      "1",
+      { command: "sleep 30", daemon: true, persist: false },
+      undefined,
+      undefined,
+      d.ctx,
+    );
+    const id = idOf(result);
+    expect(textOf(result)).toContain(`Backgrounded (${id}, daemon): sleep 30`);
+    expect(result.structuredContent).toEqual({ backgrounded: true, task_id: id, daemon: true });
+    expect(textOf(result)).toContain("It is not durable: after /reload or a restart nothing tracks it");
+    expect(d.registry.get(id)?.persistent).toBeFalsy();
+    expect(existsSync(taskMetaPath(dir, id))).toBe(false);
+    expect(d.registry.kill(id)).toBe(true); // test cleanup
   }, 15_000);
 
   it("a killed persistent task loses its group and every artifact, and never wakes", async () => {
