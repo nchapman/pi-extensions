@@ -2088,7 +2088,7 @@ Timeout is in seconds, optional, no default — a command without a timeout runs
  *  last look (tail-biased, like a first peek), so every check-in wake carries
  *  new output rather than an elapsed-time nag. Shared by the pipe and
  *  persistent background paths. */
-function logProgressFor(getPath: () => string | undefined): () => string | undefined {
+export function logProgressFor(getPath: () => string | undefined): () => string | undefined {
   let offset = 0;
   return () => {
     // Runs from reminder timers (outside deliver's try/catch) and the log has
@@ -2099,7 +2099,10 @@ function logProgressFor(getPath: () => string | undefined): () => string | undef
       if (!path || !existsSync(path)) return "(no output yet)";
       const size = statSync(path).size;
       if (size <= offset) return "no new output since the last look";
-      const chunk = readLogChunk(path, Math.max(offset, size - REMINDER_TAIL_CAP), REMINDER_TAIL_CAP);
+      // Tail-biased when the delta outgrew the cap: the skipped bytes make
+      // the window open mid-line, so ask for whole lines.
+      const start = Math.max(offset, size - REMINDER_TAIL_CAP);
+      const chunk = readLogChunk(path, start, REMINDER_TAIL_CAP, { wholeLines: start > offset });
       if (!chunk) return "(no output yet)";
       offset = size;
       return `new output since the last look (${formatSize(chunk.bytes)}):\n${chunk.text}`;
@@ -2125,6 +2128,7 @@ function readLogChunk(
   path: string,
   from: number | undefined,
   cap: number,
+  opts: { wholeLines?: boolean } = {},
 ): { text: string; next: number; bytes: number } | undefined {
   try {
     const size = statSync(path).size;
@@ -2133,11 +2137,24 @@ function readLogChunk(
     const len = Math.min(cap, size - start);
     const fd = openSync(path, "r");
     try {
-      const buf = Buffer.alloc(len);
-      readSync(fd, buf, 0, len, start);
+      // A window that skipped bytes (a tail by default, a delta past the cap
+      // when the caller says so) opens inside a line; one byte before it tells.
+      // A window continuing the previous read does not: its first fragment is
+      // the rest of a line whose start was already shown.
+      const probe = (opts.wholeLines ?? from === undefined) && start > 0 ? 1 : 0;
+      const buf = Buffer.alloc(probe + len);
+      readSync(fd, buf, 0, probe + len, start - probe);
+      let text = buf.toString("utf8", probe);
+      if (probe === 1 && buf[0] !== 0x0a) {
+        // Show whole lines only: a leading fragment reads like corruption, and
+        // its start was never shown anyway.
+        const nl = text.indexOf("\n");
+        if (nl !== -1 && nl + 1 < text.length) text = text.slice(nl + 1);
+      }
       // A tail/offset can start mid-codepoint; drop the lone leading
       // replacement character rather than printing it.
-      return { text: buf.toString("utf8").replace(/^\uFFFD/, ""), next: start + len, bytes: len };
+      text = text.replace(/^\uFFFD/, "");
+      return { text, next: start + len, bytes: Buffer.byteLength(text) };
     } finally {
       closeSync(fd);
     }

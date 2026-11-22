@@ -29,6 +29,7 @@ import {
   formatSubagentWake,
   formatBashWake,
   isWakeMessage,
+  logProgressFor,
   MAX_TIMEOUT_MS,
   MIN_CHECK_IN_IDLE_MS,
   outputLogPath,
@@ -2044,6 +2045,34 @@ describe("createBashTool", () => {
   });
 });
 
+describe("logProgressFor (real file)", () => {
+  it("carries each delta since the last look, opening on a line boundary when the cap cuts into one", () => {
+    const dir = mkdtempSync(join(tmpdir(), "progress-"));
+    const path = join(dir, "t-1.log");
+    const line = (i: number) => `tick ${String(i).padStart(3, "0")} ${"y".repeat(30)}\n`;
+    const progress = logProgressFor(() => path);
+    expect(progress()).toBe("(no output yet)"); // no log yet
+
+    // More than the tail cap (500B) appeared before the first look: the
+    // window is tail-biased, and its first whole line is where the text starts.
+    writeFileSync(path, Array.from({ length: 40 }, (_, i) => line(i + 1)).join(""));
+    const first = progress()!;
+    expect(first).toMatch(/^new output since the last look \([\d.]+[KM]?B\):\ntick \d{3} y{30}\n/);
+    expect(first.endsWith(`tick 040 ${"y".repeat(30)}\n`)).toBe(true);
+
+    appendFileSync(path, line(41) + line(42));
+    // The delta since the look, byte count and all (it continues the previous
+    // read's end exactly, so nothing is trimmed).
+    expect(progress()).toBe(`new output since the last look (80B):\n${line(41)}${line(42)}`);
+    expect(progress()).toBe("no new output since the last look");
+  });
+
+  it("reads a missing log as no output", () => {
+    const dir = mkdtempSync(join(tmpdir(), "progress-gone-"));
+    expect(logProgressFor(() => join(dir, "missing.log"))()).toBe("(no output yet)");
+  });
+});
+
 describe("createTaskTool", () => {
   function setup() {
     const dir = mkdtempSync(join(tmpdir(), "task-peek-"));
@@ -2075,6 +2104,19 @@ describe("createTaskTool", () => {
     const ctx = { sessionManager: { getSessionDir: () => undefined } } as never;
     const result = await tool.execute("1", {}, undefined, undefined, ctx);
     expect(textOf(result)).toBe("No background tasks running.");
+  });
+
+  it("a first peek of a long log opens on a line boundary, not a mid-line fragment", async () => {
+    const d = setup();
+    // 300 lines × 34 bytes: the tail window (WAKE_TEXT_CAP) opens inside a line.
+    mkdirSync(join(dirOf(d.log), "tasks"), { recursive: true });
+    writeFileSync(
+      d.log,
+      Array.from({ length: 300 }, (_, i) => `line ${String(i + 1).padStart(3, "0")} ${"x".repeat(24)}\n`).join(""),
+    );
+    const text = textOf(await d.tool.execute("1", { id: d.id }, undefined, undefined, d.ctx));
+    const block = text.slice(text.indexOf("New output ("));
+    expect(block).toMatch(/^New output \([\d.]+[KM]?B\):\nline \d{3} x{24}\n/);
   });
 
   it("errors with the running list for an unknown id", async () => {
